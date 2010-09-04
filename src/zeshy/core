@@ -1,0 +1,691 @@
+#!/usr/bin/env zsh
+# ====================[ core                               ]====================
+#                     [ Time-stamp: "2009-04-18 19:29:36 leycec" ]
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Core Zeshy functionality upon which all other Zeshy functionality depends,
+# comprising:
+#
+# * Autoload definitions.
+# * Shell options.
+# * I/O- and error-handling routines.
+#
+# --------------------( TODO                               )--------------------
+# * Add "$IS_CRON" support.
+# * Use the "vcs_info" Zsh module for displaying VCS-specific metadata in a VCS-
+#   agnostic fashion.
+# * Incorporate ZSH-lovers fixes, including:
+#   * Use "zparseopts" instead of "getopt" for script functions intended to be
+#     called from the command-line as well as for external shell scripts. Nice!
+#   * Use suffix aliases.
+
+# ....................{ PATHS                              }....................
+# Absolute path to the current script. The existence of this variable also
+# serves to inform callers as to whether or not this script has been imported
+# yet and, when it has, to avoid reimporting it.
+export zeshy_core_path=$(readlink --canonicalize-existing "${0}")
+
+# Directory having the current script. This environment variable should have
+# been permanently added to the current system on Zeshy installation. If it was
+# not, however, ensure that it at least temporarily exists now.
+[[ -n "${ZESHY_HOME}" ]] ||  
+    export ZESHY_HOME=$(readlink --canonicalize-existing $(dirname "${zeshy_core_path}")"/..")
+
+# Directory to which Zeshy caches Zsh metadata. Note that Zsh itself is unaware
+# of this path until Zeshy explicitly instructs it to cache metadata here.
+export ZESHY_CACHE_HOME="${HOME}/.zsh"
+
+# Directory to which Zeshy caches Zsh completions.
+export ZESHY_COMPLETION_CACHE_PATH="${ZESHY_CACHE_HOME}/zcompcache"
+
+# File to which the compinit() function dumps its configuration. 
+export ZESHY_COMPINIT_DUMP_FILE="${ZESHY_CACHE_HOME}/zcompdump"
+
+# ....................{ RETURN CODES                       }....................
+# Success code, as returned by successful processes on process completion.
+ZESHY_SUCCESS_CODE=0
+
+# Failure code, as returned by failed processes on process completion. Note
+# that, technically, any return code greater than or equal to this value
+# constitutes a process failure.
+ZESHY_FAILURE_CODE=1
+
+# ....................{ MESSAGES                           }....................
+#FIXME: Add ANSI coloring to uttered messages if on an ANSI-capable terminal.
+
+# void utter(char *message = '')
+#
+# Echo the passed message to the standard output stream. Specifically:
+#
+# * If a cronjob, echo to the notice stream of the cron logging facility.
+# * Otherwise, echo to "stdout".
+utter() {
+    local MESSAGE=$(get_script_name)": ${@}"
+
+    if [[ -n "${IS_CRON}" ]]
+    then logger -p cron.notice "${MESSAGE}"
+    else echo "${MESSAGE}"
+    fi
+}
+
+# void curse(char *message = '')
+#
+# Echo the passed message to the standard error stream. Specifically:
+#
+# * If a cronjob, echo to the error stream of the cron logging facility.
+# * Otherwise, echo to "stderr".
+curse() {
+    local MESSAGE=$(get_script_name)": ${@}"
+
+    if [[ -n "${IS_CRON}" ]]
+    then logger -p cron.err "${MESSAGE}"
+    else echo "${MESSAGE}" 1>&2
+    fi
+}
+
+# char *get_script_name(void)
+#
+# Return "${SCRIPT_NAME}", if defined; otherwise, return the string name of the
+# function that called the function that called this function (i.e., the
+# function two calls earlier in the function callstack). In the latter case, as
+# this function is an internal function intended to be called only by the
+# functions above, we are guaranteed of our caller being one of the functions
+# above. Then the caller of that function is precisely the function two calls
+# earlier in the callstack. (Insert magical handwaving here.)
+get_script_name() {
+    if [[ -n "${SCRIPT_NAME}" ]]; then
+        echo "${SCRIPT_NAME}"
+    #FIXME: Hmm. How to reference the global $0 from within function scope?
+    # If the current process is not ZSH itself, then it must be an external ZSH
+    # script. In this case, the script name is the basename of the invoked file.
+#   elif [[  $(basename "$0") != "zsh" ]]; then
+#       echo $(basename "$0")
+    else
+        # Ignore all functions pertaining to I/O and error handling. Since the first
+        # element of "$funcstack" is the name of the current function (and we are
+        # not particularly interested in that), skip that by setting "I=2".
+        local I
+        for (( I=2; ${I} <= ${#funcstack}; I=${I}+1 )); do
+            case ${funcstack[${I}]} in
+                die*|curse*|utter*) continue ;;
+                *) break ;;
+            esac
+        done
+
+        # If after ignoring non-relevant functions there still exists at least one
+        # function on the callstack, print the function's name. (This is our man.)
+        if [[ ${I} -le ${#funcstack} ]]
+        then echo "${funcstack[${I}]}"
+        # Otherwise, print a placeholder function name.
+        else echo "zsh"
+        fi
+    fi
+}
+
+# ....................{ MESSAGES ~ imports                 }....................
+# void utter_import(char *script_name)
+#
+# Echo a message informing the user that the passed script name is being
+# imported. This function should be called prior to actually importing that
+# script if feasible.
+utter_import() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one script name"
+
+    # If the caller has supplied no explicit "${SCRIPT_NAME}", supply a default.
+    # Failing to do this encourages the utter() function to use the name of this
+    # function as its script name, producing an unaesthetic result.
+    [[ -n "${SCRIPT_NAME}" ]] || local SCRIPT_NAME='zeshy'
+    utter "importing \"${1}\"..."
+}
+
+# ....................{ AUTOLOADS                          }....................
+# Autoload all autoloadable files. This permits all subsequent code to call
+# autoloadable functions without having to manually autoload those functions:
+# e.g.,
+#
+#     # Instead of this...
+#     autoload -U zsh-mime-setup; zsh-mime-setup
+#
+#     # ...one now does this.
+#     zsh-mime-setup
+#
+# This glob expression matches the basename of all non-executable readable files
+# residing under every path in the function path list, "${fpath}". Via Zsh
+# mandate, every such file basename corresponds to the autoloadable function
+# name defined in the file. Thus, matching these basenames also matches all
+# autoloadable function names.
+#
+# * "-.x" ignores non-executable files. While not strictly necessary, forum
+#    posters suggest this beneficially permits you to ignore undesirable
+#    autoloads by chmodding away their executable bit.
+# * "-.r" ignores non-readable files. This is strictly necessary.
+# * ":t" extracts the "tail" (i.e., basename) of the current file. This is a
+#    history modifier extracting each file's filename sans absolute path.
+# 
+for autoload_function_name in $^fpath/*(N-.r:t); do
+    autoload -U "${autoload_function_name}"
+done
+
+# Suffix aliases. (This enables BSD-style file opening, by associating file
+# suffixes with an application responsible for opening files of that suffix.
+# Thus, for example, you may open some PDF-file "/tmp/blandishment.pdf" by
+# simply typing that filename at the shell prompt. You must, however, edit
+# "/etc/mailcap" to add MIME-type handlers custom for your system: by adding,
+# for example, a new "application/pdf;/usr/local/bin/acroread %s" line to
+# this file, to open PDF-files with Adobe Acrobat.)
+zsh-mime-setup
+
+# zmv. "zmv" is a built-in shell function applying extended glob patterns to the
+# usual "mv" command, thus allowing batch renaming of file- and path-names. (Use
+# option "-n" before permanently applying any such pattern, so as to prete[n]d-
+# apply the pattern as initial "trial run;" or, use option "-i" to force "zmv"
+# to [i]nteractively ask your permission to perform each rename.) For example:
+#     zmv -n '(*).txt' '$1.xtx'  # renames files ending in 'txt' to end in 'xtx'
+#     zmv -i '(*).txt' '$1.xtx'  # renames files ending in 'txt' to end in 'xtx'
+#
+# Honestly, I prefer PCRE (Perl Compatible Regular Expression) over this
+# extended glob pattern syntax; so I use Perl, rather than Zsh, to batch rename.
+#autoload -U zmv
+
+# ....................{ MODULES                            }....................
+# Zsh modules are C-implemented shared libraries optionally loadable at runtime.
+# Zeshy loads the following Zsh modules.
+
+# Parameter module exposing Zsh's C-based internal hashes via Zsh-based
+# associative arrays. We are particularly interested in the "$funcstack"
+# associative array, for dynamically inspecting the function call stack.
+zmodload zsh/parameter
+
+# Stat module wrapping the stat() system call with the zstat() Zsh function. Do
+# not load this module via "zmodload zsh/stat", as that wraps the stat() system
+# call with the default stat() Zsh function, which conflicts with "stat" binary.
+zmodload -F zsh/stat b:zstat
+
+# ....................{ OPTIONS                            }....................
+# Command history.
+setopt appendhistory     # share history between multiple ZSH sessions
+setopt extendedhistory   # save timestamps in history
+setopt histignorealldups # don't ignore dups in history
+setopt histignoredups    # ignore consecutive dups in history
+setopt histnostore       # don't store history related functions
+setopt incappendhistory  # incrementally add items to history
+
+# Path changing.
+setopt autocd            # automatically cd to a directory if not cmd
+setopt autopushd         # automatically pushd directories on dirstack
+setopt pushdignoredups   # don't push dups on stack
+setopt pushdsilent       # be quiet about pushds and popds
+
+# File globbing.
+setopt extendedglob      # use extended globbing (#, ~, ^)
+setopt globdots          # don't require a dot ('.') to be specifically
+setopt no_nomatch        # don't emit an error for non-matching globs
+
+# Input completion.
+setopt automenu          # use menu completion after 2 tabs
+setopt completeinword    # complete inside words
+setopt nolistambiguous   # only list matches if ambiguous
+
+# I/O.
+setopt noflowcontrol     # don't use flow control (^S/^Q)
+setopt printeightbit     # allow eight bit output for completion lists
+
+# Process control.
+setopt longlistjobs      # list jobs in long format
+setopt nonotify          # report job status only before prompt printing
+
+# String matching.
+setopt rematch_pcre      # prefer Perl-Compatible Regular Expression matching
+
+# Prompt.
+# Enable variable substitution in prompt expansions in a "synchronous" fashion.
+# Enabling this re-evaluates each prompt expansion after perform each
+# interactive command with the current values of those variables without
+# having to manually recreate the prompt each time.
+setopt promptsubst
+
+# ....................{ I/O SETTINGS                       }....................
+# Disable flow control key bindings, as these increasingly conflict with those
+# of popular CLI applications (e.g., irssi, rtorrent). Specifically, prevent
+# <Ctrl-s> and <Ctrl-q> from disabling and re-enabling flow control.
+stty -ixon -ixoff
+
+# ....................{ FATALITIES                         }....................
+# void die(char *message = '')
+#
+# Echo the passed text according to the curse() function and exit the currently
+# executed script with error.
+die() {
+    # If the return code of the prior command signifies an error, exit with that
+    # return code; otherwise, exit with generic error code 1.
+    local return_code
+    if [[ ${?} -gt 0 ]]
+    then return_code=${?}
+    else return_code=1
+    fi
+
+    curse "${@}"
+
+    #FIXME: Pack the above return code into this exception.
+    # If the script is actually a function called in a running interactive and/or
+    # login shell process, exit the set of called functions rather than the shell
+    # (i.e., unwind the call stack).
+    if [[ -o interactive || -o login ]]
+    then throw ZeshyDieException
+    # Otherwise, exit the current process.
+    else exit ${return_code}
+    fi
+}
+
+# void try(char *command)
+#
+# Run the passed command and, if it fails with error, terminate the current
+# execution environment with the same error.
+try() {
+    run "${@}" || die
+}
+
+# ....................{ PROCESSES                          }....................
+# void run(char *command)
+#
+# Run the passed command. If this is a built-in shell command, just run it;
+# otherwise, run it under "nice" and "ionice" so as to assist other running
+# processes.
+#
+# Note, commands should be passed as quoted strings to prevent the calling shell
+# from evaluating pipes, redirections, et al. prior to passing the command:
+# e.g.,
+#
+#   # This is good.
+#   run "screen -list | grep --count 'eschaton'"
+#
+#   # This is not.
+#   run screen -list | grep --count 'eschaton'
+#
+# This cannot be fixed, due to the nature of shell evaluation.
+run() {
+    local return_code
+
+    # The number of passed arguments after word-splitting those arguments.
+    #
+    # The '@' parameter expansion returns all such arguments.
+    #
+    # The '=' parameter expansion performs word-splitting: e.g., some string
+    # "ls ~/peak-oil" expands to "ls" "~/peak-oil" under such word-splitting. The
+    # latter is an executable command; the former is not.
+    #
+    # The '#' parameter expansion returns the number of such words. (Phew!)
+    local argument_count=${#${=@}}
+    [[ "${argument_count}" -ge 1 ]] || die "expected a command"
+    
+    #FIXME: Revert to using ${*}?
+    # If the passed command to run actually exists, run it under it "nice" and
+    # "ionice"; otherwise, the command is probably a built-in shell command and
+    # cannot be run under "nice" or "ionice".
+    #
+    # If the passed command is run outside of an "eval" statement, strange and
+    # horrible things happen. (Let's avoid that, shall we?)
+    if is_binary_available "${1}"; then
+        if [[ -n "${RUN_AS}" ]]; then
+            su --preserve-environment --command "${NICE} ${IONICE} ${@}" "${RUN_AS}"
+            return_code=${?}
+        else
+            eval "${NICE} ${IONICE} ${@}"
+            return_code=${?}
+        fi
+    else
+        eval "${@}"
+        return_code=${?}
+    fi
+  
+    return ${return_code}
+}
+
+# void run_as(char *username, char *command)
+#
+# Run the passed command as the passed user.
+run_as() {
+    [[ "${#}" -ge 2 ]] || die "expected one username followed by a command"
+
+    # If the current user is not the passed user, locally set ${RUN_AS}. The "run"
+    # function notes this variable as being set and behaves accordingly.
+    [[ "$(whoami)" == "${1}" ]] || local RUN_AS="${1}"
+
+    # Remove the passed user from the argument list and call "run" with all
+    # remaining arguments: namely the command to be run.
+    shift
+    run "${@}"
+}
+
+# ....................{ TYPES                              }....................
+# bool is_alias_or_function(char *name)
+#
+# Return true if there exists an alias or function with the passed name.
+is_alias() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one name"
+    [[ $(whence -w "${1}") =~ ': (alias|function)$' ]]
+}
+
+# bool is_alias(char *alias_name)
+#
+# Return true if there exists an alias with the passed alias name.
+is_alias() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one alias name"
+    [[ $(whence -w "${1}") =~ ': alias$' ]]
+}
+
+# bool is_function(char *function_name)
+#
+# Return true if there exists a function with the passed function name.
+is_function() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one function name"
+    [[ $(whence -w "${1}") =~ ': function$' ]]
+}
+
+# ....................{ FILES                              }....................
+# int get_mtime(char *path)
+#
+# Get the mtime (i.e., modification time) for the passed absolute path. The
+# running kernel modifies this time as follows:
+#
+# * If this path corresponds to a file, then this time is updated to the current
+#   time on each creation, filename change, permission change, or modification
+#   of file contents.
+# * If this path corresponds to a directory, then this time is updated to the
+#   current time on each creation, pathname change, or permission change of this
+#   directory as well as creation, filename change, or deletion of files in this
+#   directory. Note that this time is not updated on permission change or
+#   modification of file contents for files in this directory.
+#
+# The return value is an integer, suitable for testing with "-ge" and "-le".
+get_mtime() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one filename"
+    try zstat +mtime "${1}"
+}
+
+# ....................{ DIRECTORIES                        }....................
+# void make_directories_if_not_found(char *path1, char *path2, ...)
+#
+# Examine each of the passed absolute paths and, for each non-existant path,
+# make that path and all non-existant parent paths of that path.
+make_directories_if_not_found() {
+    [[ "${#}" -ge 1 ]] || die "expected at least one pathname"
+
+    # While there are more paths to consider, shift the current path to be
+    # considered to a local variable "new_path" and make it when not found.
+    local new_path
+    while [[ -n "${1}" ]]; do
+        new_path="${1}"
+        shift
+
+        if [[ ! -d "${new_path}" ]]; then
+            utter "making \"${new_path}\"..."
+            try mkdir --parents "${new_path}"
+        fi
+    done
+}
+
+# ....................{ TEMPORARIES                        }....................
+# char *which_temporary_path(char *prefix)
+#
+# Print the absolute path to a temporary path having the passed prefix: e.g.,
+#
+#   # Prints "/tmp/git_patches~2010-04-18_22-58-34/", for example.
+#   which_temporary_path git_patches
+#
+# While subtle race conditions may arise with concurrent processing, this path
+# is generally unique. This should probably not be depended upon for mission
+# critical ZSH scripts, however. (Of course, if you're coding such a mission
+# critical script in ZSH, you've probably already gone too far.)
+which_temporary_path() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one path prefix"
+    
+    local which_temporary_path
+    while true; do
+        which_temporary_path="/tmp/${1}.path~$(date +'%F_%H-%M-%S')"
+        if [[ ! -d "${which_temporary_path}" ]]; then
+            echo   "${which_temporary_path}"
+            break
+        fi
+    done
+}
+
+# char *which_temporary_file(char *prefix)
+#
+# Print the absolute path to a temporary file having the passed prefix: e.g.,
+#
+#   # Prints "/tmp/git_patch_file~2010-12-01_18-37-41", for example.
+#   which_temporary_file git_patch_file
+#
+# Subtle race conditions may arise, as above.
+which_temporary_file() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one file prefix"
+    
+    local which_temporary_file
+    while true; do
+        which_temporary_file="/tmp/${1}.file~"$(date +'%F_%H-%M-%S')
+        if [[ ! -f "${which_temporary_file}" ]]; then
+            echo   "${which_temporary_file}"
+            break
+        fi
+    done
+}
+
+# ....................{ BINARIES                           }....................
+# char *is_binary_available(char *binary_name)
+#
+# Return success if the passed binary is available on this system; otherwise,
+# return failure: e.g.,
+#
+#     >>> is_binary_available bash && echo "alas, bash is installed!"
+#     alas, bash is installed!
+is_binary_available() {
+    which_binary_nonfatal "${@}" 1>/dev/null 2>&1
+}
+
+# char *which_binary(char *binary_name)
+#
+# Print the absolute path to the passed binary: e.g.,
+#
+#     >>> which_binary zsh
+#     /bin/zsh
+#
+# If the passed binary is a string, all but the first whitespace-delimited word
+# of the string is ignored: e.g.,
+#
+#     >>> which_binary "zsh -x -o shwordsplit scr"
+#     /bin/zsh
+#
+# If the passed binary is not found, if multiple binaries are passed, or if no
+# binary is passed, prints an error and dies.
+which_binary() {
+    binary_path=$(which_binary_nonfatal "${@}")
+    [[ "${?}" -eq 0 ]] || die "\"${1}\" not found"
+    echo "${binary_path}"
+}
+
+# char *which_binary_nonfatal(char *binary_name)
+#
+# Identical to the which_binary() function except that, if the passed binary
+# does not exist, returns nothing rather than dies.
+which_binary_nonfatal() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one binary name"
+
+    # This is a curious Zsh expression. First, "${1...}" is referencing the passed
+    # argument; next, "[(w)1]" is accessing the first word of that argument.
+    local binary_name="${1[(w)1]}"
+    local binary_path=$(whence -cp "${binary_name}")
+    local return_code="${?}"
+
+    if [[ ${return_code} -eq ${ZESHY_SUCCESS_CODE} ]]; then
+        echo "${binary_path}"
+        return ${ZESHY_SUCCESS_CODE}
+    else
+        return ${return_code}
+    fi
+}
+
+# char *which_binaries_nonfatal(char *binary_name1, *binary_name2, ...)
+#
+# Print the absolute path to the first binary in the list of passed binaries
+# which exists: e.g.,
+#
+#     >>> which_binaries_nonfatal Council_of_Nicea Constantinople zsh
+#     /bin/zsh
+# 
+# This function is intended to automate selection of binaries, in descending
+# order of preference. (In the above example, the hypothetical
+# "Council_of_Nicea" binary would be selected before all following binaries on
+# systems having the binary.)
+which_binaries_nonfatal() {
+    [[ "${#}" -ge 1 ]] || die "expected at least one binary name"
+    
+    # While there are more binaries to consider, shift the current binary to be
+    # considered to a local variable "binary_name".
+    local binary_name binary_path
+    while [[ -n "${1}" ]]; do
+        binary_name="${1}"
+        shift
+
+        # If this binary exists, return the absolute path to it.
+        binary_path=$(which_binary_nonfatal "${binary_name}")
+        if [[ ${?} -eq ${ZESHY_SUCCESS_CODE} ]]; then
+            echo "${binary_path}"
+            return ${ZESHY_SUCCESS_CODE}
+        fi
+    done
+    
+    # No binaries in the list of passed binaries exist. Return with failure.
+    return ${ZESHY_FAILURE_CODE}
+}
+
+# char *which_files_nonfatal(char *filename1, *filename2, ...)
+#
+# Print the absolute path to the first filename in the list of passed filenames
+# which exists.
+which_files_nonfatal() {
+    [[ "${#}" -ge 1 ]] || die "expected at least one filename"
+    
+    # While there are more filenames to consider, shift the current filename to
+    # be considered to a local variable "path".
+    local filename
+    while [[ -n "${1}" ]]; do
+        filename="${1}"
+        shift
+
+        # If this filename exists and is readable, return it.
+        if [[ -r "${filename}" ]]; then
+            echo "${filename}"
+            return ${ZESHY_SUCCESS_CODE}
+        fi
+    done
+    
+    # No filenames in the list of passed filenames exist. Return with failure.
+    return ${ZESHY_FAILURE_CODE}
+}
+
+# ....................{ IMPORTS                            }....................
+# Global dictionary mapping from imported script name to the mtime (i.e.,
+# modification time) of the script at the time of importation. The import()
+# function adds script names to this dictionary on importing those scripts so as
+# to record having done so. This record keeping allows that function to avoid
+# importing already imported scripts.
+#
+# The "-Ax" option to the "typeset" commands defines each such variable as an
+# [A]ssociative array (i.e., a dictionary) and e[x]ported to the global
+# environment for later access.
+typeset -Ax IMPORTED_SCRIPT_PATH_TO_MTIME
+IMPORTED_SCRIPT_PATH_TO_MTIME=()
+
+# void import(char *script_name)
+# 
+# Import the passed script name as a dependency of the current script.
+# 
+# Import, in this context, means: "if the ZSH script corresponding to the passed
+# script name has not already been imported by this function or has been
+# imported by this function but is modified since last imported, do so;
+# otherwise, do not."
+#
+# This function thus mimics the "import" built-in in most high-level languages.
+# Note that this function resolves the absolute path to this script via context-
+# dependent precedence, as follows:
+# 
+# * If the passed script name is an absolute filename, try to find that file.
+# * Otherwise assume the name is that file's basename. In this case, try to find
+#   a file having this basename under Zeshy's root directory.
+# * If none of the above are found, die.
+import() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one script name"
+
+    # Passed script name.
+    local script_name="${1}" 
+
+    # Absolute path to this script.
+    local script_path 
+
+    # If the passed script name is not an absolute filename, use it.
+    if [[ "${script_name[1]}" == '/' ]]
+    then script_path="${script_name}"
+    # Otherwise, it is a basename. Resolve this into an absolute filename.
+    else script_path="${ZESHY_ROOT}/${script_name}"
+    fi
+    
+    # If the absolute filename does not exist, die.
+    [[ -f "${script_path}" ]] || die "\"${script_path}\" not found"
+
+    # Modification time of this script.
+    local script_mtime=$(get_mtime "${script_path}")
+    
+    # If the script has not yet been imported or has been imported but has
+    # changed since being imported, do so.
+    if [[ -z "${IMPORTED_SCRIPT_PATH_TO_MTIME["${script_path}"]}" ||\
+             "${IMPORTED_SCRIPT_PATH_TO_MTIME["${script_path}"]}" -lt\
+             "${script_mtime}" ]]; then
+        # Prior to doing so, record the script as being imported. This prevents
+        # reimportation, should this script or another script imported by this
+        # script attempt to import this script again.
+        IMPORTED_SCRIPT_PATH_TO_MTIME["${script_path}"]="${script_mtime}"
+         
+        # Do so.
+        utter_import "${script_path}"
+        source "${script_path}"
+    fi
+}
+
+# ....................{ MAIN                               }....................
+# Inform the user that this script is being imported. This script is usually
+# sourced via the Zsh source() built-in rather than the Zeshy import()
+# function; thus, our failure to do this here would require callers do this
+# there, prior to their sourcing this script.
+utter_import "${zeshy_core_path}"
+
+# Make cache directories, if not already made.
+make_directories_if_not_found\
+    "${ZESHY_CACHE_HOME}" "${ZESHY_COMPLETION_CACHE_PATH}"
+
+#FIXME: Obsolete.
+# Directory above the directory having the current script. This environment
+# variable should have been permanently added to the current system as well.
+#[[ -n "${ZESHY_ROOT}" ]] ||  
+#    export ZESHY_ROOT=$(readlink --canonicalize-existing "${ZESHY_HOME}/..")
+
+# --------------------( COPYRIGHT AND LICENSE              )--------------------
+# The information below applies to everything in this distribution,
+# except where noted.
+#              
+# Copyleft 2007-2010 by Cecil Curry.
+#   
+#   http://www.raiazome.com
+# 
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
