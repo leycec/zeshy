@@ -163,6 +163,80 @@ setopt prompt_subst
 # <Ctrl-s> and <Ctrl-q> from disabling and re-enabling flow control.
 stty -ixon -ixoff
 
+# ....................{ SHELLS                             }....................
+# bool is_shell_interactive(void)
+#
+# Return true if the current shell is interactive or is a login shell.
+is_shell_interactive() {
+    [[ -o interactive || -o login ]]
+}
+
+# ....................{ SCRIPTS                            }....................
+# char *get_script_name(void)
+#
+# Get the script name for the current script. This is a string succinctly
+# describing the script under execution, typically of one to two words.
+#
+# Scripts may safely redefine this function to return another name; in this
+# case, scripts called by the script redefining this function will still call
+# this original definition (since functions are not inherited via script calls).
+get_script_name() {
+    if [[ -n "${SCRIPT_NAME}" ]]; then
+        echo "${SCRIPT_NAME}"
+    else
+        # If the current process is an interactive shell, then return the name
+        # of the function that called this function excluding all intermediary
+        # I/O- and error handling-specific function calls. Typically, that
+        # function is the function that called the function that called this
+        # function (i.e., the function two calls earlier in the function
+        # callstack). Insert magical handwaving here.
+        if is_shell_interactive; then
+            # Ignore all intermediary I/O- and error handling-specific function
+            # calls. As the first element of "${funcstack}" is the name of the
+            # current function (and we are not particularly interested in that),
+            # skip that by setting "I=2".
+            local I
+            for (( I=2; ${I} <= ${#funcstack}; I=${I}+1 )); do
+                case ${funcstack[${I}]} in
+                    die*|curse*|utter*) continue ;;
+                    *) break ;;
+                esac
+            done
+     
+            # If after ignoring non-relevant functions there still exists at
+            # least one function on the callstack, return that function's name.
+            if [[ ${I} -le ${#funcstack} ]]
+            then echo "${funcstack[${I}]}"
+            # Otherwise, return a placeholder function name.
+            else echo 'zeshy'
+            fi
+        # Otherwise, return of the basename of the script process that called
+        # this function.
+        else
+            local current_process_basename=$(get_current_process_basename)
+            [[ "${current_process_basename}" == 'zsh' ]] &&
+                  current_process_basename='zeshy'
+            echo "${current_process_basename}"
+        fi
+    fi
+}
+
+# Return "${SCRIPT_NAME}", if defined; otherwise, return the string name of the
+# function that called the function that called this function (i.e., the
+# function two calls earlier in the function callstack). In the latter case, as
+# this function is an internal function intended to be called only by the
+# functions above, we are guaranteed of our caller being one of the functions
+# above. Then the caller of that function is precisely the function two calls
+# earlier in the callstack. (Insert magical handwaving here.)
+    #FIXME: Hmm. How to reference the global $0 from within function scope?
+    # If the current process is not ZSH itself, then it must be an external ZSH
+    # script. In this case, the script name is the basename of the invoked file.
+#   elif [[  $(basename "$0") != "zsh" ]]; then
+#       echo $(basename "$0")
+#   else
+#   fi
+
+
 # ....................{ MESSAGES                           }....................
 #FIXME: Add ANSI coloring to uttered messages if on an ANSI-capable terminal.
 
@@ -173,7 +247,7 @@ stty -ixon -ixoff
 # * If a cronjob, echo to the notice stream of the cron logging facility.
 # * Otherwise, echo to "stdout".
 utter() {
-    local message=$(get_current_process_script_name)": ${@}"
+    local message=$(get_script_name)": ${@}"
 
     if [[ -n "${IS_CRON}" ]]
     then logger -p cron.notice "${message}"
@@ -188,7 +262,7 @@ utter() {
 # * If a cronjob, echo to the error stream of the cron logging facility.
 # * Otherwise, echo to "stderr".
 curse() {
-    local message=$(get_current_process_script_name)": ${@}"
+    local message=$(get_script_name)": ${@}"
 
     if [[ -n "${IS_CRON}" ]]
     then logger -p cron.err "${message}"
@@ -196,7 +270,6 @@ curse() {
     fi
 }
 
-# ....................{ MESSAGES ~ imports                 }....................
 # void utter_import(char *script_name)
 #
 # Echo a message informing the user that the passed script name is being
@@ -205,12 +278,11 @@ curse() {
 utter_import() {
     [[ "${#}" -eq 1 ]] || die "expected exactly one script name"
 
-    #FIXME: Remove.
     # If the caller has supplied no explicit "${SCRIPT_NAME}", supply a default.
     # Failing to do this encourages the utter() function to use the name of this
     # function as its script name, producing an unaesthetic result.
-#   [[ -n "${SCRIPT_NAME}" ]] || local SCRIPT_NAME='zeshy'
-    utter "importing \"${1}\"..."
+    [[ -n "${SCRIPT_NAME}" ]] || local SCRIPT_NAME='zeshy'
+    utter "loading \"${1}\"..."
 }
 
 # ....................{ FATALITIES                         }....................
@@ -226,14 +298,15 @@ die() {
     then return_code=${?}
     else return_code=1
     fi
-
+    
+    # A pox on ye, buggy fiend!
     curse "${@}"
-
+    
     #FIXME: Pack the above return code into this exception.
     # If the script is actually a function called in a running interactive and/or
     # login shell process, exit the set of called functions rather than the shell
     # (i.e., unwind the call stack).
-    if [[ -o interactive || -o login ]]
+    if is_shell_interactive
     then throw ZeshyDieException
     # Otherwise, exit the current process.
     else exit ${return_code}
@@ -268,7 +341,7 @@ is_runnable() {
 #     >>> is_running zsh && echo "The zealous zephyr has landed."
 #     The zealous zephyr has landed.
 is_running() {
-    [[ "${#}" -eq 1 ]] || die "expected exactly one process basename"
+    [[ "${#}" -eq 1 ]] || die "expected exactly one binary name"
     try pidof -s "${1}" 1>/dev/null 2>&1
 }
 
@@ -350,23 +423,6 @@ get_current_process_id() {
     echo "${$}"
 }
 
-# char *get_current_process_script_name(void)
-#
-# Get the script name for the current process. This is a string succinctly
-# describing the script under execution and is best confined to one to two
-# words.
-#
-# Scripts may safely redefine this function to return another name; in this
-# case, scripts called by the script redefining this function will still call
-# this original definition (since functions are not inherited via script calls).
-get_current_process_script_name() {
-    local current_process_basename=$(get_current_process_basename)
-    [[ "${current_process_basename}" == 'zsh' ]] &&
-          current_process_basename='zeshy'
-
-    echo "${current_process_basename}"
-}
-
 #FIXME: These functions are Linux-specific; generalize to other *nix.
 # char *get_current_process_basename(void)
 #
@@ -374,9 +430,16 @@ get_current_process_script_name() {
 # executed.
 get_current_process_basename() {
     [[ "${#}" -eq 0 ]] || die 'expected no arguments'
+    local current_process_command_line="$(get_current_process_command_line)"
     
-    # First, get the current process command line. Then, subject it to an
-    # inscrutable Zsh parameter expansion as follows:
+    #FIXME: This only strips one dash. How to strip more?
+    # Strip prefixing dashes from this string to prevent the "basename" command
+    # from intepreting such dashes as options to that command. This is actually
+    # a real-world concern. By convention, for example, Linux prefixes login
+    # shell command lines with one dash.
+    current_process_command_line="${current_process_command_line#-}"
+    
+    # Subject this string to an inscrutable Zsh parameter expansion as follows:
     #
     # * "(0)" splits the command line on null bytes. This is the Linux
     #   convention, and probably not applicable to other *nix.
@@ -384,8 +447,8 @@ get_current_process_basename() {
     #   executable file from which this process was executed.
     #
     # Finally, get the basename of the above result.
-    current_process_command_line="$(get_current_process_command_line)"
-    basename "${${(0)current_process_command_line}[1]}"
+    current_process_command_line_parts=( "${(0)current_process_command_line}" )
+    basename "${current_process_command_line_parts[1]}"
 }
 
 # char *get_current_process_command_line(void)
@@ -410,6 +473,12 @@ get_current_process_command_line() {
         die "\"${current_process_command_line_path}\" not found"
     cat "${current_process_command_line_path}"
 }
+
+#echo "PID: $$"
+#echo "current_process_basename:"
+#get_current_process_basename
+#echo "current_process_command_line:"
+#get_current_process_command_line
 
 # ....................{ FILES                              }....................
 # char *canonicalize_path(char *path)
@@ -557,7 +626,7 @@ import() {
     if [[ "${script_name[1]}" == '/' ]]
     then script_path="${script_name}"
     # Otherwise, it is a basename. Resolve this into an absolute filename.
-    else script_path="${ZESHY_ROOT}/${script_name}"
+    else script_path="${ZESHY_HOME}/${script_name}"
     fi
     
     # If the absolute filename does not exist, die.
