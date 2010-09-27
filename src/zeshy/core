@@ -36,8 +36,11 @@ export ZESHY_CACHE_HOME="${HOME}/.zsh"
 # Directory to which Zeshy caches Zsh completions.
 export ZESHY_COMPLETION_CACHE_PATH="${ZESHY_CACHE_HOME}/zcompcache"
 
-# File to which the compinit() function dumps its configuration. 
+# File to which the compinit() function caches its configuration. 
 export ZESHY_COMPINIT_DUMP_FILE="${ZESHY_CACHE_HOME}/zcompdump"
+
+# Directory to which Zeshy mounts media.
+export ZESHY_MOUNT_HOME='/media'
 
 # ....................{ RETURN CODES                       }....................
 # Success code, as returned by successful processes on process completion.
@@ -329,6 +332,31 @@ is_running() {
     try pidof -s "${1}" 1>/dev/null 2>&1
 }
 
+# void run_as_superuser(char *command)
+#
+# Run the passed command as the superuser.
+run_as_superuser() {
+    [[ "${#}" -ge 1 ]] || die 'expected a command'
+    run_as root "${@}"
+}
+
+# void run_as(char *username, char *command)
+#
+# Run the passed command as the passed user.
+run_as() {
+    [[ "${#}" -ge 2 ]] ||
+        die 'expected exactly one username followed by a command'
+
+    # Locally set ${RUN_AS}. The run() function notes this variable as being set
+    # and behaves accordingly.
+    local RUN_AS="${1}"
+
+    # Remove the passed user from the argument list and call "run" with all
+    # remaining arguments: namely the command to be run.
+    shift
+    run "${@}"
+}
+
 # void run(char *command)
 #
 # Run the passed command. If this is a built-in shell command, just run it;
@@ -361,41 +389,29 @@ run() {
     local argument_count=${#${=@}}
     [[ "${argument_count}" -ge 1 ]] || die 'expected exactly one command'
     
-    #FIXME: Revert to using ${*}?
     # If the passed command to run actually exists, run it under it "nice" and
     # "ionice"; otherwise, the command is probably a builtin shell command and
     # must be run inside an eval() statement. (If the passed shell command is
     # run outside of such a statement, strange and horrible things happen.)
     if is_runnable "${1}"; then
-        if [[ -n "${RUN_AS}" ]]; then
-            su --preserve-environment --command "${NICE} ${IONICE} ${@}" "${RUN_AS}"
-            return_code=${?}
-        else
-            eval "${NICE} ${IONICE} ${@}"
-            return_code=${?}
+        # If the caller requests this command be run under a different user,
+        # attempt to do so.
+        if [[ -n "${RUN_AS}" && "${RUN_AS}" != $(whoami) ]]; then
+            # If the desired user is the superuser, use "sudo" to take advantage
+            # of password caching.
+            if [[ "${RUN_AS}" == 'root' ]]; then
+                sudo -E "${NICE} ${IONICE} ${@}"
+            # Otherwise, use "su".
+            else
+                su --preserve-environment\
+                   --command "${NICE} ${IONICE} ${@}"\
+                   "${RUN_AS}"
+            fi
+        # Otherwise, run this command as the current user.
+        else eval "${NICE} ${IONICE} ${@}"
         fi
-    else
-        eval "${@}"
-        return_code=${?}
+    else eval "${@}"
     fi
-  
-    return ${return_code}
-}
-
-# void run_as(char *username, char *command)
-#
-# Run the passed command as the passed user.
-run_as() {
-    [[ "${#}" -ge 2 ]] || die 'expected one username followed by a command'
-
-    # If the current user is not the passed user, locally set ${RUN_AS}. The "run"
-    # function notes this variable as being set and behaves accordingly.
-    [[ "$(whoami)" == "${1}" ]] || local RUN_AS="${1}"
-
-    # Remove the passed user from the argument list and call "run" with all
-    # remaining arguments: namely the command to be run.
-    shift
-    run "${@}"
 }
 
 # ....................{ PROCESSES ~ current                }....................
@@ -457,12 +473,6 @@ get_current_process_command_line() {
         die "\"${current_process_command_line_path}\" not found"
     cat "${current_process_command_line_path}"
 }
-
-#echo "PID: $$"
-#echo "current_process_basename:"
-#get_current_process_basename
-#echo "current_process_command_line:"
-#get_current_process_command_line
 
 # ....................{ FILES                              }....................
 # char *canonicalize_path(char *path)
@@ -530,28 +540,40 @@ which_binary() {
 # does not exist, returns nothing rather than dies.
 which_binary_nonfatal() {
     [[ "${#}" -eq 1 ]] || die "expected exactly one binary name"
-
+    
     # This is a curious Zsh expression. First, "${1...}" is referencing the passed
     # argument; next, "[(w)1]" is accessing the first word of that argument.
     local binary_name="${1[(w)1]}"
-    local binary_path=$(whence -cp "${binary_name}")
-    local return_code="${?}"
-
-    if [[ ${return_code} -eq ${ZESHY_SUCCESS_CODE} ]]; then
+    local binary_path="$(whence -cps "${binary_name}")"
+    
+    # When the whence() built-in fails, it prints the name of the passed binary
+    # followed by "not found". Thus, if it prints such a message, the passed
+    # binary does not exist. Note that testing the return code is problematic
+    # here, since setting a local variable always forces the return code to 0
+    # (i.e., success). (ZSH = FAIL on that one.)
+    if [[ "${binary_path}" == *" not found" ]]; then
+        return ${ZESHY_FAILURE_CODE}
+    else
         echo "${binary_path}"
         return ${ZESHY_SUCCESS_CODE}
-    else
-        return ${return_code}
     fi
 }
 
 # ....................{ DIRECTORIES                        }....................
-# void make_directories_if_not_found(char *path1, char *path2, ...)
+# void make_parent_directory_if_not_found(char *path)
+#
+# Make the parent directory of the passed path, if not found.
+make_parent_directory_if_not_found() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one path"
+    make_directory_if_not_found $(dirname "${1}")
+}
+
+# void make_directory_if_not_found(char *dirname1, char *dirname2, ...)
 #
 # Examine each of the passed absolute paths and, for each non-existant path,
 # make that path and all non-existant parent paths of that path.
-make_directories_if_not_found() {
-    [[ "${#}" -ge 1 ]] || die "expected at least one pathname"
+make_directory_if_not_found() {
+    [[ "${#}" -ge 1 ]] || die "expected at least one dirname"
 
     # While there are more paths to consider, shift the current path to be
     # considered to a local variable "new_path" and make it when not found.
@@ -568,18 +590,6 @@ make_directories_if_not_found() {
 }
 
 # ....................{ IMPORTS                            }....................
-# Global dictionary mapping from imported script name to the mtime (i.e.,
-# modification time) of the script at the time of importation. The import()
-# function adds script names to this dictionary on importing those scripts so as
-# to record having done so. This record keeping allows that function to avoid
-# importing already imported scripts.
-#
-# The "-Ax" option to the "typeset" commands defines each such variable as an
-# [A]ssociative array (i.e., a dictionary) and e[x]ported to the global
-# environment for later access.
-typeset -Ax IMPORTED_SCRIPT_PATH_TO_MTIME
-IMPORTED_SCRIPT_PATH_TO_MTIME=()
-
 # void import(char *script_name)
 # 
 # Import the passed script name as a dependency of the current script.
@@ -599,7 +609,7 @@ IMPORTED_SCRIPT_PATH_TO_MTIME=()
 # * If none of the above are found, die.
 import() {
     [[ "${#}" -eq 1 ]] || die "expected exactly one script name"
-
+    
     # Passed script name.
     local script_name="${1}" 
 
@@ -619,15 +629,15 @@ import() {
     # Canonicalize the passed path. Failing to do this could hypothetically
     # prevent the passed path from being successfully looked up in the path
     # dictionary, below.
-    script_path=$(canonicalize_path "${script_path}")
+    script_path="$(canonicalize_path "${script_path}")"
     
     # Modification time of this script.
-    local script_mtime=$(get_path_mtime "${script_path}")
+    local script_mtime="$(get_path_mtime "${script_path}")"
     
     # If the script has not yet been imported or has been imported but has
     # changed since being imported, do so.
     if [[ -z "${IMPORTED_SCRIPT_PATH_TO_MTIME["${script_path}"]}" ||\
-             "${IMPORTED_SCRIPT_PATH_TO_MTIME["${script_path}"]}" -lt\
+             "${IMPORTED_SCRIPT_PATH_TO_MTIME["${script_path}"]}" -ne\
              "${script_mtime}" ]]; then
         # Prior to doing so, record the script as being imported. This prevents
         # reimportation, should this script or another script imported by this
@@ -640,6 +650,24 @@ import() {
     fi
 }
 
+# void initialize_imports(void)
+#
+# Initialize the imports dictionary, used by the import() function. This is a
+# global dictionary mapping from imported script name to the mtime (i.e.,
+# modification time) of the script at the time of importation. The import()
+# function adds script names to this dictionary on importing those scripts so as
+# to record having done so. This record keeping allows that function to avoid
+# importing already imported scripts.
+#
+# The "-Ax" option to the "typeset" commands defines each such variable as an
+# [A]ssociative array (i.e., a dictionary) and e[x]ported to the global
+# environment for later access.
+initialize_imports() {
+    typeset -Ax IMPORTED_SCRIPT_PATH_TO_MTIME
+    IMPORTED_SCRIPT_PATH_TO_MTIME=()
+}
+initialize_imports
+
 # ....................{ MAIN                               }....................
 # Inform the user that this script is being imported. This script is usually
 # sourced via the Zsh source() built-in rather than the Zeshy import()
@@ -648,10 +676,16 @@ import() {
 utter_import "${zeshy_core_path}"
 
 # Make cache directories, if not already made.
-make_directories_if_not_found\
-    "${ZESHY_CACHE_HOME}" "${ZESHY_COMPLETION_CACHE_PATH}"
+make_directory_if_not_found "${ZESHY_CACHE_HOME}" 
+make_directory_if_not_found "${ZESHY_COMPLETION_CACHE_PATH}"
 
 #FIXME: Obsolete.
+#echo "PID: $$"
+#echo "current_process_basename:"
+#get_current_process_basename
+#echo "current_process_command_line:"
+#get_current_process_command_line
+
 # Enable variable substitution in prompt expansions in a "synchronous" fashion.
 # Enabling this re-evaluates each prompt expansion after perform each
 # interactive command with the current values of those variables without
