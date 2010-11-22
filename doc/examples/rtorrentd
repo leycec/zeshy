@@ -46,7 +46,7 @@
 #   # !!!! IMPORTANT !!!!
 #   # Edit this script, changing the CONFIGURATION variables in this script to
 #   # suite the account-specific needs of your local system. In particular, you
-#   # will want to change the "USER" variable to that of the non-root user under
+#   # will want to change the "RTORRENTD_USER" variable to that of the non-root user under
 #   # which you intend to run the rtorrent daemon.
 #   sudo emacs /etc/init.d/rtorrent-screen   # or,
 #   sudo nano  /etc/init.d/rtorrent-screen   # or,
@@ -56,7 +56,7 @@
 #   # Optionally make the phrase "rtorrent" a shell alias for foregrounding
 #   # the currently backgrounded "rtorrent" process. This permits you to open
 #   # and view your current rtorrent by typing "rtorrent" at the command line
-#   # when logged in as the user specified by the "USER" variable, below.
+#   # when logged in as the user specified by the "RTORRENTD_USER" variable, below.
 #   echo 'alias rtorrent="screen -r rtorrent"' >> ~/.bashrc  # for Bash; or,
 #   echo 'alias rtorrent="screen -r rtorrent"' >> ~/.zshrc   # for ZSH
 #
@@ -113,7 +113,7 @@
 #   # (Trust us on this one.)
 #   sudo /etc/init.d/rtorrent-screen restart
 #
-#   # Foreground rtorrent. This must be done as the user specified by the "USER"
+#   # Foreground rtorrent. This must be done as the user specified by the "RTORRENTD_USER"
 #   # variable in the CONFIGURATION section of this script, below. If you type
 #   # this often (and you probably will), you might want to make a shell alias.
 #   # (See "INSTALLATION," above.)
@@ -154,16 +154,18 @@
 # * Perform automatic logging to a file when operating as a cronjob. (See
 #   "hg-cohere" for assistance, eh?)
 # * Consider enabling the "multiuser" screen option rather than using
-#   ZESHY_RUN_AS-style sudoing. That has several benefits, of which one is the
+#   RTORRENTD_USER-style sudoing. That has several benefits, of which one is the
 #   ability to allow other users to open the deattached rtorrent session.
 
 # ....................{ IMPORTS                            }....................
 import zeshy/process
 
 # ....................{ CONFIGURATION ~ defaults           }....................
+#FIXME: Fix this. Needs a proper config file, I'm afraid.
 # User under which screen is to be run. Ideally, this is the user intending to
 # foreground and actually use rtorrent.
-ZESHY_RUN_AS=$(whoami)
+RTORRENTD_USER=leycec
+#RTORRENTD_USER=$(whoami)
 
 # Absolute path to the rtorrent binary.
 RTORRENT=$(which_binary rtorrent)
@@ -175,9 +177,9 @@ SCREEN=$(which_binary screen)
 SCREEN_SESSION=rtorrent
 
 # Absolute path to the file persisting the process ID (PID) of the run rtorrent.
-if [[ "${ZESHY_RUN_AS}" == root ]]
-then RTORRENT_PIDFILE="/var/run/rtorrent-${USER}.pid"
-else RTORRENT_PIDFILE="${HOME}/.rtorrent-${USER}.pid"
+if [[ "${RTORRENTD_USER}" == root ]]
+then RTORRENT_PIDFILE="/var/run/rtorrent-${RTORRENTD_USER}.pid"
+else RTORRENT_PIDFILE="/home/${RTORRENTD_USER}/.rtorrent.pid"
 fi
 
 # ....................{ IMPLEMENTATION                     }....................
@@ -188,18 +190,19 @@ restart() {
 
 start() {
     # Wipe all outstanding "dead screens" for the target user.
-    quietly run "${SCREEN} -wipe"
+    quietly run_as "${RTORRENTD_USER}" "${SCREEN} -wipe"
 
     # If there are other rtorrent screen sessions running, warn and press on.
-    local screen_session_count=$(run "${SCREEN} -list" |\
+    local screen_session_count=$(run_as "${RTORRENTD_USER}" "${SCREEN} -list" |\
         grep --count '\.${SCREEN_SESSION}[[:space:]]')
-    [[ "${screen_session_count}" -eq "${ZESHY_SUCCESS_CODE}" ]] ||
+    [[ "${screen_session_count}" -eq 0 ]] ||
         curse "${screen_session_count} rtorrent screen session(s) already started"
 
     # Start rtorrent as a screen session. Note that screen's argument passing
     # engine is fragile... Order is important in its list of arguments.
     utter "starting rtorrent..."
-    run "${SCREEN}" -d -m -fa -U -S "${SCREEN_SESSION}" "${RTORRENT}"
+    run_as "${RTORRENTD_USER}"\
+        "'${SCREEN}' -d -m -fa -U -S '${SCREEN_SESSION}' '${RTORRENT}'"
     
     # If rtorrent fails to start, emit the cause thereof and fail.
     local RTORRENT_RETURN_CODE="${?}"
@@ -208,7 +211,7 @@ start() {
 
     # Grep the PID of the screen process corresponding to the now-detached
     # rtorrent session by asking screen itself.
-    local screen_pid=$(run "${SCREEN} -list" |\
+    local screen_pid=$(run_as "${RTORRENTD_USER}" "${SCREEN} -list" |\
         grep --max-count=1 "\.${SCREEN_SESSION}[[:space:]]" |\
         sed "s/^[[:space:]]*\([0-9][0-9]*\)\.${SCREEN_SESSION}[[:space:]].*$/\1/" -)
     
@@ -227,15 +230,16 @@ start() {
     # Note, however, that this rtorrent process may not yet have actually started
     # up. Therefore, we wait a reasonable (!) number of seconds for it to start
     # up; if it fails to do so, fail.
-    local rtorrent_pid
+    local rtorrent_pid=
     local start_time=$(date +"%s")          # current time in seconds since the Epoch
     local close_time=(( $start_time + 8 ))  # current time plus eight seconds
     while [[ $(date +"%s") -le ${close_time} ]]; do
-        rtorrent_pid=$(pgrep -P "${screen_pid}" -fx "${RTORRENT}")
+        rtorrent_pid=$(pgrep -P "${screen_pid}" -fx "${RTORRENT}" 2>/dev/null)
         
         # If rtorrent is now running, break; otherwise, sleep and try again.
-        [[ "${?}" -eq "${ZESHY_SUCCESS_CODE}" ]] && break
-        sleep 1s
+        is_previous_process_succeeded && break
+#       [[ "${?}" -eq "${ZESHY_SUCCESS_CODE}" ]] && break
+        sleep 1
     done
     
     # If rtorrent is still not running, fail.
@@ -246,7 +250,7 @@ start() {
     
     # Store its PID into an external file for later use in shutting it down.
     make_parent_directory_if_not_found "${RTORRENT_PIDFILE}"
-    try echo "${rtorrent_pid}" > "${RTORRENT_PIDFILE}"
+    try "echo ${rtorrent_pid} > '${RTORRENT_PIDFILE}'"
 
     utter "detached rtorrent PID ${rtorrent_pid} to screen PID ${screen_pid}"
 }
@@ -255,7 +259,7 @@ stop() {
     utter "stopping rtorrent..."
   
     # If not currently running, curse and return.
-    if ! is_running_as "${USER}" "${RTORRENT}"; then
+    if ! is_running_as "${RTORRENTD_USER}" "${RTORRENT}"; then
         curse "rtorrent not running"
         return "${ZESHY_FAILURE_CODE}"
     fi 
@@ -270,14 +274,14 @@ stop() {
     # Is the rtorrent PID file still exists, kill the corresponding process.
     if [[ -f "${RTORRENT_PIDFILE}" ]]; then
         # All rtorrent PIDs under this user.
-        local rtorrent_pids=$(get_pids_for_running_as "${USER}" "${RTORRENT}")
+        local rtorrent_pids=$(get_pids_for_running_as "${RTORRENTD_USER}" "${RTORRENT}")
         
         # rtorrent PID as persisted in this file.
         local rtorrent_pid=$(cat "${RTORRENT_PIDFILE}")
         
         # If the latter no longer corresponds to the former, curse and return.
         if ! echo "${rtorrent_pids}" | grep --quiet "${rtorrent_pid}"; then
-            curse "user ${USER} no longer running rtorrent PID ${rtorrent_pid}"
+            curse "user ${RTORRENTD_USER} no longer running rtorrent PID ${rtorrent_pid}"
             return "${ZESHY_FAILURE_CODE}"
         fi
        
@@ -309,16 +313,16 @@ stop() {
     # Otherwise, the file has since been deleted, renamed, or otherwise moved. In
     # that case, kill all rtorrents under this user.
     else
-        utter "stopping all rtorrent processes under user ${USER}..."
-        quietly pkill -${sigint} -u "${USER}" -fx "${RTORRENT}"
+        utter "stopping all rtorrent processes under user ${RTORRENTD_USER}..."
+        quietly pkill -${sigint} -u "${RTORRENTD_USER}" -fx "${RTORRENT}"
 
-        if is_running_as "${USER}" "${RTORRENT}"; then
-            utter "waiting on all rtorrent processes under user ${USER}..."
+        if is_running_as "${RTORRENTD_USER}" "${RTORRENT}"; then
+            utter "waiting on all rtorrent processes under user ${RTORRENTD_USER}..."
             sleep ${wait_seconds}
              
-            if is_running_as "${USER}" "${RTORRENT}"; then
-                utter "stopping all rtorrent processes under user ${USER} forcefully..."
-                quietly pkill -${sigkill} -u "${USER}" -fx "${RTORRENT}"
+            if is_running_as "${RTORRENTD_USER}" "${RTORRENT}"; then
+                utter "stopping all rtorrent processes under user ${RTORRENTD_USER} forcefully..."
+                quietly pkill -${sigkill} -u "${RTORRENTD_USER}" -fx "${RTORRENT}"
             fi
         fi
     fi
@@ -332,8 +336,8 @@ stop() {
 # rtorrent as the target user.
 curse_rtorrent_start_error() {
     if [[ -n "${screen_pid}" ]]
-    then curse "rtorrent startup error for user ${USER} under screen PID ${screen_pid}:"
-    else curse "rtorrent startup error for user ${USER}:"
+    then curse "rtorrent startup error for user ${RTORRENTD_USER} under screen PID ${screen_pid}:"
+    else curse "rtorrent startup error for user ${RTORRENTD_USER}:"
     fi
     
     # Print the error, then die.
@@ -343,7 +347,8 @@ curse_rtorrent_start_error() {
 }
 
 # ....................{ MAIN                               }....................
-[[ "${#}" -eq 1 ]] || die 'expected exactly one action'
+[[ "${#}" -eq 1 ]] ||
+    die "expected exactly one of \"start\", \"stop\", or \"restart\"" 
 
 # Action requested by the user.
 ACTION="${1}"
@@ -353,7 +358,7 @@ case "${ACTION}" in
     start)   start ;;
     stop)    stop ;;
     restart) restart ;;
-    *) die "\"${ACTION}\" not a recognized action" ;;
+    *) die "\"${ACTION}\" not one of \"start\", \"stop\", or \"restart\"" ;;
 esac
 
 #FIXME: Obsolete.
@@ -361,8 +366,8 @@ esac
 # rather than manually managing processes.
 #IS_USING_START_STOP_DAEMON=$(one_if is_installed start-stop-daemon)
 
-#   start-stop-daemon --start --user "$USER" --chuid "$USER" --pidfile "$RTORRENT_PIDFILE" \
-#       --env HOME="/home/$USER" \
+#   start-stop-daemon --start --user "$RTORRENTD_USER" --chuid "$RTORRENTD_USER" --pidfile "$RTORRENT_PIDFILE" \
+#       --env HOME="/home/$RTORRENTD_USER" \
 #       --exec "$SCREEN" -- -d -m -fa -U -S "$SCREEN_SESSION" "$RTORRENT"
 
     # "start-stop-daemon" makes a PID file having the (blatantly) wrong screen PID,
