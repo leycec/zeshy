@@ -15,8 +15,6 @@
 # * Use the "vcs_info" Zsh module for displaying VCS-specific metadata in a VCS-
 #   agnostic fashion.
 # * Incorporate ZSH-lovers fixes, including:
-#   * Use "zparseopts" instead of "getopt" for script functions intended to be
-#     called from the command-line as well as for external shell scripts. Nice!
 #   * Use suffix aliases.
 
 # ....................{ PATHS                              }....................
@@ -112,14 +110,15 @@ zsh-mime-setup
 
 # ....................{ MODULES                            }....................
 # Zsh modules are C-implemented shared libraries optionally loadable at runtime.
-# Zeshy loads the following Zsh modules.
+# Zeshy loads the following Zsh modules by default, due to their common
+# helpfulness.
 
-# Parameter module exposing Zsh's C-based internal hashes via Zsh-based
-# associative arrays. We are particularly interested in these:
+# Module exposing Zsh's C-based internal dictionaries as Zsh-based associative
+# arrays, including:
 #
 # * "$funcstack", having the current function call stack for user inspection.
 # * "$functions", having the current set of all functions for redefinition and
-# later restoration of differing function definitions.
+#   later restoration of differing function definitions.
 zmodload zsh/parameter
 
 # Perl-Compatible Regular Expression (PCRE) module. Note that, although
@@ -133,9 +132,21 @@ zmodload zsh/pcre
 
 # Stat module wrapping the stat() system call with the zstat() Zsh function. Do
 # not load this module via "zmodload zsh/stat", as that wraps the stat() system
-# call with the default stat() Zsh function, which conflicts with "stat"
+# call with the default stat() Zsh function, conflicting with the "stat"
 # binary.
 zmodload -F zsh/stat b:zstat
+
+# Utility module adding additional built-ins, including:
+#
+# * "zparseopts", parsing command-line arguments. This built-in is similar in
+#   function if not style to the "getopts" binary, and typically used like so:
+#
+#   >>> set -- -d --ad "glass arm shattering"
+#   >>> zparseopts -A args -- d e -ad: -wing:
+#   >>> echo "-d: ${args[-d]}\n--ad: ${args[--ad]}"
+#   -d:
+#   --ad: glass arm shattering
+zmodload zsh/zutil
 
 # ....................{ OPTIONS                            }....................
 # Command history.
@@ -187,8 +198,8 @@ setopt prompt_subst
 # http://zsh.sourceforge.net/Doc/Release/Zsh-Modules.html#SEC192
 #
 # Note that traditional glob matching is always available via the "==" test
-# operator: e.g., [[ $(whence -cp fahey) == *" not found" ]] && echo
-# "Farewell."
+# operator: e.g.,
+#     [[ $(whence -cp fahey) == *" not found" ]] && echo "Farewell."
 setopt rematch_pcre      # prefer Perl-Compatible Regular Expression matching
 
 # Tab completion.
@@ -319,9 +330,9 @@ die() {
     # If the return code of the prior command signifies an error, exit with
     # that return code; otherwise, exit with generic error code 1.
     local return_code
-    if [[ ${?} -gt 0 ]]
-    then return_code=${?}
-    else return_code=1
+    if [[ "${?}" -ne "${ZESHY_SUCCESS_CODE}" ]]
+    then return_code="${?}"
+    else return_code="${ZESHY_FAILURE_CODE}"
     fi
     
     # A pox on ye, buggy fiend!
@@ -339,6 +350,15 @@ die() {
 }
 
 # ....................{ COMMANDS                           }....................
+# bool is_callable(char *name)
+#
+# Return true if there exists an alias or function with the passed name.
+is_callable() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one name"
+    [[ $(whence -w "${1}") =~ ': (alias|builtin|function)$' ]]
+}
+
+# ....................{ COMMANDS                           }....................
 # Aliases.
 alias is_available="is_runnable"
 alias is_installed="is_runnable"
@@ -351,18 +371,6 @@ alias is_installed="is_runnable"
 #     >>> is_runnable bash && echo "Alas, but Bash is installed!" Alas, but
 #     Bash is installed!
 is_runnable() { quietly which_binary_nonfatal "${@}" }
-
-# bool is_running(char *command)
-#
-# Return true if there exists a process running under the passed binary name:
-# e.g.,
-#
-#     >>> is_running zsh && echo "The zealous zephyr has landed." The zealous
-#     zephyr has landed.
-is_running() {
-    [[ "${#}" -eq 1 ]] || die "expected exactly one command"
-    quietly pidof -s "${1}"
-}
 
 # void try_as_superuser(char *command)
 #
@@ -390,13 +398,14 @@ run_as_superuser() {
 run_as() {
     [[ "${#}" -ge 2 ]] || die 'expected exactly one username and one command'
 
-    # Locally set ${RUN_AS}. The run() function notes this variable as being
+    # Locally set ${ZESHY_RUN_AS}. The run() function notes this variable as being
     # set and behaves accordingly.
-    local RUN_AS="${1}"
+    local ZESHY_RUN_AS="${1}"
 
     # Remove the passed user from the argument list and call "run" with all
     # remaining arguments: namely the command to be run.
-    shift run "${@}"
+    shift
+    run "${@}"
 }
 
 # void run(char *command)
@@ -427,29 +436,37 @@ run() {
     #
     # The '#' parameter expansion returns the number of such words. (Phew!)
     local argument_count=${#${=@}}
-    [[ "${argument_count}" -ge 1 ]] ||
-        die 'expected exactly one command'
+    [[ "${argument_count}" -ge 1 ]] || die 'expected exactly one command'
     
-    # If the passed command to run actually exists, run it under it "nice" and
-    # "ionice"; otherwise, the command is probably a builtin shell command and
-    # must be run inside an eval() statement. (If the passed shell command is
-    # run outside of such a statement, strange and horrible things happen.)
-    if is_runnable "${1}"; then
+    # Command to be run, which is the first word of the first passed parameter.
+    local command_name="${1[(w)1]}"
+    
+    # If the passed command to run actually exists, run it as a shell command.
+    if is_runnable "${command_name}"; then
         # If the caller requests this command be run under a different user,
         # attempt to do so.
-        if [[ -n "${RUN_AS}" && "${RUN_AS}" != $(whoami) ]]; then
+        if [[ -n "${ZESHY_RUN_AS}" && "${ZESHY_RUN_AS}" != $(whoami) ]]; then
             # If the desired user is the superuser, use "sudo" to take
             # advantage of password caching.
-            if [[ "${RUN_AS}" == 'root' ]] && is_runnable sudo
+            if [[ "${ZESHY_RUN_AS}" == 'root' ]] && is_runnable sudo
             then sudo -E "${NICE} ${IONICE} ${@}"
             # Otherwise, use "su".
             else su --preserve-environment\
-                    --command "${NICE} ${IONICE} ${@}" "${RUN_AS}"
+                    --command "${NICE} ${IONICE} ${@}" "${ZESHY_RUN_AS}"
         fi
         # Otherwise, run this command as the current user.
         else eval "${NICE} ${IONICE} ${@}"
+#       else "${NICE}" "${IONICE}" "${@}"
         fi
-    else eval "${@}"
+    # Otherwise, if the passed command is a shell built-in, run it inside an
+    # eval statement. (If this command is run outside of such a statement,
+    # strange and hideous things occur.)
+    elif is_callable "${command_name}"; then
+        eval "${@}"
+    # Otherwise, fail.
+    else 
+        die "\"${command_name}\" not found"
+#       die "\"${command_name}\" not found, so cannot run:\n\t${@}"
     fi
 }
 
@@ -462,15 +479,15 @@ run() {
 #     >>> IS_MUTT_INSTALLED=$(one_if is_installed mutt)
 #     >>> echo "${IS_MUTT_INSTALLED}"
 #     1
-#     >>> [[ -n "${IS_MUTT_INSTALLED}" ]] && echo
-#     "mutt!" mutt!
+#     >>> (( "${+IS_MUTT_INSTALLED}" )) && echo 'mutt\!'
+#     mutt!
 # 
 # Note, commands should be passed as quoted strings to prevent the calling
 # shell from evaluating pipes, redirections, et al. prior to passing the
 # command. (See the run() function, above.)
 one_if() {
     quietly "${@}"
-    [[   "${?}" -eq 0 ]] && echo 1
+    [[ "${?}" -eq 0 ]] && echo 1
 }
 
 # void quietly(char *command)
@@ -508,6 +525,17 @@ get_current_process_id() {
 canonicalize_path() {
     [[ "${#}" -eq 1 ]] || die "expected exactly one path"
     try readlink --canonicalize-existing "${1}"
+}
+
+# char *canonicalize_path_nonfatal(char *path)
+#
+# Get the canonicalized form of the passed absolute path. Unlike the
+# canonicalize_path() function, this function does not raise an exception when
+# the passed path does not exist; it simply canonicalizes as much of this path
+# as exists.
+canonicalize_path_nonfatal() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one path"
+    try readlink --canonicalize-missing "${1}"
 }
 
 # int get_path_mtime(char *path)
@@ -635,19 +663,29 @@ make_directory_if_not_found() {
 #     # Actually imports "zeshy/os/main".
 #     >>> import zeshy/os
 import() {
-    [[ "${#}" -eq 1 ]] || die "expected exactly one script name"
+    [[ "${#}" -ge 1 ]] || die "expected one script name"
     
-    # Passed script name.
+    # Passed script name. Shift it off the argument stack, to allow us to pass
+    # this script the set of all remaining arguments on sourcing it below.
     local script_name="${1}" 
+    shift
 
     # Absolute path to this script.
     local script_path 
+    
+    # If the passed script name is an absolute path, canonicalize the path so as
+    # to ensure the dictionary lookup below successfully compares the path
+    # against a previously canonicalized entry in this dictionary.
+    if [[ "${script_name[1]}" == '/' ]]; then
+        script_path="$(canonicalize_path "${script_name}")"
+    # Otherwise, if the passed script is an existing relative path, again
+    # canonicalize this path.
+    else
+        script_path="$(canonicalize_path_nonfatal "${script_name}")"
 
-    # If the passed script name is not an absolute path, use it.
-    if [[ "${script_name[1]}" == '/' ]]
-    then script_path="${script_name}"
-    # Otherwise, it is a basename. Resolve this into an absolute path.
-    else script_path="${ZESHY_HOME}/${script_name}"
+        # Otherwise, the passed script is a Zeshy component, in which case no
+        # additional canonicalization is required.
+        [[ -e "${script_path}" ]] || script_path="${ZESHY_HOME}/${script_name}"
     fi
     
     # If the absolute path refers to a directory, assume the caller wants a
@@ -656,11 +694,6 @@ import() {
     
     # If this path does not exist, die.
     [[ -f "${script_path}" ]] || die "\"${script_path}\" not found"
-    
-    # Canonicalize the passed path. Failing to do this could hypothetically
-    # prevent the passed path from being successfully looked up in the path
-    # dictionary, below.
-    script_path="$(canonicalize_path "${script_path}")"
     
     # Modification time of this script.
     local script_mtime="$(get_path_mtime "${script_path}")"
@@ -677,7 +710,7 @@ import() {
          
         # Do so.
         utter_import "${script_path}"
-        source "${script_path}"
+        source "${script_path}" "${@}"
     fi
 }
 
