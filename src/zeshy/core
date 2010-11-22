@@ -350,7 +350,7 @@ alias is_installed="is_runnable"
 #
 #     >>> is_runnable bash && echo "Alas, but Bash is installed!" Alas, but
 #     Bash is installed!
-is_runnable() { which_binary_nonfatal "${@}" 1>/dev/null 2>&1 }
+is_runnable() { quietly which_binary_nonfatal "${@}" }
 
 # bool is_running(char *command)
 #
@@ -361,7 +361,7 @@ is_runnable() { which_binary_nonfatal "${@}" 1>/dev/null 2>&1 }
 #     zephyr has landed.
 is_running() {
     [[ "${#}" -eq 1 ]] || die "expected exactly one command"
-    try pidof -s "${1}" 1>/dev/null 2>&1
+    quietly pidof -s "${1}"
 }
 
 # void try_as_superuser(char *command)
@@ -453,7 +453,7 @@ run() {
     fi
 }
 
-# ....................{ BOOLEANS                           }....................
+# ....................{ STREAMERS                          }....................
 # bool one_if(char *command)
 #
 # Run the passed command and, if it exits successfully, echo "1". Otherwise,
@@ -469,9 +469,16 @@ run() {
 # shell from evaluating pipes, redirections, et al. prior to passing the
 # command. (See the run() function, above.)
 one_if() {
+    quietly "${@}"
+    [[   "${?}" -eq 0 ]] && echo 1
+}
+
+# void quietly(char *command)
+#
+# Run the passed command quietly: that is, squelching all output.
+quietly() {
     [[   "${#}" -ge 1 ]] || die 'expected at least one command'
     eval "${@}" 1>/dev/null 2>&1
-    [[   "${?}" -eq 0 ]] && echo 1
 }
 
 # ....................{ PROCESSES                          }....................
@@ -524,44 +531,51 @@ get_path_mtime() {
 }
 
 # ....................{ FILES ~ binaries                   }....................
-# char *which_binary(char *binary_name)
+# Aliases.
+alias which_binary="which_command"
+alias which_binary_nonfatal="which_command_nonfatal"
+
+# char *which_command(char *command)
 #
-# Print the absolute path to the passed binary: e.g.,
+# Print the absolute path to the passed command: e.g.,
 #
-#     >>> which_binary zsh /bin/zsh
+#     >>> which_command zsh /bin/zsh
 #
-# If the passed binary is a string, all but the first whitespace-delimited word
+# If the passed command is a string, all but the first whitespace-delimited word
 # of the string is ignored: e.g.,
 #
-#     >>> which_binary "zsh -x -o shwordsplit scr" /bin/zsh
+#     >>> which_command "zsh -x -o shwordsplit scr" /bin/zsh
 #
-# If the passed binary is not found, if multiple binaries are passed, or if no
-# binary is passed, prints an error and dies.
-which_binary() {
-    local binary_path=$(which_binary_nonfatal "${@}")
+# If the passed command is not found, if multiple binaries are passed, or if no
+# command is passed, prints an error and dies.
+which_command() {
+    # Set this variable *AFTER* localizing it, as integrating the two erases the
+    # return value of the former.
+    local command_path
+          command_path=$(which_command_nonfatal "${@}")
     [[ "${?}" -eq 0 ]] || die "\"${1}\" not found"
-    echo "${binary_path}"
+    echo "${command_path}"
 }
 
-# char *which_binary_nonfatal(char *binary_name)
+# char *which_command_nonfatal(char *command_name)
 #
-# Identical to the which_binary() function except that, if the passed binary
+# Identical to the which_command() function except that, if the passed command
 # does not exist, returns nothing rather than dies.
-which_binary_nonfatal() {
-    [[ "${#}" -eq 1 ]] || die "expected exactly one binary name"
+which_command_nonfatal() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one command name"
     
-    local binary_name="${1[(w)1]}"    # first word of the first passed
-    parameter local binary_path="$(whence -cp "${binary_name}")"
+    local command_name="${1[(w)1]}"    # first word of the first passed parameter
+    local command_path="$(whence -cp "${command_name}")"
     
-    # When the whence() built-in fails, it prints the name of the passed binary
+    # When the whence() built-in fails, it prints the name of the passed command
     # followed by "not found". Thus, if it prints such a message, the passed
-    # binary does not exist. Note that testing the return code is problematic
+    # command does not exist. Note that testing the return code is problematic
     # here, since setting a local variable always forces the return code to 0
     # (i.e., success). (ZSH = FAIL on that one.)
-    if [[ "${binary_path}" == *" not found" ]]; then
+    if [[ "${command_path}" == *" not found" ]]; then
         return ${ZESHY_FAILURE_CODE}
     else
-        echo "${binary_path}"
+        echo "${command_path}"
         return ${ZESHY_SUCCESS_CODE}
     fi
 }
@@ -640,7 +654,7 @@ import() {
     # script named "main" under this directory.
     [[ -d "${script_path}" ]] && script_path="${script_path}/main"
     
-     # If this path does not exist, die.
+    # If this path does not exist, die.
     [[ -f "${script_path}" ]] || die "\"${script_path}\" not found"
     
     # Canonicalize the passed path. Failing to do this could hypothetically
@@ -667,20 +681,33 @@ import() {
     fi
 }
 
-# ....................{ MAIN                               }....................
-_core() {
-    # Initialize the imports dictionary, used by the import() function. This is a
-    # global dictionary mapping from imported script name to the mtime (i.e.,
-    # modification time) of the script at the time of importation. The import()
-    # function adds script names to this dictionary on importing those scripts so
-    # as to record having done so. This record keeping allows that function to
-    # avoid importing already imported scripts.
-    #
-    # The "-Ax" option to the "typeset" commands defines each such variable as an
-    # [A]ssociative array (i.e., a dictionary) and e[x]ported to the global
-    # environment for later access.
+# void initialize_imports(void)
+#
+# Initialize the imports dictionary, used by the import() function. This is a
+# global dictionary mapping from imported script name to the mtime (i.e.,
+# modification time) of the script at the time of importation. The import()
+# function adds script names to this dictionary on importing those scripts so
+# as to record having done so. This record keeping allows that function to
+# avoid importing already imported scripts.
+#
+# The "-Ax" option to the "typeset" commands defines each such variable as an
+# [A]ssociative array (i.e., a dictionary) and e[x]ported to the global
+# environment for later access.
+initialize_imports() {
+    [[ "${#}" -eq 0 ]] || die "expected no arguments"
     typeset -Ax IMPORTED_SCRIPT_PATH_TO_MTIME
     IMPORTED_SCRIPT_PATH_TO_MTIME=()
+}
+
+# ....................{ MAIN                               }....................
+_core() {
+    # Initialize the imports dictionary used by the import() function.
+    initialize_imports
+    
+    # Add this script to the set of all imported scripts, to prevent subsequent
+    # imports from (accidentally) reimporting it. Do not add this to the
+    # initialize_imports() function, due to largely inexplicable dragons.
+    IMPORTED_SCRIPT_PATH_TO_MTIME["${zeshy_core_path}"]="$(get_path_mtime "${zeshy_core_path}")"
 
     # Inform the user that this script is being imported. This script is usually
     # sourced via the Zsh source() built-in rather than the Zeshy import()
