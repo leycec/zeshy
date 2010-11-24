@@ -230,6 +230,7 @@ is_shell_interactive() { [[ -o interactive || -o login ]] }
 # this original definition (since functions are not inherited via script
 # calls).
 get_script_name() {
+#   echo "getting..."
     if [[ -n "${ZESHY_SCRIPT_NAME}" ]]; then
         echo "${ZESHY_SCRIPT_NAME}"
     # If the current process is an interactive shell, then return the name of
@@ -239,17 +240,19 @@ get_script_name() {
     # the function two calls earlier in the function callstack). Insert magical
     # handwaving here.
     elif is_shell_interactive; then
+#       echo "uh-oh..."
         # Ignore all intermediary I/O- and error handling-specific function
         # calls. As the first element of "${funcstack}" is the name of the
         # current function (and we are not particularly interested in that),
         # skip that by setting "I=2".
-        local I
+        local  I
         for (( I=2; ${I} <= ${#funcstack}; I=${I}+1 )); do
-            case ${funcstack[${I}]} in
+            case "${funcstack[${I}]}" in
                 die*|curse*|utter*) continue ;;
                 *)                  break ;;
             esac
         done
+#       echo "bah!"
          
         # If after ignoring non-relevant functions there still exists at least
         # one function on the callstack, return that function's name.
@@ -318,6 +321,8 @@ utter_import() {
     # name of this function as its script name, producing an unaesthetic
     # result.
     [[ -n "${ZESHY_SCRIPT_NAME}" ]] || local ZESHY_SCRIPT_NAME='zeshy'
+#   local ZESHY_SCRIPT_NAME='zeshy'
+#   which utter
     utter "loading \"${1}\"..."
 }
 
@@ -505,12 +510,56 @@ quietly() {
     eval "${@}" 1>/dev/null 2>&1
 }
 
+# ....................{ REGULAR EXPRESSIONS                }....................
+# void match_multiline(...)
+#
+# Match the passed string against the passed Perl-compatible regular expression
+# (PCRE) in a multi-line fashion (e.g., matching '^' and '$' at both newline and
+# the beginning and end of the string, respectively). In all other respects,
+# this function is identical to the match() function.
+match_multiline() {
+    local ZESHY_MATCH_OPTIONS='-m'
+    match "${@}"
+}
+
+# void match(
+#   char *pattern, char *string,
+#   char *match_variable_name='MATCH', char *group_array_name='match')
+#
+# Match the passed string against the passed Perl-compatible regular expression
+# (PCRE). This function returns success when this string matches and failure
+# when it does. Also, when this function returns success it also sets:
+#
+# * The variable corresponding to the passed variable name to the whole match,
+#   defaulting to the global variable "${MATCH}".
+# * The array corresponding to the passed array name to the list of all matched
+#   groups, defaulting to the global variable "${match}".
+#
+# Also, this function accepts a hidden "fifth parameter": the global variable
+# "${ZESHY_MATCH_OPTIONS}", which when set causes this function to pass those
+# options to the pcre_compile() built-in when compiling the passed pattern.
+match() {
+    [[ "${#}" -ge 2 ]] ||
+        die 'expected at least one pattern and one string'
+
+    # Parse parameters.
+    local pattern="${1}"
+    local string="${2}"
+    local match_variable_name="${3:-MATCH}"
+    local group_array_name="${4:-match}"
+
+    # Perform the match.
+    try pcre_compile ${ZESHY_MATCH_OPTIONS} "${pattern}"
+    pcre_match -v "${match_variable_name}" -a "${group_array_name}" --\
+        "${string}"
+}
+
 # ....................{ PROCESSES                          }....................
-# int get_current_process_id(void)
+# int get_current_pid(void)
 #
 # Get the PID (process ID) for the current process. This is an integer uniquely
 # identifying this process.
-get_current_process_id() {
+get_current_pid() {
     [[ "${argument_count}" -eq 0 ]] || die 'expected no arguments'
     echo "${$}"
 }
@@ -680,28 +729,25 @@ import() {
     # Absolute path to this script.
     local script_path 
     
-    # If the passed script name is an absolute path, canonicalize the path so as
-    # to ensure the dictionary lookup below successfully compares the path
-    # against a previously canonicalized entry in this dictionary.
-    if [[ "${script_name[1]}" == '/' ]]; then
-        script_path="$(canonicalize_path "${script_name}")"
-    # Otherwise, if the passed script is an existing relative path, again
-    # canonicalize this path.
-    else
-        script_path="$(canonicalize_path_nonfatal "${script_name}")"
-
-        # Otherwise, the passed script is a Zeshy component, in which case no
-        # additional canonicalization is required.
-        [[ -e "${script_path}" ]] || script_path="${ZESHY_HOME}/${script_name}"
+    # If the passed script name is either an absolute path or existing relative
+    # path, try to import it as is.
+    if [[ "${script_name[1]}" == '/' || -e "${script_name}" ]]
+    then script_path="${script_name}"
+    # Otherwise, try to import a Zeshy component having that script name.
+    else script_path="${ZESHY_HOME}/${script_name}"
     fi
     
     # If the absolute path refers to a directory, assume the caller wants a
-    # script named "main" under this directory.
-    [[ -d "${script_path}" ]] && script_path="${script_path}/main"
+    # script named "_main" under this directory.
+    [[ -d "${script_path}" ]] && script_path="${script_path}/_main"
     
     # If this path does not exist, die.
     [[ -f "${script_path}" ]] || die "\"${script_path}\" not found"
     
+    # Canonicalize the path so as to ensure the dictionary lookup below
+    # successfully compares it against a previously canonicalized path.
+    script_path="$(canonicalize_path "${script_path}")"
+
     # Modification time of this script.
     local script_mtime="$(get_path_mtime "${script_path}")"
     
@@ -784,13 +830,15 @@ _core() {
     make_directory_if_not_found "${ZESHY_CACHE_HOME}" 
     make_directory_if_not_found "${ZESHY_COMPLETION_CACHE_PATH}"
 
-    #FIXME: Zsh-ify these matches.
+    #FIXME: Zsh-ify these matches, using the above match_multiline() function.
     # Determine whether or not this process is running is a cronjob. This is
     # adapted from this itworld.com article, "Am I being run by cron?":
     #        http://www.itworld.com/Comp/3380/nls_unixcron041209/index.html
     local cron_pids=$(pgrep -x cron)
     local grandparent_pid=$(ps -eo ppid,pid= | grep " ${PPID}$" | awk '{print $1}')
-    ZESHY_IS_CRONJOB=$(one_if "echo '${cron_pids}' | grep '${grandparent_pid}'")
+    ZESHY_IS_CRONJOB=$(one_if match_multiline "${cron_pids}" "${grandparent_pid}")
+#   ZESHY_IS_CRONJOB=$(one_if "echo '${cron_pids}' | grep '${grandparent_pid}'")
+#   echo "cron: ${ZESHY_IS_CRONJOB}; cron_pids: ${cron_pids}; gpid: ${grandparent_pid}"
 }
 _core
 
