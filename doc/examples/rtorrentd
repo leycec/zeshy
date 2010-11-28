@@ -157,8 +157,9 @@
 #   RTORRENTD_USER-style sudoing. That has several benefits, of which one is the
 #   ability to allow other users to open the deattached rtorrent session.
 
-# ....................{ IMPORTS                            }....................
+# ....................{ DEPENDENCIES                       }....................
 import zeshy/process
+import zeshy/time
 
 # ....................{ CONFIGURATION ~ defaults           }....................
 #FIXME: Fix this. Needs a proper config file, I'm afraid.
@@ -183,27 +184,24 @@ else RTORRENT_PIDFILE="/home/${RTORRENTD_USER}/.rtorrent.pid"
 fi
 
 # ....................{ IMPLEMENTATION                     }....................
-restart() {
-    stop
-    start
-}
-
 start() {
-    # Wipe all outstanding "dead screens" for the target user.
+    # Wipe all outstanding "dead screens" for the above user.
     quietly run_as "${RTORRENTD_USER}" "${SCREEN} -wipe"
 
+    # Stop any currently running rtorrent under the above user.
+    is_rtorrent_running && stop
+    utter "starting rtorrent..."
+
     # If there are other rtorrent screen sessions running, warn and press on.
-    local screen_session_count=$(run_as "${RTORRENTD_USER}" "${SCREEN} -list" |\
-        grep --count '\.${SCREEN_SESSION}[[:space:]]')
-    [[ "${screen_session_count}" -eq 0 ]] ||
-        curse "${screen_session_count} rtorrent screen session(s) already started"
+    local rtorrent_process_count=$(get_rtorrent_process_count)
+    [[ "${rtorrent_process_count}" -eq 0 ]] ||
+        curse "${rtorrent_process_count} rtorrent screen session(s) already started"
 
     # Start rtorrent as a screen session. Note that screen's argument passing
     # engine is fragile... Order is important in its list of arguments.
-    utter "starting rtorrent..."
     run_as "${RTORRENTD_USER}"\
         "'${SCREEN}' -d -m -fa -U -S '${SCREEN_SESSION}' '${RTORRENT}'"
-    
+
     # If rtorrent fails to start, emit the cause thereof and fail.
     local RTORRENT_RETURN_CODE="${?}"
     [[ "${RTORRENT_RETURN_CODE}" -ne "${ZESHY_SUCCESS_CODE}" ]] &&\
@@ -217,7 +215,7 @@ start() {
     
     # If "screen" lists no such rtorrent session for this user, fail.
     if echo "${screen_pid}" | grep --quiet "^[[:space:]]*$"; then
-        curse "screen lists no rtorrent sessions"
+        curse "\"screen\" lists no rtorrent sessions"
         curse_rtorrent_start_error
     fi
     
@@ -231,9 +229,9 @@ start() {
     # up. Therefore, we wait a reasonable (!) number of seconds for it to start
     # up; if it fails to do so, fail.
     local rtorrent_pid=
-    local start_time=$(date +"%s")          # current time in seconds since the Epoch
+    local start_time=$(get_current_time_in_seconds_since_epoch)
     local close_time=(( $start_time + 8 ))  # current time plus eight seconds
-    while [[ $(date +"%s") -le ${close_time} ]]; do
+    while [[ $(get_current_time_in_seconds_since_epoch) -le ${close_time} ]]; do
         rtorrent_pid=$(pgrep -P "${screen_pid}" -fx "${RTORRENT}" 2>/dev/null)
         
         # If rtorrent is now running, break; otherwise, sleep and try again.
@@ -243,10 +241,10 @@ start() {
     done
     
     # If rtorrent is still not running, fail.
-    if [[ -z "${rtorrent_pid}" ]]; then
-        curse "screen lists zombie rtorrent processes"
-        curse_rtorrent_start_error
-    fi
+    [[ -n "${rtorrent_pid}" ]] ||
+        die "no rtorrent process running under \"screen\" PID ${screen_pid}"
+#       curse_rtorrent_start_error
+#   fi
     
     # Store its PID into an external file for later use in shutting it down.
     make_parent_directory_if_not_found "${RTORRENT_PIDFILE}"
@@ -259,10 +257,8 @@ stop() {
     utter "stopping rtorrent..."
   
     # If not currently running, curse and return.
-    if ! is_running_as "${RTORRENTD_USER}" "${RTORRENT}"; then
-        curse "rtorrent not running"
-        return "${ZESHY_FAILURE_CODE}"
-    fi 
+#   if ! is_running_as "${RTORRENTD_USER}" "${RTORRENT}"; then
+    is_rtorrent_running || die "rtorrent not running"
     
     # Signal numbers corresponding to soft and hard process termination.
     local sigint=2 sigkill=9
@@ -329,36 +325,55 @@ stop() {
 }
 
 # ....................{ UTILITIES                          }....................
+#FIXME: Generalize this into a general-purpose "command/screen" function.
+# bool is_rtorrent_running(void)
+#
+# Return success if at least rtorrent process is screened under the above user.
+is_rtorrent_running() {
+    [[ $(get_rtorrent_process_count) -ne 0 ]]
+}
+
+#FIXME: Generalize this into a general-purpose "command/screen" function.
+# int get_rtorrent_process_count(void)
+#
+# Get the number of rtorrent processes currently screened under the above user.
+get_rtorrent_process_count() {
+    # If there are other rtorrent screen sessions running, warn and press on.
+    run_as "${RTORRENTD_USER}" "${SCREEN} -list" |\
+        grep --count "\.${SCREEN_SESSION}[[:space:]]"
+}
+
 # void curse_rtorrent_start_error()
 #
 # If rtorrent failed to run for any reason other than it is already running
 # under an existing "screen" session, then print this reason by re-running
 # rtorrent as the target user.
 curse_rtorrent_start_error() {
-    if [[ -n "${screen_pid}" ]]
-    then curse "rtorrent startup error for user ${RTORRENTD_USER} under screen PID ${screen_pid}:"
-    else curse "rtorrent startup error for user ${RTORRENTD_USER}:"
-    fi
-    
-    # Print the error, then die.
-    [[ -z "${screen_session_count}" || "${screen_session_count}" -eq 0 ]] &&\
+    # If no rtorrent process has been screened, run rtorrent to emit an error.
+    if is_rtorrent_running; then
+        if [[ -n "${screen_pid}" ]]
+        then curse "rtorrent startup error for user ${RTORRENTD_USER} under screen PID ${screen_pid}"
+        else curse "rtorrent startup error for user ${RTORRENTD_USER}"
+        fi
+
         run "${RTORRENT}"
+    fi
+
     exit "${ZESHY_FAILURE_CODE}"
 }
 
 # ....................{ MAIN                               }....................
-[[ "${#}" -eq 1 ]] ||
-    die "expected exactly one of \"start\", \"stop\", or \"restart\"" 
+[[ "${#}" -le 1 ]] ||
+    die "expected exactly one of \"start\" or \"stop\"" 
 
-# Action requested by the user.
-ACTION="${1}"
+# Action requested by the user. Defaults to "start".
+ACTION="${1:-start}"
 
 # Ensure sanity.
 case "${ACTION}" in
     start)   start ;;
     stop)    stop ;;
-    restart) restart ;;
-    *) die "\"${ACTION}\" not one of \"start\", \"stop\", or \"restart\"" ;;
+    *) die "\"${ACTION}\" not one of \"start\" or \"stop\"" ;;
 esac
 
 #FIXME: Obsolete.
