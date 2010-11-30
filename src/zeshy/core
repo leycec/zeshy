@@ -29,7 +29,14 @@ local zeshy_core_path=$(readlink --canonicalize-existing "${0}")
 
 # Directory to which Zeshy caches Zsh metadata. Note that Zsh itself is unaware
 # of this path until Zeshy explicitly instructs it to cache metadata here.
-export ZESHY_CACHE_HOME="${HOME}/.zsh"
+#
+# If "${HOME}" is the root directory, then this Zeshy process is probably
+# running as a cronjob, in which case this directory should reside under the
+# "/var" subsystem rather than the "/home" subsystem.
+if [[ "${HOME}" == / ]]
+then export ZESHY_CACHE_HOME="/var/cache/zeshy"
+else export ZESHY_CACHE_HOME="${HOME}/.zsh"
+fi
 
 # Directory to which Zeshy caches Zsh completions.
 export ZESHY_COMPLETION_CACHE_PATH="${ZESHY_CACHE_HOME}/zcompcache"
@@ -211,17 +218,30 @@ setopt automenu          # use menu completion after 2 tabs
 setopt completeinword    # complete inside words
 setopt nolistambiguous   # only list matches if ambiguous
 
-# ....................{ I/O SETTINGS                       }....................
+# ....................{ ENVIRONMENT                        }....................
+# bool is_shell_interactive(void)
+#
+# Return success if the current shell is interactive or is a login shell.
+is_shell_interactive() {
+    [[ -o interactive || -o login ]]
+}
+
+# bool is_terminal(void)
+#
+# Return success if the current shell is outputting to a terminal (i.e., an
+# interactive display). All calls to the "stty" binary should be wrapped in a
+# test for an active terminal; otherwise, one receives the following error
+# under non-terminals (e.g., under cron):
+#
+#     stty: standard input: Invalid argument
+is_terminal() {
+    [[ -t 0 ]]
+}
+
 # Disable flow control key bindings, as these increasingly conflict with those
 # of popular CLI applications (e.g., irssi, rtorrent). Specifically, prevent
 # <Ctrl-s> and <Ctrl-q> from disabling and re-enabling flow control.
-stty -ixon -ixoff
-
-# ....................{ SHELLS                             }....................
-# bool is_shell_interactive(void)
-#
-# Return true if the current shell is interactive or is a login shell.
-is_shell_interactive() { [[ -o interactive || -o login ]] }
+is_terminal && stty -ixon -ixoff
 
 # ....................{ SCRIPTS                            }....................
 # char *get_script_name(void)
@@ -281,7 +301,9 @@ get_script_name() {
 # * If a cronjob, echo to the notice stream of the cron logging facility.  *
 # Otherwise, echo to "stdout".
 utter() {
-    local message="$(get_script_name): ${@}"
+    # Message to utter. Yes, its definition must be on a separate line.
+    local message
+          message="$(get_script_name): ${@}"
     
     if [[ -n "${ZESHY_IS_CRONJOB}" ]]
     then logger -p cron.notice -- "${message}"
@@ -304,7 +326,10 @@ curse() {
     # to obtain the name of the most recently called non-trivial function, which
     # is of considerably more assistance when an error occurs.
     local ZESHY_SCRIPT_NAME=
-    local message="$(get_script_name): ${@}"
+
+    # Message to curse. Yes, its definition must be on a separate line.
+    local message
+          message="$(get_script_name): ${@}"
     
     if [[ -n "${ZESHY_IS_CRONJOB}" ]]
     then logger -p cron.err -- "${message}"
@@ -375,16 +400,30 @@ alias is_installed="is_runnable"
 # Return true if the passed binary name is runnable (i.e., is installed) on
 # this system: e.g.,
 #
-#     >>> is_runnable bash && echo "Alas, but Bash is installed!" Alas, but
-#     Bash is installed!
-is_runnable() { quietly which_binary_nonfatal "${@}" }
+#     >>> is_runnable bash && echo "Alas, but Bash is installed!"
+#     Alas, but Bash is installed!
+is_runnable() {
+    # Do not call the quietly() function, as that calls the run() function which
+    # calls *THIS* function which induces an infinitely recursive loop. Agathoth 
+    # and Memnon!
+    which_command_nonfatal "${@}" 1>/dev/null 2>&1
+}
 
-# void try(char *command)
+# void try_quietly_as(char *username, char *command)
 #
-# Run the passed command and, if it fails with error, terminate the current
-# execution environment with the same error.
-try() {
-    run "${@}" || die "\"${@}\" returned error code ${?}"
+# Run the passed command as the passed user quietly and, if it fails with error,
+# terminate the current execution environment with the same error.
+try_as() {
+    [[ "${#}" -ge 2 ]] || die 'expected exactly one username and one command'
+
+    # Locally set "${ZESHY_RUN_AS}". The run() function notes this variable as
+    # set and behaves accordingly...
+    local ZESHY_RUN_AS="${1}"
+
+    # Remove the passed user from the argument list and call "run" with all
+    # remaining arguments: namely the command to be run.
+    shift
+    try "${@}"
 }
 
 # void run_as(char *username, char *command)
@@ -393,14 +432,22 @@ try() {
 run_as() {
     [[ "${#}" -ge 2 ]] || die 'expected exactly one username and one command'
 
-    # Locally set ${ZESHY_RUN_AS}. The run() function notes this variable as being
-    # set and behaves accordingly.
+    # Locally set "${ZESHY_RUN_AS}". The run() function notes this variable as
+    # set and behaves accordingly...
     local ZESHY_RUN_AS="${1}"
 
     # Remove the passed user from the argument list and call "run" with all
     # remaining arguments: namely the command to be run.
     shift
-    run "${@}"
+    run "${(q)@}"
+}
+
+# void try(char *command)
+#
+# Run the passed command and, if it fails with error, terminate the current
+# execution environment with the same error.
+try() {
+    run "${(q)@}" || die "\"${@}\" returned error code ${?}"
 }
 
 # void run(char *command)
@@ -409,64 +456,86 @@ run_as() {
 # otherwise, run it under "nice" and "ionice" so as to assist other running
 # processes.
 #
-# Note, commands should be passed as quoted strings to prevent the calling
-# shell from evaluating pipes, redirections, et al. prior to passing the
-# command: e.g.,
+# Note that commands should be passed as quote-protected strings to prevent the
+# shell from parsing pipes, redirections, and other shell constructs before this
+# command is run: e.g.,
 #
-#   # This is good.  run "screen -list | grep --count 'eschaton'"
+#   # This is good. Manually quote-protect the passed string.
+#   >>> run "screen -list | grep --count eschaton"
+#   969
 #
-#   # This is not.  run screen -list | grep --count 'eschaton'
+#   # This is also good. Automatically quote-protect the passed string with the
+#   # "(q)" parameter expansion. (Note that *NOT* prefixing the string with this
+#   # expansion induces subtle errors, occasionally. Do not forget, we beg!)
+#   >>> local command=$(screen -list | grep --count singularity)
+#   >>> run "${(q)command}"
+#   696
 #
-# This cannot be fixed, due to the nature of shell evaluation.
+#   # This is not.
+#   >>> run screen -list | grep --count eschaton
+#
+# This cannot be fixed, due to the fixed order of shell evaluation.
+#
+# Note that *THIS IS A VERY FRAGILE FUNCTION* and the slightest wisp of light
+# hackery is liable to lend your Zeshy install to its hasty grave.
 run() {
-    local return_code
+    #FIXME: Prepend "${NICE}" "${IONICE}" onto "${@}"; maybe use:
+    #'set -- "${NICE}" "${IONICE}" "${@}"', I suppose?
+    # Command line to run, parsed from the passed parameters as follows:
+    #
+    # * "(Q)" strips one level of quote-protection from the passed parameters,
+    #   and is largely safe. This helps undo prior "(q)" quote-protections.
+    # * "(=)" splits these parameters into words: e.g., the string
+    #   "ls ~/peak-oil" splits into 2 words, "ls" and "~/peak-oil".
+    #   "ls ~/peak-oil" is not an executable command; "ls" is.
+    local command
+          command=( "${(Q)=@}" )
 
-    # The number of passed arguments after word-splitting those arguments.
-    #
-    # The '@' parameter expansion returns all such arguments.
-    #
-    # The '=' parameter expansion performs word-splitting: e.g., some string
-    # "ls ~/peak-oil" expands to "ls" "~/peak-oil" under such word-splitting.
-    # The latter is an executable command; the former is not.
-    #
-    # The '#' parameter expansion returns the number of such words. (Phew!)
-    local argument_count=${#${=@}}
+    # Number of passed arguments after word-splitting those arguments.
+    local argument_count="${#command}"
     [[ "${argument_count}" -ge 1 ]] || die 'expected exactly one command'
     
-    # Command to be run, which is the first word of the first passed parameter.
-    local command_name="${1[(w)1]}"
+    # Command name to run. This is the first word of the command line.
+    local command_name="${command[1]}"
     
+    # O.K., this is tricksy: if the eventual caller explicitly quote-protected
+    # the passed command name, there exists another "layer" of quote-protection
+    # to unravel. Do so, alas.
+    if ! is_installed "${command_name}" && is_installed "${(Q)command[1]}"; then
+        command_name="${(Q)command[1]}"
+    fi
+
     # If the passed command to run actually exists, run it as a shell command.
-    if is_runnable "${command_name}"; then
+    if is_installed "${command_name}"; then
         # If the caller requests this command be run under a different user,
         # attempt to do so.
         if [[ -n "${ZESHY_RUN_AS}" && "${ZESHY_RUN_AS}" != $(whoami) ]]; then
-            #FIXME: Not quite right. If "${@}" contains double quotes, that
-            #conflicts with our use of double quotes here. The solution is to
-            #translate all non-escaped double quotes to single quotes. Simple?
-            # If the desired user is the superuser, use "sudo" to take
+            # If the target user is the superuser, use "sudo" to take
             # advantage of password caching.
+            #
+            # Note that we do not use the "(@)" expansion in either of the
+            # following two commands, as that would split this array into
+            # discrete command arguments.
             if [[ "${ZESHY_RUN_AS}" == 'root' ]] && is_runnable sudo; then
-                sudo -E "${NICE} ${IONICE} ${@}"
+                sudo -E "${command}"
             # Otherwise, use "su".
             else
-#               echo "suing: ${@} ${ZESHY_RUN_AS}"
+#               echo "suing: ${command} ${ZESHY_RUN_AS}"
                 su --preserve-environment\
-                   --command "${NICE} ${IONICE} ${@}" "${ZESHY_RUN_AS}"
+                   --command "${command}" "${ZESHY_RUN_AS}"
         fi
-        # Otherwise, run this command as the current user.
-        else eval "${NICE} ${IONICE} ${@}"
-#       else "${NICE}" "${IONICE}" "${@}"
+        # Otherwise, run this command as the current user. Do use the "(@)"
+        # expansion here, as calling the command manually requires we split this
+        # array into discrete command arguments.
+        else "${command[@]}"
         fi
     # Otherwise, if the passed command is a shell built-in, run it inside an
     # eval statement. (If this command is run outside of such a statement,
     # strange and hideous things occur.)
-    elif is_callable "${command_name}"; then
-        eval "${@}"
+    elif is_callable "${command_name}"
+    then eval "${command}"
     # Otherwise, fail.
-    else 
-        die "\"${command_name}\" not found"
-#       die "\"${command_name}\" not found, so cannot run:\n\t${@}"
+    else die "\"${command_name}\" not found, so cannot run:\n\t${command}"
     fi
 }
 
@@ -474,20 +543,42 @@ run() {
 # bool is_superuser(void)
 #
 # Return success if the current user is the "superuser" (i.e., root).
-is_superuser() { [[ "${EUID}" == 0 || "${USER}" == root ]] }
+is_superuser() {
+    [[ "${EUID}" == 0 || "${USER}" == root ]]
+}
 
 # void try_as_superuser(char *command)
 #
 # Run the passed command as the superuser and, if it fails with error,
 # terminate the current execution environment with the same error.
-try_as_superuser() { run_as_superuser "${@}" || die }
+try_as_superuser() {
+    run_as_superuser "${@}" || die
+}
 
 # void run_as_superuser(char *command)
 #
 # Run the passed command as the superuser.
-run_as_superuser() { run_as root "${@}" }
+run_as_superuser() {
+    run_as root "${@}"
+}
 
-# ....................{ COMMANDS ~ helpers                 }....................
+# ....................{ COMMANDS ~ quietly                 }....................
+# void try_quietly(char *command)
+#
+# Run the passed command quietly and, if it fails with error, terminate the
+# current execution environment with the same error.
+try_quietly() {
+    quietly try "${@}" || die "\"${@}\" returned error code ${?}"
+}
+
+# void try_quietly_as(char *username, char *command)
+#
+# Run the passed command as the passed user quietly and, if it fails with error,
+# terminate the current execution environment with the same error.
+try_quietly_as() {
+    quietly try_as "${@}" || die "\"${@}\" returned error code ${?}"
+}
+
 # bool one_if(char *command)
 #
 # Run the passed command and, if it exits successfully, echo "1". Otherwise,
@@ -504,15 +595,25 @@ run_as_superuser() { run_as root "${@}" }
 # command. (See the run() function, above.)
 one_if() {
     quietly "${@}"
-    [[ "${?}" -eq 0 ]] && echo 1
+    if [[ "${?}" -eq "${ZESHY_SUCCESS_CODE}" ]]
+    then echo 1
+    else echo
+    fi
+}
+
+# void quietly_as(char *username, char *command)
+#
+# Run the passed command as the passed user quietly: i.e., squelching output.
+# terminate the current execution environment with the same error.
+quietly_as() {
+    run_as "${@}" 1>/dev/null 2>&1
 }
 
 # void quietly(char *command)
 #
-# Run the passed command quietly: that is, squelching all output.
+# Run the passed command quietly: i.e.,, squelching output.
 quietly() {
-    [[   "${#}" -ge 1 ]] || die 'expected at least one command'
-    eval "${@}" 1>/dev/null 2>&1
+    run "${(q)@}" 1>/dev/null 2>&1
 }
 
 # ....................{ REGULAR EXPRESSIONS                }....................
@@ -523,12 +624,13 @@ quietly() {
 # the beginning and end of the string, respectively). In all other respects,
 # this function is identical to the match() function.
 match_multiline() {
-    local ZESHY_MATCH_OPTIONS='-m'
+    local ZESHY_MATCH_OPTIONS
+          ZESHY_MATCH_OPTIONS=( -m )
     match "${@}"
 }
 
 # void match(
-#   char *pattern, char *string,
+#   char *regular_expression, char *string,
 #   char *match_variable_name='MATCH', char *group_array_name='match')
 #
 # Match the passed string against the passed Perl-compatible regular expression
@@ -545,18 +647,18 @@ match_multiline() {
 # options to the pcre_compile() built-in when compiling the passed pattern.
 match() {
     [[ "${#}" -ge 2 ]] ||
-        die 'expected at least one pattern and one string'
+        die 'expected at least one regular expression and one string'
 
     # Parse parameters.
-    local pattern="${1}"
+    local regular_expression="${1}"
     local string="${2}"
     local match_variable_name="${3:-MATCH}"
     local group_array_name="${4:-match}"
 
     # Perform the match.
-    try pcre_compile ${ZESHY_MATCH_OPTIONS} "${pattern}"
-    pcre_match -v "${match_variable_name}" -a "${group_array_name}" --\
-        "${string}"
+    pcre_compile "${ZESHY_MATCH_OPTIONS[@]}" "${regular_expression}" ||
+        die "\"${regular_expression}\" not a valid regular expression"
+    pcre_match -v "${match_variable_name}" -a "${group_array_name}" -- "${string}"
 }
 
 # ....................{ PROCESSES                          }....................
@@ -642,7 +744,7 @@ which_command() {
     # return value of the former.
     local command_path
           command_path=$(which_command_nonfatal "${@}")
-    [[ "${?}" -eq 0 ]] || die "\"${1}\" not found"
+    [[ "${?}" -eq "${ZESHY_SUCCESS_CODE}" ]] || die "\"${1}\" not found"
     echo "${command_path}"
 }
 
@@ -700,18 +802,18 @@ make_directory_if_not_found() {
 }
 
 # ....................{ IMPORTS                            }....................
-# void zimport(char *script_name)
+# void zimport(char *script_name, char *script_options)
 # 
-# Import the passed script name as a dependency of the current script.
+# Import the passed script name as a dependency of the current script, passing
+# that script the passed options.
 # 
-# Import, in this context, means: "if the ZSH script corresponding to the
-# passed script name has not already been imported by this function or has been
-# imported by this function but is modified since last imported, do so;
-# otherwise, do not."
+# Import means: "If the Zeshy script corresponding to the passed script name has
+# not already been imported by this function or has but has been externally
+# modified since last imported, do so; else, do not."
 #
-# This function thus mimics the "import" built-in in most high-level languages.
-# Note that this function resolves the absolute path to this script via
-# context- dependent precedence, as follows:
+# This function mimics the import() built-in in most high-level languages.
+# Note that this function resolves the absolute path to this script via context-
+# dependent precedence, as follows:
 # 
 # * If the passed script name is an absolute filename, try to find that file.
 # * Otherwise assume the name is that file's basename. In this case, try to
@@ -727,7 +829,7 @@ make_directory_if_not_found() {
 # This function is named "zimport" so as not to conflict with ImageMagick's
 # brashly named "import" command.
 zimport() {
-    [[ "${#}" -eq 1 ]] || die "expected exactly one script name"
+    [[ "${#}" -ge 1 ]] || die "expected exactly one script name"
     
     # Passed script name. Shift it off the argument stack, to allow us to pass
     # this script the set of all remaining arguments on sourcing it below.
@@ -804,6 +906,17 @@ _zeshy_core() {
     # initialize_imports() function, due to largely inexplicable dragons.
     ZESHY_IMPORTED_PATH_TO_MTIME["${zeshy_core_path}"]="$(get_path_mtime "${zeshy_core_path}")"
     
+    #FIXME: Zsh-ify these matches, using the above match_multiline() function.
+    # Determine whether or not this process is running is a cronjob. This is
+    # adapted from this itworld.com article, "Am I being run by cron?":
+    #        http://www.itworld.com/Comp/3380/nls_unixcron041209/index.html
+    # 
+    # Do this prior to uttering imports, as the utter() function requires this.
+    local cron_pids="$(pgrep -x cron)"
+    local grandparent_pid="$(ps -eo ppid,pid= | grep " ${PPID}$" | awk '{print $1}')"
+    ZESHY_IS_CRONJOB="$(one_if match_multiline "^${cron_pids}$" "${grandparent_pid}")"
+#   echo "cron: ${ZESHY_IS_CRONJOB}; cron_pids: ${cron_pids}; gpid: ${grandparent_pid}"
+
     # Inform the user that this script is being imported. This script is usually
     # sourced via the Zsh source() built-in rather than the Zeshy zimport()
     # function; thus, our failure to do this here would require callers do this
@@ -814,48 +927,36 @@ _zeshy_core() {
     # was sourced via zimport() rather than source().
     [[ -n "${script_mtime}" ]] || utter_import "${zeshy_core_path}"
     
-    # Import the Zeshy OS component, providing the OS-specific
-    # get_current_process_basename() function called above.
-    zimport zeshy/os
-    
-    #echo "PID: $$"
-    #echo "current_process_basename:"
-    #get_current_process_basename
-    #echo "current_process_command_line:"
-    #get_current_process_command_line
-
     # Set the default script name prior to all other logic, as any logic
     # raising an error requires this name for logging that error. Only do this
     # if the current process is not an interactive Zsh shell as, in that case,
     # the get_script_name() function dynamically inspects the script name from
     # the function call stack.
     if [[ -z "${ZESHY_SCRIPT_NAME}" ]] && ! is_shell_interactive; then
-        ZESHY_SCRIPT_NAME="$(get_current_process_basename)"
-
+        # Import Zeshy components required below.
+        zimport zeshy/os
+        
         # Strip the filetype from the script name, if present.
-        ZESHY_SCRIPT_NAME=${ZESHY_SCRIPT_NAME%%.*}
+        ZESHY_SCRIPT_NAME="$(get_current_process_basename)"
+        ZESHY_SCRIPT_NAME="${ZESHY_SCRIPT_NAME%%.*}"
 
         # Default the script name to "zeshy", if "zsh".
-        [[ "${ZESHY_SCRIPT_NAME}" == 'zsh' ]] && ZESHY_SCRIPT_NAME='zeshy'
+        [[ "${ZESHY_SCRIPT_NAME}" == zsh ]] && ZESHY_SCRIPT_NAME=zeshy
     fi
     
     # Make cache directories, if not already made.
     make_directory_if_not_found "${ZESHY_CACHE_HOME}" 
     make_directory_if_not_found "${ZESHY_COMPLETION_CACHE_PATH}"
-
-    #FIXME: Zsh-ify these matches, using the above match_multiline() function.
-    # Determine whether or not this process is running is a cronjob. This is
-    # adapted from this itworld.com article, "Am I being run by cron?":
-    #        http://www.itworld.com/Comp/3380/nls_unixcron041209/index.html
-    local cron_pids=$(pgrep -x cron)
-    local grandparent_pid=$(ps -eo ppid,pid= | grep " ${PPID}$" | awk '{print $1}')
-    ZESHY_IS_CRONJOB=$(one_if match_multiline "${cron_pids}" "${grandparent_pid}")
-#   ZESHY_IS_CRONJOB=$(one_if "echo '${cron_pids}' | grep '${grandparent_pid}'")
-#   echo "cron: ${ZESHY_IS_CRONJOB}; cron_pids: ${cron_pids}; gpid: ${grandparent_pid}"
 }
 _zeshy_core
 
 #FIXME: Obsolete.
+    #echo "PID: $$"
+    #echo "current_process_basename:"
+    #get_current_process_basename
+    #echo "current_process_command_line:"
+    #get_current_process_command_line
+
 # ....................{ GLOB EXPRESSIONS                   }....................
 # char **glob_non_dotfiles_in(char *dirname)
 #
