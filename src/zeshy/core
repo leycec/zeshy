@@ -496,17 +496,20 @@ run() {
     [[ "${argument_count}" -ge 1 ]] || die 'expected exactly one command'
     
     # Command name to run. This is the first word of the command line.
-    local command_name="${command[1]}"
+    local command_name="${(Q)command[1]}"
     
-    # O.K., this is tricksy: if the eventual caller explicitly quote-protected
-    # the passed command name, there exists another "layer" of quote-protection
-    # to unravel. Do so, alas.
-    if ! is_installed "${command_name}" && is_installed "${(Q)command[1]}"; then
-        command_name="${(Q)command[1]}"
-    fi
-
-    # If the passed command to run actually exists, run it as a shell command.
-    if is_installed "${command_name}"; then
+    # Absolute path to the command to be run or the command name if this command
+    # is a built-in, alias, or function rather than an external command.
+    local command_path
+          command_path="$(whence "${command_name}")"
+    
+    # If the passed command does not exist, fail.
+    if is_previous_command_failed; then
+        die "\"${command_name}\" not found, so cannot run:\n\t${command}"
+    # Otherwise, if the passed command has not been overridden by a shell alias
+    # or function, run it as a command. Do not call the customary is_installed()
+    # function, as that does not test whether or not a command is overridden.
+    elif is_absolute_path "${command_path}"; then
         # If the caller requests this command be run under a different user,
         # attempt to do so.
         if [[ -n "${ZESHY_RUN_AS}" && "${ZESHY_RUN_AS}" != $(whoami) ]]; then
@@ -514,7 +517,7 @@ run() {
             # advantage of password caching.
             #
             # Note that we do not use the "(@)" expansion in either of the
-            # following two commands, as that would split this array into
+            # following two commands, as that would split the array into
             # discrete command arguments.
             if [[ "${ZESHY_RUN_AS}" == 'root' ]] && is_runnable sudo; then
                 sudo -E "${command}"
@@ -525,17 +528,16 @@ run() {
                    --command "${command}" "${ZESHY_RUN_AS}"
         fi
         # Otherwise, run this command as the current user. Do use the "(@)"
-        # expansion here, as calling the command manually requires we split this
+        # expansion here, as calling the command manually requires we split the
         # array into discrete command arguments.
         else "${command[@]}"
         fi
-    # Otherwise, if the passed command is a shell built-in, run it inside an
+    # Otherwise, the passed command must be a shell built-in, run it inside an
     # eval statement. (If this command is run outside of such a statement,
     # strange and hideous things occur.)
-    elif is_callable "${command_name}"
-    then eval "${command}"
-    # Otherwise, fail.
-    else die "\"${command_name}\" not found, so cannot run:\n\t${command}"
+    else
+#       echo "evaling: ${command}"
+        eval "${command[@]}"
     fi
 }
 
@@ -616,6 +618,29 @@ quietly() {
     run "${(q)@}" 1>/dev/null 2>&1
 }
 
+# ....................{ COMMANDS ~ tests                   }....................
+# bool is_previous_command_failed(void)
+#
+# Return success if the previous command failed. Otherwise, return failure.
+is_previous_command_failed() {
+    [[ "${#}" -eq 0 ]] || die "expected no arguments"
+    if [[ "${?}" -ne "${ZESHY_SUCCESS_CODE}" ]]
+    then return "${ZESHY_SUCCESS_CODE}"
+    else return "${ZESHY_FAILURE_CODE}"
+    fi
+}
+
+# bool is_previous_command_succeeded(void)
+#
+# Return success if the previous command succeeded. Otherwise, return failure.
+is_previous_command_succeeded() {
+    [[ "${#}" -eq 0 ]] || die "expected no arguments"
+    if [[ "${?}" -eq "${ZESHY_SUCCESS_CODE}" ]]
+    then return "${ZESHY_SUCCESS_CODE}"
+    else return "${?}"
+    fi
+}
+
 # ....................{ REGULAR EXPRESSIONS                }....................
 # void match_multiline(...)
 #
@@ -672,6 +697,14 @@ get_current_pid() {
 }
 
 # ....................{ FILES                              }....................
+# bool is_absolute_path(char *path)
+#
+# Return success if the passed path is absolute (i.e., begins with an "/").
+is_absolute_path() {
+    [[ "${#}" -eq 1 ]] || die "expected exactly one path"
+    [[ "${1[1]}" == / ]]
+}
+
 # char *canonicalize_path(char *path)
 #
 # Get the canonicalized form of the passed absolute path. Canonicalization
@@ -740,11 +773,11 @@ alias which_binary_nonfatal="which_command_nonfatal"
 # If the passed command is not found, if multiple binaries are passed, or if no
 # command is passed, prints an error and dies.
 which_command() {
-    # Set this variable *AFTER* localizing it, as integrating the two erases the
-    # return value of the former.
+    # Call the whence() built-in outside of "local" so as to retain the return
+    # code. (ZSH == FAIL on that one.) 
     local command_path
           command_path=$(which_command_nonfatal "${@}")
-    [[ "${?}" -eq "${ZESHY_SUCCESS_CODE}" ]] || die "\"${1}\" not found"
+    is_previous_command_succeeded || die "\"${1}\" not found"
     echo "${command_path}"
 }
 
@@ -755,20 +788,19 @@ which_command() {
 which_command_nonfatal() {
     [[ "${#}" -eq 1 ]] || die "expected exactly one command name"
     
-    local command_name="${1[(w)1]}"    # first word of the first passed parameter
-    local command_path="$(whence -cp "${command_name}")"
+    # First word of the first passed parameter, and the absolute path to return.
+    local command_name="${1[(w)1]}" command_path
     
-    # When the whence() built-in fails, it prints the name of the passed command
-    # followed by "not found". Thus, if it prints such a message, the passed
-    # command does not exist. Note that testing the return code is problematic
-    # here, since setting a local variable always forces the return code to 0
-    # (i.e., success). (ZSH = FAIL on that one.)
-    if [[ "${command_path}" == *" not found" ]]; then
-        return ${ZESHY_FAILURE_CODE}
-    else
+    # Call the whence() built-in outside of "local" so as to retain the return
+    # code. (ZSH == FAIL on that one.) 
+    command_path="$(whence -cp "${command_name}")"
+    
+    if is_previous_command_succeeded; then
         echo "${command_path}"
         return ${ZESHY_SUCCESS_CODE}
     fi
+
+    return ${ZESHY_FAILURE_CODE}
 }
 
 # ....................{ FILES ~ directories                }....................
@@ -951,6 +983,25 @@ _zeshy_core() {
 _zeshy_core
 
 #FIXME: Obsolete.
+    # When the whence() built-in fails, it prints the name of the passed command
+    # followed by "not found". Thus, if it prints such a message, the passed
+    # command does not exist. Note that testing the return code is problematic
+    # here, since setting a local variable always forces the return code to 0
+    # (i.e., success). 
+#   if [[ "${command_path}" == *" not found" ]]; then
+#       return ${ZESHY_FAILURE_CODE}
+#   else
+#       echo "${command_path}"
+#       return ${ZESHY_SUCCESS_CODE}
+#   fi
+
+    # O.K., this is tricksy: if the eventual caller explicitly quote-protected
+    # the passed command name, there exists another "layer" of quote-protection
+    # to unravel. Do so, alas.
+#   if ! is_installed "${command_name}" && is_installed "${(Q)command[1]}"; then
+#       command_name="${(Q)command[1]}"
+#   fi
+
     #echo "PID: $$"
     #echo "current_process_basename:"
     #get_current_process_basename
