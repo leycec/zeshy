@@ -1,0 +1,303 @@
+#!/usr/bin/env zeshy
+# vim: set filetype=zsh
+#
+# ====================[ drupal-cohere                      ]====================
+#                     [ Time-stamp: "2008-12-22 13:22:33 leycec" ]
+
+# ....................{ CONFIGURATION =posix               }....................
+#FIXME: Document!
+#SOURCE_DRUPAL_SITES_ROOT="/home/leycec/pub/code/organicmechanics.com/sites"
+#TARGET_DRUPAL_SITES_ARCHIVE_PATH="/home/leycec/pub/old/site/organicmechanics.com"
+SOURCE_DRUPAL_SITES_ROOT="/srv/www/htdocs/drupal/sites"
+TARGET_DRUPAL_SITES_ARCHIVE_PATH="/media/fa_fat/old/drupal"
+
+# The command with which to "nice" (i.e., reduce the scheduling priority of)
+# all processes run by this script. By default, this runs processes with lowest
+# CPU priority ("nice -n19") and lowest "best effort" disk priority
+# ("ionice -c2 -n7").
+#
+# The default is probably fine.
+NICE="ionice -c2 -n7 nice -n19"
+
+# ....................{ CONFIGURATION =archival            }....................
+# The name of the command with which to perform file and path archival. This
+# command does not perform compression on those files or paths; rather, it
+# archives filesystem attributes (such as those files' or paths' owner, group,
+# access time, creation time, modification time, et al.). On *nux, this tends to
+# be the "tar" command.
+#
+# The default is probably fine.
+ARCHIVE_COMMAND=tar
+
+# Command-line options to be passed to the archival command above.
+#
+# The default is probably fine.
+ARCHIVE_OPTIONS=(
+    --create --file -
+    --atime-preserve --ignore-failed-read --preserve --recursion --sparse
+)
+
+# The number of archive files to retain. This script automatically deletes all
+# older archive files than this, so as to conserve disk space.
+#
+# The default may or may not be fine. Please consider this number, carefully!
+MAXIMUM_NUMBER_OF_ARCHIVE_FILES=4
+
+# ....................{ CONFIGURATION =compression         }....................
+# The name of the command with which to perform file and path compression.
+# Examples include "bzip2", "gzip", "tar", and "7z".
+#
+# The default may or may not be fine, here. Please change this, according to
+# which compression command you have installed and prefer. That said, the author
+# of this script recommends you use "7z" over other compression commands. The
+# 7-Zip algorithm tends to provide better text compression than those others.
+# Your mileage may vary, of course.
+COMPRESS_COMMAND=7z
+
+# Command-line options to be passed to the compression command, above. By
+# default, this instructs 7-Zip to use the PPMd compression algorithm, rather
+# than the LZMA compression algorithm default. (PPMd tends to provides optimal
+# compression for plaintext files.)
+#
+# The default may or may not be fine, here. If you change the compression
+# command, you should probably change this, too.
+COMPRESS_OPTIONS=( a -t7z -m0=PPMd -mmem=64m -si )
+
+# ....................{ CONFIGURATION =http-request        }....................
+# The name of the command with which to perform HTTP requests. This command is
+# run when performing an HTTP-style GET request against a Drupal site's
+# "cron.php" file, which requests that site perform a new database backup.
+#
+# The default is probably fine.
+HTTP_REQUEST_COMMAND=curl
+
+# Command-line options to be passed to the HTTP request command, above.
+#
+# The default is probably fine
+HTTP_REQUEST_OPTIONS=( --silent --compressed )
+
+# ....................{ IMPORTS                            }....................
+zimport zeshy/time
+zimport zeshy/string
+
+# ....................{ CONSTANTS                          }....................
+SCRIPT_VERSION='0.0.2'
+TODAY=$(get_current_date)
+
+# ....................{ MAIN                               }....................
+main() {
+   utter "${SCRIPT_VERSION}"
+
+   # Apply a custom umask to all files created during the implementation, below.
+   # Specifically, make all such files "u+rwx,go-rwx". (This rather restrictive
+   # umask forbids file access to public clients when hosted on a public domain.)
+   umask 077
+
+   pre_archival_compress
+   main_archival_compress
+   post_archival_compress
+}
+
+# ....................{ ARCHIVE COMPRESS ~ pre            }....................
+# If the remote site does not list a database backup corresponding to today,
+# then perform a database backup, now, by requesting the Drupal-specific URL
+# from that site responsible for running that site's cronjobs and thus
+# performing that database backup. Then, remove all database backups from that
+# site except that present backup. Boom!
+pre_archival_compress() {
+    local source_drupal_site_root source_drupal_site_backup_root
+    local source_drupal_site_domain_name source_drupal_site_backup_files
+    for   source_drupal_site_root in "${SOURCE_DRUPAL_SITES_ROOT}"/*; do
+        source_drupal_site_backup_root="${source_drupal_site_root}/files/backup_migrate"
+        source_drupal_site_domain_name=$(basename "${source_drupal_site_root}")
+
+        # Continue past the "all/" and "default/" site paths, if they have no
+        # "files/backup_migrate/" path. Typically, the "all/" site path never has a
+        # "files/backup_migrate/" path -- while the "default/" site path only has a
+        # "files/backup_migrate/" path when run under a single-site installation.
+        #
+        # Otherwise, emit an error.
+        if ! is_dir "${source_drupal_site_backup_root}"; then
+            [[ "${source_drupal_site_domain_name}" == all || \
+               "${source_drupal_site_domain_name}" == default ]] && continue
+            request_drupal_site_backup "${source_drupal_site_domain_name}"
+        fi
+
+        # Move all database backups in the "manual/" path to the "scheduled/" path.
+        # This avoids archival+compression of extraneous database backups.
+        if quietly ls "$source_drupal_site_backup_root/manual/"*.sql*; then
+            utter "moving database backups from \"${source_drupal_site_backup_root}/manual\"..."
+            try mv "${source_drupal_site_backup_root}/manual/"*.sql*\
+                   "${source_drupal_site_backup_root}/scheduled/"
+        fi
+
+        # Remove all database backups from the "scheduled/" path, except the most
+        # recently created database backup in that path. This, also, avoids
+        # archival+compression of extraneous database backups.
+        #
+        # We effect this by moving the most recently created database backup in that
+        # path out of that path, removing all other database backups from that path,
+        # and moving that database backup back to that path.
+        source_drupal_site_backup_files=$(ls -1t --almost-all "${source_drupal_site_backup_root}/scheduled/"*${TODAY}*.sql* 2>/dev/null)
+
+        # If this Drupal site has at least one database backup corresponding to
+        # today, ensure it's the only retained database backup by removing all
+        # others.
+        if [[ -n "${source_drupal_site_backup_files}" ]]; then
+            # Remove all others, if there are.
+            if [[ $(get_line_count "${source_drupal_site_backup_files}") -gt 1 ]]; then
+                source_drupal_site_backup_file=$(get_first_line "${source_drupal_site_backup_files}")
+                utter "removing database backups older than \"${source_drupal_site_backup_file}\"..."
+                try mv "${source_drupal_site_backup_file}"\
+                       "${source_drupal_site_backup_root}/manual/"
+                try rm "${source_drupal_site_backup_root}/scheduled/"*.sql*
+                try mv "${source_drupal_site_backup_root}/manual/"*.sql*\
+                       "${source_drupal_site_backup_root}/scheduled/"
+          fi
+        # Otherwise, request this Drupal site create a new database backup.
+        else request_drupal_site_backup "${source_drupal_site_domain_name}"
+        fi
+    done
+}
+
+# Request that the Drupal site corresponding to the passed domain name perform a
+# database backup, now, by requesting the Drupal-specific URL for that site
+# responsible for running that site's cronjobs and thus performing that database
+# backup.
+request_drupal_site_backup() {
+    die_unless_installed "${HTTP_REQUEST_COMMAND}"
+
+    #FIXME: Needs generalizing, obviously.
+#   DRUPAL_SITE_DOMAIN_NAME="$1"
+#   local drupal_site_domain_name="gwydden/~leycec/organicmechanics"
+    local drupal_site_domain_name="localhost/drupal/organicmechanics"
+    local drupal_site_cron_url="http://${drupal_site_domain_name}/cron.php"
+    
+    utter "requesting \"${drupal_site_cron_url}\" run database backups..."
+    try ${HTTP_REQUEST_COMMAND} ${HTTP_REQUEST_OPTIONS} "${drupal_site_cron_url}"
+}
+
+# ....................{ ARCHIVE COMPRESS ~ main           }....................
+# Archive and compress that remote site's "sites/" directory to some file on
+# another local or remote site.
+main_archival_compress() {
+    # Ensure sanity.
+    die_unless_installed "${ARCHIVE_COMMAND}"
+    die_unless_installed "${COMPRESS_COMMAND}"
+    die_unless_dir "${SOURCE_DRUPAL_SITES_ROOT}"
+    die_unless_dir "${TARGET_DRUPAL_SITES_ARCHIVE_PATH}"
+
+    local target_drupal_sites_archive_file="${TARGET_DRUPAL_SITES_ARCHIVE_PATH}/drupal_sites_${TODAY}.${ARCHIVE_COMMAND}.${COMPRESS_COMMAND}"
+    is_file "${target_drupal_sites_archive_file}" &&
+        die "\"${target_drupal_sites_archive_file}\" already exists"
+
+    # Recursively copy the entire contents of the remote Drupal "sites/" path to a
+    # local, temporary path. (Archival and compress commands tend to perform badly
+    # when run over an SSHfs mount.)
+    local target_drupal_sites_root="$(which_temporary_path drupal_sites)"
+    
+    utter "copying \"${SOURCE_DRUPAL_SITES_ROOT}\" to \"${target_drupal_sites_root}\"..."
+    try cp --no-target-directory --preserve --recursive\
+        "${SOURCE_DRUPAL_SITES_ROOT}" "${target_drupal_sites_root}"
+
+    # Recursively decompress each database backup. We recompress these backups via
+    # custom archive and compress commands, later.
+    local source_drupal_site_backup_root
+    local target_drupal_site_backup target_drupal_site_domain_name
+    local target_drupal_site_root target_drupal_site_backup_file 
+    for   target_drupal_site_root in "${target_drupal_sites_root}"/*; do
+        target_drupal_site_backup="${target_drupal_site_root}/files/backup_migrate"
+        target_drupal_site_domain_name=$(basename "${target_drupal_site_root}")
+        
+        if ! is_dir "${target_drupal_site_backup}"; then
+            [[ "${target_drupal_site_domain_name}" == all || \
+               "${target_drupal_site_domain_name}" == default ]] && continue
+            curse "\"$target_drupal_site_root\" has no database backup paths"
+        fi
+
+        for target_drupal_site_backup_file in\
+            "${target_drupal_site_backup}/scheduled/"*.sql*; do
+            utter "decompressing \"${target_drupal_site_backup_file}\"..."
+            
+            # Decompress this database backup on the basis of its filetype.
+            unpack "${target_drupal_site_backup_file}"
+        done
+    done
+
+    # Recursively recompress the entire Drupal site structure, including all
+    # recently decompressed database backups.
+    utter "compressing \"${target_drupal_site_root}\" to \"${target_drupal_sites_archive_file}\" via ${ARCHIVE_COMMAND} to ${COMPRESS_COMMAND}..."
+    try "${ARCHIVE_COMMAND}  ${ARCHIVE_OPTIONS}  '${target_drupal_sites_root}' |\
+         ${COMPRESS_COMMAND} ${COMPRESS_OPTIONS} '${target_drupal_sites_archive_file}'"
+
+    # Recursively delete the local, temporary path.
+    utter "removing \"${target_drupal_sites_root}\"..."
+    try rm --recursive "${target_drupal_sites_root}"
+
+    # Recursively delete each remote database backup, lastly.
+    local source_drupal_site_root
+    for   source_drupal_site_root in "${SOURCE_DRUPAL_SITES_ROOT}"/*; do
+        source_drupal_site_backup_root="${source_drupal_site_root}/files/backup_migrate"
+        is_dir "${source_drupal_site_backup_root}" || continue
+
+        utter "removing database backups from \"${source_drupal_site_backup_root}\"..."
+        rm "$source_drupal_site_backup_root/manual/"*.sql*    2>/dev/null
+        rm "$source_drupal_site_backup_root/scheduled/"*.sql* 2>/dev/null
+    done
+}
+
+# ....................{ ARCHIVE COMPRESS ~ post            }....................
+# Remove older versions of that archived, compressed file on that other local or
+# remote site, now that we've produced a more recent file.
+post_archival_compress() {
+    local target_drupal_sites_archive_files=$(ls -1t --almost-all "${TARGET_DRUPAL_SITES_ARCHIVE_PATH}/drupal_sites_"*".${ARCHIVE_COMMAND}.${COMPRESS_COMMAND}" 2>/dev/null)
+    local number_of_archive_files=$(get_line_count "${target_drupal_sites_archive_files}")
+
+    if [[ ${number_of_archive_files} -gt ${MAXIMUM_NUMBER_OF_ARCHIVE_FILES} ]]; then
+        utter "removing older archive files from \"${TARGET_DRUPAL_SITES_ARCHIVE_PATH}\"..."
+        target_drupal_sites_archive_files=$(get_first_lines "${target_drupal_sites_archive_files}" "${MAXIMUM_NUMBER_OF_ARCHIVE_FILES}")
+
+        # We cannot use the "try" subroutine, here, due to the seeming inability to
+        # pass newline characters in shell variables to that subroutine. *shrug*
+        echo "${target_drupal_sites_archive_files}" | xargs --delimiter="\n" -I '{}' mv '{}' \
+             "${TARGET_DRUPAL_SITES_ARCHIVE_PATH}/.."
+        is_previous_command_succeeded || exit ${ZESHY_FAILURE_CODE}
+        try rm "${TARGET_DRUPAL_SITES_ARCHIVE_PATH}/drupal_sites_"*".${ARCHIVE_COMMAND}.${COMPRESS_COMMAND}"
+        try mv "${TARGET_DRUPAL_SITES_ARCHIVE_PATH}/../drupal_sites_"*".${ARCHIVE_COMMAND}.${COMPRESS_COMMAND}" \
+               "${TARGET_DRUPAL_SITES_ARCHIVE_PATH}/"
+    fi
+}
+
+# ....................{ IMPLEMENTATION                     }....................
+main
+
+#FIXME: Obsolete.
+            # Extract this database backup's filetype.
+#           TARGET_DRUPAL_SITE_BACKUP_FILE_TYPE=$(basename "$TARGET_DRUPAL_SITE_BACKUP_FILE" | awk '{ sub(/^.+\.sql\./, ""); print }')
+#           case "${TARGET_DRUPAL_SITE_BACKUP_FILE_TYPE}" in
+#               bz | bz2 | bzip2 ) try bunzip2 "${TARGET_DRUPAL_SITE_BACKUP_FILE}";;
+#               gz | gzip )        try gunzip  "${TARGET_DRUPAL_SITE_BACKUP_FILE}";;
+#               zip )              try unzip  "${TARGET_DRUPAL_SITE_BACKUP_FILE}";;
+#               *) curse "\"${TARGET_DRUPAL_SITE_BACKUP_FILE}\" not compressed"
+#           esac
+
+# --------------------( COPYRIGHT AND LICENSE              )--------------------
+# The information below applies to everything in this distribution,
+# except where noted.
+#              
+# Copyright 2008-2011 by B.w.Curry.
+#   
+#   http://www.raiazome.com
+# 
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
