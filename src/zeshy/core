@@ -624,6 +624,8 @@ try_quietly_as() {
 }
 
 # ....................{ COMMANDS ~ return codes            }....................
+#FIXME: Truncate globally. Impossible to remember, I'm afraid. Perhaps:
+#"fail_if_error", "get_return_code", "is_ok", and "is_error" instead?
 # int fail_if_previous_command_failed(void)
 # 
 # Return from the current function with failure if the previous command or
@@ -635,8 +637,12 @@ alias get_previous_command_return_code=is_previous_command_succeeded
 #
 # Return success if the previous command failed. Otherwise, return failure.
 is_previous_command_failed() {
+    # Cache the prior command's success code, as our initial sanity check on
+    # arguments replaces this code with its own.
+    local prior_command_success_code=${?}
+
     [[ ${#} -eq 0 ]] || die 'expected no arguments'
-    if [[ ${?} -ne ${ZESHY_SUCCESS_CODE} ]]
+    if [[ ${prior_command_success_code} -ne ${ZESHY_SUCCESS_CODE} ]]
     then return ${ZESHY_SUCCESS_CODE}
     else return ${ZESHY_FAILURE_CODE}
     fi
@@ -646,8 +652,12 @@ is_previous_command_failed() {
 #
 # Return success if the previous command succeeded. Otherwise, return failure.
 is_previous_command_succeeded() {
+    # Cache the prior command's success code, as our initial sanity check on
+    # arguments replaces this code with its own.
+    local prior_command_success_code=${?}
+
     [[ ${#} -eq 0 ]] || die 'expected no arguments'
-    return ${?}
+    return ${prior_command_success_code}
 }
 
 # int exit_with_failure(void)
@@ -670,26 +680,26 @@ exit_with_success() {
 # For additional regular expression functionality, see "zeshy/string".
 
 # void match(
-#   char *regular_expression, char *string=null,
-#   char *match_variable_name='MATCH', char *group_array_name='match')
+#   char *regular_expression, char *string = null,
+#   char *match_variable_name = "MATCH", char *group_array_name = "match")
 #
-# Match the passed string against the passed Perl-compatible regular expression
-# (PCRE). This function returns success when this string matches and failure
-# when it does not. Also, when this function returns success it also sets:
+# Match the passed string or stdin if no such string is passed against the
+# passed Perl-compatible regular expression (PCRE). This function returns
+# failure if this string does not match and success otherwise, as well as
+# setting match group-specific variables in the latter case:
 #
-# * The variable corresponding to the passed variable name to the whole match,
+# * The name of the scalar variable to which this function puts the whole match,
 #   defaulting to the global variable "${MATCH}".
-# * The array corresponding to the passed array name to the list of all matched
-#   groups, defaulting to the global variable "${match}".
+# * The name of the array variable to which this function puts all match groups,
+#   defaulting to the global variable "${match}".
+#
+# This function never prints output in either case. Hence if you require the
+# exact text matched, you must either access the above match group-specific
+# variables or call a helper function defined in Zeshy Regex.
 #
 # This function also accepts a hidden "fifth parameter": the global variable
 # "${ZESHY_MATCH_OPTIONS}", which when set causes this function to pass those
 # options to the pcre_compile() built-in when compiling the passed pattern.
-#
-# If this regular expression matched at least one group, this function returns
-# this group as a string for caller convenience... Else, this function returns
-# nothing. In the former case, callers may retrieve the set of all groups via
-# the global "${match}" array. (See above.)
 #
 # For convenience, this function also accepts "stdin"-style piped input rather
 # than an explicit passed string: e.g.,
@@ -712,22 +722,23 @@ match() {
     # Parse parameters.
     [[ ${#} -ge 2 ]] ||
         die 'expected at least one regular expression and one string'
-    local pattern="${1}"
+    local regex="${1}"
           string="${2}"
     local match_variable_name="${3:-MATCH}"
     local group_array_name="${4:-match}"
-#   print "pattern: ${pattern} | string: ${string} | match_variable_name: ${match_variable_name} | group_array_name: ${group_array_name} "
-#   echo "mo: ${ZESHY_MATCH_OPTIONS[@]}"
+#   print "pattern: "${(q)regex}" | string: ${string} | match_variable_name: ${match_variable_name} | group_array_name: ${group_array_name} "
+#   print "mo: ${ZESHY_MATCH_OPTIONS[@]}"
 
-    # Compile the match. (Yes, this is *ALWAYS* necessary.)
+    # Compile the match. (Yes, ZSH requires this regardless of whether we intend
+    # to actually reuse this match.)
     if [[ -n "${ZESHY_MATCH_OPTIONS}" ]]; then 
 #       print "ZESHY_MATCH_OPTIONS: ${ZESHY_MATCH_OPTIONS}"
 #       pcre_compile -m "${pattern}" ||
-        pcre_compile "${ZESHY_MATCH_OPTIONS[@]}" "${pattern}" ||
-            die "\"${pattern}\" not a valid regular expression with match options \"${ZESHY_MATCH_OPTIONS[@]}\""
+        pcre_compile "${ZESHY_MATCH_OPTIONS[@]}" "${regex}" ||
+            die "\"${regex}\" not a valid regular expression with match options \"${ZESHY_MATCH_OPTIONS[@]}\""
     else
-        pcre_compile "${pattern}" ||
-            die "\"${pattern}\" not a valid regular expression"
+        pcre_compile "${regex}" ||
+            die "\"${regex}\" not a valid regular expression"
     fi
 
     # Perform the match and return.
@@ -988,12 +999,16 @@ zimport() {
     if [[ -z "${ZESHY_IMPORTED_PATH_TO_MTIME["${zeshy_script_path}"]}" ||\
         "${ZESHY_IMPORTED_PATH_TO_MTIME["${zeshy_script_path}"]}" -ne\
         "${zeshy_script_mtime}" ]]; then
-        # If the script corresponds to a command-specific script (i.e., a script
-        # under "zeshy/command"), ensure the command is actually installed.
+        # If the script corresponds to a command-specific script under
+        # "zeshy/command" excluding the top-level ".main" script, ensure this
+        # command is actually installed.
         if [[ "${zeshy_script_path}" == */zeshy/command/* ]]; then
             local command_name="${zeshy_script_path#*/zeshy/command/}"
-            is_installed "${command_name}" ||
-                die "\"${command_name}\" not installed or not found on \$PATH"
+
+            if [[ "${command_name}" != '.main' ]]; then
+                is_installed "${command_name}" || die\
+                    "\"${command_name}\" not installed or not found on \$PATH"
+            fi
         fi
 
         # Prior to doing so, record the script as being imported. This prevents
@@ -1080,6 +1095,12 @@ _zeshy_core() {
 _zeshy_core
 
 #FIXME: Obsolete.
+# This function returns success 
+# If this regular expression matched at least one group, this function returns
+# this group as a string for caller convenience... Else, this function returns
+# nothing. In the former case, callers may retrieve the set of all groups via
+# the global "${match}" array. (See above.)
+
     # When the whence() built-in fails, it prints the name of the passed command
     # followed by "not found". Thus, if it prints such a message, the passed
     # command does not exist. Note that testing the return code is problematic
