@@ -3,148 +3,28 @@
 #                     [ Time-stamp: "2009-04-18 19:29:36 leycec" ]
 #
 # --------------------( SYNOPSIS                           )--------------------
-# Zsh routines for mounting and unmounting remote SSH hosts to and from local
-# SSHfuse-managed paths.
-#
-# --------------------( TODO                               )--------------------
-# * This component requires quite a bit of updating. It no longers complies with
-#   current Zeshy style *AT ALL*, and is probably doing quite a bit "wrong."
-
-# ....................{ IMPORTS                            }....................
-zimport zeshy/file/file
-
-#FIXME: Move all such configuration into a new "${HOME}/.zeshy/zeshyrc" file.
-# ....................{ CONFIGURATION                      }....................
-# Root directory to which SSH hosts will be mounted.
-MOUNT_ROOT="/mnt"
-
-# List of absolute paths to "ssh_config" files. Note that order is important:
-# later file content overrides that of earlier.
-SSH_CONFIGS="/etc/ssh/ssh_config:${HOME}/.ssh/ssh_config"
-
-# Global dictionary mapping from SSH hostname to the local and remote pathnames
-# at which that hostname is to be mounted under SSHfs. SSH hostnames correspond
-# to "Host" options, in "/etc/ssh/ssh_config".
-#
-# The "-Ax" option to the "typeset" commands defines each such variable as an
-# [A]ssociative array (i.e., a dictionary) and e[x]ported to the global
-# environment for later access within the "ssh-mount" function.
-dict global SSH_HOST_TO_LOCAL_PATH
-dict global SSH_HOST_TO_REMOTE_PATH
-SSH_HOST_TO_LOCAL_PATH=()
-SSH_HOST_TO_REMOTE_PATH=()
-
-# Custom mappings for the above associative arrays. The "fill_arrays"
-# function will define acceptable defaults for all other mappings.
-SSH_HOST_TO_REMOTE_PATH[gwydden]="/"
-SSH_HOST_TO_REMOTE_PATH[rhuddin]="/"
+# Zsh SSH.
 
 # ....................{ ALIASES                            }....................
-# Define low-level aliases. You may call these aliases directly; in general,
-# however, it will probably be more expedient to call the higher-level
-# "ssh-mount" and "ssh-umount" to perform SSH host mounting and unmounting.
-
-# FUSE. 
-alias sshfs="sshfs -o allow_other,kernel_cache,reconnect,transform_symlinks,compression=yes,cache_timeout=256,cache_stat_timeout=16,cache_dir_timeout=16,cache_link_timeout=16,idmap=user,workaround=rename"
-alias sshfs-umount="fusermount -uz"
-alias sshm="ssh-mount"
-alias sshu="ssh-umount"
-
-# SSH.
 alias scp="scp -Crv"
 alias ssh="TERM=\"xterm\" ssh -v"
-alias ssh-secondary-control-master="ssh -o \"ControlPath ~/tmp/ssh_controlmaster2-%r@%h:%p\""
 
-# ....................{ INTERFACE                          }....................
-# Define high-level "front-facing" functions serving as this file's command-
-# line interface to common users.
+# ....................{ DEPENDENCIES                       }....................
+zimport zeshy/file/file
 
-# void ssh-mount(char *hostname)
+# ....................{ SSH KEYS                           }....................
+# print_ssh_key_fingerprint(char ssh_key_file = "~/.ssh/id_rsa.pub")
 #
-# Mount the passed SSH hostname to its corresponding local mount point.
-ssh-mount() {
-    [[ "${#}" -eq 1 ]] || die 'expected exactly one SSH hostname'
-
-  local SSH_HOST="$1"
-  local LOCAL_PATH="$SSH_HOST_TO_LOCAL_PATH[$SSH_HOST]"
-  local REMOTE_PATH="$SSH_HOST_TO_REMOTE_PATH[$SSH_HOST]"
-  [ -n "$LOCAL_PATH" ] || die "\"$SSH_HOST\" not a recognized host!"
-
-  if [ ! -d "$LOCAL_PATH" ]; then
-    USER_NAME=$(whoami)
-
-    utter "creating \"$LOCAL_PATH\"..."
-    sudo mkdir --parents "$LOCAL_PATH" ||
-      die "\"$LOCAL_PATH\" cannot be created!"
-    sudo chown "$USER_NAME" "$LOCAL_PATH" || 
-      die "\"$LOCAL_PATH\" cannot be chowned by \"$USER_NAME\"!"
-  fi
-
-  ssh-umount "$SSH_HOST"
-
-  # Load the "fuse" kernel module, if compiled as a module and not already loaded.
-  if ! grep -qw fuse /proc/filesystems; then
-    # If the "/etc/init.d/fuse" initscript exists, preferentially run that.
-    if [ -x "/etc/init.d/fuse" ]; then
-      sudo  "/etc/init.d/fuse" restart  ||
-        die "\"fuse\" initscript cannot be started!"
-    # Otherwise, load the kernel module.
-    else
-      sudo modprobe --quiet fuse ||
-        die "\"fuse\" kernel module cannot be loaded!"
-    fi
-  fi
-
-  # Mount the passed SSH hostname.
-  utter "mounting \"$SSH_HOST\" to \"$LOCAL_PATH\"..."
-  sshfs "${SSH_HOST}:${REMOTE_PATH}" "$LOCAL_PATH" ||
-    die "\"$SSH_HOST\" cannot be mounted to \"$LOCAL_PATH\"!"
+# Print the fingerprint of the passed SSH public or private key file.
+print_ssh_key_fingerprint() {
+    die_unless_at_most_one_argument 'expected at most one SSH key file'
+    string ssh_key_file="${1:-${HOME}/.ssh/id_rsa.pub}"
+    die_unless_file "${ssh_key_file}"
+    ssh-keygen -lf  "${ssh_key_file}"
 }
 
-# void ssh-umount(char *hostname)
-#
-# Unmount the passed SSH hostname from its corresponding local mount point.
-ssh-umount() {
-    [[ "${#}" -eq 1 ]] || die 'expected exactly one SSH hostname'
-
-  local SSH_HOST="$1"
-  local LOCAL_PATH="$SSH_HOST_TO_LOCAL_PATH[$SSH_HOST]"
-  [ -n "$LOCAL_PATH" ] || die "\"$SSH_HOST\" not a recognized host!"
-
-  # Unmount the passed SSH hostname only if already mounted.
-  if grep "$LOCAL_PATH" /etc/mtab 2>&1 1>/dev/null; then
-    utter "unmounting \"$SSH_HOST\" from \"$LOCAL_PATH\"..."
-    sshfs-umount "$LOCAL_PATH" ||
-      die "\"$SSH_HOST\" cannot be unmounted from \"$LOCAL_PATH\"!"
-  fi
-}
-
-# ....................{ MAIN                               }....................
-initialization_ssh_mounting() {
-    local ssh_config ssh_hosts ssh_host
-
-    # Split the scalar string of paths "$SSH_CONFIGS" on colons with (s.:.).
-    for ssh_config in "${(s.:.)SSH_CONFIGS}"; do
-        [[ -f "${ssh_config}" ]] || break
-        
-        # Extract a space-delimited set of all "Hosts" defined by this "ssh_config".
-        ssh_hosts="$(grep --extended-regexp 'Host[ \t]' "${ssh_config}" | cut --delimiter=' ' --fields=2 | tr '\n' ' ' | tr --delete '*')"
-        
-        # Split the scalar string of words "$ssh_hosts" on spaces with '='.
-        for ssh_host in ${=ssh_hosts}; do
-            [[ -n "$SSH_HOST_TO_LOCAL_PATH[${ssh_host}]" ]] ||
-                # Do not append a terminating '/' onto mount points. Why? We later grep
-                # "/etc/mtab" for existing mount points and, since that file also does not
-                # append the same terminating '/', must thus ensure the two paths conform.
-                SSH_HOST_TO_LOCAL_PATH[${ssh_host}]="${MOUNT_ROOT}/${ssh_host}"
-
-            [[ -n "$SSH_HOST_TO_REMOTE_PATH[${ssh_host}]" ]] ||
-                SSH_HOST_TO_REMOTE_PATH[${ssh_host}]=
-        done
-    done
-}
-
-initialization_ssh_mounting
+#FIXME: Obsolete.
+#alias ssh-secondary-control-master="ssh -o \"ControlPath ~/tmp/ssh_controlmaster2-%r@%h:%p\""
 
 # --------------------( COPYRIGHT AND LICENSE              )--------------------
 # The information below applies to everything in this distribution,
