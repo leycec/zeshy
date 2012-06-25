@@ -242,20 +242,18 @@ alias bool='typeset'
 # Declare a string local to the current scope. bool() caveats apply.
 alias string='typeset'
 
-# void dict(char *name)
+# void map(char *name)
 #
-# Declare a dictionary (i.e., associative array) local to the current scope. Due
-# to current inadequacies in Zsh, this function cannot assign this dictionary an
-# initial value. Hence, this dictionary must be initialized separately: e.g.,
+# Declare a map (i.e., associative array) local to the current scope. Due to
+# current inadequacies in Zsh, this map must be externally initialized: e.g.,
 #
-#   dict hash_map; hash_map=( 'key 1' 'value 1' 'key 2' 'value 2' )
-alias dict='typeset -A'
+#   map hash_map; hash_map=( 'key 1' 'value 1' 'key 2' 'value 2' )
+alias map='typeset -A'
 
 # void list(char *name)
 #
-# Declare a list (i.e., array) local to the current scope. Due to current
-# inadequacies in Zsh, this function cannot assign this list an initial value.
-# Hence, this list must be initialized separately: e.g.,
+# Declare a list (i.e., sequential array) local to the current scope. Due to
+# current inadequacies in Zsh, this list must be externally initialized: e.g.,
 #
 #   list sequence; sequence=( 'value 1' 'value 2' 'value 3' 'value 4' )
 alias list='typeset -a'
@@ -542,13 +540,12 @@ get_script_name() {
     # handwaving here.
     elif is_shell_interactive; then
         # Ignore all intermediary I/O- and error handling-specific function
-        # calls. As the first element of "${funcstack}" is the name of the
-        # current function (and we are not particularly interested in that),
-        # skip that by setting "I=2".
-        integer I
-        for (( I=2; ${I} <= ${#funcstack}; I=${I}+1 )); do
+        # calls. Skip the first stack frame corresponding to the current
+        # function by starting at the second stack frame.
+        integer i funcstack_size=${#funcstack}
+        for ((i=2; i <= funcstack_size; i++)); do
             # Order ignorable function names by likelihood, for "efficiency."
-            case "${funcstack[${I}]}" in
+            case "${funcstack[${i}]}" in
                 try*|run*|die*|utter*|mutter*|curse*|ask_*) continue ;;
                 *) break ;;
             esac
@@ -556,8 +553,8 @@ get_script_name() {
          
         # If after ignoring non-relevant functions there still exists at least
         # one function on the callstack, return that function's name.
-        if is ${I} -le ${#funcstack} si
-        then echo "${funcstack[${I}]}"
+        if is ${i} -le ${funcstack_size} si
+        then echo "${funcstack[${i}]}"
         # Otherwise, return the default name.
         else echo 'zeshy'
         fi
@@ -648,21 +645,19 @@ die() {
     is ${return_code} -eq ${ZESHY_SUCCESS_CODE} si and
         return_code="${ZESHY_FAILURE_CODE}"
     
-    # A pox on ye, buggy fiend!
+    # Print the passed error message followed by a complete backtrace.
     curse "${@}"
+    print_stack_trace
     
     #FIXME: Pack the above return code into this exception.
-    # If the current script is actually a function directly called by an
-    # interactive and/or login shell, unwind the call stack; otherwise, kill
-    # the process.
+    # If the current context is a function called from an interactive and/or
+    # login shell, unwind the call stack; otherwise, kill the current process.
     if is_shell_interactive
     then throw ZeshyDieException
-    # Otherwise, exit the current process.
     else exit ${return_code}
     fi
 }
 
-# ....................{ ERRORS ~ processes                 }....................
 # void die_unless_ok(char *error_message)
 #
 # Die with the passed error message unless the previous command succeeded.
@@ -672,6 +667,54 @@ die_unless_ok() {
     integer prior_command_return_code=${?}
     die_unless_one_argument 'expected exactly one error message'
     is ${prior_command_return_code} -eq ${ZESHY_SUCCESS_CODE} si or die "${1}"
+}
+
+# ....................{ BACKTRACES                         }....................
+# char *print_stack_trace(void)
+#
+# Print a stack trace of the current call stack (i.e., the sequence of all stack
+# frames, excluding the call to this function). Each such frame signifies a
+# previously called function, sourced file, or evaluated "eval". Each call
+# stack of such frames signifies a stack trace of the complete code path from
+# the most to least recently called function, source file, or evaluated "eval".
+print_stack_trace() {
+    die_unless_no_arguments
+ 
+    integer funcstack_size=${#funcstack} i 
+    string frame_prefix='    \\_' string funcname filename fileline
+#   string filename_line_number
+#   filename_line_number="${funcfiletrace[${i}]}"
+#   utter 'printing current call stack...'
+
+    # Omit the current function call by starting from the second stack frame.
+    # If there exists no such frame, curse a warning.
+    if is ${funcstack_size} -le 1 si; then
+        curse 'call stack empty'
+        return
+    fi
+
+    # Print a prefixing empty header.
+    print
+    utter
+
+    # Print the current call stack.
+    for ((i=2; i <= funcstack_size; i++)); do
+        # Split the current stack frame's funcfiletrace entry on the last colon
+        # in that entry into that frame's filename and line number, thus
+        # accounting for possible colons in filenames (e.g., from "colon:blow:7"
+        # to filename "colon:blow" and line number 7).
+        funcname="${funcstack[${i}]}"
+        filename="${funcfiletrace[${i}]%:*}"
+        fileline="${funcfiletrace[${i}]##*:}"
+
+        # Print the current stack frame.
+#       if "${funcstack[${i}]}" == "${funcfiletrace[${i}]}"
+        print "${frame_prefix} ${funcname}() { ${filename}: ${fileline} }"
+#       print "${frame_prefix} ${funcname}() {${filename}:${fileline}}"
+
+        # Indent the next stack frame one space to the right.
+        frame_prefix=" ${frame_prefix}"
+    done
 }
 
 # ....................{ COMMANDS                           }....................
@@ -813,9 +856,18 @@ run() {
 }
 
 # ....................{ COMMANDS ~ superuser               }....................
+# void die_unless_superuser(char *error_message = 'not the superuser')
+#
+# Raise an exception unless the current user is the superuser.
+die_unless_superuser() {
+    die_unless_at_most_one_argument\
+        'expected at most one optional error message'
+    is_superuser or die "${1:-\"${USER}\" not the superuser}"
+}
+
 # bool is_superuser(void)
 #
-# Return success if the current user is the "superuser" (i.e., root).
+# Return success if the current user is the superuser (i.e., root).
 is_superuser() {
     is "${EUID}" == 0 || "${USER}" == root si
 }
@@ -994,7 +1046,7 @@ match_multiline() {
 # identifying this process.
 get_current_pid() {
     die_unless_no_arguments
-    echo "${$}"
+    print "${$}"
 }
 
 # ....................{ FILES                              }....................
@@ -1003,7 +1055,7 @@ get_current_pid() {
 # Return success if the passed path is absolute (i.e., begins with an "/").
 is_absolute_path() {
     die_unless_one_argument 'expected exactly one path'
-    [[ "${1[1]}" == / ]]
+    is "${1[1]}" == '/' si
 }
 
 # char *canonicalize_path(char *path)
@@ -1305,7 +1357,7 @@ zimport_file() {
 # for hitherto inexplicable reasons. (There be subtle dragons aboot.)
 zeshy_initialize_imports() {
     die_unless_no_arguments
-    dict global ZESHY_IMPORTED_PATH_TO_MTIME
+    map global ZESHY_IMPORTED_PATH_TO_MTIME
     
     # Explicitly empty the dictionary. This is irrelevant on the first call to
     # this function, but definitely matters on subsequent calls!
