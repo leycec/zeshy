@@ -11,37 +11,26 @@
 # * Core I/O-, error-, file-, and path-handling functions.
 #
 # --------------------( SEE ALSO                           )--------------------
+# http://zsh.sourceforge.net/Doc/Release/Functions.html
+#   Detailed description of trap functions.
 # http://www.bash2zsh.com/essays/essay1_file_manager.html
-#   Brilliant introduction to suffix aliases, mime types, and file magic.
+#   Concise introduction to suffix aliases, mime types, and file magic.
 #
 # --------------------( TODO                               )--------------------
-# * Add "$IS_CRON" support.
 # * Use the "vcs_info" Zsh module for displaying VCS-specific metadata in a VCS-
 #   agnostic fashion.
 # * Incorporate ZSH-lovers fixes, including:
 #   * Use suffix aliases.
-# * It would be helpful to trap on INT (i.e., interrupt, <Ctrl-C>) and
-#   possibly conditionally on EXIT for non-zero exit status, printing a stack
-#   trace in such cases. It's unclear, however, how we can differentiate between
-#   a function call exiting with non-zero status but not erroneously (e.g., an
-#   ask_bool() call) and an external process exiting erroneously. Perhaps we
-#   can't, and I suspect that's the case. We can at least handle INT, however,
-#   and that seems worthwhile. URLs follow:
-#   * http://zsh.sourceforge.net/Doc/Release/Functions.html
-#   * http://fvue.nl/wiki/Bash:_Error_handling#The_tools
-#   Here's the most helpful example; replace function contents with stack trace
-#   printing:
-#       
-#       TRAPINT() {
-#           print "Caught SIGINT, aborting."
-#           return $(( 128 + $1 ))
-#       }
-#
-#   Important notes. We don't need to call the "trap" command. Simply defining
-#   this function notifies Zsh to set this trap. We need to return a non-zero
-#   result (any non-zero result will do) to notify Zsh that we didn't really
-#   handle the signal and that it should do so per normal. (Function traps are
-#   also nice in that subshells implicitly inherit them. Bingo!)
+# * The new trap support obsoletes an astonishing quantity of prior
+#   functionality (e.g., try(), die_unless_ok()). Such functionality should be
+#   retained, but exported out of this component into a new component: say,
+#   "zeshy/shell/job".
+# * zimport() can profitably be renamed require(). The latter captures the
+#   intent and implementation much more succinctly and without the awkward
+#   prefixing 'z'.
+# * We only call a match_*() function once in this file. It's absurd to maintain
+#   such complexity here; offload all match_*() functionality to
+#   "zeshy/type/regex" and, if still required here, simply inline.
 
 # ....................{ PATHS                              }....................
 # Absolute path to the current script.
@@ -77,10 +66,216 @@ export ZESHY_COMPINIT_DUMP_FILE="${ZESHY_CACHE_HOME}/zcompdump"
 #     >>> zimport zeshy
 export ZESHY_MAIN_SCRIPT_BASENAME='.main'
 
+# ....................{ CALL STACK                         }....................
+# For safety, trap functions and functions transitively called by such functions
+# require only Zsh functionality (i.e., no Zeshy-specific syntactic sugar). This
+# comprises all functions defined up to and including the "TRAPS" section.
+
+# char *get_script_name(void)
+#
+# Get the script name for the current script. This is a string succinctly
+# describing the script under execution, typically of one to two words.
+#
+# Scripts may safely redefine this function to return another name; in this
+# case, scripts called by the script redefining this function will still call
+# this original definition (since functions are not inherited via script
+# calls).
+get_script_name() {
+    [[ ${#} -eq 0 ]] || die 'expected no arguments'
+
+    if [[ -n  "${ZESHY_SCRIPT_NAME}" ]]; then
+        print "${ZESHY_SCRIPT_NAME}"
+    # If the current process is an interactive shell, then return the name of
+    # the function that called this function excluding all intermediary I/O-
+    # and error handling-specific function calls. Typically, that function is
+    # the function that called the function that called this function (i.e.,
+    # the function two calls earlier in the function callstack). Insert magical
+    # handwaving here.
+    elif is_shell_interactive; then
+        # Ignore all intermediary I/O- and error handling-specific function
+        # calls. Skip the first stack frame corresponding to the current
+        # function by starting at the second stack frame.
+        integer i funcstack_size=${#funcstack}
+        for (( i = 2; i <= funcstack_size; i++ )); do
+            # Order ignorable function names by likelihood, for "efficiency."
+            case "${funcstack[${i}]}" in
+                try*|run*|die*|utter*|mutter*|curse*|ask_*) continue ;;
+                *) break ;;
+            esac
+        done
+         
+        # If after ignoring non-relevant functions there still exists at least
+        # one function on the callstack, return that function's name.
+        if [[ ${i} -le ${funcstack_size} ]]
+        then print "${funcstack[${i}]}"
+        # Otherwise, return the default name.
+        else print 'zeshy'
+        fi
+    # Otherwise, return the default name.
+    else print 'zeshy'
+    fi
+}
+
+# char *print_stack_trace(void)
+#
+# Print a stack trace of the current call stack (i.e., the sequence of all stack
+# frames, excluding the call to this function). Each such frame signifies a
+# previously called function, sourced file, or evaluated "eval". Each call
+# stack of such frames signifies a stack trace of the complete code path from
+# the most to least recently called function, source file, or evaluated "eval".
+print_stack_trace() {
+    [[ ${#} -eq 0 ]] || die 'expected no arguments'
+ 
+    integer funcstack_size=${#funcstack} i 
+    local frame_prefix='    \\_' string funcname filename fileline
+
+    # Omit the current function call by starting from the second stack frame.
+    # If there exists no such frame, curse a warning.
+    if [[ ${funcstack_size} -le 1 ]]; then
+        curse 'call stack empty'
+        return 1
+    fi
+
+    # Print a prefixing empty header.
+    print
+    utter
+
+    # Print the current call stack.
+    for (( i = 2; i <= funcstack_size; i++ )); do
+        # Split the current stack frame's funcfiletrace entry on the last colon
+        # in that entry into that frame's filename and line number, thus
+        # accounting for possible colons in filenames (e.g., from "colon:blow:7"
+        # to filename "colon:blow" and line number 7).
+        funcname="${funcstack[${i}]}"
+        filename="${funcfiletrace[${i}]%:*}"
+        fileline="${funcfiletrace[${i}]##*:}"
+
+        # Print the current stack frame.
+#       if "${funcstack[${i}]}" == "${funcfiletrace[${i}]}"
+        print "${frame_prefix} ${funcname}() { ${filename}: ${fileline} }"
+#       print "${frame_prefix} ${funcname}() {${filename}:${fileline}}"
+
+        # Indent the next stack frame one space to the right.
+        frame_prefix=" ${frame_prefix}"
+    done
+}
+
+# ....................{ MESSAGES                           }....................
+#FIXME: Add ANSI coloring to uttered messages if on an ANSI-capable terminal.
+#Also, consider prefixing messages under cron with: "["$(date +'%F %T')"]
+
+# void utter(char *message = '')
+#
+# Print the passed message suffixed by a trailing newline to the notice stream
+# of the cron logging facility if a cron-job and to the standard output stream
+# otherwise.
+utter() {
+    # Message to utter. (Yes, its definition must be in a separate command.)
+    local message; message="$(get_script_name): ${@}"
+    
+    if [[ -n "${ZESHY_IS_CRONJOB}" ]]
+    then logger -p cron.notice -- "${message}"
+    else echo "${message}"
+    fi
+}
+
+# void mutter(char *message = '')
+#
+# Print the passed message suffixed by no trailing newline to the notice stream
+# of the cron logging facility if a cron-job and to the standard output stream
+# otherwise.
+mutter() {
+    # Message to mutter. (Yes, its definition must be in a separate command.)
+    local message; message="$(get_script_name): ${@}"
+    
+    if [[ -n "${ZESHY_IS_CRONJOB}" ]]
+    then logger -p cron.notice -- "${message}"
+    else echo -n "${message}"
+    fi
+}
+
+# void curse(char *message = '')
+#
+# Echo the passed message to the standard error stream. Specifically:
+#
+# * If a cronjob, echo to the error stream of the cron logging facility.
+# * Otherwise, to "stderr".
+curse() {
+    #FIXME: Given the new stack trace facilities, this probably no longer applies.
+    # Unset the script name, if set. This forces the get_script_name() function
+    # to obtain the name of the most recently called non-trivial function, which
+    # is of considerably more assistance when an error occurs.
+#   local ZESHY_SCRIPT_NAME=
+
+    # Message to curse. (Yes, its definition must be in a separate command.)
+    local message; message="$(get_script_name): ${@}"
+    
+    if [[ -n "${ZESHY_IS_CRONJOB}" ]]
+    then logger -p cron.err -- "${message}"
+    else echo "${message}" 1>&2
+    fi
+}
+
+# ....................{ TRAPS                              }....................
+# int TRAPINT(int signal_number = SIGINT)
+#
+# Trap SIGINT (i.e., signal interrupt, as after a user-driven <Ctrl-C> event).
+TRAPINT() {
+    print_stack_trace
+
+    # Store the interrupted line in the history. By default, Zsh omits such
+    # lines -- somewhat unhelpfully. Dismantled, this is:
+    #
+    # * "zle", true only if the history is currently active.
+    # * "-s", output the interrupted line to the history rather than stdout.
+    # * "-r", preserve escapes from "echo" command manipulation.
+    # * "--", prevent dash prefixes in the interrupted line from being
+    #   misinterpreted as "print" command options.
+    # * "${BUFFER}", the interrupted line.
+    zle && print -sr -- "${BUFFER}"
+    
+    # Arcane bit-munging. Exit codes are of size "char" (i.e., a single byte).
+    # Non-zero exit codes with high bit set signify signal-driven fatal errors
+    # and with high bit unset signify command-specific fatal errors. In the
+    # former case, all bits excluding the high bit signify the signal number.
+    # Hence, signal-driven exit codes are constructable by adding 128 to the
+    # signal number.
+    #
+    # SIGINT signifies fatal error of signal number 2. Rather than hard-code
+    # that constant, we note:
+    #
+    # * Zsh passes the signal number as the first argument to trap functions.
+    # * Zsh continues handling trap function-trapped signals as if untrapped
+    #   when receiving non-zero exit codes from such functions. In such cases,
+    #   Zsh returns this exit code as the signal result to calling processes.
+    # 
+    # Since we prefer Zsh handle the actual interrupt as such with the same
+    # exit code as it would customarily return, the result follows.
+    return $(( 128+${1} ))
+}
+
+# int TRAPZERR(int signal_number = SIGZERR)
+#
+# Trap SIGZERR (i.e., signal error, as after Zsh functions or non-Zsh commands
+# returning non-zero exit codes). This signal is Zsh-specific, as the function
+# name directly implies.
+TRAPZERR() {
+    # Save the return code of the prior command prior to overwriting this code
+    # by printing a stack trace.
+    integer return_code=${?}
+    print_stack_trace
+
+    # Terminate the current shell, returning the non-zero exit code of the prior
+    # command. This effectively enables "set -e" (i.e., the ERR_EXIT option,
+    # terminating the current shell on SIGZERR signals).
+    die_with ${return_code}
+}
+
 # ....................{ BOOLEANS                           }....................
 # If non-empty, the current process is running as a cronjob. (Set below.)
 export ZESHY_IS_CRONJOB=
 
+#FIXME: Shift to "zeshy/shell/shell", after confirming die()'s FIXME comment.
 # ....................{ INTEGERS                           }....................
 # Success code, as returned by successful processes on process completion.
 export ZESHY_SUCCESS_CODE=0
@@ -140,6 +335,8 @@ done
 #autoload -U zmv
 
 # ....................{ MODULES                            }....................
+#FIXME: Hmm; these should be autoloaded, no?
+
 # Zsh modules are C-implemented shared libraries optionally loadable at runtime.
 # Zeshy loads the following Zsh modules by default, due to their common
 # helpfulness.
@@ -187,7 +384,7 @@ setopt pushdignoredups   # don't push dups on stack
 setopt pushdsilent       # be quiet about pushds and popds
 
 # File globbing.
-unsetopt caseglob        # glob case-insensitively, as this is usually desirable
+setopt nocaseglob        # glob case-insensitively, as this is usually desirable
 setopt extendedglob      # enable extended globbing (#, ~, ^)
 setopt globdots          # ???
 setopt no_nomatch        # don't print errors on non-matching globs
@@ -286,6 +483,15 @@ alias map='typeset -A'
 #   list sequence; sequence=( 'value 1' 'value 2' 'value 3' 'value 4' )
 alias list='typeset -a'
 
+#FIXME: Hmm. Doesn't the "-U" option equally apply to maps? If so, this should
+#probably simply be a global_alias resembling "global", below.
+# void sett(char *name)
+#
+# Declare a set (i.e., list ignoring duplicate values) local to the current
+# scope. To avoid conflict with the set() built-in, the type name is
+# intentionally obfuscated to "sett". All list() caveats apply to this function.
+alias sett='typeset -Ua'
+
 # void list_tied_string(
 #   char *string_name, char *list_name, char *separator = ':')
 #
@@ -305,25 +511,16 @@ alias list='typeset -a'
 # be declared prior to the list to which they tie. Yes, this is unintuitive.
 alias list_tied_string='typeset -T'
 
-# void sett(char *name)
-#
-# Declare a set (i.e., list ignoring duplicate values) local to the current
-# scope. To avoid conflict with the set() built-in, the type name is
-# intentionally obfuscated to "sett". All list() caveats apply to this function.
-alias sett='typeset -Ua'
-
 # ....................{ DECLARATORS ~ modifiers            }....................
-# Mark the declared variable as global (i.e., exported). Due to established
-# Zsh behavior, this and the variable type are ordered opposite to C order:
-# e.g.,
+# Mark the declared variable as global (i.e., exported). By Zsh convention,
+# this and the variable type are ordered opposite to C order: e.g.,
 #
 #   list global two_hunters; two_hunters=( "ktulu" "orion" )  # or...
 #   local -Ax   two_hunters; two_hunters=( "ktulu" "orion" )  # equivalent!
 global_alias global='-x'
 
-# Mark the declared variable as constant (i.e., read-only). Due to established
-# Zsh behavior, this and the variable type are ordered opposite to C order:
-# e.g.,
+# Mark the declared variable as constant (i.e., read-only). By Zsh convention,
+# this and the variable type are ordered opposite to C order: e.g.,
 #
 #   string const fwtbt="ride the lightning"  # or...
 #   local -r     fwtbt="ride the lightning"  # equivalent!
@@ -364,17 +561,6 @@ global_alias and='&&'
 #
 # Negate the passed command's return code.
 alias not='!'
-
-# ....................{ FUNCTIONS ~ return values          }....................
-# void return_success(void)
-#
-# Return from the current function with success.
-alias return_success="return ${ZESHY_SUCCESS_CODE}"
-
-# void return_failure(void)
-#
-# Return from the current function with failure.
-alias return_failure="return ${ZESHY_FAILURE_CODE}"
 
 # ....................{ FUNCTIONS ~ arguments              }....................
 # Define critical argument-specific aliases prior to defining functions
@@ -434,59 +620,64 @@ make_die_unless_alias() {
 # Die with a canonical message unless the caller passed no arguments.
 alias die_unless_no_arguments='[[ ${#} -eq 0 ]] || die "expected no arguments"'
 
-# void die_unless_one_argument(void)
+# void die_unless_arguments(char *error_message)
+#
+# Die with the passed message unless the caller passed at least one argument.
+alias die_unless_arguments="$(make_die_unless_alias '${#} -ge 1')"
+
+# void die_unless_one_argument(char *error_message)
 #
 # Die with the passed message unless the caller passed exactly one argument.
 alias die_unless_one_argument="$(make_die_unless_alias '${#} -eq 1')"
 
-# void die_unless_two_arguments(void)
+# void die_unless_two_arguments(char *error_message)
 #
 # Die with the passed message unless the caller passed exactly two arguments.
 alias die_unless_two_arguments="$(make_die_unless_alias '${#} -eq 2')"
 
-# void die_unless_three_arguments(void)
+# void die_unless_three_arguments(char *error_message)
 #
 # Die with the passed message unless the caller passed exactly three arguments.
 alias die_unless_three_arguments="$(make_die_unless_alias '${#} -eq 3')"
 
-# void die_unless_one_or_two_arguments(void)
+# void die_unless_one_or_two_arguments(char *error_message)
 #
 # Die with the passed message unless the caller passed either one or two
 # arguments.
 alias die_unless_one_or_two_arguments="$(make_die_unless_alias '${#} -eq 1 || ${#} -eq 2')"
 
-# void die_unless_two_or_three_arguments(void)
+# void die_unless_two_or_three_arguments(char *error_message)
 #
 # Die with the passed message unless the caller passed either two or three
 # arguments.
 alias die_unless_two_or_three_arguments="$(make_die_unless_alias '${#} -eq 2 || ${#} -eq 3')"
 
-# void die_unless_at_least_one_argument(void)
+# void die_unless_at_least_one_argument(char *error_message)
 #
 # Die with the passed message unless the caller passed at least one argument.
 alias die_unless_at_least_one_argument="$(make_die_unless_alias '${#} -ge 1')"
 
-# void die_unless_at_least_two_arguments(void)
+# void die_unless_at_least_two_arguments(char *error_message)
 #
 # Die with the passed message unless the caller passed at least two arguments.
 alias die_unless_at_least_two_arguments="$(make_die_unless_alias '${#} -ge 2')"
 
-# void die_unless_at_least_three_arguments(void)
+# void die_unless_at_least_three_arguments(char *error_message)
 #
 # Die with the passed message unless the caller passed at least three arguments.
 alias die_unless_at_least_three_arguments="$(make_die_unless_alias '${#} -ge 3')"
 
-# void die_unless_at_most_one_argument(void)
+# void die_unless_at_most_one_argument(char *error_message)
 #
 # Die with the passed message unless the caller passed at most one argument.
 alias die_unless_at_most_one_argument="$(make_die_unless_alias '${#} -le 1')"
 
-# void die_unless_at_most_two_arguments(void)
+# void die_unless_at_most_two_arguments(char *error_message)
 #
 # Die with the passed message unless the caller passed at most two arguments.
 alias die_unless_at_most_two_arguments="$(make_die_unless_alias '${#} -le 2')"
 
-# void die_unless_at_most_three_arguments(void)
+# void die_unless_at_most_three_arguments(char *error_message)
 #
 # Die with the passed message unless the caller passed at most three arguments.
 alias die_unless_at_most_three_arguments="$(make_die_unless_alias '${#} -le 3')"
@@ -535,6 +726,7 @@ is_unset() {
     is -z "${(P)1-}" si
 }
 
+#FIXME: Rename is_nonzero(), in keeping with Zsh nomenclature.
 # bool is_nonempty(char *string)
 #
 # Return true if the passed string is non-empty (i.e., not "").
@@ -543,6 +735,7 @@ is_nonempty() {
     is -n "${1}" si
 }
 
+#FIXME: Rename is_zero(), in keeping with Zsh nomenclature.
 # bool is_empty(char *string)
 #
 # Return true if the passed string is empty (i.e., "").
@@ -586,121 +779,7 @@ is_terminal() {
 # Disable flow control key bindings, as these increasingly conflict with those
 # of popular CLI applications (e.g., irssi, rtorrent). Specifically, prevent
 # <Ctrl-s> and <Ctrl-q> from disabling and re-enabling flow control.
-is_terminal && stty -ixon -ixoff
-
-# ....................{ SCRIPTS                            }....................
-# char *get_script_name(void)
-#
-# Get the script name for the current script. This is a string succinctly
-# describing the script under execution, typically of one to two words.
-#
-# Scripts may safely redefine this function to return another name; in this
-# case, scripts called by the script redefining this function will still call
-# this original definition (since functions are not inherited via script
-# calls).
-get_script_name() {
-    if is_nonempty "${ZESHY_SCRIPT_NAME}"; then
-        echo  "${ZESHY_SCRIPT_NAME}"
-    # If the current process is an interactive shell, then return the name of
-    # the function that called this function excluding all intermediary I/O-
-    # and error handling-specific function calls. Typically, that function is
-    # the function that called the function that called this function (i.e.,
-    # the function two calls earlier in the function callstack). Insert magical
-    # handwaving here.
-    elif is_shell_interactive; then
-        # Ignore all intermediary I/O- and error handling-specific function
-        # calls. Skip the first stack frame corresponding to the current
-        # function by starting at the second stack frame.
-        integer i funcstack_size=${#funcstack}
-        for ((i=2; i <= funcstack_size; i++)); do
-            # Order ignorable function names by likelihood, for "efficiency."
-            case "${funcstack[${i}]}" in
-                try*|run*|die*|utter*|mutter*|curse*|ask_*) continue ;;
-                *) break ;;
-            esac
-        done
-         
-        # If after ignoring non-relevant functions there still exists at least
-        # one function on the callstack, return that function's name.
-        if is ${i} -le ${funcstack_size} si
-        then echo "${funcstack[${i}]}"
-        # Otherwise, return the default name.
-        else echo 'zeshy'
-        fi
-    # Otherwise, return the default name.
-    else echo 'zeshy'
-    fi
-}
-
-# ....................{ MESSAGES                           }....................
-#FIXME: Add ANSI coloring to uttered messages if on an ANSI-capable terminal.
-#Also, consider prefixing messages under cron with: "["$(date +'%F %T')"]
-
-# void utter(char *message = '')
-#
-# Print the passed message suffixed by a trailing newline to the notice stream
-# of the cron logging facility if a cron-job and to the standard output stream
-# otherwise.
-utter() {
-    # Message to utter. (Yes, its definition must be in a separate command.)
-    string message; message="$(get_script_name): ${@}"
-    
-    if is_nonempty "${ZESHY_IS_CRONJOB}"
-    then logger -p cron.notice -- "${message}"
-    else echo "${message}"
-    fi
-}
-
-# void mutter(char *message = '')
-#
-# Print the passed message suffixed by no trailing newline to the notice stream
-# of the cron logging facility if a cron-job and to the standard output stream
-# otherwise.
-mutter() {
-    # Message to mutter. (Yes, its definition must be in a separate command.)
-    string message; message="$(get_script_name): ${@}"
-    
-    if is_nonempty "${ZESHY_IS_CRONJOB}"
-    then logger -p cron.notice -- "${message}"
-    else echo -n "${message}"
-    fi
-}
-
-# void curse(char *message = '')
-#
-# Echo the passed message to the standard error stream. Specifically:
-#
-# * If a cronjob, echo to the error stream of the cron logging facility.
-# * Otherwise, to "stderr".
-curse() {
-    # Unset the script name, if set. This forces the get_script_name() function
-    # to obtain the name of the most recently called non-trivial function, which
-    # is of considerably more assistance when an error occurs.
-    string ZESHY_SCRIPT_NAME=
-
-    # Message to curse. (Yes, its definition must be in a separate command.)
-    string message; message="$(get_script_name): ${@}"
-    
-    if is_nonempty "${ZESHY_IS_CRONJOB}"
-    then logger -p cron.err -- "${message}"
-    else echo "${message}" 1>&2
-    fi
-}
-
-# void utter_import(char *script_name)
-#
-# Echo a message informing the user that the passed script name is being
-# imported. This function should be called prior to actually importing that
-# script if feasible.
-utter_import() {
-    die_unless_one_argument 'expected exactly one script name'
-
-    # If the caller has supplied no explicit "${ZESHY_SCRIPT_NAME}", supply a
-    # default.  Failing to do this encourages the utter() function to use the
-    # name of this function as its script name, producing unaesthetic results.
-    is_nonempty "${ZESHY_SCRIPT_NAME}" or string ZESHY_SCRIPT_NAME='zeshy'
-    utter "loading \"${1}\"..."
-}
+is_terminal and stty -ixon -ixoff
 
 # ....................{ ERRORS                             }....................
 # void die(char *message = '')
@@ -712,21 +791,26 @@ die() {
     # that return code; otherwise, exit with generic error code 1.
     integer return_code=${?}
     is ${return_code} -eq ${ZESHY_SUCCESS_CODE} si and
-        return_code="${ZESHY_FAILURE_CODE}"
+              return_code=${ZESHY_FAILURE_CODE}
     
-    # Print the passed error message followed by a complete backtrace.
+    # Print the passed error message and die with the prior return code.
     curse "${@}"
-    print_stack_trace
-    
-    #FIXME: Pack the above return code into this exception.
+    die_with ${return_code}
+}
+
+# void die_with(int return_code = 1)
+#
+# Exit the currently executed script or function with the passed return code.
+die_with() {
     # If the current context is a function called from an interactive and/or
     # login shell, unwind the call stack; otherwise, kill the current process.
     if is_shell_interactive
-    then throw ZeshyDieException
-    else exit ${return_code}
+    then throw ZeshyException
+    else exit ${1:-${ZESHY_FAILURE_CODE}}
     fi
 }
 
+#FIXME: No longer meaningful under TRAPZERR(); excise.
 # void die_unless_ok(char *error_message)
 #
 # Die with the passed error message unless the previous command succeeded.
@@ -736,54 +820,6 @@ die_unless_ok() {
     integer prior_command_return_code=${?}
     die_unless_one_argument 'expected exactly one error message'
     is ${prior_command_return_code} -eq ${ZESHY_SUCCESS_CODE} si or die "${1}"
-}
-
-# ....................{ BACKTRACES                         }....................
-# char *print_stack_trace(void)
-#
-# Print a stack trace of the current call stack (i.e., the sequence of all stack
-# frames, excluding the call to this function). Each such frame signifies a
-# previously called function, sourced file, or evaluated "eval". Each call
-# stack of such frames signifies a stack trace of the complete code path from
-# the most to least recently called function, source file, or evaluated "eval".
-print_stack_trace() {
-    die_unless_no_arguments
- 
-    integer funcstack_size=${#funcstack} i 
-    string frame_prefix='    \\_' string funcname filename fileline
-#   string filename_line_number
-#   filename_line_number="${funcfiletrace[${i}]}"
-#   utter 'printing current call stack...'
-
-    # Omit the current function call by starting from the second stack frame.
-    # If there exists no such frame, curse a warning.
-    if is ${funcstack_size} -le 1 si; then
-        curse 'call stack empty'
-        return
-    fi
-
-    # Print a prefixing empty header.
-    print
-    utter
-
-    # Print the current call stack.
-    for ((i=2; i <= funcstack_size; i++)); do
-        # Split the current stack frame's funcfiletrace entry on the last colon
-        # in that entry into that frame's filename and line number, thus
-        # accounting for possible colons in filenames (e.g., from "colon:blow:7"
-        # to filename "colon:blow" and line number 7).
-        funcname="${funcstack[${i}]}"
-        filename="${funcfiletrace[${i}]%:*}"
-        fileline="${funcfiletrace[${i}]##*:}"
-
-        # Print the current stack frame.
-#       if "${funcstack[${i}]}" == "${funcfiletrace[${i}]}"
-        print "${frame_prefix} ${funcname}() { ${filename}: ${fileline} }"
-#       print "${frame_prefix} ${funcname}() {${filename}:${fileline}}"
-
-        # Indent the next stack frame one space to the right.
-        frame_prefix=" ${frame_prefix}"
-    done
 }
 
 # ....................{ COMMANDS                           }....................
@@ -1067,22 +1103,21 @@ try_quietly_as() {
 # For convenience, this function also accepts "stdin"-style piped input rather
 # than an explicit passed string: e.g.,
 #
-#     >>> echo 1776 | match '^\d'
-#     >>> echo "${MATCH}" 
+#     >>> print 1776 | match '^\d'
+#     >>> print "${MATCH}" 
 #     1
 match() {
     # Parse parameters.
     die_unless_at_least_two_arguments\
         'expected at least one regular expression and one string'
-    string\
-        regex="${1}" string="${2}"\
+    string regex="${1}" text="${2}"\
         match_variable_name="${3:-MATCH}" group_array_name="${4:-match}"
 #   print "pattern: "${(q)regex}" | string: ${string} | match_variable_name: ${match_variable_name} | group_array_name: ${group_array_name} "
 #   print "mo: ${ZESHY_MATCH_OPTIONS[@]}"
 
-    # Compile the match. (Yes, ZSH requires this regardless of whether we intend
+    # Compile the match. (Yes, Zsh requires this regardless of whether we intend
     # to actually reuse this match.)
-    if is_nonempty "${ZESHY_MATCH_OPTIONS}"; then 
+    if is_set 'ZESHY_MATCH_OPTIONS'; then 
 #       print "ZESHY_MATCH_OPTIONS: ${ZESHY_MATCH_OPTIONS}"
 #       pcre_compile -m "${pattern}" ||
         pcre_compile "${ZESHY_MATCH_OPTIONS[@]}" "${regex}" or
@@ -1092,10 +1127,9 @@ match() {
             die "\"${regex}\" not a valid regular expression"
     fi
     
-    # Perform the match and return.
-    pcre_match -v "${match_variable_name}" -a "${group_array_name}" -- \
-        "${string}" or return ${?}
-#   pcre_match "${string}" || return ${?}
+    # Match.
+    pcre_match -v "${match_variable_name}" -a "${group_array_name}" --\
+        "${text}" or return ${?}
 }
 
 # void match_multiline(...)
@@ -1182,6 +1216,9 @@ get_path_mtime() {
 alias which_binary="which_command"
 alias which_binary_nonfatal="which_command_nonfatal"
 
+#FIXME: This function appears to be functionally obsolete now. If so, kill and
+#rename which_command_nonfatal() to this.
+
 # char *which_command(char *command)
 #
 # Print the absolute path to the passed command: e.g.,
@@ -1200,7 +1237,7 @@ which_command() {
     # code. (ZSH == FAIL on that one.) 
     string command_path; command_path="$(which_command_nonfatal "${@}")"
     die_unless_ok "\"${1}\" not found"
-    echo "${command_path}"
+    print "${command_path}"
 }
 
 # char *which_command_nonfatal(char *command_name)
@@ -1209,21 +1246,8 @@ which_command() {
 # does not exist, returns nothing rather than dies.
 which_command_nonfatal() {
     die_unless_one_argument 'expected exactly one command name'
-    
-    # First word of the first passed parameter, and the absolute path to return.
-    string command_name="${1[(w)1]}" command_path
-    
-    # Call the whence() built-in outside of "local" so as to retain the return
-    # code. (ZSH == FAIL on that one.) 
-    command_path="$(whence -cp "${command_name}")"
-    
-    #FIXME: Clean this up.
-    if is_ok; then
-        echo "${command_path}"
-        return ${ZESHY_SUCCESS_CODE}
-    fi
-
-    return ${ZESHY_FAILURE_CODE}
+    string command_path command_name="${1[(w)1]}"
+    command_path="$(whence -cp "${command_name}")" and print "${command_path}"
 }
 
 # ....................{ FILES ~ directories                }....................
@@ -1401,7 +1425,7 @@ zimport_file() {
         ZESHY_IMPORTED_PATH_TO_MTIME["${zeshy_script_path}"]="${zeshy_script_mtime}"
          
         # Do so.
-        utter_import "${zeshy_script_path}"
+        utter "loading \"${zeshy_script_path}\"..."
         source "${zeshy_script_path}" "${@}"
     fi
 }
@@ -1457,7 +1481,7 @@ _zeshy_core() {
     # Distinguish the former from the latter by noting whether the
     # "${zeshy_script_mtime}" variable has been set or not; if it has, this script
     # was sourced via zimport() rather than source().
-    is_unset 'zeshy_script_mtime' or utter_import "${zeshy_core_path}"
+    is_unset 'zeshy_script_mtime' or utter "loading \"${zeshy_core_path}\"..."
     
     # Set the default script name prior to all other logic, as any logic
     # raising an error requires this name for logging that error. Only do this
@@ -1486,6 +1510,32 @@ _zeshy_core
 unset _zeshy_core
 
 #FIXME: Obsolete.
+# void utter_import(char *script_name)
+#
+# Echo a message informing the user that the passed script name is being
+# imported. This function should be called prior to actually importing that
+# script if feasible.
+#utter_import() {
+#    die_unless_one_argument 'expected exactly one script name'
+#
+#    utter "loading \"${1}\"..."
+#}
+
+    # If the caller has supplied no explicit "${ZESHY_SCRIPT_NAME}", supply a
+    # default.  Failing to do this encourages the utter() function to use the
+    # name of this function as its script name, producing unaesthetic results.
+#   "${ZESHY_SCRIPT_NAME:=zeshy}"
+
+        # Print the passed error message followed by a complete backtrace.
+#   curse "${@}"
+#   print_stack_trace
+ #
+    # Shells differentiate
+    # fatal from non-fatal errors by setting the high bit (i.e., 2^7 = 128).
+    # According to "zshbuiltins", this forces Zsh to continue handling the
+    # signal as if untrapped and hence returning the same exit status. Having no
+    # arcanely carnal knowledge of the Linux signal implementation, it's unclear
+    # why setting the high bit 
 
     #FIXME: Old.
     # If the passed path is a directory, only import filename
