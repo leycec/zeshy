@@ -10,42 +10,129 @@
 
 # ....................{ DEPENDENCIES                       }....................
 zimport zeshy/file/file
+zimport zeshy/type/list
+zimport zeshy/type/string
+zimport zeshy/type/type
+
+# ....................{ NAMESPACES                         }....................
+# void disable_function(char *function_name)
+#
+# Globally disable the function with the passed name. This function remains
+# defined but uncallable until reenabled with a call to enable_function().
+alias disable_function='disable -f'
+
+# void enable_function(char *function_name)
+#
+# Globally re-enable the function with the passed name, presumably previously
+# disabled with a call to disable_function().
+alias enable_function='enable -f'
+
+# ....................{ ALIASES                            }....................
+#FIXME: Technically, we can support interactive aliases on functions -- but only
+#in somewhat roundabout fashion. We would need detect this to be an alias on a
+#function (easy), then define a new function with the same implementation as the
+#function to be replaced by such alias but with a new name, say,
+#"${alias_name}____tmp" (perhaps easy; doesn't "which ${function_name}" provide
+#us a function implementation which we could then eval into a new function with
+#such placeholder name?), then replace the old with the new function name in the
+#alias expansion (easy). It's a bit involved, but nothing too intractable.
+
+# void interactive_alias(char *alias_specification)
+#
+# Declare the passed specification as an interactive alias, active only when the
+# builtin or command to be aliased is run directly from an interactive shell.
+# Due to implementation details, functions cannot currently be interactively
+# aliased. Interactive aliases are inactive in non-interactive scripts and
+# functions, and hence helpful for applying human-readable options on that
+# builtin or command when run directly by a human.
+#
+# The alias specification format is identical to that of normal aliases: e.g.,
+#
+#   # Alias print() to sort arguments only when called interactively.
+#   >>> print T M D
+#   T M D
+#   >>> interactive_alias print="print -o"
+#   >>> print T M D
+#   D M T
+#   >>> print_indirectly() { print "${@}" }
+#   >>> print_indirectly T M D
+#   T M D
+interactive_alias() {
+    die_unless_arguments
+
+    # Split the passed '='-divided alias specification into name and expansion.
+    string alias_name alias_expansion
+    split_first "${@}" 'alias_name' 'alias_expansion' '='
+#   print "alias_name: ${alias_name}\nalias_expansion: ${alias_expansion}"
+
+    #FIXME: Also die if this name is not a valid Zsh function name.
+    # Die if the desired alias name is already a defined callable.
+    is_callable "${alias_name}" and
+        die "\"${alias_name}\" already defined as:\n"$(which "${alias_name}")
+
+    # Define the desired alias as a function of the same name, which:
+    #
+    # * Temporarily disables this function to prevent infinite recursion on
+    #   subsequently calling a builtin or command of the same name.
+    # * If:
+    #   * This shell is interactive (thus excluding non-interactive scripts). 
+    #   * This function was called directly from the command line (thus
+    #     excluding non-interactive calls from function implementations). 
+    #   Then runs the desired alias expansion.
+    # * Otherwise, runs the desired builtin or command without aliasing.
+    # * Reenables this function for subsequent use.
+    eval "${alias_name}() {
+    disable_function ${alias_name}
+    if is_shell_interactive and is \${#funcstack} equals 1 si
+    then ${alias_expansion} "\${@}"
+    else ${alias_name} "\${@}"
+    fi
+    enable_function ${alias_name}
+}"
+}
 
 # ....................{ ARGUMENT PARSING                   }....................
 # void parse_arguments(char *argument_spec1, char *argument_spec2, ...)
 #
-# Parse command-line arguments according to the passed list of argument
-# specifications into the "${ARGS}" global associative array. For convenience,
-# this function always registers the "-h" and "--help" options as valid options.
-# This function delegates to the zparseopts() built-in function and thus expects
-# argument specifications in the same (relatively simple) format: e.g.,
+# Parse script (or function) arguments according to the passed zparseopts()-
+# style argument specifications into map "ARGS". For details on specification
+# format, search "man zshmodules" for "zparseopts". For convenience, "-h" and
+# "--help" are always parsed as valid argument options: e.g.,
 #
-#   # Parse command-line options, with "--ad" a long option accepting no
-#   # argument, "--crest" a long option requiring an argument, and "--wing" a
-#   # long argument accepting an optional argument.
+#   # Set fake command-line arguments.
 #   >>> set -- -d --ad --crest "glass arm shattering"
+#
+#   # Parse such arguments as:
+#   #
+#   # * "--ad", a long option followed by no value.
+#   # * "--crest", a long option followed by some value.
+#   # * "--wing", a long option optionally followed by some value.
 #   >>> parse_arguments d e -ad -crest: -wing::
-#   >>> (( ${+ARGS[-d]} )) && echo 'option "-d" passed!'
-#   option "-d" passed!
-#   >>> (( ${+ARGS[-d]} + ${+ARGS[--ad]} )) &&
-#   >>>     echo 'option "-d" AND/OR option "--ad" passed!'
-#   option "-d" AND/OR option "--ad" passed!
+#
+#   # Validate such parsing.
+#   >>> is_map_key 'ARGS' '-d' and print 'option "-d" parsed'
+#   option "-d" parsed
 #   >>> echo "-d: ${ARGS[-d]}\n--ad: ${ARGS[--crest]}\n--wing: ${ARGS[--wing]}"
 #   -d:
 #   --crest: glass arm shattering
 #   --wing:
-#
-# For details, see the "zparseopts" section of "man zshmodules".
 alias parse_arguments='zparseopts -D -E -A ARGS -- h -help' 
 
-# void check_parsed_arguments(char *help_message)
+#FIXME: This no longer works as intended, due to TRAPZERR(). Contemplate. Ah.
+#Yes. The simple solution is to require the parse_arguments() alias to pipe into
+#this command: e.g.,
+#   parse_arguments d e -ad -crest: -wing:: | check_arguments_with_help_string 'Help!'
+#Bit awkward, but nothing too onerous. Alternatively, couldn't we define the
+#parse_arguments() alias to simply temporarily disable TRAPZERR() by.... hmm; I
+#don't believe the disable() builtin accepts a command to be run, unfortunately.
+
+# void check_arguments_with_help_string(char *help_message)
 #
 # Check the set of all parsed arguments for unknown options. If the caller
 # passed at least one unknown option OR the "-h" or "--help" options, die with
 # the passed help message. This function expects to be called immediately after
 # calling the parse_arguments() function.
-check_parsed_arguments() {
-    #FIXME: This no longer works as intended, due to TRAPZERR(). Contemplate.
+check_arguments_with_help_string() {
     # If the immediately prior command failed, assume that was a call to the
     # parse_arguments() function and enable a boolean noting this fact.
     is_ok and bool is_parse_arguments_failed=1
