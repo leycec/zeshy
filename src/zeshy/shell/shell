@@ -11,8 +11,26 @@
 # ....................{ DEPENDENCIES                       }....................
 zimport zeshy/file/file
 zimport zeshy/type/list
+zimport zeshy/type/regex
 zimport zeshy/type/string
 zimport zeshy/type/type
+
+# ....................{ DEATH                              }....................
+# int exit_with_success(void)
+# 
+# Exit the current process with a successful return code.
+exit_with_success() {
+    die_unless_no_arguments
+    exit ${ZESHY_SUCCESS_CODE}
+}
+
+# int exit_with_failure(void)
+# 
+# Exit the current process with a failure return code.
+exit_with_failure() {
+    die_unless_no_arguments
+    exit ${ZESHY_FAILURE_CODE}
+}
 
 # ....................{ NAMESPACES                         }....................
 # void disable_function(char *function_name)
@@ -26,6 +44,19 @@ alias disable_function='disable -f'
 # Globally re-enable the function with the passed name, presumably previously
 # disabled with a call to disable_function().
 alias enable_function='enable -f'
+
+#FIXME: Not fond of this name. Step away from the kill metaphor, Sir. How about
+#something resembling "reset_shell_environment" or "revert_..." or
+#"restore_..."? Also, destroy all Zeshy-specific globals excluding "ZESHY_HOME". 
+# void kill_callables(void)
+#
+# Destroy all existing aliases and functions. This is, of course, fairly
+# destructive but does guard against desynchronization issues resulting from
+# modification to this Zeshy installation (e.g., when upgrading).
+kill_callables() {
+    unalias    -m '*'
+    unfunction -m '*'
+}
 
 # ....................{ ALIASES                            }....................
 #FIXME: Technically, we can support interactive aliases on functions -- but only
@@ -44,7 +75,9 @@ alias enable_function='enable -f'
 # Due to implementation details, functions cannot currently be interactively
 # aliased. Interactive aliases are inactive in non-interactive scripts and
 # functions, and hence helpful for applying human-readable options on that
-# builtin or command when run directly by a human.
+# builtin or command when run directly by a human. This function fails if the
+# builtin or command to be aliased does not exist. See 
+# interactive_alias_if_installed() for an alternative not failing in such cases.
 #
 # The alias specification format is identical to that of normal aliases: e.g.,
 #
@@ -65,10 +98,19 @@ interactive_alias() {
     split_first "${@}" 'alias_name' 'alias_expansion' '='
 #   print "alias_name: ${alias_name}\nalias_expansion: ${alias_expansion}"
 
-    #FIXME: Also die if this name is not a valid Zsh function name.
     # Die if the desired alias name is already a defined callable.
     is_callable "${alias_name}" and
         die "\"${alias_name}\" already defined as:\n"$(which "${alias_name}")
+
+    #FIXME: This should be augmented to support builtins, as well.
+    # If the builtin or command to be aliased does not exist, return with error.
+    # To avoid costly exception handling on this frequently called helper
+    # function, do not throw an exception.
+    string command_name="$(get_first_word "${alias_expansion}")"
+    if not is_installed "${command_name}"; then
+        curse "\"${command_name}\" not installed"
+        return_failure
+    fi
 
     # Define the desired alias as a function of the same name, which:
     #
@@ -85,11 +127,17 @@ interactive_alias() {
     disable_function ${alias_name}
     if is_shell_interactive and is \${#funcstack} equals 1 si
     then ${alias_expansion} "\${@}"
-    else ${alias_name} "\${@}"
+    else ${command_name} "\${@}"
     fi
     enable_function ${alias_name}
 }"
 }
+
+# void interactive_alias_if_installed(char *alias_specification)
+#
+# Declare the passed specification as an interactive alias only if the builtin
+# or command to be aliased exists. This function is a no-nop if it does not.
+interactive_alias_if_installed() { quietly interactive_alias "${@}" or true }
 
 # ....................{ ARGUMENT PARSING                   }....................
 # void parse_arguments(char *argument_spec1, char *argument_spec2, ...)
@@ -159,33 +207,87 @@ check_arguments_with_help_string() {
 # expected by that script with default shell options and traps (e.g., a script
 # "mandibles_of_joy.sh" expects a Bourne rather than Zsh shell environment).
 source_safely() {
-    # Localize and validate arguments.
     die_unless_arguments 'expected at least one filename'
+
+    # Localize and validate arguments. If the passed filename is not absolute,
+    # resolve its absolute path by iteratively searching the current working
+    # directory, "${PATH}", and "${FPATH}" (in that order).
     string script_filename="${1}"
-    die_unless_file "${script_filename}"
-    string script_filetype="$(get_filetype "${script_filename}")"
+    is_path_absolute "${script_filename}" or
+        script_filename="$(which_script "${script_filename}")"
 #   print "filetype: ${script_filetype}"
 
     # Identify the shell to be emulated. If the passed filename's type
     # identifies an emulatable shell, assume that. 
-    string script_shell='zsh' script_shells='zsh|sh|ksh|csh'
+    string\
+        script_filetype="$(get_filetype "${script_filename}")"\
+        script_shell='zsh' script_shells='zsh|sh|ksh|csh'
     if is "${script_filetype}" == ${~script_shells} si; then
         script_shell="${script_filetype}"
-    # Otherwise, grep the passed file's shebang line for an emulatable shell.
+    # Otherwise, attempt to match the passed file's first line for a shebang
+    # referencing an emulatable shell. When no such match, default to "zsh".
     else
         string script_shebang_regex="^#.*[/ ](${script_shells})($| )"
         string script_shebang="$(head -1 "${script_filename}")"
+        script_shell="$(match_first_group "${script_shebang_regex}" "${script_shebang}")" or true
 #       print "regex::: ${script_shebang_regex}"
 #       print "shebang: ${script_shebang}"
-#       match_first_group "${script_shebang_regex}" "${script_shebang}"
-        script_shell="$(match_first_group "${script_shebang_regex}" "${script_shebang}")" # or true
     fi
    
     # Safely source the passed shell script. Dismantled, this is:
     # 
+    # * "-L", localizing the redefinition of TRAPZERR() to this function call.
     # * "-R", resetting shell options to the default expected by such shell.
-    # * "-c", run the following command under such emulation.
-    emulate -R "${script_shell}" -c "source ${@}"
+    # * "TRAPZERR()", disabling error raising on builtin, command, and function
+    #   failure, as expected by most scripts by default.
+    # 
+    # Do not redefine TRAPINT(), since printing stack traces on user interrupts
+    # is universally useful and not conflicting with script expectations.
+    emulate -LR "${script_shell}"
+    TRAPZERR() { return $(( 128 + ${1} )) }
+    PATH="${PATH}:${FPATH}" source "${@}"
+}
+
+# void redot(void)
+#
+# Resource all Zsh startup scripts in the same order Zsh sources these scripts
+# on initial login for the current user. This function is of principal use for
+# Zeshy developers (making frequent changes to Zeshy itself) as well as Zsh
+# dot-file hackers (making frequent changes to Zsh dot-files).
+redot() {
+    die_unless_no_arguments
+    string ZESHY_SCRIPT_NAME='redot'
+    utter "reloading user ${USER}..."
+
+    # Force reimportation of all Zeshy components. Then, as the importations
+    # below redefine all defined callables, destroy all such callables to
+    # avoid desynchronization issues.
+    #
+    # Do this prior to calling the utter() function for obvious reasons.
+    zeshy_initialize_imports
+    kill_callables
+
+    # void source_if_found(char *filename)
+    #
+    # Source the passed filename if found and readable by the current user. Note
+    # this function definition calls no Zeshy-specific aliases or functions; the
+    # the above call to the kill_callables() function has already killed them.
+    source_if_found() {
+        string script_name="${1}"
+        if [[ -f "${script_name}" && -r "${script_name}" ]]; then
+            print "redot: loading \"${script_name}\"..."
+            source "${script_name}"
+        fi
+    }
+
+    source_if_found '/etc/zsh/zprofile'
+    source_if_found "${HOME}/.zprofile"
+    source_if_found '/etc/zsh/zshrc'
+    source_if_found "${HOME}/.zshrc"
+    source_if_found '/etc/zsh/zlogin'
+    source_if_found "${HOME}/.zlogin"
+
+    unfunction source_if_found
 }
 
 # ....................{ BIRTH ~ path                       }....................
@@ -245,8 +347,8 @@ PATH_append() {
     die_unless_one_argument 'expected exactly one dirname'
     string dirname="${1}"
 
-    if is -d "${dirname}" && -r "${dirname}" &&
-        ! "${PATH}" =~ "(^|:)${dirname}($|:)" si; then
+    if is_dir "${dirname}" and\
+        is -r "${dirname}" and not "${PATH}" =~ "(^|:)${dirname}($|:)" si; then
         if is_nonempty "${PATH}"
         then PATH+=":${dirname}"
         else PATH="${dirname}"
@@ -254,91 +356,18 @@ PATH_append() {
     fi
 }
 
-# ....................{ DEATH                              }....................
-# void return_success(void)
-#
-# Return from the current function with success.
-alias return_success="return ${ZESHY_SUCCESS_CODE}"
-
-# void return_failure(void)
-#
-# Return from the current function with failure.
-alias return_failure="return ${ZESHY_FAILURE_CODE}"
-
-# int exit_with_success(void)
-# 
-# Exit the current process with a successful return code.
-exit_with_success() {
-    die_unless_no_arguments
-    exit ${ZESHY_SUCCESS_CODE}
-}
-
-# int exit_with_failure(void)
-# 
-# Exit the current process with a failure return code.
-exit_with_failure() {
-    die_unless_no_arguments
-    exit ${ZESHY_FAILURE_CODE}
-}
-
-#FIXME: Not fond of this name. Step away from the kill metaphor, Sir. How about
-#something resembling "reset_shell_environment" or "revert_..." or
-#"restore_..."? Also, destroy all Zeshy-specific globals excluding "ZESHY_HOME". 
-# void kill_callables(void)
-#
-# Destroy all existing aliases and functions. This is, of course, fairly
-# destructive but does guard against desynchronization issues resulting from
-# modification to this Zeshy installation (e.g., when upgrading).
-kill_callables() {
-    unalias    -m '*'
-    unfunction -m '*'
-}
-
-# ....................{ REBIRTH                            }....................
-# void redot(void)
-#
-# Resource all Zsh startup scripts in the same order Zsh sources these scripts
-# on initial login for the current user. This function is of principal use for
-# Zeshy developers (making frequent changes to Zeshy itself) as well as Zsh
-# dot-file hackers (making frequent changes to Zsh dot-files).
-redot() {
-    die_unless_no_arguments
-
-    string ZESHY_SCRIPT_NAME='redot'
-    utter "reloading user ${USER}..."
-
-    # Force reimportation of all Zeshy components. Then, as the importations
-    # below redefine all defined callables, destroy all such callables to
-    # avoid desynchronization issues.
-    #
-    # Do this prior to calling the utter() function for obvious reasons.
-    zeshy_initialize_imports
-    kill_callables
-
-    # void source_if_found(char *filename)
-    #
-    # Source the passed filename if found and readable by the current user. Note
-    # this function definition calls no Zeshy-specific aliases or functions; the
-    # the above call to the kill_callables() function has already killed them.
-    source_if_found() {
-        string script_name="${1}"
-        if [[ -f "${script_name}" && -r "${script_name}" ]]; then
-            print "redot: loading \"${script_name}\"..."
-            source "${script_name}"
-        fi
-    }
-
-    source_if_found '/etc/zsh/zprofile'
-    source_if_found "${HOME}/.zprofile"
-    source_if_found '/etc/zsh/zshrc'
-    source_if_found "${HOME}/.zshrc"
-    source_if_found '/etc/zsh/zlogin'
-    source_if_found "${HOME}/.zlogin"
-
-    unfunction source_if_found
-}
-
 #FIXME: Obsolete.
+#   die_unless_file "${script_filename}"
+# elif is_file "${script_filename}"; then
+#       match_first_group "${script_shebang_regex}" "${script_shebang}"
+
+#
+# * "-c", run the following command under such emulation.
+#interactive_alias_if_installed au='aouauauauau'
+
+#This is a no-op if the
+# builtin or command to be aliased does not exist.
+#
 #   print "shell: ${script_shell}"
 #   emulate -R ${script_shell} -c "ls"
 #   emulate -R ${script_shell} -c "${@}"
