@@ -72,7 +72,6 @@ export ZESHY_MAIN_SCRIPT_BASENAME='.main'
 # If non-empty, the current process is running as a cronjob. (Set below.)
 export ZESHY_IS_CRONJOB=
 
-#FIXME: Shift to "zeshy/shell/shell", after confirming die()'s FIXME comment.
 # ....................{ INTEGERS                           }....................
 # Success code, as returned by successful processes on process completion.
 export ZESHY_SUCCESS_CODE=0
@@ -258,27 +257,8 @@ curse() {
     fi
 }
 
-# ....................{ EXCEPTIONS                         }....................
-# void die(char *message = '')
-#
-# Echo the passed text according to the curse() function and exit the currently
-# executed script with error.
-die() {
-    # If the return code of the prior command signified an error, exit with
-    # that return code; otherwise, exit with generic error code 1.
-    integer return_code=${?}
-    [[ ${return_code} -eq ${ZESHY_SUCCESS_CODE} ]] &&
-              return_code=${ZESHY_FAILURE_CODE}
-    
-    # Print the passed error message and a complete stack trace.
-    curse "${@}"
-    print_stack_trace
-
-    # Die with the prior return code.
-    die_with ${return_code}
-}
-
-# void die_with(int return_code = 1)
+# ....................{ ERRORS                             }....................
+# void die_with(int exit_status = 1)
 #
 # Exit the currently executed script or function with the passed return code.
 die_with() {
@@ -309,10 +289,10 @@ TRAPINT() {
     zle && print -sr -- "${BUFFER}"
     
     # Arcane bit-munging. Exit codes are of size "char" (i.e., a single byte).
-    # Non-zero exit codes with high bit set signify signal-driven fatal errors
+    # Non-zero exit statuss with high bit set signify signal-driven fatal errors
     # and with high bit unset signify command-specific fatal errors. In the
     # former case, all bits excluding the high bit signify the signal number.
-    # Hence, signal-driven exit codes are constructable by adding 128 to the
+    # Hence, signal-driven exit statuss are constructable by adding 128 to the
     # signal number.
     #
     # SIGINT signifies fatal error of signal number 2. Rather than hard-code
@@ -320,29 +300,29 @@ TRAPINT() {
     #
     # * Zsh passes the signal number as the first argument to trap functions.
     # * Zsh continues handling trap function-trapped signals as if untrapped
-    #   when receiving non-zero exit codes from such functions. In such cases,
-    #   Zsh returns this exit code as the signal result to calling processes.
+    #   when receiving non-zero exit statuss from such functions. In such cases,
+    #   Zsh returns this exit status as the signal result to calling processes.
     # 
     # Since we prefer Zsh handle the actual interrupt as such with the same
-    # exit code as it would customarily return, the result follows.
+    # exit status as it would customarily return, the result follows.
     return $(( 128+${1} ))
 }
 
 # int TRAPZERR(int signal_number = SIGZERR)
 #
 # Trap SIGZERR (i.e., signal error, as after Zsh functions or non-Zsh commands
-# returning non-zero exit codes). This signal is Zsh-specific, as the function
+# returning non-zero exit statuss). This signal is Zsh-specific, as the function
 # name directly implies.
 TRAPZERR() {
     # Save the return code of the prior command prior to overwriting this code
     # by printing a stack trace.
-    integer return_code=${?}
+    integer exit_status=${?}
     print_stack_trace
 
-    # Terminate the current shell, returning the non-zero exit code of the prior
+    # Terminate the current shell, returning the non-zero exit status of the prior
     # command. This effectively enables "set -e" (i.e., the ERR_EXIT option,
     # terminating the current shell on SIGZERR signals).
-    die_with ${return_code}
+    die_with ${exit_status}
 }
 
 # ....................{ AUTOLOADS                          }....................
@@ -643,6 +623,27 @@ alias is_one_argument='is ${#} -eq 1 si'
 # Return true only if the caller was called with exactly two arguments.
 alias is_two_arguments='is ${#} -eq 2 si'
 
+# ....................{ EXCEPTIONS                         }....................
+# void die(char *error_message = '')
+#
+# Print the passed text to standard error and:
+#
+# * exit the current script with error.
+die() {
+    # If the exit status of the prior command signified an error, exit with that
+    # status; otherwise, exit with the normal error status (i.e., 1).
+    integer exit_status=${?}
+    is ${exit_status} equals ${ZESHY_SUCCESS_CODE} si and
+       exit_status=${ZESHY_FAILURE_CODE}
+    
+    # Print the passed error message and a complete stack trace.
+    curse "${@}"
+    print_stack_trace
+
+    # Die with the prior return code.
+    die_with ${exit_status}
+}
+
 # ....................{ EXCEPTIONS ~ arguments             }....................
 # As a convenience, all argument aliases except die_unless_no_arguments() first
 # attempt to read their argument from stdin when the caller passed no explicit
@@ -734,6 +735,18 @@ alias die_unless_at_most_three_arguments="$(make_die_unless_alias '${#} -le 3')"
 # Delete the temporary function used to construct the above aliases.
 unfunction make_die_unless_alias
 
+# ....................{ EXCEPTIONS ~ commands              }....................
+# void die_unless_installed(
+#   char *command_name, char *error_message = 'not found in $PATH')
+#
+# Raise an exception unless the passed command exists.
+die_unless_installed() {
+    die_unless_one_or_two_arguments 'expected exactly one command name'
+    string dirname="${1}"
+    is_installed "${dirname}" or
+        die "${2:-\"${dirname}\" not found in \$PATH}"
+}
+
 # ....................{ TESTS                              }....................
 # bool is_set_nonempty(char *variable_name)
 #
@@ -764,9 +777,7 @@ is_set() {
 # Return true if the  variable with the passed name is unset (i.e., undeclared).
 is_unset() {
     die_unless_one_argument 'expected exactly one variable name'
-
-    # Negate the condition is_set() tests for.
-    is -z "${(P)1+x}" si
+    is -z "${(P)1+x}" si  # negate the condition is_set() tests for
 }
 
 #FIXME: Rename is_nonzero(), in keeping with Zsh nomenclature.
@@ -889,39 +900,26 @@ run_as() {
     run "${(q)@}"
 }
 
-#FIXME: We no longer require a separate run() function. Fold all functionality
-#into the run_as() function and ditch the unwiedly "ZESHY_RUN_AS" global.
-# void run(char *command)
+# void run(char *command_name, char *command_arg1, char *command_arg2, ...)
 #
-# Run the passed command. If this is a built-in shell command, just run it;
-# otherwise, run it under "nice" and "ionice" so as to assist other running
-# processes.
+# Run the passed builtin or command, ideally quote-protected to avoid premature
+# parsing of shell-specific syntax (e.g., pipes, redirections). Where passing a
+# parameter expansion to this function, force such protection with "(q)": e.g.,
 #
-# Note that commands should be passed as quote-protected strings to prevent the
-# shell from parsing pipes, redirections, and other shell constructs before this
-# command is run: e.g.,
-#
-#   # This is good. Manually quote-protect the passed string.
-#   >>> run "screen -list | grep --count eschaton"
+#   # This is good. Manually quote-protect with single or double quotes.
+#   >>> run 'screen -list | grep --count eschaton'
 #   969
 #
-#   # This is also good. Automatically quote-protect the passed string with the
-#   # "(q)" parameter expansion. (Note that *NOT* prefixing the string with this
-#   # expansion induces subtle errors, occasionally. Do not forget, we beg!)
-#   >>> local command=$(screen -list | grep --count singularity)
+#   # This is good. Automatically quote-protect with flag "(q)".
+#   >>> string command=$(screen -list | grep --count singularity)
 #   >>> run "${(q)command}"
 #   696
 #
-#   # This is not.
+#   # This is doubleplusungood. Zsh parses the pipe prior to calling run().
 #   >>> run screen -list | grep --count eschaton
-#
-# This cannot be fixed, due to the fixed order of shell evaluation.
-#
-# Note that *THIS IS A VERY FRAGILE FUNCTION* and the slightest wisp of light
-# hackery is liable to lend your Zeshy install to its hasty grave.
 run() {
-    #FIXME: Prepend "${NICE}" "${IONICE}" onto "${@}"; maybe use:
-    #'set -- "${NICE}" "${IONICE}" "${@}"', I suppose?
+    die_unless_arguments
+
     # Command line to run, parsed from the passed parameters as follows:
     #
     # * "(Q)" strips one level of quote-protection from the passed parameters,
@@ -929,13 +927,9 @@ run() {
     # * "(=)" splits these parameters into words: e.g., the string
     #   "ls ~/peak-oil" splits into 2 words, "ls" and "~/peak-oil".
     #   "ls ~/peak-oil" is not an executable command; "ls" is.
-    string command; command=( "${(Q)=@}" )
-
-    # Number of passed arguments after word-splitting those arguments.
-    integer argument_count="${#command}"
-    is "${argument_count}" -ge 1 si or die 'expected exactly one command'
+    list command; command=( "${(Q)=@}" )
     
-    # Command name to run. This is the first word of the command line.
+    # Command name to run (i.e., first word of the passed command line).
     string command_name="${(Q)command[1]}"
     
     # Absolute path to the command to be run or the command name if this command
@@ -943,10 +937,10 @@ run() {
     # command does not exist, fail.
     string command_path
     command_path="$(whence "${command_name}")" or
-        "\"${command_name}\" not found; cannot run \"${command}\""
+        die "\"${command_name}\" not found in \$PATH"
 
-    # Otherwise, if the passed command has not been overridden by a shell alias
-    # or function, run it as a command. Do not call the customary is_installed()
+    # If the passed command has not been overridden by a shell alias or
+    # function, run it as a command. Do not call the customary is_installed()
     # function, as that does not test whether or not a command is overridden.
     if is_absolute_pathname "${command_path}"; then
         # If the caller requests this command be run under a different user,
@@ -997,18 +991,18 @@ one_if() {
     quietly "${@}" and print 1 or true
 }
 
-# void quietly_as(char *username, char *command)
-#
-# Run the passed command as the passed user quietly (i.e., squelching output).
-quietly_as() {
-    run_as "${@}" 1>/dev/null 2>&1
-}
-
 # void quietly(char *command)
 #
-# Run the passed command quietly (i.e., squelching output).
+# Run the passed command quietly (i.e., squelching standard output and error).
 quietly() {
     run "${(q)@}" 1>/dev/null 2>&1
+}
+
+# void stderr_to_stdout(char *command)
+#
+# Divert standard error to standard output.
+stderr_to_stdout() {
+    run "${(q)@}" 2>&1
 }
 
 # ....................{ REGULAR EXPRESSIONS                }....................
@@ -1282,7 +1276,7 @@ zimport_file() {
     # If the script has not yet been imported or has been imported but has
     # changed since being imported, do so.
     if is -z\
-        "${ZESHY_IMPORTED_PATH_TO_MTIME[(I)"${zeshy_script_path}"]}" ||\
+        "${ZESHY_IMPORTED_PATH_TO_MTIME[(I)"${zeshy_script_path}"]}" or
         "${ZESHY_IMPORTED_PATH_TO_MTIME["${zeshy_script_path}"]}" -ne\
         "${zeshy_script_mtime}" si; then
         # If the script corresponds to a command-specific script under
@@ -1290,11 +1284,8 @@ zimport_file() {
         # command is actually installed.
         if is "${zeshy_script_path}" == */zeshy/command/* si; then
             string command_name="${zeshy_script_path#*/zeshy/command/}"
-
-            if is "${command_name}" != '.main' si; then
-                is_installed "${command_name}" or die\
-                    "\"${command_name}\" not installed or not found on \$PATH"
-            fi
+            is "${command_name}" == '.main' si or
+                die_unless_installed "${command_name}"
         fi
 
         # Prior to doing so, record the script as being imported. This prevents
@@ -1387,6 +1378,19 @@ _zeshy_core
 unfunction _zeshy_core
 
 #FIXME: Obsolete.
+# void quietly_as(char *username, char *command)
+#
+# Run the passed command as the passed user quietly (i.e., squelching output).
+#quietly_as() {
+#    run_as "${@}" 1>/dev/null 2>&1
+#}
+
+#FIXME: I suppose I don't quite understand why we can't simply implement this as
+#some variant of '"${@}" 1>/dev/null 2>&1'. Doesn't that work as is?
+#quietly() { run "${(q)@}" 1>/dev/null 2>&1 }
+
+#   is "${#command}" exceeds 0 si or die 'expected exactly one command'
+#
 #global_alias to='|'
 
     # Decompacted:
@@ -1407,10 +1411,10 @@ unfunction _zeshy_core
 #    run_as_superuser "${@}" or die
 #}
 
-# int get_last_return_code(void)
+# int get_last_exit_status(void)
 # 
 # Return the return code returned by the previous command.
-#alias get_last_return_code='is_ok'
+#alias get_last_exit_status='is_ok'
 
 # bool is_ok(void)
 #
@@ -1418,9 +1422,9 @@ unfunction _zeshy_core
 #is_ok() {
 #    # Cache the prior command's return code, as our initial sanity check on
 #    # arguments replaces this code with its own.
-#    integer prior_command_return_code=${?}
+#    integer prior_command_exit_status=${?}
 #    die_unless_no_arguments
-#    return ${prior_command_return_code}
+#    return ${prior_command_exit_status}
 #}
 
 # bool is_error(void)
@@ -1429,9 +1433,9 @@ unfunction _zeshy_core
 #is_error() {
 #    # Cache the prior command's return code, as our initial sanity check on
 #    # arguments replaces this code with its own.
-#    integer prior_command_return_code=${?}
+#    integer prior_command_exit_status=${?}
 #    die_unless_no_arguments
-#    is ${prior_command_return_code} -ne ${ZESHY_SUCCESS_CODE} si
+#    is ${prior_command_exit_status} -ne ${ZESHY_SUCCESS_CODE} si
 #}
 
 # char *canonicalize_path_nonfatal(char *pathname)
@@ -1538,9 +1542,9 @@ unfunction _zeshy_core
 #die_unless_ok() {
 #    # Cache the prior command's return code, as our initial sanity check on
 #    # arguments replaces this code with its own.
-#    integer prior_command_return_code=${?}
+#    integer prior_command_exit_status=${?}
 #    die_unless_one_argument 'expected exactly one error message'
-#    is ${prior_command_return_code} -eq ${ZESHY_SUCCESS_CODE} si or die "${1}"
+#    is ${prior_command_exit_status} -eq ${ZESHY_SUCCESS_CODE} si or die "${1}"
 #}
 
 # void utter_import(char *script_name)
