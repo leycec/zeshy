@@ -1,0 +1,186 @@
+#!/usr/bin/env zsh
+# ====================[ device                             ]====================
+#                     [ Time-stamp: "2009-04-18 19:29:36 leycec" ]
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Zeshy Disk, implementing filesystem-handling.
+#
+# --------------------( TODO                               )--------------------
+# * It'd be *very* nice to add implicit support for conditional paging on
+#   output; basically, only page output when such output exceeds the current
+#   terminal height; otherwise, print output as is. This has broad applicability
+#   throughout Zeshy (e.g., grep, ls, du, cat).
+# * Add support for disk cloning. To be blunt, it's highly non-trivial and
+#   rather dangerous (an understatement); but, current Linux command-line
+#   support for such cloning only excacerbates this issue by unsafely admitting
+#   inherently damaging operations (e.g., "dd"-ing onto a mounted partition).
+#   Disk cloning requires two separate actions:
+#   1. First, cloning the partition(s) header(s) and ensuring the output disk or
+#      partition is at least as large as the input disk or partition. Assuming
+#      an output disk of /dev/sdb and input disk of /dev/sda, this is achievable
+#      by running:
+#      sfdisk -d /dev/sda | sfdisk /dev/sdb
+#   2. Second, cloning the actual disk or partition ("dd" operates on either
+#      transparently, since both are device files). This is somewhat complicated
+#      by the lack of a progress bar for "dd" and the need to prevent "dd" from
+#      committing blatantly damaging data deletion. Specifically:
+#      1. If the output is a disk, validate that no partition of that disk is
+#         currently mounted. If the output is a partition, validate that that
+#         partition is currently unmounted. Note that this implicitly guards
+#         against overwriting of the main hard drive in use.
+#      2. Validate that the output disk or partition is at least as large as the
+#         input disk or partition. Note that the output may be an ".img" file,
+#         thus somewhat complicating such checks.
+#      2. Interactively confirm the user wishes to do so with ask_bool().
+#      3. Perform the actual clone with "pv" (pipe view) if installed, providing
+#         a visual progress bar: e.g.,
+#         dd if=/dev/sda bs=32M | pv -s 512M | dd bs=32M of=/dev/sdb 
+#         The "bs" (block size) argument is essential to provide decent
+#         throughput. Being an archaic application, "dd" defaults to an absurd
+#         512KB block size; anything from 4MB to 128MB appears to be the current 
+#         preferred default. Since "pv" can't reasonably know the full size of
+#         data being transferred, we provide it the explicit size with "-s".
+
+# ....................{ ALIASES                            }....................
+interactive_alias df="df --human-readable --sync"
+interactive_alias du="du --human-readable --total"
+interactive_alias dup="print_disk_usage_paged"
+interactive_alias dus="print_disk_usage_paged_sorted"
+
+# ....................{ PRINTERS                           }....................
+print_disk_usage_paged() {
+    zpage du "${@}"
+}
+
+print_disk_usage_paged_sorted() {
+    du "${@}" | sort --human-numeric-sort --reverse | "${PAGER}"
+#  [ -z "$1" ] && 1="."
+#  \du --all --no-dereference $1 | sort --numeric-sort --reverse | less
+}
+
+# char *print_partition_tables(char *device_file1, char *device_file2, ...)
+#
+# Print the partition table for each passed device or all available devices
+# listed by "/proc/partitions" if no devices are passed.
+print_partition_tables() {
+    fdisk -l "${@}"
+}
+
+# ....................{ WRITERS                            }....................
+# void clean_machine(void)
+#
+# Clean this machine of temporary files and directories.
+clean_machine() {
+    # Confirm.
+    ask_bool_hard "really clean temporary files and directories?" || return
+    print
+
+    #FIXME: Do the deletions below already clean such cache? I suspect so.
+    if is_installed ccache; then
+        utter "cleaning \"ccache\"..."
+        try_as_superuser ccache -C
+    fi
+    
+    #FIXME: It would be nice to implement a clever "distfile" cleaner that ONLY
+    #removed distfiles for which there is no corresponding installed version.
+    string cleanable_dir
+    for    cleanable_dir in /tmp /var/tmp /home/*/tmp; do
+        if is_dir "${cleanable_dir}"; then
+            utter "cleaning \"${cleanable_dir}\"..."
+            try_as_superuser rm -rf "${cleanable_dir}"/*
+        fi
+    done
+}
+
+# void clone_partition_table(char *device_file1, char *device_file2)
+#
+# Clone the partition table from the former to latter passed device.
+clone_partition_table() {
+    # Localize passed arguments.
+    die_unless_two_arguments\
+        'expected exactly one source and one target device file'
+    string device_file_src="${1}"
+    string device_file_trg="${2}"
+
+    # Validate passed arguments.
+    die_unless_installed sfdisk\
+        '"sfdisk" required for partition table cloning but not installed'
+    die_unless_device_file "${device_file_src}"
+    die_unless_device_file "${device_file_trg}"
+
+    # Confirm.
+    ask_bool_hard "really destructively clone the partition table from "\
+        "\"${device_file_src}\" onto ${device_file_trg}?" or return
+    print
+
+    # Clone.
+    sfdisk -d "${device_file_src}" | sfdisk "${device_file_trg}"
+}
+
+# char *format_device(
+#     char *device_file, char *filesystem_type = 'ext4', char *label = '')
+#
+# Format the passed n table for each passed device or all available devices
+# listed by "/proc/partitions" if no devices are passed.
+format_device() {
+    # Declare this function to be the top-level "script" for pretty output.
+#   ZESHY_SCRIPT_NAME='format_device'
+
+    # Localize passed arguments.
+    die_unless_at_least_one_argument\
+        'expected one device file and optional filesystem type, label, and "mkfs" arguments'
+    string device_file="${1}"
+    string filesystem_type="${2:-ext4}"
+    string label="${3}"
+    
+    # Shift off prior arguments, squelching warnings for non-extant arguments.
+    repeat 3 do quietly shift; done
+
+    # Validate passed arguments.
+    die_unless_superuser
+    die_unless_device_file "${device_file}"
+    string formatter="mkfs.${filesystem_type}"
+    die_unless_installed "${formatter}"\
+        "\"${filesystem_type}\" not a recognized filesystem type"
+
+    # Astonishingly, "mkfs.*" commands do *NOT* ask interactive shell users to
+    # confirm extremely destructive formats prior to doing so. (Really? Come on,
+    # Linux! This isn't obtuse rocket science. It's common decency.)
+    ask_bool_hard "really destructively format \"${device_file}\" as "\
+        "${filesystem_type}?" or return
+    print
+
+    # Format under "-v" for forced verbosity.
+    if is_nonempty "${label}"
+    then "${formatter}" -L "${label}" -v "${@}" "${device_file}"
+    else "${formatter}"               -v "${@}" "${device_file}"
+    fi
+}
+
+#FIXME: Obsolete.
+#   utter "really format "${device_file}" as ${filesystem_type}? [yes/no] "
+#   string is_sure
+#   read   is_sure
+#   if is "${is_sure}" == y || "${is_sure}" == ye || "${is_sure}" == yes si; then
+#       utter      "formatting \"${device_file}\" as ${filesystem_type}..."
+ 
+# --------------------( COPYRIGHT AND LICENSE              )--------------------
+# The information below applies to everything in this distribution,
+# except where noted.
+#              
+# Copyright 2007-2012 by Cecil Curry.
+#   
+#   http://www.raiazome.com
+# 
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
