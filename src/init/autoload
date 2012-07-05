@@ -1,0 +1,341 @@
+#!/usr/bin/env zsh
+# ====================[ autoload                           ]====================
+#                     [ Time-stamp: "2009-04-18 19:29:36 leycec" ]
+#
+# --------------------( SYNOPSIS                           )--------------------
+# ZeshyInit Autoload, autoloading *ALL* autoloadable Zsh and Zeshy functions.
+#
+# --------------------( TODO                               )--------------------
+# * Ultimately, Zeshy should auto-compile the recursive entirety of all Zeshy
+#   function definitions into a single so-called "digest" file at, say,
+#   "~/.zeshy/digest.zwc". Such a file is autoloadable by:
+#       
+#       # ...implicitly autoloading such digest.
+#       fpath=( "~/.zeshy/digest.zwc" "${fpath[@]}" )
+#
+#       # ...explicitly autoloading such digest.
+#       autoload -Uw "~/.zeshy/digest.zwc"
+#
+#   I'm unsure if the former supercedes the latter. (Probably not, no.) Both
+#   required, perhaps.
+#
+#   What's nice about this is that such a digest file appears to come prepended
+#   with a list of all functions defined by such digest, thus rendering
+#   autoloading of digest files terrifically fast. Auto-generating such a digest
+#   on any change to any Zeshy file or directory is, unfortunately, not quite so
+#   easy. We'll need to write something resembling:
+#
+#       if is "$(get_path_mtime "~/.zeshy/digest.zwc") equals SOMETHING si; then
+#           zcompile "~/.zeshy/digest.zwc" "${ZESHY_HOME}/src/"**/*(.)
+#       fi
+#
+#   However, it's unclear just how aggregating multiple files into one handles
+#   initialization code. Clearly, it either doesn't or does but simply lumps all
+#   initialization together. Either case is bad. We'll need to rewrite Zeshy to:
+#
+#   * Perform all non-costly initialization up-front in Zeshy .main or core.
+#   * Perform all costly initialization in the functions requiring such
+#     initialization as the first line of such functions. You know that grind...
+
+# ....................{ MAIN                               }....................
+# Import all Zeshy dependencies relevant for the current system. Typically, this
+# means:
+#
+# * All scripts immediately under "zeshy/".
+# * All scripts under "zeshy/distro" corresponding to the current distribution
+#   (e.g., "zeshy/distro/exherbo" on Exherbo systems).
+{
+    # Autoload all autoloadable files in function path "${FPATH}", eliminating the
+    # need to manually load such files prior to use (e.g., "zsh-mime-setup" rather
+    # than "autoload -U zsh-mime-setup; zsh-mime-setup"). Dismantled, this is:
+    #
+    # * "fpath", the list of all directories with autoloadable files.
+    # * "^", iteratively expanding to each such directory.
+    # * "/*", each immediate file and subdirectory of such directory.
+    # * "N", ignoring non-extant files and subdirectories.
+    # * ".", excluding subdirectories.
+    # * ":t", the tail (i.e., basename) of such file.
+    #
+    # This matches all basenames of immediate files of directories in the function
+    # path. (Since this is also the set of all autoloadable function names,
+    # autoloading such basenames autoloads all autoloadable functions.) Oh!
+    for autoloadable_function_name in ${^fpath}/*(N.:t); do
+    #   print "autoloading \"${autoload_function_name}\"..."
+        
+        # Autoload this function under option "-U" to suppress alias expansion.
+        autoload -U "${autoloadable_function_name}"
+    done
+
+    #     zrecompile -p\
+    #         -R ~/.zshrc --\
+    #         -M ~/.zcompdump --\
+    #         ~/zsh/comp.zwc ~/zsh/Completion/*/_*
+    #
+    #This does everything for us. Swag, no? Memory map everything, of course.
+    #Oh, and the latter line is the one that applies to us. To quote: "re-create
+    #the file ~/zsh/comp.zwc if any of the files matching the given pattern is
+    #newer than it." We'll need to dynamically construct the arguments to be
+    #passed for the command-specific directories. Shouldn't be hard:
+    #
+    #     list zrecompile_args
+    #     zrecompile_args=( "${generic_dir}.zwc" "${generic_dir}"/**/*(.) )
+    #     for command_dir in "src/auto/command"/*(/); do
+    #         zrecompile_args+=( "${command_dir}.zwc" "${command_dir}"/**/*(.) )
+    #     done
+    #     print "za: ${zrecompile_args[@]}"
+
+    # Automatically recompile all compiled files in function path "${FPATH}" whose
+    # corresponding uncompiled files have since changed.
+    #autoload -U zrecompile
+#   zrecompile -p
+
+    # Last modification time of Zeshy's user-specific configuration file.
+    integer zeshy_mtime=$(zstat +mtime "${ZESHY_CONFIG_FILE}")
+
+    # If the current user is a Zeshy developer, obtain the last modification
+    # time of the Zeshy codebase by sorting the set of all last modification 
+    # times of all files and directories in this codebase and selecting the
+    # largest such time. This is at best an O(n*lg(n)) operation, and hence
+    # confined to developers.
+    if is -n ${ZESHY_IS_DEVELOPMENT} si; then
+        # Dismantled, this is:
+        #
+        # * "${...}"/**/*, all files and directories of this codebase.
+        # * "om", sorting such files and directories by ascending mtime.
+        # * "[1]", the first and hence newest such file or directory.
+        integer zeshy_src_mtime=$(zstat +mtime "${ZESHY_SOURCE_DIR}"/**/*(om[1]))
+
+        # Find the maximum of this and the prior modification time.
+        (( zeshy_src_mtime > zeshy_mtime )) and
+            zeshy_mtime=zeshy_src_mtime
+    fi
+
+    # If the digest file does not exist or does but is older than Zeshy's last
+    # modification time, recompile this file to synchronize compiled function
+    # definitions with newer Zeshy changes.
+    utter "detecting \"${ZESHY_DIGEST_FILE}\"..."
+    if not is -f "${ZESHY_DIGEST_FILE}" si or
+        (( zeshy_mtime != $(zstat +mtime "${ZESHY_DIGEST_FILE}") )); then
+        utter "composing \"${ZESHY_DIGEST_DIR}\"..."
+
+        # Make the digest directory and remove all existing symbolic links in
+        # such directory, if needed.
+        mkdir -p "${ZESHY_DIGEST_DIR}"
+        rm       "${ZESHY_DIGEST_DIR}/"*(N@)
+
+        # Load "mapfile", a core Zsh module mapping file contents to map values.
+        # It's both brilliant and efficient, an unhappily rare combination. It's
+        # also remarkably dangerous, since accidentally unsetting keys from this
+        # map deletes the corresponding files. Hence, we immediately unload this
+        # module after use.
+        zmodload zsh/mapfile
+
+        # Forcibly prevent harmful "mapfile" and hence filesystem changes.
+        typeset -r mapfile
+
+        # List of files containing autoloadable functions with which to populate
+        # the digest directory.
+        #
+        # For each file in Zeshy's command directory whose filename is the name
+        # of an executable command in the $PATH, add such to the prior list.
+        # Dismantled, this is:
+        #
+        # * "${ZESHY_AUTOLOAD_COMMAND_DIR}/"*, listing each file in Zeshy's
+        #   command directory.
+        # * "(e{[[ ... ]]})", excluding files failing the following test:
+        #   * "$REPLY", the current file.
+        #   * ":t", the basename of such file.
+        #   * ":c", the absolute path to a command in the $PATH with such name.
+        #   * "== /*", true only when ":c" succeeds in finding such a command.
+        list autoload_filenames; autoload_filenames=(
+            "${ZESHY_AUTOLOAD_COMMAND_DIR}/"*(e{'[[ $REPLY:t:c == /* ]]'})
+        )
+
+        # List of directories recursively containing files containing
+        # autoloadable functions with which to populate the digest directory.
+        list autoload_dirnames; autoload_dirnames=(
+            "${ZESHY_AUTOLOAD_CORE_DIR}"
+            "${ZESHY_AUTOLOAD_THEME_DIR}/${ZESHY_THEME}"
+        )
+
+        # For each function declared in each file in the passed directory and
+        # subdirectories of that directory, make a symbolical link in the digest
+        # directory with that function name to that file. Dismantled, this is:
+        #
+        # * "${^autoload_dirnames[@]}", expanding to each directory in the list.
+        # * "/**/*",  recursively expanding to each file of this directory.
+        # * "~*.(swp)", excluding temporary files.
+        # * "(.)", including only plain files.
+        for autoload_function_file (
+            "${autoload_filenames[@]}"
+            "${^autoload_dirnames[@]}"/**/*~*.(swp)(.)
+        ) {
+            # Dismantled, this is:
+            #
+            # * "${(f)mapfile["${autoload_function_file}"]}", iteratively
+            #   expanding to each line of this file.
+            # * "${(M)", ":#", and "}", excluding lines not matching the
+            #   following extended glob expression:
+            #   * "[[:alnum:]_-]##", greedily matching a substring of one or
+            #     more alphanumeric, underscore, and hyphen characters.
+            #   * "\(\) \{", followed by "() {", signifying a function.
+            # * "${" and "%%\(*}", excluding the "() {" suffixing such lines.
+            for autoload_function_name\
+                ( "${${(M)${(f)mapfile["${autoload_function_file}"]}:#[[:alnum:]_-]##\(\) \{}%%\(*}" ) {
+                ln -s\
+                    "${autoload_function_file}"\
+                    "${ZESHY_DIGEST_DIR}/${autoload_function_name}"
+            }
+        }
+
+        # Unload "mapfile", for safety.
+        zmodload -u zsh/mapfile
+
+        # Recompile the digest file against such symbolic links.
+        utter "compiling \"${ZESHY_DIGEST_FILE}\"..."
+        zcompile "${ZESHY_DIGEST_FILE}" "${ZESHY_DIGEST_DIR}"/**/*(@)
+
+        # Set the mtime of the compiled script to that of the uncompiled
+        # script to ensure the above conditional fails on future imports.
+        touch -m --date=@"${zeshy_mtime}" "${ZESHY_DIGEST_FILE}"
+    fi
+
+    # Declare all functions compiled into the digest file to be autoloadable.
+    autoload -w "${ZESHY_DIGEST_FILE}"
+
+    # Prefix the function path with the absolute path to the digest file to
+    # ensure Zsh searches such file for the definition of such functions first.
+    # Oddly, Zsh has no means of directly associating the two.
+    fpath=( "${ZESHY_DIGEST_FILE}" "${fpath[@]}" )
+}
+
+#FIXME: Obsolete.
+#   zstat +mtime "${1}"
+    # Dismantled, this is:
+    #
+    # * "${pathname}"/**/*, all files and subdirectories of this directory.
+    # * "om", such files and subdirectories in ascending order by mtime.
+    # * "[1]", the first and hence newest such file or subdirectory.
+#   zstat +mtime "${pathname}"/**/*(om[1])
+
+#   touch -m --date=@"${mtime}" "${pathname}"
+
+# void _populate_zeshy_digest_dir_with(char *dirname)
+#
+# Populate Zeshy's digest directory with one symbolic link for each autoloadable
+# function in each file of the passed directory, recursively.
+#_populate_zeshy_digest_dir_with() {
+#    die_unless_one_argument 'expected exactly one dirname'
+#
+#    # For each function declared in each file in the passed directory and
+#    # subdirectories of that directory, make a symbolical link in the digest
+#    # directory with that function name to that file. Dismantled, this is:
+#    #
+#    # * "/**/*", recursively expanding to each file and subdirectory of the
+#    #   passed directory.
+#    # * "~*.(swp)", excluding temporary files.
+#    # * "(.)", including only plain files.
+#    for autoload_function_file\
+#        ( "${ZESHY_AUTOLOAD_ALWAYS_DIR}"/**/*~*.(swp)(.) ) {
+#        # Dismantled, this is:
+#        #
+#        # * "${(f)mapfile["${autoload_function_file}"]}", iteratively
+#        #   expanding to each line of this file.
+#        # * "${(M)", ":#", and "}", excluding lines not matching the
+#        #   following extended glob expression:
+#        #   * "[[:alnum:]_-]##", greedily matching a substring of one or
+#        #     more alphanumeric, underscore, and hyphen characters.
+#        #   * "\(\) \{", followed by "() {", signifying a function.
+#        # * "${" and "%%\(*}", excluding the "() {" suffixing such lines.
+#        for autoload_function_name\
+#            ( "${${(M)${(f)mapfile["${autoload_function_file}"]}:#[[:alnum:]_-]##\(\) \{}%%\(*}" ) {
+#            ln -s\
+#                "${autoload_function_file}"\
+#                "${ZESHY_DIGEST_DIR}/${autoload_function_name}"
+#        }
+#    }
+#}
+
+#       for autoload_command_filename\
+#           ( "${ZESHY_COMMAND_DIR}/"*(e{'[[ $REPLY:t:c == /* ]]'}) ) {
+#           autoload_filenames+=( "${autoload_command_filename}" )
+#       }
+
+        #FIXME: Replace with an "rm -rf" once confident this works.
+#           mv "${ZESHY_DIGEST_DIR}" "${ZESHY_DOTDIR}/tmp/$(date +'%N')"
+
+#_zeshy_autoload_digest_old() {
+    #FIXME: This only applies to developer systems. In production, Zeshy
+    #requires only one initial compilation, thus eliminating the cost of such
+    #recompilation. Ah; I wonder. Wouldn't a "zrecompile -p" immediately after
+    #declaring the "fpath" do this, assuming we'd first compiled all necessary
+    #digests? If so, that would suggest we'd only need a simple test for
+    #
+    #    if not is_file "${ZESHY_DIGEST_FILE}"; then
+    #       # Compile everything anew here! Don't bother checking mtimes.
+    #    fi
+    #
+    #Then, a zrecompile should handle the rest, yes? That would be considerably
+    #more efficient, given Zsh's C-backed implementation. Ah; O.K., it gets even
+    #better. We can entirely reduce this if-conditional to a zrecompile() call
+    #resembling the given example:
+    #
+    #     zrecompile -p\
+    #         -R ~/.zshrc --\
+    #         -M ~/.zcompdump --\
+    #         ~/zsh/comp.zwc ~/zsh/Completion/*/_*
+    #
+    #This does everything for us. Swag, no? Memory map everything, of course.
+    #Oh, and the latter line is the one that applies to us. To quote: "re-create
+    #the file ~/zsh/comp.zwc if any of the files matching the given pattern is
+    #newer than it." We'll need to dynamically construct the arguments to be
+    #passed for the command-specific directories. Shouldn't be hard:
+    #
+    #     list zrecompile_args
+    #     zrecompile_args=( "${generic_dir}.zwc" "${generic_dir}"/**/*(.) )
+    #     for command_dir in "src/auto/command"/*(/); do
+    #         zrecompile_args+=( "${command_dir}.zwc" "${command_dir}"/**/*(.) )
+    #     done
+    #     print "za: ${zrecompile_args[@]}"
+#    utter "detecting \"${ZESHY_DIGEST_FILE}\"..."
+#    integer zeshy_mtime=$(get_path_mtime_recursive "${ZESHY_SRC_HOME}")
+#    if not is_file "${ZESHY_DIGEST_FILE}" or
+#        (( zeshy_mtime != $(get_path_mtime "${ZESHY_DIGEST_FILE}") )); then
+#        utter "compiling \"${ZESHY_DIGEST_FILE}\"..."
+#        # ...the "-." matches all files and symbolic links to files.
+#        zcompile "${ZESHY_DIGEST_FILE}" "${ZESHY_SRC_HOME}"/**/*~*.(swp|zwc)(-.)
+
+#        # Set the mtime of the compiled script to that of the uncompiled
+#        # script to ensure the above conditional fails on future imports.
+#        set_path_mtime "${ZESHY_DIGEST_FILE}" "${zeshy_mtime}"
+#    fi
+
+    # Declare all functions provided by the digest file to be autoloadable.
+#    autoload -w "${ZESHY_DIGEST_FILE}"
+
+    # Prefix "${FPATH}" with the absolute path to the digest file, ensuring Zsh
+    # searches such file for the definition of such functions first. Oddly, Zsh
+    # has no means of directly associating the two.
+#    fpath=( "${ZESHY_DIGEST_FILE}" "${fpath[@]}" )
+#}
+
+# --------------------( COPYRIGHT AND LICENSE              )--------------------
+# The information below applies to everything in this distribution,
+# except where noted.
+#              
+# Copyright 2007-2012 by Cecil Curry.
+#   
+#   http://www.raiazome.com
+# 
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
