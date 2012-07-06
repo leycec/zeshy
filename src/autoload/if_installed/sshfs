@@ -1,0 +1,154 @@
+#!/usr/bin/env zsh
+# ====================[ sshfs                              ]====================
+#                     [ Time-stamp: "2009-04-18 19:29:36 leycec" ]
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Zsh SSHfuse, mounting and unmounting remote SSH hosts to and from local
+# SSHfuse-managed mount points.
+#
+# --------------------( TODO                               )--------------------
+# * This component requires quite a bit of updating. It no longers complies with
+#   current Zeshy style *AT ALL*, and is doing pretty much everything "wrong."
+
+# ....................{ ALIASES                            }....................
+interactive_alias sshfs='sshfs -o allow_other,kernel_cache,reconnect,transform_symlinks,compression=yes,cache_timeout=256,cache_stat_timeout=16,cache_dir_timeout=16,cache_link_timeout=16,idmap=user,workaround=rename'
+interactive_alias sshfs-umount='fusermount -uz'
+interactive_alias sshm='ssh-mount'
+interactive_alias sshu='ssh-umount'
+
+#FIXME: Move all such configuration into "${HOME}/.zeshy/config" file.
+# ....................{ CONFIGURATION                      }....................
+# Root directory to which SSH hosts will be mounted.
+global_string MOUNT_ROOT="/mnt"
+
+# List of absolute paths to "ssh_config" files. Note that order is important:
+# later file content overrides that of earlier.
+global_list SSH_CONFIGS
+SSH_CONFIGS=( '/etc/ssh/ssh_config' "${HOME}/.ssh/ssh_config" )
+
+# Global maps from SSH hostname to the local and remote pathnames at which that
+# hostname is to be mounted under SSHfs. SSH hostnames correspond to "Host"
+# options in "/etc/ssh/ssh_config".
+global_map SSH_HOST_TO_LOCAL_PATH;  SSH_HOST_TO_LOCAL_PATH=()
+global_map SSH_HOST_TO_REMOTE_PATH; SSH_HOST_TO_REMOTE_PATH=()
+
+# Custom mappings for the above associative arrays. The _sshfs_main()
+# function will define acceptable defaults for all other mappings.
+SSH_HOST_TO_REMOTE_PATH[gwydden]='/'
+SSH_HOST_TO_REMOTE_PATH[rhuddin]='/'
+
+# ....................{ [UN]MOUNTING                       }....................
+# Define high-level "front-facing" functions serving as this file's command-
+# line interface to common users.
+
+# void ssh-mount(char *hostname)
+#
+# Mount the passed SSH hostname to its corresponding local mount point.
+ssh-mount() {
+    die_unless_one_argument 'expected exactly one SSH hostname'
+
+    string SSH_HOST="${1}"
+    string\
+        LOCAL_PATH="$SSH_HOST_TO_LOCAL_PATH[$SSH_HOST]"\
+        REMOTE_PATH="$SSH_HOST_TO_REMOTE_PATH[$SSH_HOST]"
+    [ -n "$LOCAL_PATH" ] || die "\"$SSH_HOST\" not a recognized host!"
+
+    if not is_dir "${LOCAL_PATH}" ]; then
+        string USER_NAME=$(whoami)
+
+        utter "creating \"$LOCAL_PATH\"..."
+        sudo mkdir --parents "$LOCAL_PATH" ||
+            die "\"$LOCAL_PATH\" cannot be created!"
+        sudo chown "$USER_NAME" "$LOCAL_PATH" || 
+            die "\"$LOCAL_PATH\" cannot be chowned by \"$USER_NAME\"!"
+    fi
+
+    ssh-umount "$SSH_HOST"
+
+    # Load the "fuse" kernel module, if compiled as a module and not already loaded.
+    if not grep -qw fuse /proc/filesystems; then
+        # If the "/etc/init.d/fuse" initscript exists, preferentially run that.
+        if [[ -x "/etc/init.d/fuse" ]]; then
+            sudo  "/etc/init.d/fuse" restart  ||
+                die "\"fuse\" initscript cannot be started!"
+        # Otherwise, load the kernel module.
+        else
+            sudo modprobe --quiet fuse ||
+                die "\"fuse\" kernel module cannot be loaded!"
+        fi
+    fi
+
+    # Mount the passed SSH hostname.
+    utter "mounting \"$SSH_HOST\" to \"$LOCAL_PATH\"..."
+    sshfs "${SSH_HOST}:${REMOTE_PATH}" "$LOCAL_PATH" ||
+      die "\"$SSH_HOST\" cannot be mounted to \"$LOCAL_PATH\"!"
+}
+
+# void ssh-umount(char *hostname)
+#
+# Unmount the passed SSH hostname from its corresponding local mount point.
+ssh-umount() {
+    die_unless_one_argument die 'expected exactly one SSH hostname'
+
+    local SSH_HOST="$1"
+    local LOCAL_PATH="$SSH_HOST_TO_LOCAL_PATH[$SSH_HOST]"
+    [ -n "$LOCAL_PATH" ] || die "\"$SSH_HOST\" not a recognized host!"
+
+    # Unmount the passed SSH hostname only if already mounted.
+    if grep "$LOCAL_PATH" /etc/mtab 2>&1 1>/dev/null; then
+        utter "unmounting \"$SSH_HOST\" from \"$LOCAL_PATH\"..."
+        sshfs-umount "$LOCAL_PATH" or
+            die "\"$SSH_HOST\" cannot be unmounted from \"$LOCAL_PATH\"!"
+    fi
+}
+
+# ....................{ MAIN                               }....................
+set_default_sshfs_mappings() {
+    string ssh_hosts ssh_host
+
+    # Split the scalar string of paths "$SSH_CONFIGS" on colons with (s.:.).
+    for ssh_config ("${SSH_CONFIGS[@]}") {
+        is_file "${ssh_config}" or break
+        
+        # Extract a space-delimited set of all "Hosts" defined by this "ssh_config".
+        ssh_hosts="$(grep --extended-regexp 'Host[ \t]' "${ssh_config}" | cut --delimiter=' ' --fields=2 | tr '\n' ' ' | tr --delete '*')"
+        
+        # Split the scalar string of words "$ssh_hosts" on spaces with '='.
+        for ssh_host (${(z)ssh_hosts}) {
+            is_map_key 'SSH_HOST_TO_LOCAL_PATH' "${ssh_host}" or
+                # Do not append a terminating '/' onto mount points. Why? We later grep
+                # "/etc/mtab" for existing mount points and, since that file also does not
+                # append the same terminating '/', must thus ensure the two paths conform.
+                SSH_HOST_TO_LOCAL_PATH[${ssh_host}]="${MOUNT_ROOT}/${ssh_host}"
+
+            is_map_key 'SSH_HOST_TO_REMOTE_PATH' "${ssh_host}" or
+                SSH_HOST_TO_REMOTE_PATH[${ssh_host}]=
+        }
+    }
+}
+
+#FIXME: Obsolete.
+# Define low-level aliases. You may call these aliases directly; in general,
+# however, it will probably be more expedient to call the higher-level
+# "ssh-mount" and "ssh-umount" to perform SSH host mounting and unmounting.
+
+# --------------------( COPYRIGHT AND LICENSE              )--------------------
+# The information below applies to everything in this distribution,
+# except where noted.
+#              
+# Copyright 2007-2012 by Cecil Curry.
+#   
+#   http://www.raiazome.com
+# 
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
