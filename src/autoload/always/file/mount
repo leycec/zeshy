@@ -14,25 +14,50 @@ interactive_alias mo="mount"
 interactive_alias umo="umount"
 
 # ....................{ TESTS                              }....................
-# bool is_dir_mounted(char *dirname)
+# bool is_mount_point(char *dirname)
 #
-# Return success if the passed directory name is an existing mount point (i.e.,
-# if "something" is currently mounted under this directory).
-is_dir_mounted() {
+# Return true if the directory with the passed dirname is hosting a mount point.
+is_mount_point() {
     die_unless_one_argument 'expected exactly one dirname'
-    string mount_point="${1}"
+    string mount_dirname="${1}"
     
     # If the passed pathname does not correspond to an existing directory, it
     # cannot correspond to a valid mount point.
-    is_dir "${mount_point}" or return_failure
+    is_dir "${mount_dirname}" or return_failure
 
     # If the "mountpoint" binary is available, use that.
     if is_installed mountpoint
-    then mountpoint -q "${mount_point}"
+    then mountpoint -q "${mount_dirname}"
+    #FIXME: This test requires we convert relative to absolute dirnames, here.
     # Otherwise, manually search the file listing current mount points.
-    else grep -q "${mount_point}" "$(get_mount_points_filename)"
+    else is_file_contains "$(get_mount_dirnames_filename)" "${mount_dirname}"
     fi
 }
+
+# bool is_device_file_mounted_to(char *device_filename, char *mount_dirname)
+#
+# Return true if the device with the passed filename is mounted to the directory
+# with the passed dirname.
+is_device_file_mounted_to() {
+    die_unless_two_arguments\
+        'expected exactly one device filename and mount dirname'
+    string device_filename="${1}" mount_dirname="${2}"
+    
+    # If the passed pathname does not correspond to an existing directory, it
+    # cannot correspond to a valid mount point.
+    { is_device_file_file "${device_filename}" and is_dir "${mount_dirname}" } or
+        return_failure
+
+    #FIXME: Also implement without "mountpoint", if feasible.
+    die_unless_installed mountpoint
+    is "$(mountpoint -d "${devile_filename}" 2>&1)" ==\
+       "$(mountpoint -x "${mount_dirname}"   2>&1)" si
+}
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#FIXME: This is *TERRIBLE*. Just use "mount -l" to list current mount points.
+#Grepping this Linux-specific file is horrible.
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 # ....................{ GETTERS                            }....................
 # char *get_mount_points_filename(void)
@@ -43,15 +68,45 @@ get_mount_points_filename() {
     print '/proc/mounts'
 }
 
+#FIXME: Make mount_safely() subsume mount_iso(). Should be pretty simple; I'd
+#much rather have one intelligent command than two sub-intelligent commands.
 # ....................{ WRITERS                            }....................
+# void mount_safely(
+#   char *device_filename, char *mount_dirname,
+#   char *mount_option1, char *mount_option2, ...)
+#
+# Mount the device with the passed filename to the mount point with the passed
+# dirname and options. If this mount point already mounts this device, do *NOT*
+# remount this device. If this mount point does not exist, make it.
+mount_safely() {
+    # Localize and validate passed arguments.
+    die_unless_at_least_two_arguments\
+        'expected one device filename, one mount dirname, and optional mount options'
+    string device_filename="${1}" mount_dirname="${2}"
+    die_unless_devile_file "${device_filename}"
+    shift_two_arguments
+
+    # If the passed device is already mounted to the passed directory, noop.
+    is_device_file_mounted_to "${device_filename}" "${mount_dirname}" and
+        return
+
+    # If the passed device is already mounted *NOT* to the passed directory,
+    # raise an exception.
+    is_mount_point "${mount_dirname}" and
+        die "\"${mount_dirname}\" already mounted"
+
+    # Mount.
+    make_directory_if_not_found "${mount_dirname}" 
+    mount "${@}" "${device_filename}" "${mount_dirname}"
+}
+
 # void mount_iso(char *filename)
 #
-# Mount the passed ISO filename to the "${ZESHY_MOUNT_ISO_PATH}" directory. If
-# something is already mounted to this path, this function iteratively appends
-# numbers (starting at 1), until discovering a directory name to which nothing
-# is currently mounted.
+# Mount the ISO with the passed filename to directory ${ZESHY_MOUNT_ISO_PATH}.
+# If this directory already hosts a mount point, iteratively uniquify this
+# dirname until finding one hosting no mount point.
 mount_iso() {
-    # Ensure sanity.
+    # Localize and validate passed arguments.
     die_unless_one_argument 'expected exactly one ISO filename'
     string iso_filename="${1}"
     is "${iso_filename}" == *.iso si or
@@ -64,10 +119,10 @@ mount_iso() {
     string  iso_mount_path_prefix="${ZESHY_MOUNT_ISO_PATH}"\
             iso_mount_path="${iso_mount_path_prefix}"
     utter 'searching for available mount point...'
-    while is_dir_mounted "${iso_mount_path}"; do
+    while (is_mount_point "${iso_mount_path}") {
         (( iso_mount_path_suffix++ ))
         iso_mount_path="${iso_mount_path_prefix}${iso_mount_path_suffix}"
-    done
+    }
     
     # Mount the passed ISO filename to the desired mount path.
     #
