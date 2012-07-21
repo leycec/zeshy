@@ -107,37 +107,50 @@ get_pids_for_running_as() {
 }
 
 # ....................{ GETTERS ~ path                     }....................
+#FIXME: This probably doesn't work as expected for scripts preceeded by set
+#variables (e.g., "TMP=~/.tmp script.zeshy"). Test; hack; fix!
 # char *get_process_command_name(int pid = PID)
 #
-# Get the name of the command run by the process with the passed PID, defaulting
-# to that of the current process.
+# Get the name of the command the process with the passed PID (defaulting to
+# that of the current process) is running.
 get_process_command_name() {
-    # Array of strings split on null bytes from the above command-line string.
-    # This is the Linux convention, and probably not applicable to other *nix.
-    list command_line_parts
-         command_line_parts=( "${(0)$(get_process_command_line "${@}")}" )
+    # List splitting the command-line the current process is running on words.
+    # Dismantled, this is:
+    #
+    # * "(0)", split the command-line on null bytes. By Linux convention (and
+    #   hence probably not applicable to other *nix), a null byte delimits each
+    #   shell word of such line.
+    list command_line_words
+         command_line_words=( "${(0)$(get_process_command_line "${@}")}" )
+#   curse "pclp: ${command_line_words[@]}"
     
-    # If the current process is a Zsh script (and it better be!), then the path
-    # to this process is given by the third string in this array: e.g.,
+    # The name and absolute path of the command the current process is running.
+    string command_name="${command_line_words[1]}" command_path
+
+    # If this process is a Zsh script (which it usually is), the absolute path
+    # to this command is given by the third string in this array: e.g.,
     #
     #   # For a Zeshy script "h3110", this array resembles...
-    #   command_line_parts=( zsh /usr/bin/zeshy h3110 )
-#   curse "pclp: ${command_line_parts[@]}"
-    string command_name="${command_line_parts[1]}" process_path
-    if is "${command_name}" == *sh si and (( ${#command_line_parts} >= 3 ))
-    then process_path="${command_line_parts[3]}"
-    else process_path="${command_name}"
+    #   command_line_words=( zsh /usr/bin/zeshy h3110 )
+    if is "${command_name}" == *sh si and (( ${#command_line_words} >= 3 ))
+    then command_path="${command_line_words[3]}"
+    else command_path="${command_name}"
     fi
 
+    # If this command is "su", the absolute path is instead "-su". For sanity,
+    # strip the prefixing hyphen.
+    is "${command_path}" == '-'* si and command_path="${command_path[2,-1]}"
+
     # Return the basename of this command.
-    get_basename "${process_path}"
-#   basename -- "${process_path}"
+#   print "\ncommand_line_words: ${command_line_words[@]}"
+#   print "command_path: ${command_path}"
+    get_basename "${command_path}"
 }
 
 # char *get_process_command_line(int pid = PID)
 #
-# Get the command line run by the process with the passed PID, defaulting to
-# that of the current process. This is a string consisting of (in order):
+# Get the command line the process with the passed PID (defaulting to that of
+# the current process) is running. This is a string consisting of (in order):
 #
 # * Either the absolute or relative path to the command. In the latter case,
 #   there is no reliable means of resolving this path into an absolute path.
@@ -208,6 +221,57 @@ run_with_priorities() {
     run "${commands[@]}"
 }
 
+# ....................{ REDIRECTORS                        }....................
+# int one_if(
+#   char *command_name, char *command_argument1, char *command_argument2, ...)
+#
+# Run the passed command quietly (i.e., squelching output) and, if exiting
+# with success, return "1"; otherwise, return the empty string: e.g.,
+#
+#     >>> integer IS_MUTT_INSTALLED=$(one_if 'is_installed mutt')
+#     >>> is_nonzero "${IS_MUTT_INSTALLED}" and print '"mutt" is installed'
+#     "mutt" is installed
+one_if() {
+    quietly "${@}" and print 1 or true
+}
+
+# char *page(
+#   char *command_name, char *command_argument1, char *command_argument2, ...)
+#
+# Run the passed command with standard output and error piped to the current
+# ${PAGER} (e.g., "less", "more").
+page() {
+    die_unless_at_least_one_argument 'expected a command'
+    print "page command line: ${*}"
+    print "page second arg: ${2}"
+    run "${(q)@} 2>&1 | '${PAGER:-less}'"
+}
+
+# void quietly_as(
+#   char *command_name, char *command_argument1, char *command_argument2, ...)
+#
+# Run the passed command as the passed user quietly (i.e., squelching output).
+quietly_as() {
+    run_as "${@}" 1>/dev/null 2>&1
+#   run_as "${@}"
+}
+
+# void quietly(
+#   char *command_name, char *command_argument1, char *command_argument2, ...)
+#
+# Run the passed command quietly (i.e., squelching output).
+quietly() {
+    run "${(q)@}" 1>/dev/null 2>&1
+}
+
+# char *pipe_stderr_to_stdout(
+#   char *command_name, char *command_argument1, char *command_argument2, ...)
+#
+# Divert standard error to standard output.
+pipe_stderr_to_stdout() {
+    run "${(q)@}" 2>&1
+}
+
 # ....................{ RUNNERS                            }....................
 # void run_as_superuser(char *command)
 #
@@ -252,12 +316,17 @@ run_as() {
 run() {
     die_unless_arguments
 
+    #FIXME: ...we appear to no longer require the "Q". (Naturally, I have no
+    #firm idea why.)
     # Command line to run. Dismantled, this is:
     #
     # * "Q", stripping one level of quote protection from the passed parameters,
     #   undoing prior "(q)" quote protection.
     # * "z", splitting such parameters into Zsh-specific words.
-    list command; command=( "${(Qz)@}" )
+#   print "command line: ${@}"
+    list command; command=( "${(z)@}" )
+#   list command; command=( "${(Qz)@}" )
+#   print "second arg: ${command[2]}"
     
     # Command name to run as the first word of such command line.
     string command_name="${(Q)command[1]}"
@@ -280,11 +349,9 @@ run() {
         if is_set_nonempty 'ZESHY_RUN_AS' and
            is "${ZESHY_RUN_AS}" != "${USER}" si; then
             # If the target user is the superuser, use "sudo" to take
-            # advantage of password caching.
-            #
-            # Note that we do not use the "(@)" expansion in either of the
-            # following two commands, as that would split the array into
-            # discrete command arguments.
+            # advantage of password caching. Do *NOT* use the "(@)" expansion in
+            # either of the following two commands, as that would split the line
+            # into discrete command arguments.
             if is "${ZESHY_RUN_AS}" == root si and is_installed sudo; then
 #               echo "sudoing as ${ZESHY_RUN_AS}: ${command}"
                 sudo -E "${command}"
@@ -293,70 +360,21 @@ run() {
 #               echo "suing as ${ZESHY_RUN_AS}: ${command}"
                 su --preserve-environment\
                    --command "${command}" "${ZESHY_RUN_AS}"
-        fi
-        # Otherwise, run this command as the current user. Do use the "(@)"
+            fi
+        # Otherwise, run this command as the current user. Use the "(@)"
         # expansion here, as calling the command manually requires we split the
-        # array into discrete command arguments. Evaluate this command to ensure
+        # line into discrete command arguments. Evaluate this command to ensure
         # the shell correctly handles shell constructs (e.g., "|").
         else
-#           echo "evaling: ${command[@]}"
+            print "evaling: ${command[@]}"
             eval "${command[@]}"
         fi
     #FIXME: Incomplete. How does one run a builtin as another user? Implement.
     # Otherwise, the passed command must be a shell built-in. Evaluate it!
     else
-#       echo "evaling: ${command[@]}"
+        print "evaling: ${command[@]}"
         eval "${command[@]}"
     fi
-}
-
-# ....................{ REDIRECTORS                        }....................
-# int one_if(
-#   char *command_name, char *command_argument1, char *command_argument2, ...)
-#
-# Run the passed command quietly (i.e., squelching output) and, if exiting
-# with success, return "1"; otherwise, return the empty string: e.g.,
-#
-#     >>> integer IS_MUTT_INSTALLED=$(one_if 'is_installed mutt')
-#     >>> is_nonzero "${IS_MUTT_INSTALLED}" and print '"mutt" is installed'
-#     "mutt" is installed
-one_if() {
-    quietly "${@}" and print 1 or true
-}
-
-# char *page(
-#   char *command_name, char *command_argument1, char *command_argument2, ...)
-#
-# Run the passed command with standard output and error piped to the current
-# ${PAGER} (e.g., "less", "more").
-page() {
-    die_unless_at_least_one_argument 'expected a command'
-    run "${(q)@} 2>&1 | '${PAGER:-less}'"
-}
-
-# void quietly_as(
-#   char *command_name, char *command_argument1, char *command_argument2, ...)
-#
-# Run the passed command as the passed user quietly (i.e., squelching output).
-quietly_as() {
-    run_as "${@}" 1>/dev/null 2>&1
-#   run_as "${@}"
-}
-
-# void quietly(
-#   char *command_name, char *command_argument1, char *command_argument2, ...)
-#
-# Run the passed command quietly (i.e., squelching output).
-quietly() {
-    run "${(q)@}" 1>/dev/null 2>&1
-}
-
-# char *pipe_stderr_to_stdout(
-#   char *command_name, char *command_argument1, char *command_argument2, ...)
-#
-# Divert standard error to standard output.
-pipe_stderr_to_stdout() {
-    run "${(q)@}" 2>&1
 }
 
 #FIXME: Obsolete.
