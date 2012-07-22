@@ -4,8 +4,12 @@
 #
 # --------------------( SYNOPSIS                           )--------------------
 # Zeshy Which, implementing ${PATH}-based filename finding.
+#
+# --------------------( TODO                               )--------------------
+# * Compress which_commands() into which_command() and which_files() into
+#   which_file(). (Simplify life, yes? No justifiable reason not to, really.)
 
-# ....................{ STRINGS                            }....................
+# ....................{ SINGULAR                           }....................
 # char *which_command(char *command_name)
 #
 # Return the absolute path to the command with the passed name if such command
@@ -19,7 +23,7 @@ which_command() {
     string command_pathname="${command_name:c}"
 
     # If no such command exists, print an error message and return with failure.
-    is_pathname_absolute "${command_pathname}" or
+    is_absolute_path "${command_pathname}" or
         die "command \"${command_name}\" not found"
 
     # Otherwise, print the absolute path of this command.
@@ -51,8 +55,7 @@ which_script() {
 #     /usr/share/zsh/4.3.11/functions/MIME/zsh-mime-handler
 which_autoload() {
     die_unless_at_least_one_argument 'expected exactly one autoload name'
-    string autoload_name="${1}"
-    string autoload_paths_list_name="${2:-fpath}"
+    string autoload_name="${1}" autoload_paths_list_name="${2:-fpath}"
     
     # Dismantled, this is:
     #
@@ -70,14 +73,46 @@ which_autoload() {
     # If no command has the passed name, print an error message and return
     # failure. To permit the caller to recover, do not raise a fatal error.
 #   print "which_autoload: ${autoload_paths[@]}"
-    is_nonempty "${autoload_paths}" or
-        die "script \"${autoload_name}\" not found"
+    die_unless_list_nonempty 'autoload_paths' "\"${autoload_name}\" not found"
+#   is_nonempty "${autoload_paths}" or
+#       die "\"${autoload_name}\" not found"
 
     # Otherwise, print the first absolute path to this autoload.
     print "${autoload_paths[1]}"
 }
 
-# ....................{ LISTS ~ files                      }....................
+#FIXME: *****WAIT*****. We can substantially improve every other function by
+#rewriting to the implementation of which_dir_writable(). Also, which_files()
+#should clearly simply defer to which_files_if_found() rather than
+#reimplementing the whole shebang.
+
+# ....................{ PLURAL ~ dirs                      }....................
+# char *which_dir_writable(char *dirname1, *dirname2, ...)
+#
+# Get the absolute path of the first directory in the passed list of dirnames
+# that exists and is writable by the current user or raise an exception if no
+# such directory exists.
+which_dir_writable() {
+    die_unless_at_least_one_argument 'expected at least one dirname'
+
+    # List of writable dirnames filtered from the list of passed pathnames.
+    # Dismantled, this is:
+    #
+    # * "${^@}", iteratively expanding to each passed pathname.
+    # * "(e{'...'}), excluding pathnames not matching the embedded test.
+    # * "or true", preventing failure if at least one pathname is excluded.
+    list dirnames
+         dirnames=( ${^@}(e{'[[ -d $REPLY && -w $REPLY ]]'}) ) or true
+
+    # If the list of passed pathnames contains at least one writable dirname,
+    # print the first such match; otherwise, raise an exception.
+    if is_list_nonempty dirnames
+    then print "${dirnames[1]}"
+    else die "neither $(join_list_to_string_prefixing_last_with ', ' 'or ' "\"${^@}\"") found"
+    fi
+}
+
+# ....................{ PLURAL ~ files                     }....................
 # char *which_files(char *filename1, *filename2, ...)
 #
 # Get the absolute path of the first file in the passed list of filenames that
@@ -97,14 +132,14 @@ which_files() {
     }
     
     # Otherwise, no such filename exists. Die. Die! Die?
-    die "no files named "\
-        "$(join_list_to_string_prefixing_last_with ', ' 'or ' "\"${^@}\"") found"
+    string filenames=$(join_list_to_string_prefixing_last_with ', ' 'or ' "\"${^@}\"")
+    die "neither ${filenames} found"
 }
 
 # char *which_files_if_found(char *filename1, *filename2, ...)
 #
 # Get the absolute path of the first file in the passed list of filenames that
-# exists or return failure but do not raise an exception.
+# exists or return failure (but do not raise an exception) if no file exists.
 which_files_if_found() {
     die_unless_at_least_one_argument 'expected at least one filename'
 
@@ -119,7 +154,7 @@ which_files_if_found() {
     return_failure
 }
 
-# ....................{ LISTS ~ files                      }....................
+# ....................{ PLURAL ~ commands                  }....................
 # char *which_commands(char *command_name1, *command_name2, ...)
 #
 # Get the absolute path of the first command in the passed list of command names
@@ -145,73 +180,8 @@ which_commands() {
     }
     
     # Otherwise, no such command exists. Die? Die! Die.
-    die "no commands named "\
-        "$(join_list_to_string_prefixing_last_with ', ' 'or ' "\"${^@}\"")"\
-        "found in \$PATH"
-}
-
-# ....................{ TEMPORARIES                        }....................
-# char *which_temporary_home(void)
-#
-# Get the absolute path of this user's topmost temporary directory (in order):
-#
-# * "${HOME}/tmp", if this directory exists.
-# * "/tmp", otherwise.
-which_temporary_home() {
-    die_unless_no_arguments 'expected no arguments'
-    
-    string user_temporary_home="${HOME}/tmp" root_temporary_home="/tmp"
-    if   is_dir "${user_temporary_home}"
-    then print  "${user_temporary_home}"
-    elif is_dir "${root_temporary_home}"
-    then print  "${root_temporary_home}"
-    else die 'no temporary directory found'
-    fi
-}
-
-# char *which_temporary_dir(char *prefix)
-#
-# Get the absolute path to a temporary path having the passed prefix: e.g.,
-#
-#     >>> which_temporary_dir git_patches
-#     /tmp/git_patches~2012-04-18_22-58-34_609198275
-#
-# While subtle race conditions may arise with concurrent processing, this path
-# is generally unique. This should probably not be depended upon for mission
-# critical Zsh scripts, however. (.......of course, if you're coding mission
-# critical Zsh scripts, you've probably already gone too far.)
-which_temporary_dir() {
-    die_unless_one_argument 'expected exactly one dirname prefix'
-    
-    string which_temporary_dir
-    while true; do
-        which_temporary_dir="$(which_temporary_home)/${1}.path~$(date +'%F_%H-%M-%S_%N')"
-        if not is_dir "${which_temporary_dir}"; then
-            print  "${which_temporary_dir}"
-            break
-        fi
-    done
-}
-
-# char *which_temporary_file(char *prefix)
-#
-# Get the absolute path to a temporary file having the passed prefix: e.g.,
-#
-#     >>> which_temporary_file git_patch_file
-#     /tmp/git_patch_file~2012-12-01_18-37-41_837170937
-#
-# Subtle race conditions may arise, as above.
-which_temporary_file() {
-    die_unless_one_argument 'expected exactly one filename prefix'
-    
-    string which_temporary_file
-    while true; do
-        which_temporary_file="$(which_temporary_home)/${1}.file~$(date +'%F_%H-%M-%S_%N')"
-        if not is_file "${which_temporary_file}"; then
-            print "${which_temporary_file}"
-            break
-        fi
-    done
+    string command_names=$(join_list_to_string_prefixing_last_with ', ' 'or ' "\"${^@}\"")
+    die "neither ${command_names} found in \$PATH"
 }
 
 #FIXME: Obsolete.
