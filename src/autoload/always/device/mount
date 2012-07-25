@@ -6,12 +6,8 @@
 # Zeshy Mount, implementing filesystem mounting and unmounting functionality.
 
 # ....................{ ALIASES                            }....................
-#interactive_alias mo="mount | column -t"
-#FIXME: O.K.; implement a new zmount() function that, when called with no arguments,
-#runs "mount | column -t" (...looks awesome; trust me), or, when called with arguments,
-#defers to simply "mount "${@}"". Yum.
-interactive_alias mo="mount"
-interactive_alias umo="umount"
+interactive_alias mo='mount_safely'
+interactive_alias umo='umount'
 
 # ....................{ TESTS                              }....................
 # bool is_mount_point(char *dirname)
@@ -25,13 +21,10 @@ is_mount_point() {
     # cannot correspond to a valid mount point.
     is_dir "${mount_dirname}" or return_failure
 
-    # If the "mountpoint" binary is available, use that.
-    if is_installed mountpoint
-    then mountpoint -q "${mount_dirname}"
-    #FIXME: This test requires we convert relative to absolute dirnames, here.
-    # Otherwise, manually search the file listing current mount points.
-    else is_file_contains "$(get_mount_dirnames_filename)" "${mount_dirname}"
-    fi
+    #FIXME: Also implement without "mountpoint", if feasible. Note such an
+    #implementation requires we convert relative to absolute dirnames.
+    die_unless_installed mountpoint
+    mountpoint -q "${mount_dirname}"
 }
 
 # bool is_device_file_mounted_to(char *device_filename, char *mount_dirname)
@@ -50,14 +43,9 @@ is_device_file_mounted_to() {
 
     #FIXME: Also implement without "mountpoint", if feasible.
     die_unless_installed mountpoint
-    is "$(mountpoint -d "${devile_filename}" 2>&1)" ==\
+    is "$(mountpoint -d "${device_filename}" 2>&1)" ==\
        "$(mountpoint -x "${mount_dirname}"   2>&1)" si
 }
-
-#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-#FIXME: This is *TERRIBLE*. Just use "mount -l" to list current mount points.
-#Grepping this Linux-specific file is horrible.
-#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 # ....................{ GETTERS                            }....................
 # char *get_mount_home(void)
@@ -75,8 +63,176 @@ is_device_file_mounted_to() {
 # If no such directory exists or is writable, raise an exception.
 get_mount_home() {
     die_unless_no_arguments
-    print '/proc/mounts'
+    get_first_writable_dir '/media' '/mnt' "${HOME}/media" "${HOME}/mnt"
 }
+
+# ....................{ PRINTERS                           }....................
+# char *print_mount_points(void)
+#
+# Print a detailed human-readable list of current mount points.
+print_mount_points() {
+    die_unless_no_arguments
+
+    # Dismantled, this is:
+    #
+    # * "print '...';", prefixing output with a header line.
+    # * "LC_ALL=C ", guaranteeing output from "mount" in the default format.
+    # * "mount | awk", formatting output from "mount" through an "awk" script
+    #   cutting the extraneous second and fourth columns.
+    # * "(...)", aggregating such output into a single output stream.
+    # * "column -t", reformatting output into a whitespace-delimited table.
+    # * "awk", substituting commas with spaces in the flags column. Since
+    #   "column -t" tabulates with such spaces, we must defer such substitution
+    #   until after tabulating. Dismantled, this is:
+    #   * "-F'[ ]'", preserving whitespace by treating individual spaces rather
+    #     than contiguous "runs" of spaces as column delimiters.
+    #   * "NR == 1", matching the first and hence header line. 
+    #   * "NR > 1", matching all subsequent lines output from "mount". 
+    #   * "$NF", the last and hence flags column. We can't simply write "$4", as
+    #     treating individual spaces as delimiters creates "dummy" columns.
+    #
+    # This one-liner inspired by Peteris Krumin's magical bash one-liner at:
+    # http://www.catonmat.net/blog/another-ten-one-liners-from-commandlinefu-explained
+    (
+        print 'DEVICE MOUNT-POINT TYPE FLAGS'
+        LC_ALL=C mount | awk '{$2=$4=""; print}'
+    ) | column -t | awk -F'[ ]' '
+NR == 1 {
+    sub(/-/, " ")
+    print
+}
+NR > 1 {
+    gsub(/\(|\)/, "", $NF)
+    gsub(/,/, " ", $NF)
+    print
+}
+'
+}
+
+# ....................{ WRITERS                            }....................
+# void mount_safely(
+#   char *device_filename, char *mount_dirname,
+#   char *mount_option1, char *mount_option2, ...)
+#
+# Mount the device with the passed filename to the mount point with the passed
+# dirname and options. This function safely (and sanely) interprets the passed
+# arguments as follows:
+#
+# * If this is an interactive shell and no arguments were passed, print a human-
+#   readable list of current mount points.
+# * If the passed device does not exist, attempt to find a device with such
+#   basename under these directories (in order):
+#   * "/dev/disk/by-label'.
+#   * "/dev'.
+#   * ...otherwise, raise an exception.
+# * If no mount point was passed, assume a mount point with the passed device
+#   basename under the current user's mount home.
+# * If the passed mount point does not exist, recursively make it.
+# * If the passed mount point is already mounted to:
+#   * ...the passed device, do nothing.
+#   * ...otherwise, raise an exception.
+# * If the passed device is:
+#   * ...a device file, perform the expected mount.
+#   * ...a file with filetype ".iso", mount this file as an ISO image.
+#
+# In other words, this function quasi-intelligently accepts darn near anything.
+mount_safely() {
+    if is_interactive and not is_arguments; then
+        print_mount_points
+    else
+        # Localize and validate passed arguments.
+        die_unless_arguments\
+            'expected one device filename, optional mount dirname, and optional mount options'
+        string device_filename="${1}" mount_dirname
+        shift_one_argument
+
+        if not is_found "${device_filename}"; then
+            is_absolute_path "${device_filename}" and
+                die "\"${device_filename}\" not found"
+            device_filename="$(get_first_device_file "/dev/disk/by-label/${device_filename}" "/dev/${device_filename}")"
+        fi
+        die_unless_file "${device_filename}"
+
+        if is_arguments; then
+            mount_dirname="${1}"
+            shift_one_argument
+        else
+            mount_dirname="$(get_mount_home)/$(get_basename "${device_filename}")"
+        fi
+
+        if is_mount_point "${mount_dirname}"; then
+            # If the passed device is already mounted to the passed directory, noop.
+            # By default, "mount" unhelpfully fails with error.
+            is_device_file_mounted_to "${device_filename}" "${mount_dirname}" and
+                return
+
+            #FIXME: Print what it's actually mounted to, for assistance.
+            # Otherwise, raise an exception.
+            die "\"${mount_dirname}\" already mounted"
+        fi
+
+        make_dir_if_not_found "${mount_dirname}" 
+        die_unless_dir        "${mount_dirname}"
+        interactively utter\
+            "mounting \"${device_filename}\" to \"${mount_dirname}\"..."
+
+        if is_device_file "${device_filename}"; then
+            mount "${@}" "${device_filename}" "${mount_dirname}"
+        elif is "${device_filename}" == *.iso si; then
+            mount "${@}" -t iso9660 -o 'exec,loop'\
+                "${device_filename}" "${mount_dirname}"
+        else
+            die "\"${device_filename}\" neither a device or ISO file"
+        fi
+    fi
+}
+
+#FIXME: Obsolete.
+# void mount_iso(char *filename)
+#
+# Mount the ISO image with the passed filename to a temporary directory under
+# the current user's mount home.
+#mount_iso() {
+    # Localize and validate passed arguments.
+#   die_unless_one_argument 'expected exactly one ISO filename'
+#   string iso_filename="${1}"
+#   is "${iso_filename}" == *.iso si or
+#       die "\"${iso_filename}\" not an ISO"
+#   die_unless_file "${iso_filename}"
+#   string ZESHY_SCRIPT_NAME='mount_iso'
+
+    # Find a suitable mount path.
+#   integer iso_mount_path_suffix=0
+#   string  iso_mount_path_prefix="${ZESHY_MOUNT_ISO_PATH}"\
+#           iso_mount_path="${iso_mount_path_prefix}"
+#   utter 'searching for available mount point...'
+#   while (is_mount_point "${iso_mount_path}") {
+#       (( iso_mount_path_suffix++ ))
+#       iso_mount_path="${iso_mount_path_prefix}${iso_mount_path_suffix}"
+#   }
+    
+    # Mount the passed ISO filename to the desired mount path.
+    #
+    # Note that this does not pass the ",user" option when mounting, as doing so
+    # would implicitly enables unhelpful mount options (e.g., "noexec").
+#   utter "mounting \"${iso_filename}\" to \"${iso_mount_path}\"..."
+#   make_dir_if_not_found "${iso_mount_path}" 
+#   mount -t iso9660 -o 'exec,loop'\
+#       "${iso_filename}" "${iso_mount_path}" or
+#       die "\"${iso_filename}\" not mountable to \"${iso_mount_path}\""
+#}
+#       if is_one_argument and is "${1}" == *.iso si; then
+#           mount_iso "${1}"
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#FIXME: This is *TERRIBLE*. Just use "mount -l" to list current mount points.
+#Grepping this Linux-specific file is horrible.
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# * If only one argument was passed and:
+#   * ...this is an existing file with filetype "ISO", mount this file as an ISO
+#     image to the current user's mount home.
+#   * ...otherwise, raise an exception.
 
 # char *get_mount_points_filename(void)
 #
@@ -85,73 +241,6 @@ get_mount_home() {
 #    die_unless_no_arguments
 #    print '/proc/mounts'
 #}
-
-#FIXME: Make mount_safely() subsume mount_iso(). Should be pretty simple; I'd
-#much rather have one intelligent command than two sub-intelligent commands.
-# ....................{ WRITERS                            }....................
-# void mount_safely(
-#   char *device_filename, char *mount_dirname,
-#   char *mount_option1, char *mount_option2, ...)
-#
-# Mount the device with the passed filename to the mount point with the passed
-# dirname and options. If this mount point already mounts this device, do *NOT*
-# remount this device. If this mount point does not exist, make it.
-mount_safely() {
-    # Localize and validate passed arguments.
-    die_unless_at_least_two_arguments\
-        'expected one device filename, one mount dirname, and optional mount options'
-    string device_filename="${1}" mount_dirname="${2}"
-    die_unless_devile_file "${device_filename}"
-    shift_two_arguments
-
-    # If the passed device is already mounted to the passed directory, noop.
-    is_device_file_mounted_to "${device_filename}" "${mount_dirname}" and
-        return
-
-    # If the passed device is already mounted *NOT* to the passed directory,
-    # raise an exception.
-    is_mount_point "${mount_dirname}" and
-        die "\"${mount_dirname}\" already mounted"
-
-    # Mount.
-    make_dir_if_not_found "${mount_dirname}" 
-    mount "${@}" "${device_filename}" "${mount_dirname}"
-}
-
-# void mount_iso(char *filename)
-#
-# Mount the ISO with the passed filename to directory ${ZESHY_MOUNT_ISO_PATH}.
-# If this directory already hosts a mount point, iteratively uniquify this
-# dirname until finding one hosting no mount point.
-mount_iso() {
-    # Localize and validate passed arguments.
-    die_unless_one_argument 'expected exactly one ISO filename'
-    string iso_filename="${1}"
-    is "${iso_filename}" == *.iso si or
-        die "\"${iso_filename}\" not an ISO"
-    die_unless_file "${iso_filename}"
-    string ZESHY_SCRIPT_NAME='mount_iso'
-
-    # Find a suitable mount path.
-    integer iso_mount_path_suffix=0
-    string  iso_mount_path_prefix="${ZESHY_MOUNT_ISO_PATH}"\
-            iso_mount_path="${iso_mount_path_prefix}"
-    utter 'searching for available mount point...'
-    while (is_mount_point "${iso_mount_path}") {
-        (( iso_mount_path_suffix++ ))
-        iso_mount_path="${iso_mount_path_prefix}${iso_mount_path_suffix}"
-    }
-    
-    # Mount the passed ISO filename to the desired mount path.
-    #
-    # Note that this does not pass the ",user" option when mounting, as doing so
-    # would implicitly enables unhelpful mount options (e.g., "noexec").
-    utter "mounting \"${iso_filename}\" to \"${iso_mount_path}\"..."
-    run_as_superuser make_dir_if_not_found "${iso_mount_path}" 
-    run_as_superuser mount -t iso9660 -o 'exec,loop'\
-        "${iso_filename}" "${iso_mount_path}" or
-        die "\"${iso_filename}\" not mountable to \"${iso_mount_path}\""
-}
 
 # --------------------( COPYRIGHT AND LICENSE              )--------------------
 # The information below applies to everything in this distribution,
