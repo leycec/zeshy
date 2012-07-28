@@ -1,6 +1,5 @@
 #!/usr/bin/env zsh
 # ====================[ disk                               ]====================
-#                     [ Time-stamp: "2009-04-18 19:29:36 leycec" ]
 #
 # --------------------( SYNOPSIS                           )--------------------
 # Zeshy Disk, implementing filesystem-handling.
@@ -43,17 +42,7 @@
 
 # ....................{ ALIASES                            }....................
 interactive_alias df='df --human-readable --sync'
-
-# Filesystem checking (fsck). Note we do not implicitly pass the "-a" or "-p"
-# options to fsck, as fsck ignores some filesystem errors (e.g., superblock
-# mount time in the future) when those options are passed.
-() {
-    string ZESHY_FSCK_OPTIONS="-C -M -T"
-    interactive_alias fsck="fsck ${ZESHY_FSCK_OPTIONS}"
-    interactive_alias fsck.ext2="fsck.ext2 ${ZESHY_FSCK_OPTIONS}"
-    interactive_alias fsck.ext3="fsck.ext3 ${ZESHY_FSCK_OPTIONS}"
-    interactive_alias fsck.vfat="fsck.vfat ${ZESHY_FSCK_OPTIONS}"
-}
+interactive_alias fdisk='check_disk'
 
 # ....................{ EXCEPTIONS                         }....................
 # void die_unless_disk_device(
@@ -76,7 +65,7 @@ die_unless_disk_device() {
 # attached disk.
 is_disk_device() {
     die_unless_one_argument 'expected exactly one pathname'
-    quietly /sbin/blkid "${1}"
+    quietly /sbin/blkid -- "${1}"
 }
 
 # ....................{ GETTERS                            }....................
@@ -102,7 +91,7 @@ get_disk_property() {
         'expected exactly one device file and one property name'
     string device_filename="${1}" property_name="${2}"
     die_unless_disk_device "${device_filename}"
-    /sbin/blkid -o value -s "${property_name}" "${device_filename}"
+    /sbin/blkid -o value -s -- "${property_name}" "${device_filename}"
 }
  
 # ....................{ SETTERS                            }....................
@@ -126,7 +115,7 @@ set_disk_label() {
     case "${filesystem_type}" in
         ext<2-4>)
             die_unless_installed e2label
-            e2label "${device_filename}" "${label}";;
+            e2label -- "${device_filename}" "${label}";;
         *) die "\"${filesystem_type}\" not a currently supported filesystem type";;
     esac
 }
@@ -178,79 +167,81 @@ print_disks() {
 #   ) | column -t
 }
 
-# char *print_partitions(char *device_filename1, char *device_filename2, ...)
-#
-# Print the partition table for each passed device or all available disk devices
-# listed by "/proc/partitions" if no such devices are passed.
-print_partitions() {
-    /sbin/fdisk -l "${@}"
-}
-
 # ....................{ WRITERS                            }....................
-# void clone_partition_table(char *device_file1, char *device_file2)
+# char *check_disk(
+#     char *device_filename, char *fsck_option1, char *fsck_option2, ...)
 #
-# Clone the partition table from the former to latter passed device.
-clone_partition_table() {
-    # Localize passed arguments.
-    die_unless_two_arguments\
-        'expected exactly one source and one target device file'
-    string device_file_src="${1}" device_file_trg="${2}"
+# Check the passed disk device for errors with the passed custom "fsck" options,
+# automatically repairing all such errors.
+check_disk() {
+    # Localize and validate passed arguments.
+    die_unless_at_least_one_argument\
+        'expected one device file and optional "fsck" arguments'
+    string device_file="${1}"
+    shift_one_argument
+    die_unless_disk_device "${device_filename}"
 
-    # Validate passed arguments.
-    die_unless_installed sfdisk\
-        '"sfdisk" required for partition table cloning but not installed'
-    die_unless_disk_device "${device_file_src}"
-    die_unless_disk_device "${device_file_trg}"
-
-    # Confirm.
-    if ask_bool_hard "really destructively clone the partition table from "\
-        "\"${device_file_src}\" onto ${device_file_trg}?"; then
-        print
-        sfdisk -d "${device_file_src}" | sfdisk "${device_file_trg}"
+    # Check and repair. Always enable option "-M" regardless of whether called
+    # interactively or not, thus prohibiting disk repair on mounted devices.
+    # Current research shows disk repair on even read-only mounted devices to be
+    # inherently risky: e.g.,
+    #
+    #     http://serverfault.com/questions/405248/linux-force-fsck-of-a-read-only-mounted-filesystem
+    #
+    # Do not, however, always enable options "-a" or "-p". While seemingly
+    # sensible defaults, both induce "fsck" to conditionally ignore otherwise
+    # repairable errors (e.g., superblock mount time in the future).
+    if is_interactive
+    then /sbin/fsck -M -C -- "${device_filename}" "${@}"
+    else /sbin/fsck -M -T -- "${device_filename}" "${@}"
     fi
 }
 
-# char *format_device(
-#     char *device_file, char *filesystem_type = 'ext4', char *label = '')
+# char *format_disk(
+#     char *device_filename, char *filesystem_type = 'ext4', char *label = '',
+#     char *mkfs_option1, char *mkfs_option2, ...)
 #
-# Format the passed partition table for each passed device or all available
-# devices listed by "/proc/partitions" if no such devices are passed.
-format_device() {
-    # Declare this function to be the top-level "script" for pretty output.
-#   ZESHY_SCRIPT_NAME='format_device'
-
+# Format the passed disk device as the passed filesystem type (defaulting to
+# EXT4) with the passed label (defaulting to nothing) and custom "mkfs" options.
+format_disk() {
     # Localize passed arguments.
     die_unless_at_least_one_argument\
         'expected one device file and optional filesystem type, label, and "mkfs" arguments'
-    string device_file="${1}"
-    string filesystem_type="${2:-ext4}"
-    string label="${3}"
-    
-    # Shift off prior arguments, squelching warnings for non-extant arguments.
+    string device_filename="${1}" filesystem_type="${2:-ext4}" label="${3}"
     shift_three_arguments
 
     # Validate passed arguments.
-    die_unless_superuser
-    die_unless_disk_device "${device_file}"
-    string formatter="mkfs.${filesystem_type}"
+    die_unless_disk_device "${device_filename}"
+    string formatter="/sbin/mkfs.${filesystem_type}"
     die_unless_installed "${formatter}"\
         "\"${filesystem_type}\" not a recognized filesystem type"
 
     # Astonishingly, "mkfs.*" commands do *NOT* ask interactive shell users to
     # confirm extremely destructive formats prior to doing so. (Really? Come on,
     # Linux! This isn't obtuse rocket science. It's common decency.)
-    ask_bool_hard "really format \"${device_file}\" as ${filesystem_type}?" or
+    ask_bool_hard "really (re)format \"${device_filename}\" as ${filesystem_type}?" or
         return
     print
 
     # Format under "-v" for forced verbosity.
     if is_nonempty "${label}"
-    then "${formatter}" -v -L "${label}" "${@}" "${device_file}"
-    else "${formatter}" -v               "${@}" "${device_file}"
+    then "${formatter}" -v -L "${label}" "${@}" -- "${device_filename}"
+    else "${formatter}" -v               "${@}" -- "${device_filename}"
     fi
 }
 
 #FIXME: Obsolete.
+# Filesystem checking (fsck). Note we do not implicitly pass the "-a" or "-p"
+# options to fsck, as fsck ignores some filesystem errors (e.g., superblock
+# mount time in the future) when those options are passed.
+#() {
+#    string ZESHY_FSCK_OPTIONS="-C -M -T"
+#    interactive_alias fsck="fsck ${ZESHY_FSCK_OPTIONS}"
+#    interactive_alias fsck.ext2="fsck.ext2 ${ZESHY_FSCK_OPTIONS}"
+#    interactive_alias fsck.ext3="fsck.ext3 ${ZESHY_FSCK_OPTIONS}"
+#    interactive_alias fsck.vfat="fsck.vfat ${ZESHY_FSCK_OPTIONS}"
+#}
+
 #FIXME: O.K.; the current implementation is obviously a sham. We need a new
     #getter "get_disk_filesystem" to acquire the filesystem of this disk,
     #ideally without mounting. This is trivially easy if the disk is already
