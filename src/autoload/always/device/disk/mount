@@ -9,22 +9,35 @@
 interactive_alias mo='mount_safely'
 interactive_alias umo='umount'
 
-# ....................{ TESTS                              }....................
-# bool is_mount_point(char *dirname)
+# ....................{ EXCEPTIONS                         }....................
+# void die_unless_unmounted_disk(
+#   char *pathname, char *error_message = 'currently mounted')
 #
-# Return true if the directory with the passed dirname is hosting a mount point.
-is_mount_point() {
-    die_unless_one_arg 'expected exactly one dirname'
-    string mount_dirname="${1}"
-    
-    # If the passed pathname does not correspond to an existing directory, it
-    # cannot correspond to a valid mount point.
-    is_dir "${mount_dirname}" or return_failure
+# Raise an exception unless the passed device file corresponds to an unmounted
+# disk (i.e., neither the disk itself or any partition of such disk is mounted).
+die_unless_unmounted_disk() {
+    die_unless_one_or_two_args\
+        'expected one pathname and optional error message'
+    string pathname="${1}"
+    is_disk_device "${pathname}" and not is_disk_mounted "${pathname}" or
+        die "${2:-\"${pathname}\" not found or not a mounted disk}"
+}
 
-    #FIXME: Also implement without "mountpoint", if feasible. Note such an
-    #implementation requires we convert relative to absolute dirnames.
-    die_unless_installed mountpoint
-    mountpoint -q "${mount_dirname}"
+# ....................{ TESTS                              }....................
+# bool is_disk_mounted(char *pathname)
+# 
+# Return true if the passed device file corresponds to a mounted disk (i.e.,
+# either the disk itself or some partition of such disk is currently mounted).
+is_disk_mounted() {
+    die_unless_one_arg 'expected exactly one device filename'
+    string device_filename="${1}"
+
+    # Genius. Unless "blkid -o list" reports the passed disk under column "mount
+    # point" as "(not mounted)", either the disk itself or some partition of
+    # such disk is currently mounted. There appears to be other reasonable means
+    # of testing such transitive dependencies, so this is quite essential.
+    is '(not mounted)' !=\
+      "$(blkid -o list | awk -v DEV="${device_filename}" '$1 == DEV { print $4, $5 }')" si
 }
 
 # bool is_device_mounted_to(char *device_filename, char *mount_dirname)
@@ -45,6 +58,66 @@ is_device_mounted_to() {
     die_unless_installed mountpoint
     is "$(mountpoint -x "${device_filename}" 2>&1)" ==\
        "$(mountpoint -d "${mount_dirname}"   2>&1)" si
+}
+
+# ....................{ TESTS ~ mount points               }....................
+# bool is_mount_point(char *dirname)
+#
+# Return true if the directory with the passed dirname hosts a mount point.
+is_mount_point() {
+    die_unless_one_arg 'expected exactly one dirname'
+    string mount_dirname="${1}"
+
+    # If the passed pathname corresponds to no existing directory, fail.
+    if not is_dir "${mount_dirname}"
+    then return_failure
+    # If the cross-platform portable "mountpoint" is installed, defer to such
+    # command. This is more reliable than grepping file content.
+    elif is_installed mountpoint; then
+        mountpoint -q "${mount_dirname}" | return_exit_status
+    # If the Linux-specific "/proc/mounts" exists, grep its content. This is
+    # more reliable than matching "mount" output. (See "man mount".)
+    elif is_file '/proc/mounts'; then
+        awk -v DIR="${mount_dirname}"\
+            'BEGIN {CODE=1} $2 == DIR {CODE=0} END {exit CODE}' '/proc/mounts' |
+            return_exit_status
+    # Otherwise, manually match "mount" output.
+    else
+        mount | awk -v DIR="${mount_dirname}"\
+            'BEGIN {CODE=1} $3 == DIR {CODE=0} END {exit CODE}' |
+            return_exit_status
+    fi
+}
+
+# bool is_writable_mount_point(char *dirname)
+#
+# Return true if the directory with the passed dirname is hosting a writable
+# mount point (i.e., was not mounted read-only).
+is_writable_mount_point() {
+    die_unless_one_arg 'expected exactly one dirname'
+    string mount_dirname="${1}"
+    
+    # If the passed pathname corresponds to no existing directory writable by
+    # the current user, fail.
+    if not is_writable_dir "${mount_dirname}"
+    then return_failure
+    # Since "mountpoint" has no writability option, we manually match strings.
+    # This is hardly ideal, but there you are. If the Linux-specific
+    # "/proc/mounts" exists, grep its content.
+    elif is_file '/proc/mounts'; then
+#       utter 'testing...'
+        awk -v DIR="${mount_dirname}" '
+BEGIN { CODE = 1 }
+$2 == DIR && $4 ~ /(^|,)rw($|,)/ { CODE = 0 }
+END { exit CODE }' '/proc/mounts' | return_exit_status
+#       utter 'failed...'
+    # Otherwise, manually match "mount" output.
+    else
+        mount | awk -v DIR="${mount_dirname}" '
+BEGIN { CODE = 1 }
+$3 == DIR && $NF ~ /(,|\()rw(,|\))/ { CODE = 0 }
+END { exit CODE }' | return_exit_status
+    fi
 }
 
 # ....................{ GETTERS                            }....................
@@ -99,26 +172,49 @@ print_mount_points() {
     # This one-liner inspired by Peteris Krumin's magical bash one-liner at:
     # http://www.catonmat.net/blog/another-ten-one-liners-from-commandlinefu-explained
     (
-        print 'device mount-point type flags'
-        print '-'
+        print 'device directory type flags'
+        print '???'
         LC_ALL=C mount | awk '{$2=$4=""; print}'
-    ) | column -t | awk -v banner="$(utter_banner)" -F'[ ]' '
-NR == 1 {
-    sub(/-/, " ")
-    print
-}
-NR == 2 {
-    print banner
-}
+    ) | column -t | awk -v BANNER="$(utter_banner)" -F'[ ]' '
+NR == 1 { print }
+NR == 2 { print BANNER }
 NR >= 3 {
     gsub(/\(|\)/, "", $NF)
     gsub(/,/, " ", $NF)
     print
-}
-'
+}'
 }
 
-# ....................{ WRITERS                            }....................
+# ....................{ MOUNTERS                           }....................
+# void mount_boot_writably(void)
+#
+# Mount the "/boot" partition if such partition exists and is not already
+# mounted writably and do nothing otherwise.
+mount_boot_writably() {
+    #FIXME: Replace with die_if_args() everywhere.
+    die_unless_no_args
+
+    # Return immediately if "/boot" is already a writable mount point.
+    is_writable_mount_point '/boot' and return_success
+
+    # If the filesystem table defines an uncommented "/boot" mapping...
+    if awk '
+BEGIN { CODE = 1}
+!/^[[:blank:]]*#/ && $2 == "/boot" { CODE = 0 }
+END { exit CODE }' '/etc/fstab'; then
+        # ...and "/boot" is already mounted (and hence read-only, since the prior
+        # test failed to return), remount "/boot" read-write; otherwise, simply
+        # mount "/boot" read-write.
+        if is_mount_point '/boot'
+        then mount -o remount,rw '/boot'
+        else mount -o         rw '/boot'
+        fi
+    # Otherwise, raise an exception unless "/boot/" is already writable.
+    else
+	    die_unless_writable_dir '/boot'
+    fi
+}
+
 # void mount_safely(
 #   char *device_filename, char *mount_dirname,
 #   char *mount_option1, char *mount_option2, ...)
@@ -146,64 +242,108 @@ NR >= 3 {
 #
 # In other words, this function quasi-intelligently accepts darn near anything.
 mount_safely() {
-    if is_interactive_directly and not is_args; then
+    #FIXME: Add a dash of commentary, here and below.
+    if not is_args and is_interactive_directly; then
         print_mount_points
     else
         # Localize and validate passed arguments.
         die_unless_args\
-            'expected one device filename, optional mount dirname, and optional mount options'
-        string device_filename="${1}" mount_dirname
-        shift_one_arg
+            'expected one device filename and/or mount dirname and optional mount options'
 
-        if not is_found "${device_filename}"; then
-            is_absolute_path "${device_filename}" and
-                die "\"${device_filename}\" not found"
-            #FIXME: Hmm; this doesn't appear to behave as expected. If
-            #get_first_device() raises an exception, I'd expect that to unwind
-            #this function's stack frame as well. It doesn't. Instead, "device_filename"
-            #just gets the output of get_first_device(), which in the case of a
-            #raised exception is a stack trace. Of course, that isn't a file, so
-            #the subsequent call to die_unless_disk_device() fails as well. This
-            #strikes me as a bug, perhaps corrected by a subsequent Zsh update?
-            device_filename="$(get_first_device "/dev/disk/by-label/${device_filename}" "/dev/${device_filename}")"
-        fi
-        die_unless_disk_device "${device_filename}"
+        #FIXME: This and the following conditional are effectively distinct
+        #functions, and could reasonably be separated as such..... Perhaps.
+        #Ah. Yes. Then, our calling of "mount -o rw /boot" above should be
+        #replaced by calls to, say, "mount_point -o rw /boot". Note we'd need
+        #define such function to take the last argument as the mount_dirname,
+        #but that's certainly no issue.
+        if is_one_arg; then
+            string mount_dirname="${1}"
 
-        if is_args; then
-            mount_dirname="${1}"
+            make_dir_safely         "${mount_dirname}" 
+            die_unless_writable_dir "${mount_dirname}"
+            interactively utter\
+                "mounting to \"${mount_dirname}\" via \"/etc/fstab\"..."
+            mount "${mount_dirname}"
+        #FIXME: Yup. How 'bout naming this one mount_disk()? Sensible.
+        else
+            string device_filename="${1}" mount_dirname
             shift_one_arg
-        else
-            mount_dirname="$(get_mount_home)/$(get_basename "${device_filename}")"
-        fi
 
-        if is_mount_point "${mount_dirname}"; then
-            # If the passed device is already mounted to the passed directory, noop.
-            # By default, "mount" unhelpfully fails with error.
-            is_device_mounted_to "${device_filename}" "${mount_dirname}" and
-                return
+            if not is_found "${device_filename}"; then
+                # If the passed
+                is_absolute_path "${device_filename}" and
+                    die "\"${device_filename}\" not found"
 
-            #FIXME: Print what it's actually mounted to, for assistance.
-            # Otherwise, raise an exception.
-            die "\"${mount_dirname}\" already mounted"
-        fi
+                #FIXME (new): O.K.; we need a new function testify(). (Clever, no?
+                #Also consider falsify(), though that name doesn't accurately describe
+                #its purpose.) Call it like this:
+                #device_filename="$(testify get_first_device "/dev/disk/by-label/${device_filename}" "/dev/${device_filename}")" or die "device \"${device_filename}\" not found"
+                #Simple. testify() calls the passed command via the typical run()
+                #construct *BUT WRAPPED IN AN EXCEPTION HANDLER* implicitly squelching
+                #any caught exception and simply converting it into a false return value.
+                #That then causes the entire equality to evaluate to "false" and hence
+                #implicitly throw an exception. Phew! Solved.
+                #
+                #FIXME: Hmm; this doesn't appear to behave as expected. If
+                #get_first_device() raises an exception, I'd expect that to unwind
+                #this function's stack frame as well. It doesn't. Instead, "device_filename"
+                #just gets the output of get_first_device(), which in the case of a
+                #raised exception is a stack trace. Of course, that isn't a file, so
+                #the subsequent call to die_unless_disk_device() fails as well. This
+                #strikes me as a bug, perhaps corrected by a subsequent Zsh update?
+                device_filename="$(get_first_device "/dev/disk/by-label/${device_filename}" "/dev/mapper/${device_filename}" "/dev/vg/${device_filename}" "/dev/${device_filename}")"
+            fi
+            die_unless_disk_device "${device_filename}"
 
-        make_dir_safely "${mount_dirname}" 
-        die_unless_dir        "${mount_dirname}"
-        interactively utter\
-            "mounting \"${device_filename}\" to \"${mount_dirname}\"..."
+            if is_args; then
+                mount_dirname="${1}"
+                shift_one_arg
+            else
+                mount_dirname="$(get_mount_home)/$(get_basename "${device_filename}")"
+            fi
 
-        if is_device "${device_filename}"; then
-            mount "${@}" "${device_filename}" "${mount_dirname}"
-        elif is "${device_filename}" == *.iso si; then
-            mount "${@}" -t iso9660 -o 'exec,loop'\
-                "${device_filename}" "${mount_dirname}"
-        else
-            die "\"${device_filename}\" neither a device or ISO file"
+            if is_mount_point "${mount_dirname}"; then
+                # If the passed device is already mounted to the passed directory, noop.
+                # By default, "mount" unhelpfully fails with error.
+                is_device_mounted_to "${device_filename}" "${mount_dirname}" and
+                    return
+
+                #FIXME: Print what it's actually mounted to, for assistance.
+                # Otherwise, raise an exception.
+                die "\"${mount_dirname}\" already mounted"
+            fi
+
+            make_dir_safely         "${mount_dirname}" 
+            die_unless_writable_dir "${mount_dirname}"
+            interactively utter\
+                "mounting \"${device_filename}\" to \"${mount_dirname}\"..."
+
+            if is_device "${device_filename}"; then
+                mount "${@}" "${device_filename}" "${mount_dirname}"
+            elif is "${device_filename}" == *.iso si; then
+                mount "${@}" -t iso9660 -o 'exec,loop'\
+                    "${device_filename}" "${mount_dirname}"
+            else
+                die "\"${device_filename}\" neither a device or ISO file"
+            fi
         fi
     fi
 }
 
 #FIXME: Obsolete.
+#   else is_nonempty "$(mount | awk '$3 == "/boot" {print $3}')"
+
+#NR == 1 {
+#    sub(/-/, " ")
+#    print
+#}
+
+#   if is_nonempty\
+#       "$(awk '!/^[[:blank:]]*#/ && $2 == "/boot" {print $2}' /etc/fstab)"; then
+#   if is '/boot' == "$(awk '!/^[[:blank:]]*#/ {print $2}' /etc/fstab)" si; then
+
+#is_disk_device "${device_filename}" and 
+
 # void mount_iso(char *filename)
 #
 # Mount the ISO image with the passed filename to a temporary directory under
