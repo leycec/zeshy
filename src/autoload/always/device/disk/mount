@@ -26,6 +26,19 @@ die_if_mount_point() {
         die "${2:-\"${pathname}\" mounted}"
 }
 
+# void die_if_mountable_point(
+#   char *pathname, char *error_message = 'not listed by "/etc/fstab"')
+#
+# Raise an exception unless the passed path is listed by "/etc/fstab" and hence
+# mountable without explicitly specifying a source device file.
+die_unless_mountable_point() {
+    die_unless_one_or_two_args\
+        'expected one pathname and optional error message'
+    string pathname="${1}"
+    is_mountable_point "${pathname}" or
+        die "${2:-\"${pathname}\" not listed by \"/etc/fstab\"}"
+}
+
 # void die_unless_unmounted_disk(
 #   char *pathname, char *error_message = 'currently mounted')
 #
@@ -77,14 +90,26 @@ is_device_mounted_to() {
 }
 
 # ....................{ TESTS ~ mount points               }....................
+# bool is_mountable_point(char *dirname)
+#
+# Return true if the passed directory is listed by "/etc/fstab" and hence
+# mountable without explicitly specifying a source device file.
+is_mountable_point() { 
+    die_unless_one_arg 'expected exactly one dirname'
+    awk -v DIR="${1}" '
+BEGIN { CODE = 1}
+!/^[[:blank:]]*#/ && $2 == DIR { CODE = 0 }
+END { exit CODE }' '/etc/fstab'
+}
+
 # bool is_mount_point(char *dirname)
 #
-# Return true if the directory with the passed dirname hosts a mount point.
+# Return true if the passed directory currently mounts some disk.
 is_mount_point() {
     die_unless_one_arg 'expected exactly one dirname'
     string mount_dirname="${1}"
 
-    # If the passed pathname corresponds to no existing directory, fail.
+    # If the passed path is not a directory readable by the current user, fail.
     if not is_dir "${mount_dirname}"
     then return_failure
     # If the cross-platform portable "mountpoint" is installed, defer to such
@@ -107,14 +132,12 @@ is_mount_point() {
 
 # bool is_writable_mount_point(char *dirname)
 #
-# Return true if the directory with the passed dirname is hosting a writable
-# mount point (i.e., was not mounted read-only).
+# Return true if the passed directory currently mounts some disk writably.
 is_writable_mount_point() {
     die_unless_one_arg 'expected exactly one dirname'
     string mount_dirname="${1}"
     
-    # If the passed pathname corresponds to no existing directory writable by
-    # the current user, fail.
+    # If the passed path is not a directory writable by the current user, fail.
     if not is_writable_dir "${mount_dirname}"
     then return_failure
     # Since "mountpoint" has no writability option, we manually match strings.
@@ -202,35 +225,6 @@ NR >= 3 {
 }
 
 # ....................{ MOUNTERS                           }....................
-# void mount_boot_writably(void)
-#
-# Mount the "/boot" partition if such partition exists and is not already
-# mounted writably and do nothing otherwise.
-mount_boot_writably() {
-    #FIXME: Replace with die_if_args() everywhere.
-    die_unless_no_args
-
-    # Return immediately if "/boot" is already a writable mount point.
-    is_writable_mount_point '/boot' and return_success
-
-    # If the filesystem table defines an uncommented "/boot" mapping...
-    if awk '
-BEGIN { CODE = 1}
-!/^[[:blank:]]*#/ && $2 == "/boot" { CODE = 0 }
-END { exit CODE }' '/etc/fstab'; then
-        # ...and "/boot" is already mounted (and hence read-only, since the prior
-        # test failed to return), remount "/boot" read-write; otherwise, simply
-        # mount "/boot" read-write.
-        if is_mount_point '/boot'
-        then mount_point -o remount,rw '/boot'
-        else mount_point -o         rw '/boot'
-        fi
-    # Otherwise, raise an exception unless "/boot/" is already writable.
-    elif not is_writable_dir '/boot'; then
-        die '"/boot" neither writable or listed by "/etc/fstab"'
-    fi
-}
-
 # void mount_safely(void) --OR--
 # void mount_safely(char *mount_dirname) --OR--
 # void mount_safely(
@@ -263,12 +257,29 @@ END { exit CODE }' '/etc/fstab'; then
 # In other words, this function quasi-intelligently accepts darn near anything.
 mount_safely() {
     #FIXME: Add a dash of commentary, here and below.
-#   if not is_args and is_interactive_directly; then
-    if not is_args
+    if is_no_args
     then print_mount_points
     elif is_one_arg
     then mount_point "${1}"
     else mount_disk  "${@}"
+    fi
+}
+
+# ....................{ MOUNTERS ~ points                  }....................
+# void mount_writable_boot_dir(void)
+#
+# Mount the "/boot" partition if such partition exists and is not already
+# mounted writably; otherwise, no-op. 
+mount_writable_boot_dir() {
+    die_if_args
+
+    # If "/etc/fstab" maps some device to "/boot", mount such device.
+    if is_mountable_point '/boot'
+    then mount_writable_point '/boot'
+    # Otherwise, raise an exception unless "/boot" is already writable.
+    elif not is_writable_dir "${mount_dirname}"
+    then die\
+        "\"${mount_dirname}\" neither writable or listed by \"/etc/fstab\""
     fi
 }
 
@@ -281,12 +292,17 @@ mount_point() {
     # Localize and validate passed arguments.
     die_unless_args 'expected optional mount options and one mount dirname'
     string mount_dirname="${@[-1]}"
-    die_if_mount_point "${mount_dirname}"
 
     #FIXME: O.K.; for orthogonality with mount_disk(), we should really avoid
     #remounting to an already mounted directory only if such mount point
     #corresponds to the current mapping defined by /etc/fstab. (Annoying, but
     #certainly feasible.)
+    # If this directory is already a mount point, return immediately.
+    is_mount_point "${mount_dirname}" and return_success
+
+    # If this directory is not listed by "/etc/fstab", raise an exception.
+    die_unless_mountable_point "${mount_dirname}"
+
     # Mount.
     make_dir_safely         "${mount_dirname}" 
     die_unless_writable_dir "${mount_dirname}"
@@ -295,6 +311,29 @@ mount_point() {
     command mount "${@}"
 }
 
+# void mount_writable_point(
+#    char *mount_option1, char *mount_option2, ..., char *mount_dirname)
+#
+# Mount the device that "/etc/fstab" maps to the passed dirname to that
+# directory writably with the passed options.
+mount_writable_point() {
+    # Localize passed arguments.
+    die_unless_args 'expected optional mount options and one mount dirname'
+    string mount_dirname="${@[-1]}"
+
+    # If this directory is already a writable point, return immediately.
+    is_writable_mount_point "${mount_dirname}" and return_success
+
+    # If this directory is already mounted (and hence read-only, since the prior
+    # test fell through), remount "/boot" read-write; otherwise, mount "/boot"
+    # read-write.
+    if is_mount_point "${mount_dirname}"
+    then mount_point -o remount,rw "${@}"
+    else mount_point -o         rw "${@}"
+    fi
+}
+
+# ....................{ MOUNTERS ~ disks                   }....................
 # void mount_disk(
 #   char *mount_option1, char *mount_option2, ..., char *device_filename) --OR--
 # void mount_disk(
