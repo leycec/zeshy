@@ -244,6 +244,25 @@ get_script_name() {
 
 #FIXME: Add ANSI coloring to uttered messages if on an ANSI-capable terminal.
 #Also, consider prefixing messages under cron with: "["$(date +'%F %T')"].
+
+#FIXME: *BRILLIANT IDEA*. Stack traces are great. But, with longer function
+#implementations, output like:
+#
+#   print_stack_trace: make_and_install_kernel() failed with exit status 1
+#        \_ TRAPZERR() { /root/.zeshy/digest.zwc/make_and_install_kernel: 34 }
+#         \_ make_and_install_kernel() { /bin/zsh: 130 }
+#
+#...isn't really helpful. What is the 34th line of that function excluding
+#comments? Right. There's no easy way to peruse that function's commented
+#implementation and discern just where the fault lies. Hence, a solution:
+#
+#* Add a new "ZESHY_DEBUG" config global. (Think we might have one already, yes?)
+#* If enabled, print_stack_trace() should implicitly with no external effort
+#  append something resembling "which ${funcname[2]}" to its output. That's
+#  closer to what we want, but still incomplete: "which" has no option for
+#  prefixing each line of output with its line number, which is what we need.
+#  I guarantee there's an "awk" script to do it, though. Search us up the fix!
+
 # ....................{ PRINTERS                           }....................
 # For safety, trap functions and functions transitively called by such functions
 # require only Zsh functionality (i.e., no Zeshy-specific syntactic sugar). This
@@ -359,33 +378,40 @@ TRAPINT() {
     # * "${BUFFER}", the interrupted line.
     zle && print -sr -- "${BUFFER}"
     
-    # Continue the default trap handler, as under TRAPZERR(). 
+    # Arcanely uncanny bit-munging. Exit status is always a 1-byte integer.
+    # Non-zero exit status with:
+    #
+    # * The high bit unset signifies a command or function-specific error.
+    # * The high bit set signifies a signal-specific error. All bits excluding
+    #   the high bit signify the signal number.
+    #
+    # Hence, constructing a signal-specific exit status requires merely adding
+    # 128 to the desired signal number. Moreover, Zsh interprets non-zero trap
+    # function return values as the exit status to be returned from running the
+    # default handler for the trap. Since we would like to continue running the
+    # default handler for the trap (SIGINT, in this case), this function returns
+    # a non-zero value. Rather than hard-coding the desired signal number, reuse
+    # the number Zsh passed as the first argument to this function.
     return $(( 128 + ${signal_number} ))
 }
 
 # ....................{ TRAPS ~ errors                     }....................
-# After a command or function returns non-zero exit status but prior to
-# executing the next such command or function:
-#
-# * Execute the ZERR trap, if set.
-# * Execute the TRAPZERR trap function, if defined.
-# * If the failing command or function was itself called from a function:
-#   * Return from that function with that command or function e return value .
-# Terminate the current shell, returning the non-zero exit status of the prior
-# command.
-#
-# The combination of enabling this option and defining TRAPZERR() as below
-# offers a robust alternative to the customary command "set -e", whose
-# default implementation dangerously terminates the current shell on failure.
-setopt err_return
+# Globally enable "setopt ERR_RETURN" by trapping ZERR. Specifically, print a
+# complete stack trace and immediately unwind the call stack on *ANY* command
+# returning non-zero exit status. Such unwind exits all intermediate subshells
+# (e.g., non-interactive Zeshy functions or scripts) to the originating shell
+# (e.g., the interactive Zeshy or Zsh shell transitively responsible for running
+# the failed command).
+# 
+# Unlike "setopt ERR_RETURN", this prints stack traces. Unlike "setopt
+# ERR_EXIT", this merely unwinds the call stack rather than coercively exiting
+# both intermediate subshells *AND* the originating shell.
 
 # int TRAPZERR(int signal_number = SIGZERR)
 #
 # Trap SIGZERR (i.e., signal error, as after Zsh functions or non-Zsh commands
 # returning non-zero exit statuss). This signal is Zsh-specific, as the function
 # name directly implies.
-#
-# This implementation 
 TRAPZERR() {
     # Save the return code of the prior command prior to overwriting this code
     # by printing a stack trace.
@@ -400,21 +426,8 @@ TRAPZERR() {
     else print_stack_trace
     fi
 
-    # Arcanely uncanny bit-munging. Exit status is always a 1-byte integer.
-    # Non-zero exit status with:
-    #
-    # * The high bit unset signifies a command or function-specific error.
-    # * The high bit set signifies a signal-specific error. All bits excluding
-    #   the high bit signify the signal number.
-    #
-    # Hence, constructing a signal-specific exit status requires merely adding
-    # 128 to the desired signal number. Moreover, Zsh interprets non-zero trap
-    # function return values as the exit status to be returned from running the
-    # default handler for the trap. Since we would like to continue running the
-    # default handler for the trap ("err_return", in this case), this function
-    # returns a non-zero value. Rather than hard-code the desired signal number,
-    # recall Zsh passes this number as the first argument to this functions.
-    return $(( 128 + ${signal_number} ))
+    # Mimic "setopt ERR_RETURN". See "man zshoptions" for further details.
+    return ${exit_status}
 }
 
 # void die(char *error_message = '')
@@ -492,6 +505,37 @@ source "${ZESHY_SOURCE_DIR}/digest"
 setup_zeshy
 
 #FIXME: Obsolete.
+    # Continue the default trap handler, as under TRAPZERR(). 
+
+# After any command returns non-zero exit status but prior to executing the next
+# such command, instruct Zsh to:
+#
+# * Execute the TRAPZERR() trap function.
+# * Unwind the call stack, exiting all intermediate shells, back to the
+#   originating shell -- typically, the interactive shell from which the failing
+#   command was transitively run.
+# * If the failing command was run directly by some Zsh function:
+#   * Return from that function with that command's non-zero exit status.
+# Terminate the current shell, returning the non-zero exit status of the prior
+# command.
+#
+# The combination of enabling this option and defining TRAPZERR() as below
+# offers a robust alternative to the customary command "set -e", whose
+# default implementation dangerously terminates the current shell on failure.
+#setopt err_return
+
+# * Execute the ZERR trap, if set.
+# * Execute the TRAPZERR trap function, if defined.
+# * If the failing command or function was itself called from a function:
+#   * Return from that function with that command or function e return value .
+# Terminate the current shell, returning the non-zero exit status of the prior
+# command.
+#
+# The combination of enabling this option and defining TRAPZERR() as below
+# offers a robust alternative to the customary command "set -e", whose
+# default implementation dangerously terminates the current shell on failure.
+#setopt err_return
+
     #FIXME: Hmm. If called from a pipe (e.g., "false or die "false!"), we really
     #want to use "${pipestatus[-2]}" here rather than "${?}".
 #   if (( # == 0 ))
