@@ -206,12 +206,50 @@ is_interactive() {
     [[ -o interactive ]]
 }
 
-# ....................{ CALL STACK                         }....................
+# ....................{ GETTERS                            }....................
+# char *get_script_name(void)
+#
+# Get the script name for the current script. This is a string succinctly
+# describing the script under execution, typically of one to two words.
+#
+# Scripts may safely redefine this function to return another name; in this
+# case, scripts called by the script redefining this function will still call
+# this original definition (since functions are not inherited via script
+# calls).
+get_script_name() {
+    (( # == 0 )) || die 'expected no arguments'
+
+    # If the caller set a non-empty ${ZESHY_SCRIPT_NAME}, return that name.
+    if [[ -n  "${ZESHY_SCRIPT_NAME-}" ]]; then
+        print "${ZESHY_SCRIPT_NAME}"
+    # If the current process is an interactive shell, then return the name of
+    # the function that called this function excluding all intermediary I/O-
+    # and error handling-specific function calls. Typically, that function is
+    # the function that called the function that called this function (i.e.,
+    # the function two calls earlier in the function callstack). Insert magical
+    # handwaving here.
+    elif (( ${#funcstack} > 0 )); then
+#   elif [[ "${#funcstack}" -gt 0 &&
+#            "${funcstack[-1]}" != (get_script_name|utter|mutter|curse) ]]; then
+        # If this name is an absolute path, return that path's basename.
+        if [[ "${funcstack[-1]}" == /* ]]
+        then print "${funcstack[-1]:t}"
+        # Otherwise, return this name as is.
+        else print "${funcstack[-1]}"
+        fi
+    # Otherwise, return the default name.
+    else print 'zeshy'
+    fi
+}
+
+#FIXME: Add ANSI coloring to uttered messages if on an ANSI-capable terminal.
+#Also, consider prefixing messages under cron with: "["$(date +'%F %T')"].
+# ....................{ PRINTERS                           }....................
 # For safety, trap functions and functions transitively called by such functions
 # require only Zsh functionality (i.e., no Zeshy-specific syntactic sugar). This
 # comprises all functions defined up to and including the "TRAPS" section.
 
-# char *print_stack_trace(void)
+# char *print_stack_trace(char *message = "")
 #
 # Print a stack trace of the current call stack (i.e., the sequence of all stack
 # frames, excluding the call to this function). Each such frame signifies a
@@ -219,11 +257,12 @@ is_interactive() {
 # stack of such frames signifies a stack trace of the complete code path from
 # the most to least recently called function, source file, or evaluated "eval".
 print_stack_trace() {
-    (( # == 0 )) || die 'expected no arguments'
- 
+    # Localize passed arguments.
+    (( # <= 1 )) || die 'expected at most one optional message'
     integer funcstack_size=${#funcstack} i fileline
-    local ZESHY_SCRIPT_NAME='print_stack_trace'\
-        frame_prefix='    \\_' funcname filename
+    local funcname filename\
+        frame_prefix='    \\_'\
+        ZESHY_SCRIPT_NAME='print_stack_trace'\
 
     # Omit the current function call by starting from the second stack frame.
     # If there exists no such frame, curse a warning.
@@ -232,9 +271,9 @@ print_stack_trace() {
         return ${ZESHY_FAILURE_CODE}
     fi
 
-    # Print a prefixing empty header.
+    # Print a prefixing header with the passed message.
     print
-    utter
+    utter "${1:-}"
 
     # Print the current call stack.
     for (( i = 2; i <= funcstack_size; i++ )); do
@@ -255,10 +294,6 @@ print_stack_trace() {
         frame_prefix=" ${frame_prefix}"
     done
 }
-
-# ....................{ MESSAGES                           }....................
-#FIXME: Add ANSI coloring to uttered messages if on an ANSI-capable terminal.
-#Also, consider prefixing messages under cron with: "["$(date +'%F %T')"].
 
 # void utter(char *message = '')
 #
@@ -305,82 +340,12 @@ curse() {
     [[ -n "${ZESHY_IS_CRONJOB}" ]] && logger -p cron.err -- "${message}"
 }
 
-# char *get_script_name(void)
-#
-# Get the script name for the current script. This is a string succinctly
-# describing the script under execution, typically of one to two words.
-#
-# Scripts may safely redefine this function to return another name; in this
-# case, scripts called by the script redefining this function will still call
-# this original definition (since functions are not inherited via script
-# calls).
-get_script_name() {
-    (( # == 0 )) || die 'expected no arguments'
-
-    # If the caller set a non-empty ${ZESHY_SCRIPT_NAME}, return that name.
-    if [[ -n  "${ZESHY_SCRIPT_NAME-}" ]]; then
-        print "${ZESHY_SCRIPT_NAME}"
-    # If the current process is an interactive shell, then return the name of
-    # the function that called this function excluding all intermediary I/O-
-    # and error handling-specific function calls. Typically, that function is
-    # the function that called the function that called this function (i.e.,
-    # the function two calls earlier in the function callstack). Insert magical
-    # handwaving here.
-    elif (( ${#funcstack} > 0 )); then
-#   elif [[ "${#funcstack}" -gt 0 &&
-#            "${funcstack[-1]}" != (get_script_name|utter|mutter|curse) ]]; then
-        # If this name is an absolute path, return that path's basename.
-        if [[ "${funcstack[-1]}" == /* ]]
-        then print "${funcstack[-1]:t}"
-        # Otherwise, return this name as is.
-        else print "${funcstack[-1]}"
-        fi
-    # Otherwise, return the default name.
-    else print 'zeshy'
-    fi
-}
-
-# ....................{ EXCEPTIONS                         }....................
-# void die(char *error_message = '')
-#
-# Print the passed error message and a stack trace to standard error, then exit
-# the current shell with an error exit status.
-die() {
-    # If the exit status of the prior command signified an error, exit with that
-    # status; otherwise, exit with the normal error status (i.e., 1).
-    integer exit_status=${?}
-    (( ${exit_status} == ${ZESHY_SUCCESS_CODE} )) &&
-       exit_status=${ZESHY_FAILURE_CODE}
-    
-    # Print the passed error message and a complete stack trace.
-    curse "${@}"
-    print_stack_trace
-
-    # Die with the prior return code.
-    die_with_exit_status ${exit_status}
-}
-
-# void die_with_exit_status(int exit_status = 1)
-#
-# Exit the currently executed script or function with the passed return code.
-die_with_exit_status() {
-#   for ((i = 1; i <= ${#funcstack}; i++)) { print "${i}: ${funcstack[${i}]}" }
-#   if is_interactive; then
-#   then print 'throwing exception'; throw ZeshyException
-
-    # If the current context is a function called from an interactive and/or
-    # login shell, unwind the call stack; otherwise, kill the current process.
-    if is_interactive
-    then throw ZeshyException
-    else exit ${1:-${ZESHY_FAILURE_CODE}}
-    fi
-}
-
 # ....................{ TRAPS                              }....................
 # int TRAPINT(int signal_number = SIGINT)
 #
 # Trap SIGINT (i.e., signal interrupt, as after a user-driven <Ctrl-C> event).
 TRAPINT() {
+    integer signal_number=${1}
     print_stack_trace
 
     # Store the interrupted line in the history. By default, Zsh omits such
@@ -394,50 +359,122 @@ TRAPINT() {
     # * "${BUFFER}", the interrupted line.
     zle && print -sr -- "${BUFFER}"
     
-    # Arcane bit-munging. Exit codes are of size "char" (i.e., a single byte).
-    # Non-zero exit statuss with high bit set signify signal-driven fatal errors
-    # and with high bit unset signify command-specific fatal errors. In the
-    # former case, all bits excluding the high bit signify the signal number.
-    # Hence, signal-driven exit statuss are constructable by adding 128 to the
-    # signal number.
-    #
-    # SIGINT signifies fatal error of signal number 2. Rather than hard-code
-    # that constant, we note:
-    #
-    # * Zsh passes the signal number as the first argument to trap functions.
-    # * Zsh continues handling trap function-trapped signals as if untrapped
-    #   when receiving non-zero exit statuss from such functions. In such cases,
-    #   Zsh returns this exit status as the signal result to calling processes.
-    # 
-    # Since we prefer Zsh handle the actual interrupt as such with the same
-    # exit status as it would customarily return, the result follows.
-    return $(( 128+${1} ))
+    # Continue the default trap handler, as under TRAPZERR(). 
+    return $(( 128 + ${signal_number} ))
 }
+
+# ....................{ TRAPS ~ errors                     }....................
+# After a command or function returns non-zero exit status but prior to
+# executing the next such command or function:
+#
+# * Execute the ZERR trap, if set.
+# * Execute the TRAPZERR trap function, if defined.
+# * If the failing command or function was itself called from a function:
+#   * Return from that function with that command or function e return value .
+# Terminate the current shell, returning the non-zero exit status of the prior
+# command.
+#
+# The combination of enabling this option and defining TRAPZERR() as below
+# offers a robust alternative to the customary command "set -e", whose
+# default implementation dangerously terminates the current shell on failure.
+setopt err_return
 
 # int TRAPZERR(int signal_number = SIGZERR)
 #
 # Trap SIGZERR (i.e., signal error, as after Zsh functions or non-Zsh commands
 # returning non-zero exit statuss). This signal is Zsh-specific, as the function
 # name directly implies.
+#
+# This implementation 
 TRAPZERR() {
     # Save the return code of the prior command prior to overwriting this code
     # by printing a stack trace.
-    integer exit_status=${?}
-    print_stack_trace
-#   for ((i = 1; i <= ${#funcstack}; i++)) { print "${i}: ${funcstack[${i}]}" }
+    integer signal_number=${1} exit_status=${?}
 
-    # Terminate the current shell, returning the non-zero exit status of the prior
-    # command. This effectively enables "set -e" (i.e., the ERR_EXIT option,
-    # terminating the current shell on SIGZERR signals).
-#   eval 'throw ZeshyException'; return ${exit_status}
-    die_with_exit_status ${exit_status}
+    # Print a complete stack trace. If some function called this function (i.e.,
+    # this function was not called directly from the prompt), prefix such trace
+    # with that function's name and exit status; otherwise, no such prefix.
+    if (( ${#funcstack} >= 2 ))
+    then print_stack_trace\
+        "${funcstack[2]}() failed with exit status ${exit_status}"
+    else print_stack_trace
+    fi
+
+    # Arcanely uncanny bit-munging. Exit status is always a 1-byte integer.
+    # Non-zero exit status with:
+    #
+    # * The high bit unset signifies a command or function-specific error.
+    # * The high bit set signifies a signal-specific error. All bits excluding
+    #   the high bit signify the signal number.
+    #
+    # Hence, constructing a signal-specific exit status requires merely adding
+    # 128 to the desired signal number. Moreover, Zsh interprets non-zero trap
+    # function return values as the exit status to be returned from running the
+    # default handler for the trap. Since we would like to continue running the
+    # default handler for the trap ("err_return", in this case), this function
+    # returns a non-zero value. Rather than hard-code the desired signal number,
+    # recall Zsh passes this number as the first argument to this functions.
+    return $(( 128 + ${signal_number} ))
 }
 
-#FIXME: Zsh fails to trigger ZERR traps from within the sourcing of zprofile and
-#zshrc. I have no idea why. Since the following line does nothing to help,
-#however, I can only assume this is somehow the intended behavior. Nonetheless,
-#file a mailing list comment.
-#trap TRAPZERR ZERR
+# void die(char *error_message = '')
+#
+# Print the passed error message and a stack trace to standard error, then exit
+# the current shell with an error exit status.
+die() {
+    # Exit status of the prior command. Zsh defines "pipestatus" to be a global
+    # list with elements the return values of each subcommand of the prior pipe
+    # command or of the prior command if not a pipe command. Conversely, Zsh
+    # defines "?" to be a global integer with the return value of the prior
+    # command. Since the former subsumes the latter *AND* the latter fails to
+    # provide the return value of the prior command when a subcommand of a pipe
+    # command, we defer to the latter.
+    #
+    # For example, consider:
+    #
+    #     # Define helper functions.
+    #     >>> pipe_status() { print ${pipestatus[-1]} }
+    #     >>> exit_status() { print $? }
+    #
+    #     # Show "pipestatus" to return the required values.
+    #     >>> true; pipe_status  # this works...
+    #     0
+    #     >>> true; true | false || pipe_status  # ...and so does this.
+    #     1
+    #
+    #     # Show "?" to *NOT* return the required values.
+    #     >>> true; exit_status  # this works...
+    #     0
+    #     >>> true; true | false || exit_status  # ...but this doesn't.
+    #     0
+    integer exit_status="${pipestatus[-1]}"
+
+    # If the prior command succeeded, coerce the exit status into an error.
+    (( ${exit_status} == ${ZESHY_SUCCESS_CODE} )) &&
+       exit_status=${ZESHY_FAILURE_CODE}
+    
+    # Print the passed error message.
+    curse "${@}"
+    
+    # Print a complete stack trace.
+    if (( ${#funcstack} >= 2 ))
+    then print_stack_trace\
+        "${funcstack[2]}() failed with exit status ${exit_status}"
+    else print_stack_trace
+    fi
+
+    # If called under an interactive shell, unwind the call stack to return the
+    # current user to an interactive prompt; otherwise, exit this shell script.
+    #
+    # Note that the simpler command "return ${exit_status}" implicitly invokes
+    # the "err_return" and TRAPZERR() handlers and hence (ultimately) performs
+    # the same logic, but that such invocation produces less readable stack
+    # traces. Consequently, we prefer the present implementation.
+    if is_interactive
+    then throw ZeshyException
+    else exit ${exit_status}
+    fi
+}
 
 # ....................{ BOOTSTRAP                          }....................
 # Bootstrap Zeshy by loading core aliases, globals, and autoloads, the minimal
@@ -455,6 +492,77 @@ source "${ZESHY_SOURCE_DIR}/digest"
 setup_zeshy
 
 #FIXME: Obsolete.
+    #FIXME: Hmm. If called from a pipe (e.g., "false or die "false!"), we really
+    #want to use "${pipestatus[-2]}" here rather than "${?}".
+#   if (( # == 0 ))
+#   then utter
+#   else utter "${1:-}"
+#   fi
+
+    #FIXME: Truncate.
+    # Arcane bit-munging. Exit codes are of size "char" (i.e., a single byte).
+    # Non-zero exit statuss with high bit set signify signal-driven fatal errors
+    # and with high bit unset signify command-specific fatal errors. In the
+    # former case, all bits excluding the high bit signify the signal number.
+    # Hence, signal-driven exit statuss are constructable by adding 128 to the
+    # signal number.
+    #
+    # SIGINT signifies fatal error of signal number 2. Rather than hard-code
+    # that constant, we note:
+    #
+    # * Zsh passes the signal number as the first argument to trap functions.
+    # * Zsh continues handling trap function-trapped signals as if untrapped
+    #   when receiving non-zero exit statuss from such functions. In such cases,
+    #   Zsh returns this exit status as the signal result to calling processes.
+    # 
+    # Since we prefer Zsh handle the actual interrupt as such with the same
+    # exit status as it would customarily return, the result follows.
+#   return ${exit_status}
+#   return $(( ${exit_status} + 128 + ${signal_number} ))
+
+    # Die with the prior return code.
+#   die_with_exit_status ${exit_status}
+
+# void die_with_exit_status(int exit_status = 1)
+#
+# Exit the currently executed script or function with the passed return code.
+#die_with_exit_status() {
+#   for ((i = 1; i <= ${#funcstack}; i++)) { print "${i}: ${funcstack[${i}]}" }
+#   if is_interactive; then
+#   then print 'throwing exception'; throw ZeshyException
+
+    # If the current context is a function called from an interactive and/or
+    # login shell, unwind the call stack; otherwise, kill the current process.
+#    if is_interactive
+#    then throw ZeshyException
+#    else exit ${1:-${ZESHY_FAILURE_CODE}}
+#    fi
+#    print 'still here!'
+#}
+
+#set -e
+
+#FIXME: Zsh fails to trigger ZERR traps from within the sourcing of zprofile and
+#zshrc. I have no idea why. Since the following line does nothing to help,
+#however, I can only assume this is somehow the intended behavior. Nonetheless,
+#file a mailing list comment.
+#trap TRAPZERR ZERR
+#trap 'print_stack_trace; throw ZeshyException' ZERR
+
+#   if is_interactive
+#   then return $(( ${exit_status} + 128 + ${signal_number} ))
+#   else exit       ${exit_status}
+#   fi
+ #   throw ZeshyException
+#   print 'still here...'
+#   for ((i = 1; i <= ${#funcstack}; i++)) { print "${i}: ${funcstack[${i}]}" }
+
+    # Terminate the current shell, returning the non-zero exit status of the prior
+    # command. This effectively enables "set -e" (i.e., the ERR_EXIT option,
+    # terminating the current shell on SIGZERR signals).
+#   eval 'throw ZeshyException'; return ${exit_status}
+#   die_with_exit_status ${exit_status}
+
 # * Uhm; how did I never see this? Zsh supports loop syntax resembling:
 #   for d (../**/*) {
 #   }
