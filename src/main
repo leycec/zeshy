@@ -221,7 +221,7 @@ get_script_name() {
 
     # If the caller set a non-empty ${ZESHY_SCRIPT_NAME}, return that name.
     if [[ -n  "${ZESHY_SCRIPT_NAME-}" ]]; then
-        print "${ZESHY_SCRIPT_NAME}"
+        print -- "${ZESHY_SCRIPT_NAME}"
     # If the current process is an interactive shell, then return the name of
     # the function that called this function excluding all intermediary I/O-
     # and error handling-specific function calls. Typically, that function is
@@ -229,13 +229,11 @@ get_script_name() {
     # the function two calls earlier in the function callstack). Insert magical
     # handwaving here.
     elif (( ${#funcstack} > 0 )); then
-#   elif [[ "${#funcstack}" -gt 0 &&
-#            "${funcstack[-1]}" != (get_script_name|utter|mutter|curse) ]]; then
         # If this name is an absolute path, return that path's basename.
         if [[ "${funcstack[-1]}" == /* ]]
-        then print "${funcstack[-1]:t}"
+        then print -- "${funcstack[-1]:t}"
         # Otherwise, return this name as is.
-        else print "${funcstack[-1]}"
+        else print -- "${funcstack[-1]}"
         fi
     # Otherwise, return the default name.
     else print 'zeshy'
@@ -244,6 +242,40 @@ get_script_name() {
 
 #FIXME: Add ANSI coloring to uttered messages if on an ANSI-capable terminal.
 #Also, consider prefixing messages under cron with: "["$(date +'%F %T')"].
+
+#FIXME: *WAIT*. We only need to define a placeholder utter() and curse() here.
+#The real utter() and curse() implementations should be subsequently defined by
+#the currently enabled theme. Make it so with a sprinkle of ANSI excellence.
+
+# ....................{ PRINTERS                           }....................
+# For safety, trap functions and functions transitively called by such functions
+# require only Zsh functionality (i.e., no Zeshy-specific syntactic sugar). This
+# comprises all functions defined up to and including the "TRAPS" section.
+
+# void utter(char *message = '')
+#
+# Print the passed message suffixed by a trailing newline to the notice stream
+# of the cron logging facility if a cron-job and to the standard output stream
+# otherwise.
+utter() {
+    local message; message="$(get_script_name): ${@}"
+    print -- "${message}"
+}
+
+# void curse(char *message = '')
+#
+# Echo the passed message to the standard error stream. Specifically:
+#
+# * If a cronjob, echo to the error stream of the cron logging facility.
+# * Otherwise, to "stderr".
+curse() {
+    # Print this message. Do *NOT* call print() as "print -u2 -- "${message}".
+    # While that appears superficially identical to the following call, passing
+    # the desired file descriptor as an argument fails to preserve interleaving
+    # with prior commands printing to file descriptor 1 (i.e., standard out).
+    local message; message="$(get_script_name): ${@}"
+    print -- "${message}" 2>&1
+}
 
 #FIXME: *BRILLIANT IDEA*. Stack traces are great. But, with longer function
 #implementations, output like:
@@ -263,100 +295,108 @@ get_script_name() {
 #  prefixing each line of output with its line number, which is what we need.
 #  I guarantee there's an "awk" script to do it, though. Search us up the fix!
 
-# ....................{ PRINTERS                           }....................
-# For safety, trap functions and functions transitively called by such functions
-# require only Zsh functionality (i.e., no Zeshy-specific syntactic sugar). This
-# comprises all functions defined up to and including the "TRAPS" section.
-
+# ....................{ PRINTERS ~ stack                   }....................
 # char *print_stack_trace(char *message = "")
 #
-# Print a stack trace of the current call stack (i.e., the sequence of all stack
-# frames, excluding the call to this function). Each such frame signifies a
-# previously called function, sourced file, or evaluated "eval". Each call
-# stack of such frames signifies a stack trace of the complete code path from
-# the most to least recently called function, source file, or evaluated "eval".
+# Print to standard error a trace of the current call stack of all stack frames
+# (i.e., previously called functions, sourced files, and "eval" evaluations),
+# excluding the stack frame of the call to this function.
+#
+# Printing to standard error rather than output ensures that stack traces
+# printed within command substitution (e.g., by thrown exceptions and/or errors)
+# are not hidden by such substitution: e.g.,
+#
+#     # Assuming neither "/spider" or "/murphy" exist, the following command
+#     # substitution internally throws an exception printing a stack trace.
+#     >>> string first_file; first_file="$(get_first_file /spider /murphy)"
 print_stack_trace() {
     # Localize passed arguments.
     (( # <= 1 )) || die 'expected at most one optional message'
-    integer funcstack_size=${#funcstack} i fileline
-    local funcname filename\
+    integer i\
+        fileline fileline_first\
+        funcstack_size=${#funcstack}
+    local filename\
+        funcname funcname_first\
         frame_prefix='    \\_'\
         ZESHY_SCRIPT_NAME='print_stack_trace'\
 
     # Omit the current function call by starting from the second stack frame.
-    # If there exists no such frame, curse a warning.
-    if (( funcstack_size == 0 )); then
+    # If there exists no such frame, return with failure.
+    (( funcstack_size >= 2 )) || {
         curse 'call stack empty'
-        return ${ZESHY_FAILURE_CODE}
-    fi
+        return_failure
+    }
 
     # Print a prefixing header with the passed message.
-    print
-    utter "${1:-}"
+    print 2>&1
+    curse "${1:-}"
 
     # Print the current call stack.
-    for (( i = 2; i <= funcstack_size; i++ )); do
+    for (( i = 2; i <= funcstack_size; i++ )) {
         # Split the current stack frame's funcfiletrace entry on the last colon
-        # in that entry into that frame's filename and line number, thus
+        # in that entry into this frame's filename and line number, thus
         # accounting for possible colons in filenames (e.g., from "colon:blow:7"
         # to filename "colon:blow" and line number 7).
         funcname="${funcstack[${i}]}"
         filename="${funcfiletrace[${i}]%:*}"
         fileline="${funcfiletrace[${i}]##*:}"
 
-        # Print the current stack frame.
-#       if "${funcstack[${i}]}" == "${funcfiletrace[${i}]}"
-        print "${frame_prefix} ${funcname}() { ${filename}: ${fileline} }"
-#       print "${frame_prefix} ${funcname}() {${filename}:${fileline}}"
+        # If this is the most recent stack frame, recall the name of the second-
+        # most recent stack frame that called that frame and line number of that
+        # call for subsequent pretty printing.
+        (( i == 2 )) && fileline_first="${fileline}"
+        (( i == 3 )) && funcname_first="${funcname}"
+
+        # Print the current stack frame to standard error.
+        print -- "${frame_prefix} ${funcname}() { ${filename}: ${fileline} }" 2>&1
 
         # Indent the next stack frame one space to the right.
         frame_prefix=" ${frame_prefix}"
-    done
+    }
+
+    # If the most recent stack frame signifies an existing function, print that
+    # function's definition to standard error as line-numbered code. Since line
+    # numbers in stack frames start from the first line of such definition while
+    # the default printer for such definitions starts from the prior line
+    # declaring the function name, do *NOT* number the first printed line.
+    if [[ -n "${ZESHY_IS_DEVELOPMENT-}" && -n "${funcname_first}" &&\
+          "$(whence -w -- "${funcname_first}")" == *': function' ]]; then
+        print 2>&1
+        curse "${funcname_first}() failed on line ${fileline_first}."
+        whence -f -- "${funcname_first}" | awk -vNRBAD=${fileline_first} '
+# If the function name, print a hyphen in place of the current line number
+# followed by the name.
+NR == 1 {
+    printf("%6s   %s\n", "-", $0)
 }
-
-# void utter(char *message = '')
-#
-# Print the passed message suffixed by a trailing newline to the notice stream
-# of the cron logging facility if a cron-job and to the standard output stream
-# otherwise.
-utter() {
-    # Message to print. (Yes, its declaration and definition *MUST* be separate.
-    # I'm not entirely clear why, but declaring and defining the message in the
-    # same command induces inexplicably, undebuggably subtle errors.)
-#   print "script name: $(get_script_name)"
-    local message; message="$(get_script_name): ${@}"
-    print -- "${message}"
-    [[ -n "${ZESHY_IS_CRONJOB}" ]] && logger -p cron.notice -- "${message}"
+# If any line other than the erroneous line, print the current line number
+# followed by the line. (Due to the prefixing function name declaration, the
+# current line number is one larger than expected. Subtract one for comparison.)
+NR > 1 && NR-1 != NRBAD {
+    # If this line is "}" and hence the end of this function definition, print
+    # hyphens in place of the current line number followed by the "}".
+    if ($0 == "}") {
+        NREND=NR
+        gsub(/./, "-", NREND)
+        printf("%6s   }\n", NREND)
+    }
+    else {
+        printf("%6d   %s\n", NR-1, $0)
+    }
 }
-
-# void mutter(char *message = '')
-#
-# Print the passed message suffixed by no trailing newline to the notice stream
-# of the cron logging facility if a cron-job and to the standard output stream
-# otherwise.
-mutter() {
-    # Message to print. (Yes, its declaration and definition must be separate.)
-    local message; message="$(get_script_name): ${@}"
-    print -n -- "${message}"
-    [[ -n "${ZESHY_IS_CRONJOB}" ]] && logger -p cron.notice -- "${message}"
-}
-
-# void curse(char *message = '')
-#
-# Echo the passed message to the standard error stream. Specifically:
-#
-# * If a cronjob, echo to the error stream of the cron logging facility.
-# * Otherwise, to "stderr".
-curse() {
-    # Message to print. (Yes, its declaration and definition must be separate.)
-    local message; message="$(get_script_name): ${@}"
-
-    # Print this message. Do *NOT* call print() as "print -u2 -- "${message}".
-    # While that appears superficially identical to the following call, passing
-    # the desired file descriptor as an argument fails to preserve interleaving
-    # with prior commands printing to file descriptor 1 (i.e., standard out).
-    print -- "${message}" 2>&1
-    [[ -n "${ZESHY_IS_CRONJOB}" ]] && logger -p cron.err -- "${message}"
+# If the erroneous line, print the current line number prefixed and suffixed by
+# pleasing ASCII arrows. (What? YOU CAN DO BETTER!?)
+NR-1 == NRBAD {
+    # Number of digits in the current line number.
+    NRLEN = length(NR-1);
+         if (NRLEN==1) {NRNOW = " <-~ " NR-1}
+    else if (NRLEN==2) {NRNOW = "<-~ " NR-1}
+    else if (NRLEN==3) {NRNOW = "<- " NR-1}
+    else if (NRLEN==4) {NRNOW = "< " NR-1}  # if true, your function is horrid
+    else               {NRNOW = NR-1}       # if true, your function is OMFG
+    printf("%s ~->   %s\n", NRNOW, $0)
+}' 2>&1
+    fi
 }
 
 # ....................{ TRAPS                              }....................
@@ -422,7 +462,7 @@ TRAPZERR() {
     # with that function's name and exit status; otherwise, no such prefix.
     if (( ${#funcstack} >= 2 ))
     then print_stack_trace\
-        "${funcstack[2]}() failed with exit status ${exit_status}"
+        "${funcstack[2]}() failed with exit status ${exit_status}."
     else print_stack_trace
     fi
 
@@ -441,9 +481,7 @@ die() {
     # defines "?" to be a global integer with the return value of the prior
     # command. Since the former subsumes the latter *AND* the latter fails to
     # provide the return value of the prior command when a subcommand of a pipe
-    # command, we defer to the latter.
-    #
-    # For example, consider:
+    # command, we defer to the former. For example, consider:
     #
     #     # Define helper functions.
     #     >>> pipe_status() { print ${pipestatus[-1]} }
@@ -460,7 +498,7 @@ die() {
     #     0
     #     >>> true; true | false || exit_status  # ...but this doesn't.
     #     0
-    integer exit_status="${pipestatus[-1]}"
+    integer exit_status=${pipestatus[-1]}
 
     # If the prior command succeeded, coerce the exit status into an error.
     (( ${exit_status} == ${ZESHY_SUCCESS_CODE} )) &&
@@ -472,7 +510,7 @@ die() {
     # Print a complete stack trace.
     if (( ${#funcstack} >= 2 ))
     then print_stack_trace\
-        "${funcstack[2]}() failed with exit status ${exit_status}"
+        "${funcstack[2]}() failed with exit status ${exit_status}."
     else print_stack_trace
     fi
 
@@ -505,6 +543,28 @@ source "${ZESHY_SOURCE_DIR}/digest"
 setup_zeshy
 
 #FIXME: Obsolete.
+#       (( i == 3 )) && {
+#           funcname_first="${funcname}"
+#           fileline_first="${fileline}"
+#       }
+    # Message to print. (Yes, its declaration and definition must be separate.)
+    # Message to print. (Yes, its declaration and definition *MUST* be separate.
+    # I'm not entirely clear why, but declaring and defining the message in the
+    # same command induces inexplicably, undebuggably subtle errors.)
+#   print "script name: $(get_script_name)"
+#   [[ -n "${ZESHY_IS_CRONJOB}" ]] && logger -p cron.notice -- "${message}"
+#   [[ -n "${ZESHY_IS_CRONJOB}" ]] && logger -p cron.err -- "${message}"
+#   elif [[ "${#funcstack}" -gt 0 &&
+#            "${funcstack[-1]}" != (get_script_name|utter|mutter|curse) ]]; then
+
+#       if "${funcstack[${i}]}" == "${funcfiletrace[${i}]}"
+#       print "${frame_prefix} ${funcname}() {${filename}:${fileline}}"
+
+# This
+# Each such frame signifies a previously called function, sourced file, or evaluated "eval". Each call
+# stack of such frames signifies a stack trace of the complete code path from
+# the most to least recently called function, source file, or evaluated "eval".
+
     # Continue the default trap handler, as under TRAPZERR(). 
 
 # After any command returns non-zero exit status but prior to executing the next
