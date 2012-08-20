@@ -16,19 +16,67 @@
 # * Provide a glob-specific equivalent to the get_*match() family of functions.
 #   The (M) flag to #- and %-style matches appears to support this, if crudely.
 
+#FIXME: We really want to eliminate the *_multiline() functions. Nice idea, but
+#there are simply too many useful permutations (e.g., multiline_caseless,
+#multiline_extended). Rather, use a similar mechanism as the
+#get_pcre_match_count() function whereby options are passed after all other
+#parameters. (Somewhat awkward, but... *shrug*)
+
 # ....................{ GETTERS                            }....................
-# int get_match_count(...)
+# int get_pcre_match_count(
+#   char *string, char *pcre, char *pcre_options1, char *pcre_options2, ...)
+#
+# Get the number of substrings in the passed string matching the passed PCRE
+# with the passed PCRE options (see "man zshmodules/pcre_compile"): e.g.,
+#
+#     >>> get_pcre_match_count 'anthropocene tropes' '
+#     ...   # This is an extended regular expression matching "ropo" and "rope".
+#     ...   rop[aeiou]' -x
+#     2
+get_pcre_match_count() {
+    # Localize passed arguments.
+    die_unless_two_or_three_args\
+        'expected one string, one PCRE, and optional options'
+    string text="${1}" pcre="${2}" 
+    shift_two_args
+    list pcre_options; pcre_options=( "${@}" )
+
+    # If either the passed string or PCRE is empty, return 0.
+    { is_empty "${text}" or is_empty "${pcre}" } and return_integer 0
+
+    # Compile the passed PCRE for optimum matching with the passed options.
+    pcre_compile "${pcre_options[@]}" -- "${pcre}"
+    pcre_study
+
+    # Count with brute-force iteration. While Zsh offers no flags or
+    # functions for optimizing counting, iterating a counter while matching
+    # until no matches remain yields the number of matches. Dismantled, this is:
+    #
+    # * "ZPCRE_OP='0 0'", initializing a Zsh global tracking the first and last
+    #   0-based byte indices of the currently matched substring in ${text}.
+    # * "pcre_match", matching the next substring given:
+    #   * "-b", tracking indices in the ${ZPCRE_OP} global.
+    #   * "-n", starting matching at the passed string index:
+    #     * "${ZPCRE_OP[(w)2]}", expanding to the byte immediately following the
+    #       last byte index of the previously matched substring.
+    integer pcre_match_count=0
+    global_string ZPCRE_OP='0 0'
+    while pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}"; do
+        (( ++pcre_match_count ))
+    done
+    return_integer ${pcre_match_count}
+}
+
+#FIXME: Shift to Zeshy Grep. Also, the implementation is pretty suck. Stop
+#using "--pcre-regexp" and just use the "ZESHY_GREP_OPTIONS" default.
+# int get_grep_match_count(...)
 #
 # Return the number of matches in the passed string. Among other uses, this
 # function counts occurrences of characters and substrings in strings: e.g.,
 #
-#     >>> get_number_of_matches 'rop[aeiou]' 'anthropocene tropes'
+#     >>> get_number_of_matches 
 #     2
-#
-# See also the get_number_of_glob_matches() function, which behaves similarly
-# but less efficiently -- matching via multiple glob rather than one regular
-# expression.
-get_match_count() {
+get_grep_match_count() {
     die_unless_at_least_two_args\
         'expected at least one regular expression and one string'
     string regex="${1}" string="${2}" string_newlined
@@ -53,10 +101,9 @@ get_match_count() {
     # and hence the number of matches. (Yeth, this sucketh mightily.)
 #   print "sed expression: s/${(q)regex}/${(q)regex}\n/g"
     string_newlined="$(print "${string}" | sed --regexp-extended "s~(${regex})~\1\n~g")"
-    die_unless_ok "string \"${string}\" or regular expression \"${regex}\" malformed"
+#   die_unless_ok "string \"${string}\" or regular expression \"${regex}\" malformed"
 #   print "string_newlined: ${string_newlined}"
 
-    #FIXME: This is horrible. IT'S ALL HORRIBLE!
     # If "sed" did nothing, then neither should we.
     if is "${string}" == "${string_newlined}" si
     then print 0
@@ -64,9 +111,26 @@ get_match_count() {
     fi
 }
 
+# ....................{ GETTERS ~ lines                    }....................
+# int get_line_count_matching_pcre(char *string, char *pcre)
+#
+# Get the number of lines in the passed string matching the passed multiline
+# PCRE (i.e., such that "^" and "$" also match newlines).
+get_line_count_matching_pcre() {
+    # If the string was passed to this function from piped standard input, then
+    # die_unless_two_args() erroneously reversed the argument order. Reverse it
+    # back. Otherwise, we're good to go.
+    die_unless_two_args 'expected one string and one PCRE'
+    if is_piped_input
+    then get_pcre_match_count "${2}" "${1}" -m
+    else get_pcre_match_count "${@}" -m
+    fi
+}
+
+#FIXME: This is uniformly terrible, any way you dice it. Slice this apart.
 # char *get_matching_lines(...)
 #
-# Return all lines matching the passed regex. Unlike most Zeshy matching
+# Get all lines matching the passed regex. Unlike most Zeshy matching
 # functions, this function uses "grep" rather than the "zsh/pcre" module as the
 # latter provides no efficient means of obtaining non-overlapping matches.
 #
@@ -76,16 +140,6 @@ get_matching_lines() {
         'expected at least one regular expression and one string'
 #   local regexp="${1}" string="${2}"
     utter_raw "${2}" | grep --perl-regexp "${1}"
-}
-
-# int get_matching_lines_count(...)
-#
-# Return the number of lines matching the passed regex. See the
-# get_matching_lines() function for caveats.
-get_matching_lines_count() {
-    die_unless_at_least_two_args\
-        'expected at least one regular expression and one string'
-    utter_raw "${2}" | grep --perl-regexp --count "${1}"
 }
 
 # ....................{ MATCHES                            }....................
@@ -223,6 +277,47 @@ match_pcre_first_line() {
 }
 
 #FIXME: Obsolete.
+#   print "arg1: ${1}\narg2: ${2}"
+
+# int get_matching_lines_count(...)
+#
+# Return the number of lines matching the passed regex. See the
+# get_matching_lines() function for caveats.
+#get_matching_lines_count() {
+#    die_unless_at_least_two_args\
+#        'expected at least one regular expression and one string'
+##    utter_raw "${2}" | grep --perl-regexp --count "${1}"
+#}
+
+#   pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}"
+#   print "pmc: ${pcre_match_count}\nop: ${ZPCRE_OP[(w)2]}"
+#   pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}"
+#   print "pmc: ${pcre_match_count}\nop: ${ZPCRE_OP[(w)2]}"
+#       print "pmc: ${pcre_match_count}\nop: ${ZPCRE_OP[(w)2]}"
+#   while (pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}") {
+#       (( pcre_match_count++ ))
+#   }
+# int get_pcre_match_count(char *pcre_options, char *string, char *pcre)
+#   string error_message='expected optional options, one string, and one PCRE'
+#   die_unless_args "${error_message}"
+#   if si "${1[1]}" == '-' si; then
+#       die_unless_three_args "${error_message}"
+#   else
+#       die_unless_two_args "${error_message}"
+#   fi
+
+#FIXME: This is horrible. IT'S ALL HORRIBLE! Use pure Zsh expressions rather
+#than this nonsense. There exists no guarantee that grep's "--perl-regexp" are
+#anything like Zsh's. The implementation should resemble that of
+#get_match_count(). (Yes, I've searched for better ways. They don't exist.)
+#
+#That said; it'd be a shame to jettison this. Instead, just shift the existing
+#function into Zeshy Grep, perhaps renamed to get_grep_match_count(...).
+
+# See also the get_number_of_glob_matches() function, which behaves similarly
+# but less efficiently -- matching via multiple glob rather than one regular
+# expression.
+
 # --------------------( CONVENTIONS                        )--------------------
 # All regular expressions matched by this component are Perl-compatible regular
 # expressions (PCRE), unless otherwise stated. Thus, we abbreviate such regular
