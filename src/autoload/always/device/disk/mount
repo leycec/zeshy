@@ -26,7 +26,7 @@ die_if_mount_point() {
         die "${2:-\"${pathname}\" mounted}"
 }
 
-# void die_if_mountable_point(
+# void die_unless_mountable_point(
 #   char *pathname, char *error_message = 'not listed by "/etc/fstab"')
 #
 # Raise an exception unless the passed path is listed by "/etc/fstab" and hence
@@ -69,11 +69,11 @@ is_disk_mounted() {
       "$(blkid -o list | awk -v DEV="${device_filename}" '$1 == DEV { print $4, $5 }')" si
 }
 
-# bool is_device_mounted_to(char *device_filename, char *mount_dirname)
+# bool is_disk_mounted_to(char *device_filename, char *mount_dirname)
 #
 # Return true if the device with the passed filename is mounted to the directory
 # with the passed dirname.
-is_device_mounted_to() {
+is_disk_mounted_to() {
     die_unless_two_args\
         'expected exactly one device filename and mount dirname'
     string device_filename="${1}" mount_dirname="${2}"
@@ -260,11 +260,14 @@ NR >= 3 {
 #
 # In other words, this function quasi-intelligently accepts darn near anything.
 mount_safely() {
-    #FIXME: Add a dash of commentary, here and below.
+    # If no arguments were passed, list all current mount points.
     if is_no_args
     then print_mount_points
-    elif is_one_arg
+    # If one argument was passed listed by "/etc/fstab" as a mountable point,
+    # mount such point as such.
+    elif is_one_arg and is_mountable_point "${1}"
     then mount_point "${1}"
+    # Otherwise, mount the passed device file to the passed mount point.
     else mount_disk  "${@}"
     fi
 }
@@ -296,6 +299,7 @@ mount_point() {
     # Localize and validate passed arguments.
     die_unless_args 'expected optional mount options and one mount dirname'
     string mount_dirname="${@[-1]}"
+    pop_one_arg
 
     #FIXME: O.K.; for orthogonality with mount_disk(), we should really avoid
     #remounting to an already mounted directory only if such mount point
@@ -305,17 +309,13 @@ mount_point() {
     # Otherwise, create such directory if needed and ensure its writability.
     is_mount_point  "${mount_dirname}" and return_success
     make_dir_safely "${mount_dirname}" 
-    die_unless_writable_dir "${mount_dirname}"
+    die_unless_writable_dir    "${mount_dirname}"
+    die_unless_mountable_point "${mount_dirname}"
 
-    # If this directory is not listed by "/etc/fstab", raise an exception.
-    if is_mountable_point "${mount_dirname}"; then
-        interactively utter\
-            "mounting \"${mount_dirname}\" via \"/etc/fstab\"..."
-        command mount "${@}"
-    elif false
-    then false
-    else false
-    fi
+    # Mount.
+    interactively utter\
+        "mounting \"${mount_dirname}\" via \"/etc/fstab\"..."
+    command mount "${@}" -- "${mount_dirname}"
 }
 
 # void mount_writable_point(
@@ -352,22 +352,59 @@ mount_disk() {
         'expected optional mount options, one device filename, and optional mount dirname'
     string device_filename mount_dirname
 
+    # If the last passed argument is a writable directory, treat it as the
+    # target mount point.
     if is_writable_dir "${@[-1]}"; then
         die_unless_at_least_two_args\
             'expected optional mount options, one device filename, and one mount dirname'
         device_filename="${@[-2]}"
         mount_dirname="${@[-1]}"
         pop_two_args
+    # Otherwise, treat such argument as the source device file.
     else
         device_filename="${@[-1]}"
         mount_dirname="$(get_mount_home)/$(get_basename "${device_filename}")"
         pop_one_arg
     fi
 
+    # Make the mount point, if needed.
+    die_if_mount_point      "${mount_dirname}"
+    make_dir_safely         "${mount_dirname}" 
+    die_unless_writable_dir "${mount_dirname}"
+
+    # If the passed device file is instead an ISO image, mount it as such.
+    if is "${device_filename}" == *.iso si; then
+        interactively utter\
+            "mounting \"${device_filename}\" to \"${mount_dirname}\"..."
+        command mount "${@}" -t iso9660 -o 'exec,loop' --\
+            "${device_filename}" "${mount_dirname}"
+        return_success
+    fi
+
+    # If no passed device file exists, search these directories for such file:
+    #
+    # * "/dev/disk/by-label".
+    # * "/dev/mapper".
+    # * "/dev".
     if not is_found "${device_filename}"; then
         is_absolute_path "${device_filename}" and
             die "\"${device_filename}\" not found"
+        device_filename="$(get_first_device "/dev/disk/by-label/${device_filename}" "/dev/mapper/${device_filename}" "/dev/${device_filename}")"
+    fi
+    die_unless_device "${device_filename}"
 
+    # If the passed device is already mounted to the passed directory, noop.
+    # By default, "mount" unhelpfully fails with error.
+    if is_disk_mounted_to "${device_filename}" "${mount_dirname}"; then
+        interactively utter "\"${device_filename}\" already mounted to \"${mount_dirname}\"."
+        return_success
+    fi
+
+    # Mount.
+    command mount "${@}" -- "${device_filename}" "${mount_dirname}"
+}
+
+#FIXME: Obsolete.
         #FIXME (new): O.K.; we need a new function testify(). (Clever, no?
         #Also consider falsify(), though that name doesn't accurately describe
         #its purpose.) Call it like this:
@@ -385,36 +422,7 @@ mount_disk() {
         #raised exception is a stack trace. Of course, that isn't a file, so
         #the subsequent call to die_unless_disk_device() fails as well. This
         #strikes me as a bug, perhaps corrected by a subsequent Zsh update?
-        device_filename="$(get_first_device "/dev/disk/by-label/${device_filename}" "/dev/mapper/${device_filename}" "/dev/vg/${device_filename}" "/dev/${device_filename}")"
-    fi
-
-    # If the passed device is already mounted to the passed directory, noop.
-    # By default, "mount" unhelpfully fails with error.
-    if is_device_mounted_to "${device_filename}" "${mount_dirname}"; then
-        interactively utter "\"${device_filename}\" already mounted to \"${mount_dirname}\"."
-        return_success
-    fi
-
-    # Make the mount point if non-extant.
-    die_if_mount_point "${mount_dirname}"
-    make_dir_safely         "${mount_dirname}" 
-    die_unless_writable_dir "${mount_dirname}"
-    interactively utter\
-        "mounting \"${device_filename}\" to \"${mount_dirname}\"..."
-
-    # Mount.
-    if is_device "${device_filename}"; then
-        die_unless_unmounted_disk "${device_filename}"
-        command mount "${@}" "${device_filename}" "${mount_dirname}"
-    #FIXME: This globs case-insensitively, no?
-    elif is "${device_filename}" == *.iso si; then
-        command mount "${@}" -t iso9660 -o 'exec,loop'\
-            "${device_filename}" "${mount_dirname}"
-    else die "\"${device_filename}\" neither a device or ISO file"
-    fi
-}
-
-#FIXME: Obsolete.
+#
 #       mountpoint -q "${mount_dirname}" | true; return_exit_status
 #       print 'here'
 #       mountpoint -q "${mount_dirname}"
