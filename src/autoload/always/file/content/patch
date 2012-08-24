@@ -1,0 +1,166 @@
+#!/usr/bin/env zsh
+# ====================[ content                            ]====================
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Zeshy File Patch, handling patch files (i.e., files containing "diff" output).
+#
+# --------------------( TODO                               )--------------------
+# * Add support for compressed patch files, both on input (apply_) and output
+#   (make_). For the latter, we'll need a new function "is_archive_file" in
+#   "file/content/archive" matching on... hmm; we probably shouldn't trust
+#   filenames. "file" is probably faster, anyway, given it's C heritage; just
+#   call get_mimetype() and test the return value. Most archive files should
+#   (hopefully) have a common prefix (say, "x-compressed"). Check this.
+
+# ....................{ WRITERS ~ appliers                 }....................
+# char *apply_patch_file(
+#   char *patch_filename,
+#   char *target_directory = get_current_dir(),
+#   int patch_level = 0)
+#
+# Apply the passed patch file to the appropriate file(s) in the passed directory
+# (defaulting to the current directory) under the passed 0-based patch level
+# (defaulting to the first level in the range 0 to 5 that successfully applies).
+#
+# For security, this function throws an exception if the passed patch file
+# attempts to patch absolute filenames (e.g., "/sbin/init") or parent-relative
+# filenames (e.g., "../../../init/sh").
+apply_patch_file() {
+    # Localize and validate passed arguments.
+    die_unless_one_to_three_args\
+        'expected one patch filename, optional target dirname, and optional patch level'
+    string\
+        patch_filename="${1}"\
+        target_dirname="${2:-$(get_current_dir)}"\
+        patch_level="${3:-}"
+    die_unless_file "${patch_filename}"
+    die_unless_dir "${target_dirname}"
+
+    # Forbid absolute and parent-relative filenames in the patch file.
+    if is_line_matching_pcre '^(\*\*\*|\+\+\+|\-\-\-)\s+(/|(.*/)?\.\./)'; then
+        string error_message="\"${patch_filename}\" dangerously patches an absolute or parent-relative path"
+
+        # If interactive, require the user confirm such risky behavior.
+        if is_interactive; then
+            curse "${error_message}"
+            ask_bool_hard 'really apply a potentially dangerous patch?'
+        # Otherwise, throw an exception.
+        else die "${error_message}"
+        fi
+    fi
+
+    # Patch.
+    set_current_dir "${target_dirname}"
+    {
+        # If no patch level was passed, iteractively search for a successful
+        # patch level by attempting each in ascending order (as dry runs).
+        if is_empty "${patch_level}"; then
+            integer patch_level=0 patch_level_max=5
+            for ((; patch_level <= patch_level_max; patch_level++)) {
+                run_with_options "patch -p${patch_level} --dry-run --force --quiet"\
+                    'ZESHY_PATCH_OPTIONS' "< '${patch_filename}'"\
+                    and break or continue
+            }
+
+            # If no patch level succeeded, rerun the first dry run, thus forcing
+            # "patch" to print a helpful error message before returning non-zero
+            # exit status and hence inducing a fatal exception.
+            (( patch_level <= patch_level_max )) or
+                run_with_options "patch -p0 --dry-run --force "\
+                    'ZESHY_PATCH_OPTIONS' "< '${patch_filename}'"
+        fi
+
+        # Apply the current (presumably successful) patch level.
+        die_unless_number "${patch_level}"
+        interactively utter "applying \"${patch_filename}\" to \"${target_dirname}\" under patch level ${patch_level}..."
+        run_with_options "patch -p${patch_level}" 'ZESHY_PATCH_OPTIONS'\
+            "< '${patch_filename}'"
+    } always {
+        restore_current_dir
+    }
+}
+
+# ....................{ WRITERS ~ makers                   }....................
+# char *make_patch_file(
+#   char *old_pathname, char *new_pathname, char *patch_filename)
+#
+# Make the passed patch file with all differences between the passed old and new
+# pathnames. Such pathnames must either be both filenames or both dirnames. In
+# the latter case, the patch file describes all recursive differences between
+# the two directories.
+make_patch_file() {
+    # Localize passed arguments, removing the passed patch if already extant.
+    die_unless_three_args\
+        'expected one old pathname, one new pathname, and one patch filename'
+    string old_pathname="${1}" new_pathname="${2}" patch_filename="${3}"
+    die_unless_found "${old_pathname}"
+    die_unless_found "${new_pathname}"
+    remove_path_if_found "${patch_filename}"
+
+    # Validate passed arguments.
+    list zeshy_diff_options; zeshy_diff_options=( "${ZESHY_DIFF_OPTIONS[@]}" )
+    if is_file "${old_pathname}" and is_file "${new_pathname}"
+    then noop
+    elif is_dir "${old_pathname}" and is_dir "${new_pathname}"
+    then zeshy_diff_options+='-r'
+    else die\
+        "\"${old_pathname}\" and \"${new_pathname}\" neither both files or directories"
+    fi
+
+    # Make.
+    interactively utter\
+        "from \"${old_pathname}\" to \"${new_pathname}\" into \"${patch_filename}\"..."
+    run_with_options diff 'zeshy_diff_options'\
+        "${old_pathname}" "${new_pathname}" > "${patch_filename}"
+}
+
+# char *make_patch_file_for_new_path(char *new_pathname, char *patch_filename)
+#
+# Make the passed patch file with the contents of the passed pathname. If such
+# path is a directory, the patch file contains the recursive contents of all
+# files in such directory. The resulting patch file is typically used for new
+# files added to projects.
+make_patch_file_for_new_path() {
+    # Localize passed arguments, removing the passed patch if already extant.
+    die_unless_three_args 'expected one new pathname and one patch filename'
+    string new_pathname="${1}" patch_filename="${2}"
+    die_unless_found "${new_pathname}"
+    remove_path_if_found "${patch_filename}"
+
+    # Validate passed arguments.
+    list zeshy_diff_options; zeshy_diff_options=( "${ZESHY_DIFF_OPTIONS[@]}" )
+    is_dir "${new_pathname}" and zeshy_diff_options+='-r'
+
+    # Make.
+    interactively utter\
+        "from \"${new_pathname}\" into \"${patch_filename}\"..."
+    run_with_options 'diff --from-file=/dev/null' 'ZESHY_DIFF_OPTIONS'\
+        "${new_pathname}" > "${patch_filename}"
+}
+
+# ....................{ WASTELANDS                         }....................
+# function thus is intended for describing new
+# files added to a project.
+# By precedent, the old pathname in the resulting patch
+# file will be "/dev/null".
+
+# --------------------( COPYRIGHT AND LICENSE              )--------------------
+# The information below applies to everything in this distribution,
+# except where noted.
+#              
+# Copyright 2007-2012 by Cecil Curry.
+#   
+#   http://www.raiazome.com
+# 
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.

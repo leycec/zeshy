@@ -31,72 +31,91 @@ jointly() {
     run_ph "${@}" 2>&1
 }
 
-# ....................{ RUNNERS ~ quietly                  }....................
-# void quietly_as(
-#   char *username,
+# ....................{ RUNNERS ~ mapfile                  }....................
+# char *run_with_mapfile(
 #   char *command_name, char *command_arg1, char *command_arg2, ...)
-#
-# Run the passed command as the passed user quietly (i.e., squelching output).
-quietly_as() {
-    run_as "${@}" 1>/dev/null 2>&1
-#   run_as "${@}"
+# 
+# Run the passed command with the Zsh "mapfile" module loaded before and
+# unloaded after running the command. "mapfile" is inherently unsafe, though
+# more efficient than alternatives (e.g., "$(< ${filename})"), and so should be
+# available only as long as is necessary.
+run_with_mapfile() {
+    # Load Zsh module "mapfile".
+    load_zsh_module zsh/mapfile
+
+    #FIXME: Causes subtle errors, at the moment. Zsh bugs, yes?
+    # Forcibly prevent harmful ${mapfile} and hence filesystem changes.
+#   freeze_variable mapfile
+
+    # Run the passed command.
+    run_ph "${@}"
+
+    # Unload "mapfile", for safety.
+    unload_zsh_module zsh/mapfile
 }
 
-# void quietly(
-#   char *command_name, char *command_arg1, char *command_arg2, ...)
+# ....................{ RUNNERS ~ options                  }....................
+# char *run_with_options(
+#   char *command, char *list_options_name,
+#   char *command_arg1, char *command_arg2, ...)
 #
-# Run the passed command quietly (i.e., squelching output).
-quietly() {
-    run_ph "${@}" 1>/dev/null 2>&1
-}
-
-# ....................{ RUNNERS ~ prioritized              }....................
-# char *quickly(char *command_name, char *command_arg1, char *command_arg2, ...)
+# Run the passed command with the passed options and arguments. Unlike most
+# functions in the run*() family, this function requires the passed command be a
+# single string. This function creates the command line to be run as follows:
 #
-# Run the passed command "quickly" under prioritized CPU and I/O scheduling.
-quickly() {
-    run_with_priorities\
-        ${ZESHY_NICE_PRIORITY_LOW}\
-        ${ZESHY_IONICE_CLASS_LOW}\
-        ${ZESHY_IONICE_CLASS_PRIORITY_LOW}\
-        "${@}"
-}
+# * Begin with the passed command.
+# * Append the contents of the list with the passed name.
+# * If interactive, append the contents of the list with name
+#   "${list_options_name}_IF_INTERACTIVE"; otherwise, of the list with name
+#   "${list_options_name}_IF_NON_INTERACTIVE".
+# * Append "--", treating subsequent command arguments as non-options. This
+#   precaution prevents treating option-like arguments as options (e.g., if a
+#   file "-l" exists, "ls -- -l" lists that file while "ls -l" does not).
+# * Append the passed command arguments. This completes the command line.
+# * If this function was called with piped input, pipe such input to the command
+#   line; otherwise, run the command line as is.
+run_with_options() {
+    # Localize passed arguments. Do *NOT* call die_unless_at_least_two_args().
+    # Such a call implicitly prefixes the argument list with piped input, which
+    # is typically precisely what we want. Not here, however. For sanity, this
+    # function already pipes piped input to the command to be run; hence,
+    # prefixing the argument list with such input passes such input to such
+    # command twice: one on standard input and once in the argument list. Forego
+    # the latter by manually testing passed arguments here.
+    (( # >= 2 )) or
+        die 'expected one command prefix, one list name, and zero or more command arguments'
+    string\
+        command_line_prefix="${1}"\
+        options_list_name="${2}" interactive_options_list_name
+    list command_line
+    shift_two_args
 
-# char *slowly(char *command_name, char *command_arg1, char *command_arg2, ...)
-#
-# Run the passed command "slowly" under deprioritized CPU and I/O scheduling.
-slowly() {
-    run_with_priorities\
-        ${ZESHY_NICE_PRIORITY_LOW}\
-        ${ZESHY_IONICE_CLASS_LOW}\
-        ${ZESHY_IONICE_CLASS_PRIORITY_LOW}\
-        "${@}"
-}
+    # Validate passed arguments, uppercasing the desired interactive list name
+    # regardless of the original case of the passed list name.
+    is_interactive and
+        interactive_options_list_name="${(U)options_list_name}_IF_INTERACTIVE" or
+        interactive_options_list_name="${(U)options_list_name}_IF_NON_INTERACTIVE"
+    die_unless_list "${options_list_name}"
+    die_unless_list "${interactive_options_list_name}"
 
-# char *run_with_priorities(
-#   int nice_priority, int ionice_class, int ionice_class_priority,
-#   char *command_name, char *command_arg1, char *command_arg2, ...)
-#
-# Run the passed command under the passed "nice" and "ionice" priorities.
-run_with_priorities() {
-    # Localize passed arguments.
-    die_unless_args
-    integer\
-        nice_priority="${1}"\
-        ionice_class="${2}"\
-        ionice_class_priority="${3}"
-    shift_three_args
+    # If passed piped input, propagate such input to the desired command.
+    is_piped_input and command_line=( cat '/dev/stdin' \| )
 
-    # Command line to be run, prefixed by commands prioritizing the passed
-    # command. All systems provide "nice" but not necessarily "ionice".
-    list command_line; command_line=( nice -n${nice_priority} )
-    is_installed ionice and command_line+=( ionice
-        -c${ionice_class}
-        -n${ionice_class_priority}
+    # Dismantled, this is:
+    #
+    # * "(z)", splitting the passed command prefix into shell words.
+    # * "(@P)", expanding the passed list name into the shell words of the
+    #   corresponding external lists.
+    # * "-- ${@}", expanding to all remaining arguments as non-options.
+    command_line+=(
+        "${(z)command_line_prefix}"
+        "${(@P)options_list_name}"
+        "${(@P)interactive_options_list_name}"
+        -- "${@}" 
     )
 
     # Run.
-    command_line+=( "${@}" )
+#   utter "running \"${command_line[@]}\"..."
     run_ph "${command_line[@]}"
 }
 
@@ -163,7 +182,7 @@ run_paged() {
         pager+=( "${(@P)pager_options_list_name}" )
     
     # Page.
-    utter_raw "${output}" | "${pager[@]}"
+    sputter "${output}" | "${pager[@]}"
 }
 
 #FIXME: Implement me, sometime. Shift to "file/content/content", as well.
@@ -181,78 +200,73 @@ print_file_paged() {
     }
 }
 
-# ....................{ RUNNERS ~ options                  }....................
-# char *run_with_options(
-#   char *command, char *list_options_name,
-#   char *command_arg1, char *command_arg2, ...)
+# ....................{ RUNNERS ~ prioritized              }....................
+# char *quickly(char *command_name, char *command_arg1, char *command_arg2, ...)
 #
-# Run the passed command with the passed options and arguments. Unlike most
-# functions in the run*() family, this function requires the passed command be a
-# single string. This function creates the command line to be run as follows:
+# Run the passed command "quickly" under prioritized CPU and I/O scheduling.
+quickly() {
+    run_with_priorities\
+        ${ZESHY_NICE_PRIORITY_LOW}\
+        ${ZESHY_IONICE_CLASS_LOW}\
+        ${ZESHY_IONICE_CLASS_PRIORITY_LOW}\
+        "${@}"
+}
+
+# char *slowly(char *command_name, char *command_arg1, char *command_arg2, ...)
 #
-# * Begin with the passed command.
-# * Append the contents of the list with the passed name.
-# * If interactive, append the contents of the list with name
-#   "${list_options_name}_IF_INTERACTIVE"; otherwise, of the list with name
-#   "${list_options_name}_IF_NON_INTERACTIVE".
-# * Append "--", treating subsequent command arguments as non-options. This
-#   precaution prevents treating option-like arguments as options (e.g., if a
-#   file "-l" exists, "ls -- -l" lists that file while "ls -l" does not).
-# * Append the passed command arguments. This completes the command line.
-# * If this function was called with piped input, pipe such input to the command
-#   line; otherwise, run the command line as is.
-run_with_options() {
-    # Localize passed arguments. Do *NOT* call die_unless_at_least_two_args().
-    # Such a call implicitly prefixes the argument list with piped input, which
-    # is typically precisely what we want. Not here, however. For sanity, this
-    # function already pipes piped input to the command to be run; hence,
-    # prefixing the argument list with such input passes such input to such
-    # command twice: one on standard input and once in the argument list. Forego
-    # the latter by manually testing passed arguments here.
-    (( # >= 2 )) or
-        die 'expected one command prefix, one list name, and zero or more command arguments'
-    string\
-        command_line_prefix="${1}" command_line_suffix\
-        options_list_name="${2}" interactive_options_list_name
-    list command_line
-    shift_two_args
+# Run the passed command "slowly" under deprioritized CPU and I/O scheduling.
+slowly() {
+    run_with_priorities\
+        ${ZESHY_NICE_PRIORITY_LOW}\
+        ${ZESHY_IONICE_CLASS_LOW}\
+        ${ZESHY_IONICE_CLASS_PRIORITY_LOW}\
+        "${@}"
+}
 
-    # Validate passed arguments.
-    is_interactive and
-        interactive_options_list_name="${options_list_name}_IF_INTERACTIVE" or
-        interactive_options_list_name="${options_list_name}_IF_NON_INTERACTIVE"
-    die_unless_list "${options_list_name}"
-    die_unless_list "${interactive_options_list_name}"
+# char *run_with_priorities(
+#   int nice_priority, int ionice_class, int ionice_class_priority,
+#   char *command_name, char *command_arg1, char *command_arg2, ...)
+#
+# Run the passed command under the passed "nice" and "ionice" priorities.
+run_with_priorities() {
+    # Localize passed arguments.
+    die_unless_args
+    integer\
+        nice_priority="${1}"\
+        ionice_class="${2}"\
+        ionice_class_priority="${3}"
+    shift_three_args
 
-    # If passed piped input, propagate such input to the desired command.
-    is_piped_input and
-        command_line=( cat '/dev/stdin' \| )
-
-    # Dismantled, this is:
-    #
-    # * "(z)", splitting the passed command prefix into shell words.
-    # * "(@P)", expanding the passed list name into the shell words of the
-    #   corresponding external lists.
-    command_line+=(
-        "${(z)command_line_prefix}"
-        "${(@P)options_list_name}"
-        "${(@P)interactive_options_list_name}"
+    # Command line to be run, prefixed by commands prioritizing the passed
+    # command. All systems provide "nice" but not necessarily "ionice".
+    list command_line; command_line=( nice -n${nice_priority} )
+    is_installed ionice and command_line+=( ionice
+        -c${ionice_class}
+        -n${ionice_class_priority}
     )
 
-    # If the second-to-last passed argument is "--", treat the last passed
-    # argument as a command line suffix to be appended to the command line.
-#   if is_at_least_two_args and is "${@[-2]}" == '--' si; then
-#       command_line_suffix="${@[-1]}"
-#       pop_two_args
-#   fi
-
-    # All remaining arguments signify non-option arguments to be passed to the
-    # command to be run.
-    command_line+=( -- "${@}" "${(z)command_line_suffix}" )
-
     # Run.
-#   utter "running \"${command_line[@]}\"..."
+    command_line+=( "${@}" )
     run_ph "${command_line[@]}"
+}
+
+# ....................{ RUNNERS ~ quiet                    }....................
+# void quietly_as(
+#   char *username,
+#   char *command_name, char *command_arg1, char *command_arg2, ...)
+#
+# Run the passed command as the passed user quietly (i.e., squelching output).
+quietly_as() {
+    run_as "${@}" 1>/dev/null 2>&1
+#   run_as "${@}"
+}
+
+# void quietly(
+#   char *command_name, char *command_arg1, char *command_arg2, ...)
+#
+# Run the passed command quietly (i.e., squelching output).
+quietly() {
+    run_ph "${@}" 1>/dev/null 2>&1
 }
 
 # ....................{ RUNNERS ~ users                    }....................
@@ -375,6 +389,13 @@ run() {
 }
 
 # ....................{ WASTELANDS                         }....................
+    # If the second-to-last passed argument is "--", treat the last passed
+    # argument as a command line suffix to be appended to the command line.
+#   if is_at_least_two_args and is "${@[-2]}" == '--' si; then
+#       command_line_suffix="${@[-1]}"
+#       pop_two_args
+#   fi
+
     #FIXME: This isn't quite right. The reason why, of course, is long lines.
     #Technically, such lines contain a single newline; when displayed, such
     #lines implicitly force more than a single newline. To account for this,
