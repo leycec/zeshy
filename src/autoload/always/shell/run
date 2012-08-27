@@ -9,17 +9,46 @@
 #interactive_alias cat='print_file'
 
 # ....................{ RUNNERS                            }....................
+# char *run(char *command_name, char *command_arg1, char *command_arg2, ...)
+#
+# Run the passed command. While Zsh and hence Zeshy already run strings as
+# commands if in command position, strings containing shell-reserved characters
+# (e.g., "|", "<", ">") do not run as expected. This function amends that: e.g.,
+#
+#   # Command to be run.
+#   >>> string command='screen -list | grep --count eschaton'
+#
+#   # Doubleplusungood. Zsh parses the former as one composite command name and
+#   # the pipe in the latter as a raw command argument. In either case, failure.
+#   >>> ${command}     # bad
+#   >>> ${(z)command}  # equally bad
+#
+#   # Ohsonice. Run the expected command.
+#   >>> run ${command}
+#   969
+run() {
+    die_unless_args 'expected one command'
+
+    # Dismantled, this is:
+    #
+    # * "(q)", preserving escaped quotes in the resulting expansion.
+#   sputter_unescaped "running: ${(q)@}..."
+    eval "${(q)@}"
+}
+
+# ....................{ RUNNERS ~ exit status              }....................
+#FIXME: Pretty silly. We don't use this. Consider excising.
 # int one_if(
 #   char *command_name, char *command_arg1, char *command_arg2, ...)
 #
 # Run the passed command quietly (i.e., squelching output) and, if exiting
 # with success, return "1"; otherwise, return the empty string: e.g.,
 #
-#     >>> integer IS_MUTT_INSTALLED=$(one_if 'is_installed mutt')
+#     >>> integer IS_MUTT_INSTALLED=$(one_if is_installed mutt)
 #     >>> is_nonzero "${IS_MUTT_INSTALLED}" and print '"mutt" is installed'
 #     "mutt" is installed
 one_if() {
-    quietly "${@}" and return_integer 1 or return_success
+    quietly "${@}" and return 1 or return_true
 }
 
 #FIXME: Rename to merely stderr_to_stdout().
@@ -28,7 +57,7 @@ one_if() {
 #
 # Run the passed command, diverting standard error to standard output.
 jointly() {
-    run_ph "${@}" 2>&1
+    run "${@}" 2>&1
 }
 
 # ....................{ RUNNERS ~ mapfile                  }....................
@@ -47,15 +76,10 @@ run_with_mapfile() {
     #    "(anon):82: bad math expression: operand expected at `/usr/share...'"
     #File a bug report if this is still the case under recent Zsh versions.
     # Forcibly prevent harmful ${mapfile} and hence filesystem changes.
-#       typeset -r mapfile
-#       print ${mapfile[/tmp/config]}
-#       print -rl -- ${(f)mapfile[/usr/share/zeshy/src/autoload/if_installed/7z]}
-
-    # Forcibly prevent harmful ${mapfile} and hence filesystem changes.
 #   freeze_variable mapfile
 
     # Run the passed command.
-    run_ph "${@}"
+    run "${@}"
 
     # Unload "mapfile", for safety.
     unload_zsh_module zsh/mapfile
@@ -82,13 +106,11 @@ run_with_mapfile() {
 # * If this function was called with piped input, pipe such input to the command
 #   line; otherwise, run the command line as is.
 run_with_options() {
-    # Localize passed arguments. Do *NOT* call die_unless_at_least_two_args().
-    # Such a call implicitly prefixes the argument list with piped input, which
-    # is typically precisely what we want. Not here, however. For sanity, this
-    # function already pipes piped input to the command to be run; hence,
-    # prefixing the argument list with such input passes such input to such
-    # command twice: one on standard input and once in the argument list. Forego
-    # the latter by manually testing passed arguments here.
+    # Localize passed arguments. Do *NOT* call die_unless_at_least_two_args(),
+    # as such function suffixes the argument list with piped input. While this
+    # is typically what we want, this function already pipes piped input to the
+    # command to be run... Suffixing the argument list passes such input to such
+    # command twice, therefore. Which is blatantly bad.
     (( # >= 2 )) or
         die 'expected one command prefix, one list name, and zero or more command arguments'
     string\
@@ -113,17 +135,22 @@ run_with_options() {
     # * "(z)", splitting the passed command prefix into shell words.
     # * "(@P)", expanding the passed list name into the shell words of the
     #   corresponding external lists.
-    # * "-- ${@}", expanding to all remaining arguments as non-options.
     command_line+=(
         "${(z)command_line_prefix}"
         "${(@P)options_list_name}"
         "${(@P)interactive_options_list_name}"
-        -- "${@}" 
+        -- "${@}"
     )
 
     # Run.
-#   utter "running \"${command_line[@]}\"..."
-    run_ph "${command_line[@]}"
+#   print -r -- "running \"${command_line[@]}\"..."
+#   sputter_unescaped "running \"${command_line[@]}\"..."
+#   sputter_unescaped "last... \"${command_line[-1]}\"..."
+#   eval command ls -l "${command_line[-1]}"
+#   eval run_paged command ls -l "${command_line[-1]}"
+#   run_it run_paged command ls -l "${command_line[-1]}"
+    run "${command_line[@]}"
+#   run ${command_line[@]}
 }
 
 # ....................{ RUNNERS ~ paged                    }....................
@@ -145,20 +172,19 @@ run_paged() {
 
     # If not attached to a terminal, run the passed command as is and
     # immediately return without paging.
-    if not is_terminal; then
-        run_ph "${@}"
-        return_success
-    fi
+    is_terminal or {
+        run "${@}"
+        return_true
+    }
 
     # Otherwise, run the passed command with redirection. Dismantled, this is:
     #
-    # * "${(q)@}", quoting this command as required by the run() function.
     # * "1>&1", preserving standard output prior to its subsequent redirection
     #   and hence the assignment of output to variable "output".
     # * "1>&2", redirecting standard output to error. Since command substitution
     #   only captures the former, this immediately prints all output produced by
     #   running such command.
-    string output; output="$(run_ph "${@}" 1>&1 1>&2)"
+    string output; output="$(run "${@}" 1>&1 1>&2)"
 
     # Ascertain whether or not the logical line length (i.e., accounting for
     # implicit wrapping of long lines) exceeds terminal height. The
@@ -176,7 +202,7 @@ run_paged() {
     # If the terminal is sufficiently tall to display all output without paging,
     # return. Our job is done, folks.
 #   utter "line length: $(get_line_length "${output}")"
-    (( displayed_line_length > terminal_height )) or return_success
+    (( displayed_line_length > terminal_height )) or return_true
 
     # Pager command to be run.
     list pager; pager=( "${PAGER}" )
@@ -254,7 +280,7 @@ run_with_priorities() {
 
     # Run.
     command_line+=( "${@}" )
-    run_ph "${command_line[@]}"
+    run "${command_line[@]}"
 }
 
 # ....................{ RUNNERS ~ quiet                    }....................
@@ -265,7 +291,6 @@ run_with_priorities() {
 # Run the passed command as the passed user quietly (i.e., squelching output).
 quietly_as() {
     run_as "${@}" 1>/dev/null 2>&1
-#   run_as "${@}"
 }
 
 # void quietly(
@@ -273,7 +298,7 @@ quietly_as() {
 #
 # Run the passed command quietly (i.e., squelching output).
 quietly() {
-    run_ph "${@}" 1>/dev/null 2>&1
+    run "${@}" 1>/dev/null 2>&1
 }
 
 # ....................{ RUNNERS ~ users                    }....................
@@ -291,18 +316,57 @@ run_as_superuser() {
 #
 # Run the passed command as the passed user.
 run_as() {
-    die_unless_at_least_two_args\
-        'expected one username and one or more command strings'
-
-    # Locally set "${ZESHY_RUN_AS}". The run() function notes this variable as
-    # set and behaves accordingly...
-    string ZESHY_RUN_AS="${1}"
+    # Localize passed arguments, stripping off the prefixing username.
+    die_unless_at_least_two_args 'expected one username and one command'
+    string username="${1}"
     shift_one_arg
 
-    # Call run() with all remaining arguments: the command to be run.
-#   print "running as ${ZESHY_RUN_AS}: ${@}"
-    run "${(q)@}"
+    # If the user under which to run the passed command is the current user,
+    # defer to the run() command and immediately return.
+    is "${username}" == "$(get_current_username)" si and {
+        run "${@}"
+        return_true
+    }
+
+    # Command line to run. Dismantled, this is:
+    #
+    # * "Q", stripping one level of quote protection from the passed parameters,
+    #   undoing prior "(q)" quote protection.
+    # * "z", splitting such parameters into Zsh-specific words.
+#   sputter_unescaped "command line: ${@}"
+    list command_line; command_line=( "${(z)@}" )
+#   list command_line; command_line=( "${(Qz)@}" )
+    
+    #FIXME: Insufficient. Consider "LC_ALL=C ls".
+    # Command name to run.
+    string command_name="${command_line[1]}"
+
+    #FIXME: Insufficient. Zsh builtins and functions should be executable as
+    #other users, though it's probably non-trivial to do so. Perhaps prefix the
+    #command line with "zeshy" and augment "bin/zeshy" to handle passed commands?
+    die_unless_installed "${command_name}"
+    
+    # If the target user is the superuser, use "sudo" to take advantage of
+    # password caching. Avoid "@", as that splits the command line into discrete
+    # arguments. "sudo" and "su" can split their own arguments, thank you.
+    if is_superuser "${username}" and is_installed sudo
+    then sudo -E  "${command_line}"
+    # Otherwise, use "su".
+    else su -p -c "${command_line}" "${username}"
+    fi
 }
+
+# ....................{ WASTELANDS                         }....................
+#FIXME: This function should really be cleaved into two: all of the user-
+#specific logic shifted into run_as() and only the eval() retained in this
+#function. That shouldn't leave terribly much here... which is good. You know;
+#the more I consider it, the more I wonder if run() shouldn't simply be a
+#straightforward alias for 'alias'. That would single-handedly eliminate all of
+#the "(q)" nonsense... and thereby break everything! The solution is simple:
+#
+#* Create a new "alias run='eval'" alias.
+#* Transition all existing run() calls to run().
+#* Rename run() to run_as(), probably with slight implementation changes.
 
 #FIXME: This function should really be cleaved into two: all of the user-
 #specific logic shifted into run_as() and only the eval() retained in this
@@ -311,8 +375,8 @@ run_as() {
 #straightforward alias for 'alias'. That would single-handedly eliminate all of
 #the "(q)" nonsense... and thereby break everything! The solution is simple:
 #
-#* Create a new "alias run_ph='eval'" alias.
-#* Transition all existing run() calls to run_ph().
+#* Create a new "alias run='eval'" alias.
+#* Transition all existing run() calls to run().
 #* Rename run() to run_as(), probably with slight implementation changes.
 
 # void run(char *command_name, char *command_arg1, char *command_arg2, ...)
@@ -332,8 +396,8 @@ run_as() {
 #
 #   # Doubleplusungood. Zsh parses the pipe prior to calling run().
 #   >>> run screen -list | grep --count eschaton
-run() {
-    die_unless_args 'expected one or more command strings'
+#run() {
+#    die_unless_args 'expected one or more command strings'
 
     # Command line to run. Dismantled, this is:
     #
@@ -341,13 +405,13 @@ run() {
     #   undoing prior "(q)" quote protection.
     # * "z", splitting such parameters into Zsh-specific words.
 #   print "command line: ${@}"
-    list command_line; command_line=( "${(Qz)@}" )
+#    list command_line; command_line=( "${(Qz)@}" )
 #   list command; command=( "${(Qz)@}" )
 #   print "second arg: ${command_line[2]}"
     
     # Command name to run as the first word of such command line.
 #   string command_name="${(Q)command_line[1]}"
-    string command_name="${command_line[1]}"
+#    string command_name="${command_line[1]}"
     
     # A string conditionally defined to (in order):
     #
@@ -355,47 +419,45 @@ run() {
     # * Otherwise, if the current $PATH contains the command name, the absolute
     #   path to that command.
     # * Otherwise, raise an exception.
-    string command_path
-    command_path="$(whence "${command_name}")" or
-        die "\"${command_name}\" not found in \$PATH"
+#    string command_path
+#    command_path="$(whence "${command_name}")" or
+#        die "\"${command_name}\" not found in \$PATH"
 
     # If the passed command has not been overridden by a shell alias or
     # function, run it as a command. Do not call the customary is_installed()
     # function, as that does not test whether or not a command is overridden.
-    if is_absolute_path "${command_path}"; then
+#    if is_absolute_path "${command_path}"; then
         # If running this command under a different user, do so.
-        if is_set_nonempty 'ZESHY_RUN_AS' and
-           is "${ZESHY_RUN_AS}" != "${USER}" si; then
+#        if is_set_nonempty 'ZESHY_RUN_AS' and
+#           is "${ZESHY_RUN_AS}" != "${USER}" si; then
             # If the target user is the superuser, use "sudo" to take
             # advantage of password caching. Do *NOT* use the "(@)" expansion in
             # either of the following two commands, as that would split the line
             # into discrete command arguments.
-            if is "${ZESHY_RUN_AS}" == root si and is_installed sudo; then
+#            if is "${ZESHY_RUN_AS}" == root si and is_installed sudo; then
 #               echo "sudoing as ${ZESHY_RUN_AS}: ${command}"
-                sudo -E "${command_line}"
+#                sudo -E "${command_line}"
             # Otherwise, use "su".
-            else
+#            else
 #               echo "suing as ${ZESHY_RUN_AS}: ${command}"
-                su --preserve-environment\
-                   --command "${command_line}" "${ZESHY_RUN_AS}"
-            fi
+#                su --preserve-environment\
+#                   --command "${command_line}" "${ZESHY_RUN_AS}"
+#            fi
         # Otherwise, run this command as the current user. Use the "[@]"
         # expansion here, as calling the command manually requires we split the
         # line into discrete command arguments. Evaluate this command to ensure
         # the shell correctly handles shell constructs (e.g., "|").
-        else
-#           print "evaling: ${command_line[@]}"
-            eval "${command_line[@]}"
-        fi
+#        else
+##           print "evaling: ${command_line[@]}"
+#            eval "${command_line[@]}"
+#        fi
     #FIXME: Incomplete. How does one run a builtin as another user? Implement.
     # Otherwise, the passed command must be a shell built-in. Evaluate it!
-    else
+#    else
 #       print "evaling: ${command_line[@]}"
-        eval "${command_line[@]}"
-    fi
-}
-
-# ....................{ WASTELANDS                         }....................
+#        eval "${command_line[@]}"
+#    fi
+#}
     # If the second-to-last passed argument is "--", treat the last passed
     # argument as a command line suffix to be appended to the command line.
 #   if is_at_least_two_args and is "${@[-2]}" == '--' si; then
@@ -418,7 +480,7 @@ run() {
 
 #   is_terminal and
 #     (( $(get_displayed_line_length "${output}") >  )) or
-#     return_success
+#     return_true
 
     # Localize passed arguments.
 #   list lines; lines=( "${(f)@}" )
