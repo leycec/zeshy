@@ -12,6 +12,8 @@
 # * It'd be helpful to auto-truncate the directory stack if it gets too tall --
 #   say, higher than ${ZESHY_DIRSTACK_MAX_SIZE} (defaulting to 16). Entries
 #   should probably be truncated off the bottom, I r'ckon.
+# * This looks quite nice, a "vi"-key aware path switcher:
+#   http://www.reddit.com/r/linux/comments/yxfwz/introducing_cdd_a_simply_directory_navigation
 
 # ....................{ ALIASES                            }....................
 #FIXME: It'd be quite nice to improve interactive_alias() to accept multiple
@@ -56,7 +58,7 @@ die_unless_writable_dir() {
 # 
 # Return true if the passed path is an existing directory.
 is_dir() {
-    die_unless_one_arg 'expected exactly one pathname'
+    die_unless_one_arg 'expected one pathname'
     is -d "${1}" si
 }
 
@@ -65,7 +67,7 @@ is_dir() {
 # Return true if the passed path is an existing directory and writable by the
 # current user.
 is_writable_dir() {
-    die_unless_one_arg 'expected exactly one pathname'
+    die_unless_one_arg 'expected one pathname'
     is -d "${1}" and -w "${1}" si
 }
 
@@ -75,7 +77,7 @@ is_writable_dir() {
 # Get the absolute path of the current working directory.
 get_current_dir() {
     die_unless_no_args
-    print "${PWD}"
+    sputter "${PWD}"
 }
 
 # ....................{ GETTERS ~ first                    }....................
@@ -116,20 +118,32 @@ get_first_writable_dir() {
 #       and set the current working dirname to that directory.
 #     * Otherwise, set the current working dirname to the current user's home.
 #   * Otherwise, set the current working dirname to the passed dirname.
-#   * Print the current directory stack.
 set_current_dir() {
-#   if is_interactive_directly; then 
     if is_interactive; then 
+        # If passed at least one argument, switch to such directory.
         if is_args
-        then builtin cd "${@}"  #print_dir_stack
+        then builtin cd -- "${@}"
+        # If the directory stack is non-empty, switch to the prior directory.
         elif is_list_nonempty dirstack
         then restore_current_dir
-        else builtin cd "${HOME}"  #print_dir_stack
+        # Otherwise, switch to the home directory.
+        else builtin cd -- "${HOME}"
         fi
     else
-        die_unless_one_arg 'expected exactly one dirname'
-        builtin cd "${1}"
+        die_unless_one_arg 'expected one dirname'
+        builtin cd -- "${1}"
     fi
+}
+
+# void store_current_dir(char *dirname)
+# 
+# Set the current working directory to the passed dirname, implicitly invoking
+# the chpwd() hook and hence pushing that dirname if valid onto the persistent
+# directory stack. This function is the less intelligent step-child of
+# set_current_dir() and hence appropriate for non-interactive scripts.
+store_current_dir() {
+    die_unless_one_arg 'expected one dirname'
+    builtin pushd -- "${1}"
 }
 
 # void restore_current_dir()
@@ -149,11 +163,19 @@ restore_current_dir() {
 #   interactively print_dir_stack
 }
 
+# ....................{ SETTERS ~ dir stack                }....................
+# void clear_dir_stack(void)
+# 
+# Clear the directory stack.
+clear_dir_stack() {
+    die_if_args
+    dirs -c
+}
+
 # void rotate_dir_stack_backward(int dir_count = 1)
 # 
-# Set the current working directory to the directory of the passed count from
-# the top (defaulting to 1 and hence the first directory) on the directory
-# stack.
+# Set the current directory to that of the passed offset from the top of the
+# directory stack (defaulting to 1 and hence the prior directory).
 rotate_dir_stack_backward() {
     die_if_args
     die_unless_list_nonempty dirstack 'directory stack empty'
@@ -163,10 +185,10 @@ rotate_dir_stack_backward() {
 
 # void rotate_dir_stack_forward(int dir_count = 1)
 # 
-# Set the current working directory to the directory of the passed count from
-# the bottom (defaulting to 1 and hence the last directory) on the directory
-# stack. Assuming a prior call to rotate_current_dir_backward(), calling this
-# function with the same count effectively undoes the former.
+# Set the current directory to that of the passed offset from the bottom of the
+# directory stack (defaulting to 1 and hence the last directory). Assuming some
+# prior call to rotate_current_dir_backward(), calling this function with the
+# same count effectively undoes the former.
 rotate_dir_stack_forward() {
     die_if_args
     die_unless_list_nonempty dirstack 'directory stack empty'
@@ -175,16 +197,51 @@ rotate_dir_stack_forward() {
     interactively print_dir_stack
 }
 
+#FIXME: Auto-compress the stack when it gets too large. Also, we really don't
+#want *ANY* duplicates on the stack; we currently only prohibit duplicates on
+#the top of the stack.
+
+# ....................{ HOOKS                              }....................
+# void chwpd(void)
+#
+# Respond to the current directory being set by pushing that directory onto the
+# directory stack if not already. Unlike the "auto_pushd" option activated only
+# on pushd() calls, Zsh activates this hook on every call setting the current
+# directory excluding popd() (e.g., cd(), pushd()).
+chpwd() {
+    # If the top directory on the stack is not already the current working
+    # directory, push this directory onto the stack.
+#   utter "pwd: ${PWD}\ndirstack[1]: ${dirstack[1]}\ndirstack[-1]: ${dirstack[-1]}"
+    { is_list_empty dirstack or is "${dirstack[1]}" != "${PWD}" si } and
+        #FIXME: Add a new prepend_list() function to "type/list".
+        dirstack=( "${PWD}" "${dirstack[@]}" )
+#   {
+#       is_list_nonempty dirstack and utter "pwd: ${PWD}\ndirstack[1]: ${dirstack[1]}\ndirstack[-1]: ${dirstack[-1]}"
+#   }
+}
+
 # ....................{ PRINTERS                           }....................
 # char *print_dir_stack(void)
 #
 # Print the contents of the directory stack in human-readable format.
 print_dir_stack() {
+    # Print a prefixing header.
     die_if_args
-    utter 'printing the current directory stack...'
-#   utter 'current directory stack.'
+#   interactively utter 'printing the current directory stack...'
     sputter '   index     dir'
-    dirs -p | number_lines_highlighting_line 1
+    utter_banner
+
+    # Capture standard output from "dirs". Oddly, this output does not coincide
+    # with the actual contents of the ${dirstack} list: specifically, "dirs"
+    # prepends output with the current directory regardless of whether the
+    # first directory in the directory stack is already this directory. To
+    # amend this:
+    #
+    # * If the directory stack is empty, print nothing.
+    # * Otherwise, print all lines following the first.
+    is_list_nonempty dirstack or return_true
+    string dirs_output; dirs_output="$(dirs -p)"
+    number_lines_highlighting "$(get_lines "${dirs_output}" 2 -1)" 1
 }
 
 # ....................{ WRITERS                            }....................
@@ -206,7 +263,12 @@ make_dir_safely() {
     mkdir -p -- "${@}"
 }
 
-#FIXME: Obsolete.
+# ....................{ WASTELANDS                         }....................
+#       dirstack+=( "${PWD}" )
+#   if is_list_empty dirstack
+#   then dirstack+=( "${PWD}" )
+#   else is "${dirstack[-1]}" == "${PWD}" si or dirstack+=( "${PWD}" )
+#   fi
 #   (( ${#dirstack} )) or die 'directory stack empty'
 #   die_unless_list_nonempty dirstack 'directory stack empty'
   
@@ -260,7 +322,7 @@ make_dir_safely() {
 #
 # Make the parent directory of the passed path, if not found.
 #make_parent_directory_if_not_found() {
-#    die_unless_one_arg 'expected exactly one pathname'
+#    die_unless_one_arg 'expected one pathname'
 #    make_dir_safely "$(dirname "${1}")"
 #}
 
@@ -286,7 +348,7 @@ make_dir_safely() {
 #     >>> which_command "zsh -x -o shwordsplit scr"
 #     /bin/zsh
 #which_command() {
-#    die_unless_one_arg 'expected exactly one command name'
+#    die_unless_one_arg 'expected one command name'
 #    string command_name="${1[(w)1]}"
 #    string command_path="${command_name:c}"
 #

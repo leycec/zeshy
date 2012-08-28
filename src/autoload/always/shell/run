@@ -13,30 +13,60 @@
 #
 # Run the passed command. While Zsh and hence Zeshy already run strings as
 # commands if in command position, strings containing shell-reserved characters
-# (e.g., "|", "<", ">") do not run as expected. This function amends that: e.g.,
+# (e.g., "|", "<", ">") do not run as expected. This function amends that,
+# conditionally quote-protecting passed arguments as required: e.g.,
 #
-#   # Command to be run.
-#   >>> string command='screen -list | grep --count 'eschaton emtombed'
+#   # Command to be run, split into multiple parts to make life troublesome.
+#   >>> string command='cat /dev/random | grep'
+#   >>> list grep_args; grep_args=( -E '\{Eschaton Entombed\(\)\}' )
 #
 #   # Doubleplusungood. Zsh parses the former as one composite command name and
 #   # the pipe in the latter as a raw command argument. In either case, failure.
-#   >>> ${command}     # bad
-#   >>> ${(z)command}  # equally bad
+#   >>> ${command} ${grep_args[@]}          # bad!
+#   >>> ${(z)command} ${(q)grep_args[@]}    # equally bad!
 #
 #   # Ohsonice. Run the expected command.
-#   >>> run ${command}
-#   969
+#   >>> run "${command}" "${grep_args[@]}"
+#   {Eschaton Entombed()}                   # it could happen...
 run() {
     die_unless_args 'expected one command'
+#   sputter_unescaped "running: ${@}..."
 
-    # If one argument was passed, such argument signifies a command line to be
-    # run. Otherwise, only the concatenation of such arguments signifies the
-    # line. In the latter case, embedded escapes and quotes (e.g., "\ ", "'''")
-    # in such arguments must be preserved in the expansion with "(q)".
-#   sputter_unescaped "running: ${(q)@}..."
+    # If only one argument, evaluate it as is. Clearly, this is the ideal case.
     if is_one_arg
     then eval "${1}"
-    else eval "${(q)@}"
+    # Otherwise, we've entered the Clusterfuck Zone. Zsh deals poorly with
+    # quotes in "eval" strings. We can't simply brute-force quote-protection on
+    # all passed arguments (e.g., "eval ${(q)@}"), as that overly quotes passed
+    # arguments the caller expects to remain unquoted (e.g., "2>&1"). Instead,
+    # we implement a crude shell parser selectively quote-protecting only non-
+    # evaluatable strings *NOT* containing reserved characters. YES, THIS IS
+    # AAAAAAAAAABSOLUTELY CRAZY. Fix this, kind Zsh developers. (Fix this now.)
+    else
+        list args; args=( "${@}" )
+        for ((i = 1; i <= ${#args}; i++)) {
+            #FIXME: Clearly, this fails to match all possible shell strings. It
+            #should, however, be sufficient for immediate needs.
+            # If the current argument contains at least one reserved shell
+            # string (i.e., "<", ">", "||", "&&", or "$" when not preceded by an
+            # escaping "\\" and not enclosed in quotes), ignore such argument.
+            # (Quoting such argument destroys its expected shell interpretation.)
+            is "${args[${i}]}" == (\$*|(|*[^\\])[\<\>\|\&]*) si and
+            is "${args[${i}]}" != (\'*\'|\"*\"|\`*\`) si and continue
+
+            # If the current argument cannot be evaluated, quote such argument
+            # and ensure the result can be. Avoid calling Zeshy functions here
+            # (e.g., quietly()), as such functions transitively call this
+            # function. (Ugh!)
+            eval ": ${args[${i}]}" 1>/dev/null 2>&1 or {
+#               utter "fixing up ${args[${i}]}"
+                args[${i}]="${(q)args[${i}]}"
+                eval ": ${args[${i}]}" 1>/dev/null 2>&1 or
+                    die "command \"${@}\" argument \"${arg}\" invalid"
+            }
+        }
+#       sputter_unescaped "running: ${args[@]}..."
+        eval "${args[@]}"
     fi
 }
 
@@ -64,31 +94,6 @@ quietly() {
 # Run the passed command, diverting standard error to standard output.
 unify_output() {
     run "${@}" 2>&1
-}
-
-# ....................{ RUNNERS ~ mapfile                  }....................
-# char *run_with_mapfile(
-#   char *command_name, char *command_arg1, char *command_arg2, ...)
-# 
-# Run the passed command with the Zsh "mapfile" module loaded before and
-# unloaded after running the command. "mapfile" is inherently unsafe, though
-# more efficient than alternatives (e.g., "$(< ${filename})"), and so should be
-# available only as long as is necessary.
-run_with_mapfile() {
-    # Load Zsh module "mapfile".
-    load_zsh_module zsh/mapfile
-
-    #FIXME: When enabled, this sporadically fails with an inscrutible error like:
-    #    "(anon):82: bad math expression: operand expected at `/usr/share...'"
-    #File a bug report if this is still the case under recent Zsh versions.
-    # Forcibly prevent harmful ${mapfile} and hence filesystem changes.
-#   freeze_variable mapfile
-
-    # Run the passed command.
-    run "${@}"
-
-    # Unload "mapfile", for safety.
-    unload_zsh_module zsh/mapfile
 }
 
 # ....................{ RUNNERS ~ options                  }....................
@@ -149,8 +154,9 @@ run_with_options() {
     )
 
     # Run.
-#   sputter_unescaped "running \"${command_line[@]}\"..."
-    run "${command_line[@]}"
+    sputter_unescaped "running \"${command_line[@]}\"..."
+    eval ${command_line[@]}
+#   eval "${(q)command_line[@]}"
 }
 
 # ....................{ RUNNERS ~ pages                    }....................
@@ -186,7 +192,8 @@ run_paged() {
     # * "1>&2", redirecting standard output to error. Since command substitution
     #   only captures the former, this immediately prints all output produced by
     #   running such command.
-    string output; output="$(run "${@}" 2>&2 2>&1 1>&1 1>&2)"
+#   string output; output="$(run "${@}" 2>&2 2>&1 1>&1 1>&2)"
+    string output; output="$(run "${@}" 1>&1 1>&2 2>&1)"
     list lines; lines=( ${(f)output} )
 
     # Ascertain whether such output's logical line length (i.e., accounting for
@@ -350,6 +357,49 @@ run_as() {
 }
 
 # ....................{ WASTELANDS                         }....................
+    # If passed at least one non-option argument, append such arguments.
+#   is_args and is "${1}" != [\<\|]* si and command_line+=( -- "${@}" )
+#   is_args and {
+#       if is "${1}" == [\>\<\|]* si
+#       then command_line+=(    "${@}" )
+#       else command_line+=( -- "${@}" )
+#       else command_line+=( -- "${(q)@}" )
+#       fi
+#   }
+
+#. Note
+# that preserving escapes and quotes (e.g., "\ ", "'''") in command arguments
+# requires protecting arguments with "(q)" prior to calling this function#|\$\{*\))|(\$\(*\)
+#       for arg ("${args}") {
+#           noop "${args[${i}]}" or {
+#           if not eval "print -- ${args[${i}]}" 1>/dev/null 2>&1 or {
+#               utter "fixing up ${args[${i}]}"
+#               args[${i}]="${(q)args[${i}]}"
+#               eval "print -- ${args[${i}]}" 1>/dev/null 2>&1 or
+#                   die "command \"${@}\" argument \"${arg}\" invalid"
+#           }
+#                  eval "print -- ${(q)args[${i}]} true" 1>/dev/null 2>&1; then
+#              eval "print -- ${args[${i}]} true" 1>/dev/null 2>&1 or {
+#              eval "print -- ${args[${i}]}" 1>/dev/null 2>&1 or {
+#           if is "${args[${i}]}" != [\'\"]* si and
+#              is "${args[${i}]}" != *[\<\>\|]* si and
+#              not eval "print -- ${args[${i}]}" 1>/dev/null 2>&1; then
+#               utter "fixing up ${args[${i}]}"
+#               args[${i}]="${(q)args[${i}]}"
+#               eval "print -- ${args[${i}]} true" 1>/dev/null 2>&1 or
+#                   die "command \"${@}\" argument \"${arg}\" invalid"
+#           fi
+
+    # If one argument was passed, such argument signifies a command line to be
+    # run. Otherwise, only the concatenation of such arguments signifies the
+    # line. In the latter case, embedded escapes and quotes (e.g., "\ ", "'''")
+    # in such arguments must be preserved in the expansion with "(q)".
+#   if is_one_arg
+#   then eval "${1}"
+#   else eval "${@}"
+#   else eval "${(q)@}"
+#   fi
+
 #FIXME: Pretty silly. We don't use this. Consider excising. Actually, it could
 #be helpful to generalize this to something like:
 #   return_exit_status_if_false
