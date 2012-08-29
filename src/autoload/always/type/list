@@ -29,6 +29,7 @@ die_unless_list() {
     is_list "${1}" or die "${2:-\"${1}\" not a declared list}"
 }
 
+# ....................{ EXCEPTIONS ~ emptiness             }....................
 # void die_unless_list_nonempty(
 #   char *variable_name, char *error_message = 'not a list')
 #
@@ -37,6 +38,14 @@ die_unless_list_nonempty() {
     die_unless_one_or_two_args\
         'expected one variable name and optional error message'
     is_list_nonempty "${1}" or die "${2:-\"${1}\" not a non-empty list}"
+}
+
+# void die_if_list_empty(
+#   char *variable_name, char *error_message = 'not a list')
+#
+# A synonym of die_unless_list_nonempty().
+die_if_list_empty() {
+    die_unless_list_nonempty "${@}"
 }
 
 # ....................{ TESTS                              }....................
@@ -142,7 +151,7 @@ get_first_list_element_globbing() {
         "pattern \"${glob_pattern}\" not matched in list \"${list_name}\""
 
     # Otherwise, return such element.
-    return_string ${element}
+    sputter ${element}
 }
 
 # ....................{ PASS-BY-VALUE                      }....................
@@ -175,7 +184,7 @@ return_list() {
     # * '@' interprets this expansion as a list rather than scalar.
     # * 'qq' protectively embeds all reserved shell characters in such names
     #   and values in single quotes.
-    return_string "${(qq@P)list_name}"
+    sputter "${(qq@P)list_name}"
 }
 
 #FIXME: Fix now-broken examples in "README.dev".
@@ -189,6 +198,165 @@ alias restore_list='{
     list list; list=( ${(z)"$(< /dev/stdin)"} )
 }'
 
+# ....................{ JOINERS                            }....................
+# void join_list_to_lines(char *list_name)
+#
+# Join the list with the passed name into a newline-delimited string: e.g.,
+#
+#     >>> list robert; robert=( "Stranger in" "a" "Strange Land"
+#     >>> join_list_to_lines robert
+#     Stranger in
+#     a
+#     Strange Land
+join_list_to_lines() {
+    die_unless_one_arg 'expected one list name'
+    join_list_to_string "${1}" '\n' 
+}
+
+# void join_list_to_string(char *list_name, char *separator)
+#
+# Join the list with the passed name into a string with each list element
+# delimited by the passed separator. The separator may be of any non-zero
+# length: e.g.,
+#
+#     >>> list heinlein; heinlein=( "The Moon" "Is" "a" "Harsh Mistress" )
+#     >>> join_list_to_string heinlein ", "
+#     The Moon, Is, a, Harsh Mistress
+join_list_to_string() {
+    # Shift off the separator argument, the remainder thus signifying the list
+    # to be joined.
+    die_unless_two_args\
+        'expected one list name and one separator string'
+    string list_name="${1}" separator="${2}"
+
+    # If no list elements were passed, print the empty string and return.
+    is_list_nonempty "${list_name}" or return_true
+
+    # If the passed separator is a colon, delimit such separator by periods.
+    # Delimited, this is:
+    #
+    # * "j.:.", joining on colons.
+    # * "@P", expanding to the list with the passed name.
+    if is "${separator}" == ':' si
+    then sputter ${(j.:.@P)list_name}
+    # Otherwise, delimit such separator by colons. Since Zsh appears to
+    # expand no parameters embedded in parameter expansion flags (e.g.,
+    # "print ${(j:${separator}:)@}", joining list elements with the raw string
+    # "${separator}" rather than the expansion of such parameter), wrap the
+    # desired expression in an "eval" to force such expansion.
+    else run "print -- \${(j:${separator}:)${list_name}}"
+    fi
+}
+ 
+# ....................{ JOINERS ~ legible                  }....................
+# void join_list_to_legible_string(
+#   char *last_element_prefix, char *string1, char *string2, ...)
+#
+# Join the passed elements into a human-readable string separated by commas,
+# prefixing the last such element with the passed string: e.g.,
+#
+#     >>> join_list_to_legible_string 'or' 'Wingnut' 'Dishwashers' 'Union'
+#     Wingnut, Dishwashers, or Union
+join_list_to_legible_string() {
+    # Shift off the separator and last element prefix arguments, the remainder
+    # thus signifying the list to be joined.
+    die_unless_at_least_two_args\
+        'expected one separator, one last element prefix, and zero or more list elements'
+    string last_element_prefix="${1}"
+    shift_one_arg
+
+    # If more than two list elements were passed, join such elements and prefix
+    # the last such element.
+    if is_at_least_three_args; then
+        list munged; munged=( "${@[1,-2]}" "${last_element_prefix} ${@[-1]}" )
+        join_list_to_string munged ', ' 
+    # If only two list elements were passed, print the first element, the last
+    # element prefix, and the third element.
+    elif is_two_args
+    then sputter "${1} ${last_element_prefix} ${2}"
+    # If only one list element was passed, print that element as is.
+    else sputter "${1}"
+    fi
+}
+
+# void join_list_to_legible_truncated_string(
+#   char *last_element_prefix, char *string1, char *string2, ...)
+#
+# Join the passed elements into a human-readable string separated by commas,
+# prefixing the last such element with the passed string and truncating the
+# resulting string to a helpfully brief number of characters.
+join_list_to_legible_truncated_string() {
+    truncate_string "$(join_list_to_legible_string "${@}")" 32 '...'
+}
+ 
+# ....................{ SPLITTERS                          }....................
+# char *split_string_to_list(char separator, char *string, char *variable_name)
+#
+# Split the passed string on all substrings of the passed separating character
+# into a list of the results. If no separator is passed, split words by default
+# parsing (i.e., first by quote- and then whitespace-delimited words): e.g.,
+#
+#     >>> list array
+#     >>> split_string_to_list '/' 'Obseqious/Deep/Journeys' array
+#     >>> sputter "${array[1]}"
+#     Obseqious
+
+# See split_string_on_first() for alternative splitting into string variables.
+split_string_to_list() {
+    # Localize and validate arguments.
+    die_unless_three_args\
+        'expected one separator, source string, and target list variable name'
+    string separator="${1}" text="${2}" list_name="${3}"
+    die_unless_char 'separator'
+    die_unless_list "${list_name}"
+
+    # If the passed separator is a colon, delimit such separator by periods.
+    if is "${separator}" == ':' si
+    then eval "${list_name}=( \${(s.:.)text} )"
+    # Otherwise, delimit such separator by colons.
+    else eval "${list_name}=( \${(s:${separator}:)text} )"
+    fi
+}
+
+# void split_string_to_strings_on_first(
+#   char *separator, char *string, char *variable_name1, char *variable_name2)
+#
+# Split the passed string on the first substring of the passed separator into:
+#
+# * The string with the former name to the substring preceding such separator.
+# * The string with the latter name to the substring following such separator.
+#
+# The separator may be of any non-zero length: e.g.,
+#
+#     >>> string prefix suffix
+#     >>> split_string_to_strings_on_first\
+#       '==' 'wolfs==head==society' 'prefix' 'suffix'
+#     >>> sputter "prefix: ${prefix}\nsuffix: ${suffix}"
+#     prefix: wolfs
+#     suffix: head==society
+# 
+# See split_string_to_list() for alternative splitting on all substrings.
+split_string_to_strings_on_first() {
+    # Localize and validate passed arguments.
+    die_unless_four_args\
+        'expected one separator, source string, and target prefix and suffix variable names'
+    string\
+        separator="${1}"\
+        text="${2}"\
+        variable_name_prefix="${3}"\
+        variable_name_suffix="${4}"
+    die_unless_string "${variable_name_prefix}"
+    die_unless_string "${variable_name_suffix}"
+
+    # Fail if the passed string contains no such separator.
+    is "${text}" == *"${separator}"* si or
+        die "\"${text}\" contains no \"${separator}\" to be split on"
+
+    # Split.
+    eval\
+        "${variable_name_prefix}=\"${text%%${separator}*}\"; "\
+        "${variable_name_suffix}=\"${text#*${separator}}\""
+}
 # ....................{ WASTELANDS                         }....................
 #   >>> string List="$(get_list)"
 #   >>> expand_List_to_list
