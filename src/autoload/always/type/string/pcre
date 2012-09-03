@@ -55,7 +55,7 @@ is_line_matching_pcre() {
     # Localize passed arguments.
     die_unless_two_or_three_args\
         'expected one string, one regex, and optional regex options'
-    string text="${1}" pcre="${2}" 
+    string text="${1}" pcre="${2}"
     shift_two_args
 
     # If the passed regex is not explicitly anchored to newlines with a "^"
@@ -67,32 +67,114 @@ is_line_matching_pcre() {
     is_matching_pcre "${text}" "${pcre}" "${@}" -m
 }
 
-# ....................{ GETTERS                            }....................
+# ....................{ GETTERS ~ counts                   }....................
+# int get_pcre_line_match_count(
+#   char *string, char *pcre, char *pcre_arg1, char *pcre_arg2, ...)
+#
+# Get the number of lines in the passed string matching the passed multiline
+# PCRE (i.e., such that "^" and "$" also match newlines).
+get_pcre_line_match_count() {
+    if is_piped_input; then
+        (( # >= 1 )) or
+            die 'expected one regex and optional regex options'
+        pass_piped_input_to get_pcre_match_count "${@}" -m
+    else
+        (( # >= 2 )) or
+            die 'expected one string, one regex, and optional regex options'
+        get_pcre_match_count "${@}" -m
+    fi
+}
+
 # int get_pcre_match_count(
 #   char *string, char *pcre, char *pcre_arg1, char *pcre_arg2, ...)
 #
 # Get the number of substrings in the passed string matching the passed PCRE
-# with the passed PCRE options. See pcre_compile in "man zshmodules" for further
-# details on PCRE options: e.g.,
+# with the passed PCRE options: e.g.,
 #
 #     >>> get_pcre_match_count 'anthropocene tropes' '
-#     ...   # This is an extended regular expression matching "ropo" and "rope".
+#     ...   # An extended regular expression matching "ropo" and "rope".
 #     ...   rop[aeiou]' -x
 #     2
 get_pcre_match_count() {
+    integer match_count=0
+    for_each_pcre_match '(( ++match_count ))' "${@}"
+    sputter ${match_count}
+}
+
+# ....................{ LISTERS                            }....................
+#FIXME: Good name; just a comment to myself: list_ is better than get_ here.
+#Since we're matching on lines, we can safely return a newline-delimited string.
+#That said, it's not terribly orthogonal; perhaps return_list(), instead?
+#
+#Hmm; use this everywhere we operate on lines.
+get_multiline_pcre() {
+    die_unless_one_arg 'expected one regex'
+    string pcre="${1}"
+
+    # If the passed regex is not explicitly anchored to newlines with a "^"
+    # prefix and "$" suffix, add such anchors.
+    is "${pcre[1]}"  == '^' si or pcre="^.*?${pcre}"
+    is "${pcre[-1]}" == '$' si or pcre="${pcre}.*?$"
+
+    sputter "${pcre}"
+}
+
+list_pcre_line_matches() {
+    for_each_pcre_match\
+        '(( ${#match} )) and sputter ${match[@]} or sputter ${MATCH}' "${@}" -m
+}
+
+# ....................{ RUNNERS                            }....................
+# int for_each_pcre_match(
+#   char *command,
+#   char *string,
+#   char *pcre, char *pcre_arg1, char *pcre_arg2, ...)
+#
+# Run the passed command on each substring of the passed string matching the
+# passed PCRE with the passed PCRE options. Commands may access matches with two
+# global variables:
+#
+# * ${MATCH}, a string global expanding to the currently matched substring
+#   (ignoring match groups).
+# * ${match}, a list global containing each match group of the currently matched
+#   substring (e.g., "${match[1]}" expands to the first match group).
+#
+# PCRE options include zero or more of the following:
+#
+# * "-i", matching case-insensitively. By default, matches are case-sensitive.
+# * "-m", matching multiline-aware; specifically:
+#   * "^" matches either the string start or a newline.
+#   * "$" matches either the string end or a newline.
+# * "-s", matching all characters with ".". By default, "." matches all
+#   characters excluding newlines.
+# * "-x", matching an extended PCRE ignoring whitespace and "#" comments. By
+#   default, whitespace and "#" are significant and hence matched as is.
+#
+# For example:
+#
+#     >>> for_each_pcre_match 'sputter $MATCH' "
+#     ... holocene event" '^ho?|en?' -m
+#     hol
+#     ene
+#     ent
+for_each_pcre_match() {
     # Localize passed arguments.
-    string text pcre
+    string args_error_message='expected one command, string, regex, and optional regex options'
+    die_unless_args "${args_error_message}"
+    string command="${1}" text pcre
+    shift_one_arg
+
+    # If passed piped input, treat such input as the string to be matched.
     if is_piped_input; then
-        die_unless_one_or_two_args\
-            'expected one regex and optional regex options'
+        die_unless_one_or_two_args "${args_error_message}"
         text="$(get_piped_input)"
-        pcre="${1}" 
+        pcre="${1}"
         shift_one_arg
+    # Otherwise, treat the second passed argument as the string to be matched.
     else
-        die_unless_two_or_three_args\
-            'expected one string, one regex, and optional regex options'
+        die_unless_two_or_three_args "${args_error_message}"
         text="${1}"
-        pcre="${2}" 
+        pcre="${2}"
         shift_two_args
     fi
     list pcre_args; pcre_args=( "${@}" )
@@ -104,39 +186,19 @@ get_pcre_match_count() {
     pcre_compile "${pcre_args[@]}" -- "${pcre}"
     pcre_study
 
-    # Count with brute-force iteration. While Zsh offers no flags or
-    # functions for optimizing counting, iterating a counter while matching
-    # until no matches remain yields the number of matches. Dismantled, this is:
+    # Perform brute-force iteration. Dismantled, this is:
     #
-    # * "ZPCRE_OP='0 0'", initializing a Zsh global tracking the first and last
+    # * "ZPCRE_OP='0 0'", a Zsh string global tracking the first and last
     #   0-based byte indices of the currently matched substring in ${text}.
     # * "pcre_match", matching the next substring given:
     #   * "-b", tracking indices in the ${ZPCRE_OP} global.
     #   * "-n", starting matching at the passed string index:
     #     * "${ZPCRE_OP[(w)2]}", expanding to the byte immediately following the
     #       last byte index of the previously matched substring.
-    integer pcre_match_count=0
     global_string ZPCRE_OP='0 0'
     while pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}"; do
-        (( ++pcre_match_count ))
+        run "${command}"
     done
-    sputter ${pcre_match_count}
-}
-
-# int get_line_count_matching_pcre(char *string, char *pcre)
-#
-# Get the number of lines in the passed string matching the passed multiline
-# PCRE (i.e., such that "^" and "$" also match newlines).
-get_line_count_matching_pcre() {
-    if is_piped_input; then
-        (( # >= 1 )) or
-            die 'expected one regex and optional regex options'
-        pass_piped_input_to get_pcre_match_count "${@}" -m
-    else
-        (( # >= 2 )) or
-            die 'expected one string, one regex, and optional regex options'
-        get_pcre_match_count "${@}" -m
-    fi
 }
 
 # ....................{ MATCHES                            }....................
@@ -174,7 +236,7 @@ get_line_count_matching_pcre() {
 # than an explicit passed string: e.g.,
 #
 #     >>> print 1776 | match '^\d'
-#     >>> print "${MATCH}" 
+#     >>> print "${MATCH}"
 #     1
 match_pcre() {
     # Parse parameters.
@@ -187,7 +249,7 @@ match_pcre() {
 
     # Compile the match. (Yes, Zsh requires this regardless of whether we intend
     # to actually reuse this match.)
-    if is_set 'ZESHY_MATCH_OPTIONS'; then 
+    if is_set 'ZESHY_MATCH_OPTIONS'; then
 #       print "ZESHY_MATCH_OPTIONS: ${ZESHY_MATCH_OPTIONS}"
 #       pcre_compile -m "${pattern}" ||
         pcre_compile "${ZESHY_MATCH_OPTIONS[@]}" "${regex}" or
@@ -196,7 +258,7 @@ match_pcre() {
         pcre_compile "${regex}" or
             die "\"${regex}\" not a valid regular expression"
     fi
-    
+
     # Match.
     pcre_match -v "${match_variable_name}" -a "${group_array_name}" -- "${text}"
 }
@@ -268,7 +330,7 @@ match_pcre_first_line() {
     is "${regex}" == ^.* si or regex="^.*${regex}"
     is "${regex}" == *$  si or regex="${regex}.*$"
 #   print "regex: "${regex}
-    
+
     # Pack this modified regular expression back into the array of all passed
     # arguments, for convenience.
     set_args "${regex}" "${@}"
@@ -282,6 +344,79 @@ match_pcre_first_line() {
 }
 
 # ....................{ WASTELANDS                         }....................
+# ....................{ SETTERS                            }....................
+# int append_pcre_matches_to(
+#   list *matches_name,
+#   char *string, char *pcre, char *pcre_arg1, char *pcre_arg2, ...)
+
+# Append all match groups...
+# Set the list with the passed name to .
+# Get the number of substrings in the passed string matching the passed PCRE
+# with the passed PCRE options: e.g.,
+#
+#     >>> list pcre_matches
+#     >>> set_pcre_matches_to pcre_matches 'Xanadu  # XaXaXaXaXaXa' '([Xn]a)' -x
+#     >>> print ${pcre_matches[-1]}
+#     na
+#append_pcre_matches_to() {
+#    die_unless_at_least_two_args\
+#        'expected one list name, one string, one regex, and optional regex options'
+#    string matches_name="${1}"
+#    die_unless_list "${matches_name}"
+
+#    for_each_pcre_match 'matches_name+=(( ${MATCH} ))' "${@}"
+#   eval '${matches_name}=( )
+#}
+
+#get_pcre_match_count_old() {
+    # Localize passed arguments.
+#    string text pcre
+#    if is_piped_input; then
+#        die_unless_one_or_two_args\
+#            'expected one regex and optional regex options'
+#        text="$(get_piped_input)"
+#        pcre="${1}"
+#        shift_one_arg
+#    else
+#        die_unless_two_or_three_args\
+#            'expected one string, one regex, and optional regex options'
+#        text="${1}"
+#        pcre="${2}"
+#        shift_two_args
+#    fi
+#    list pcre_args; pcre_args=( "${@}" )
+
+    # If either the passed string or PCRE is empty, return 0.
+#    { is_empty "${text}" or is_empty "${pcre}" } and sputter 0
+
+    # Compile the passed PCRE for optimum matching with the passed options.
+#    pcre_compile "${pcre_args[@]}" -- "${pcre}"
+#    pcre_study
+
+    # Count with brute-force iteration. While Zsh offers no flags or
+    # functions for optimizing counting, iterating a counter while matching
+    # until no matches remain yields the number of matches. Dismantled, this is:
+    #
+    # * "ZPCRE_OP='0 0'", initializing a Zsh global tracking the first and last
+    #   0-based byte indices of the currently matched substring in ${text}.
+    # * "pcre_match", matching the next substring given:
+    #   * "-b", tracking indices in the ${ZPCRE_OP} global.
+    #   * "-n", starting matching at the passed string index:
+    #     * "${ZPCRE_OP[(w)2]}", expanding to the byte immediately following the
+    #       last byte index of the previously matched substring.
+#    integer pcre_match_count=0
+#    global_string ZPCRE_OP='0 0'
+#    while pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}"; do
+#        (( ++pcre_match_count ))
+#    done
+#    sputter ${pcre_match_count}
+#}
+
+#FIXME: This shares nearly the same implementation as get_pcre_matches().
+#Clearly, what we need is a helper function passed the same arguments as this
+#function with an additional first argument specifying the command to be
+#evaluated in each "while" loop iteration. Say, run_on_pcre_matches()?
+
     #FIXME: Hmm; we should probably anchor the passed PCRE with "^.*" and ".*$"
     #unless already beginning with "^" and ending with "$". Otherwise, we're not
     #actually matching within lines. Too much work, for the present.
@@ -466,11 +601,11 @@ match_pcre_first_line() {
 # --------------------( COPYRIGHT AND LICENSE              )--------------------
 # The information below applies to everything in this distribution,
 # except where noted.
-#              
+#
 # Copyright 2007-2012 by Cecil Curry.
-#   
+#
 #   http://www.raiazome.com
-# 
+#
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation; either version 3 of the License, or
