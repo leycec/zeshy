@@ -1,0 +1,714 @@
+#!/usr/bin/env zsh
+# ====================[ compile                            ]====================
+#
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2012 by Cecil Curry.
+# See "COPYING" for additional details.
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Zeshy Compile, handling Zeshy digest file recompilation.
+#
+# --------------------( SYMBOLS                            )--------------------
+# In most programming languages, the symbols that language exports for external
+# use (e.g., packages, classes, functions, globals) do not vary with system or
+# user configuration. The same version of the same language unconditionally
+# exports the same symbols, everywhere. This forms the core.
+#
+# As expected, Zeshy behaves different. Most symbols Zeshy exports for external
+# use at the command line and within scripts conditionally vary with system and
+# user state, including:
+#
+# * The output of the system-specific "lsb_release" and/or "uname" commands.
+# * The contents of the user-specific Zeshy configuration at "~/.zeshy/config".
+# * The contents of the user-specific ${PATH} (i.e., the set of currently
+#   installed and accessible programs).
+#
+# Zeshy monitors such content for changes -- silently, efficiently, and entirely
+# automatically. On detecting changes, Zeshy changes itself. As example:
+#
+# * On switching from a Linux to BSD operating system, Zeshy supplants the
+#   Linux-specific symbols it exports with those specific to BSD.
+# * On editing the "ZESHY_THEME" global in the "~/.zeshy/config/main"
+#   configuration file from the default "vanilla" to, say, "cookiedough", Zeshy
+#   supplants the default theme symbols it exports with those from the
+#   "cookiedough" theme.
+# * On installing a new program "rtorrent" into the system-wide "/bin" directory
+#   in the ${PATH}, Zeshy exports "rtorrent"-specific symbols.
+#
+# Zeshy symbols comprise Zeshy-specific Zsh functions and, to a lesser extent,
+# Zsh aliases and globals. For efficiency, Zeshy exports the former as a single
+# Zsh digest file (i.e., a binary file in a Zsh-specific format functionally
+# analogous to that of C and C++-style shared libraries).
+#
+# Zeshy compiles *ONLY* that subset of itself specific to current system and
+# user state into its digest file. Uncompiled code remains inaccessible until
+# such state changes (e.g., installing "rtorrent" notifies Zeshy to compile
+# start_rtorrent() and stop_rtorrent() functions into its digest file). For end
+# user purposes, Zeshy *IS* its digest file.
+#
+# --------------------( OVERLAYS                           )--------------------
+# To accomodate system- and user-specific Zeshy add-ons (e.g., plugins, themes),
+# Zeshy divides itself into overlays: directories with the same structure as
+# Zeshy's top-level "src" directory. Zeshy ignores all files and directories in
+# an overlay except those with the following Zeshy-specific names:
+#
+# * "always", a subdirectory recursively containing only:
+#   * Zeshy scripts, to be unconditionally compiled into Zeshy's digest file.
+#     These scripts may reside directly in the mandatory "always" directory
+#     or under optional subdirectories. In either case, Zeshy automatically
+#     finds and compiles all Zsh functions in all such files.
+#   * Subdirectories with arbitrary names and nesting. (Zeshy automatically
+#     finds all scripts in such subdirectories. Subdirectory structure is
+#     insignificant and hence only for optional organization.)
+# * "if_installed", a subdirectory directly containing only:
+#   * Zeshy scripts, each conditionally compiled into Zeshy's digest file *ONLY*
+#     if an executable file of the same case-sensitive basename currently exists
+#     in the user-specific ${PATH}.
+#   * Subdirectories, each conditionally enabled as a Zeshy overlay and hence
+#     subject to recursive processing (e.g., for an "always" subdirectory) only
+#     if an executable file of the same case-sensitive basename currently exists
+#     in the user-specific ${PATH}.
+# * "if_distro", a subdirectory directly containing only:
+#   * Subdirectories, each conditionally enabled as a Zeshy overlay *ONLY* if
+#     the current system-specific Linux and/or BSD distribution has the same
+#     lowercase name. At most one such subdirectory matches; Zeshy ignores the
+#     remaining subdirectories.
+# * "if_config", a subdirectory directly containing only:
+#   * Zeshy configuration files, to be unconditionally copied into the user-
+#     specific "~/.zeshy/config" directory if not already found.
+
+# ....................{ COMPILERS                          }....................
+compile_zeshy() {
+    # Validate sanity.
+    die_if_args
+    compile_zeshy_preamble
+
+    # List of directories recursively containing Zsh scripts containing
+    # autoloadable functions to be compiled into Zeshy's digest file.
+    list ZESHY_AUTOLOAD_DIRNAMES
+
+    # List of Zsh scripts containing autoloadable functions to be so compiled.
+    list ZESHY_AUTOLOAD_FILENAMES
+
+    # FIFO stack of Zeshy overlays. Since recursion is prohibitively expensive,
+    # perform a non-recursive depth-first search of overlays starting from the
+    # following tree roots (in order):
+    #
+    # * The system-wide Zeshy root.
+    # * The user-specific Zeshy root, if found.
+    list ZESHY_OVERLAY_STACK; ZESHY_OVERLAY_STACK=( "${ZESHY_OVERLAY_ROOT}" )
+    is -d "${ZESHY_USER_OVERLAY_ROOT}" si and
+        ZESHY_OVERLAY_STACK+="${ZESHY_USER_OVERLAY_ROOT}"
+
+    # List of all function names declared at this point (i.e., prior to
+    # recursively sourcing Zeshy and hence declaring Zeshy functions).
+    list ZESHY_OLD_FUNCTION_NAMES; ZESHY_OLD_FUNCTION_NAMES=( $(typeset -f +) )
+
+    #FIXME: BSD installs no such command, so this clearly fails to suffice.
+    #We'll probably want to just import the entire get_distro_name() command.
+    #Or perhaps not. Is the logic simple, under BSD?
+    # Lowercase name of the current Linux or BSD distribution, if such
+    # distribution installs the "lsb_release" command. While crude alternatives
+    # to "lsb_release" do exist (e.g., globbing for filenames matching
+    # /etc/*release), it hardly seems worth the effort so early in the bootstrap
+    # process. Dismantled, this is:
+    #
+    # * "${:-lsb_release}", expanding to the string "lsb_release".
+    # * "${...:c}", expanding to the absolute path of "lsb_release" if installed
+    #   in the current $PATH or only "lsb_release" otherwise.
+    # * "-x", returning true if such path is executable and hence installed.
+    #   Unless the current directory contains an executable "lsb_release", this
+    #   returns true only if ":c" expanded to an absolute path.
+    string ZESHY_DISTRO_NAME
+    is -x "${${:-lsb_release}:c}" si and
+        ZESHY_DISTRO_NAME="${(L)$(lsb_release -si)}"
+
+    # Iteratively source all applicable functions in all applicable overlays
+    # into the current shell environment. Since we modify the stack while
+    # iterating on it, loop dynamically (e.g., "for ((...))") rather than
+    # statically (e.g., "for overlay_dir ("${ZESHY_OVERLAY_ROOT[@]})").
+    for ((i = 1; i <= ${#ZESHY_OVERLAY_STACK}; i++)) {
+        compile_zeshy_overlay "${ZESHY_OVERLAY_STACK[i]}"
+    }
+
+    # Compile the Zeshy digest from the function definitions sourced above.
+    compile_zeshy_digest
+}
+
+compile_zeshy_preamble() {
+    # Validate sanity.
+    die_if_args
+
+    # Recompilation optimizations require Zeshy to *NOT* have been autoloaded at
+    # this point... Throw an exception if Zeshy has been. While this should
+    # never be the case, one can't be too careful in a bitwise world.
+    typeset -f get_zeshy_version 1>/dev/null and
+        die "get_zeshy_version() and hence Zeshy already autoloaded"
+
+    # Make the user-specific Zeshy configuration directory, if not found.
+    is -d "${ZESHY_USER_CONFIG_DIR}" si or mkdir -p "${ZESHY_USER_CONFIG_DIR}"
+}
+
+#FIXME: Sourcing configuration files *REALLY* needs to happen prior to
+#compilation, for obvious reasons. O.K.; so, that's taken care of. But we need
+#to also ensure that if we *DON'T* perform compilation we still source such files.
+#Do:
+#    source "${ZESHY_USER_CONFIG_DIR}/"*
+
+# Without compunction, compile it.
+compile_zeshy_overlay() {
+    # Validate passed arguments.
+    die_unless_one_arg 'expected one overlay dir'
+    string overlay_dir="${1}"
+    is -d "${overlay_dir}" si or
+        die "\"${overlay_dir}\" not found or not a directory"
+    utter "autoloading overlay \"${overlay_dir}\"..."
+
+    # Absolute paths of overlay subdirectories.
+    string\
+        overlay_main_dir="${overlay_dir}/always"\
+        overlay_command_dir="${overlay_dir}/if_installed"\
+        overlay_theme_dir="${overlay_dir}/if_theme/${ZESHY_THEME}"
+
+    # Source all configuration files in this overlay's configuration directory.
+    # Do this prior to all other overlay logic depending on globals defined by
+    # such files (e.g., ${ZESHY_THEME}).
+    compile_zeshy_overlay_config "${overlay_dir}"
+
+    # Append this overlay's main directory as autoloadable, if found.
+    is -d "${overlay_main_dir}" si and
+        ZESHY_AUTOLOAD_DIRNAMES+="${overlay_main_dir}"
+
+    # Append the subdirectory of this overlay's theme directory matching the
+    # user's currently configured theme to the overlay stack, if found.
+    is -d "${overlay_theme_dir}" si and\
+        ZESHY_OVERLAY_STACK+="${overlay_theme_dir}"
+
+    # Append the subdirectory of this overlay's distro directory matching the
+    # user's currently installed distro to the overlay stack, if found.
+    is -n "${ZESHY_DISTRO_NAME}" si and {
+        string overlay_distro_dir="${overlay_dir}/if_distro/${ZESHY_DISTRO_NAME}"
+        is -d "${overlay_distro_dir}" si and
+            ZESHY_OVERLAY_STACK+="${overlay_distro_dir}"
+    }
+
+    # If this overlay provides a command directory...
+    is -d "${overlay_command_dir}" si and {
+        # List of all paths in this overlay's command directory corresponding to a
+        # currently installed executable file in the $PATH. Dismantled, this is:
+        #
+        # * "${ZESHY_AUTOLOAD_COMMAND_DIR}/"*, listing each file in Zeshy's
+        #   command directory.
+        # * "(e{[[ ... ]]})", excluding files failing the following test:
+        #   * "$REPLY", the current file.
+        #   * ":t", the basename of such file.
+        #   * ":c", the absolute path to a command in the $PATH with such name.
+        #   * "== /*", true only when ":c" succeeds in finding such a command.
+        # * "or true", ignoring failure (if ":c" fails finding such a command).
+        list overlay_command_paths; overlay_command_paths=(
+            "${overlay_command_dir}/"*(e{'[[ $REPLY:t:c == /* ]]'})
+        ) or true
+
+        # Append all files in this directory to the list of autoloadable files.
+        ZESHY_AUTOLOAD_FILENAMES+=( "${^overlay_command_paths[@]}"(.) )
+
+        # Append all directories in this directory to the overlay stack.
+        ZESHY_OVERLAY_STACK+=( "${^overlay_command_paths[@]}"(/) )
+    }
+}
+
+compile_zeshy_overlay_config() {
+    # Validate passed arguments.
+    die_unless_one_arg 'expected one overlay dirname'
+    string overlay_config_dir="${1}/if_config"
+    is -d "${overlay_config_dir}" si or return_true
+
+    #FIXME: This'd be a nice place to add update handling for patching locally
+    #modified config files against Zeshy-bundled config files on update.
+    # For each configuration file in the passed overlay:
+    #
+    # * Copy such file to the current user's configuration directory, if
+    #   containing no such file already.
+    # * Source the file in the current user's configuration directory.
+    string basename target_filename
+    for source_filename ("${overlay_config_dir}/"*) {
+        basename="$(basename "${source_filename}")"
+        target_filename="${ZESHY_USER_CONFIG_DIR}/${basename}"
+
+        # Copy.
+        is -f "${target_filename}" si or {
+            utter "fabricating \"${target_filename}\"..."
+            cp "${source_filename}" "${target_filename}"
+        }
+
+        # Source.
+#       utter "sourcing \"${target_filename}\"..."
+        source "${target_filename}"
+    }
+}
+
+compile_zeshy_digest() {
+    # Validate sanity.
+    die_if_args
+    utter "recompiling \"${ZESHY_USER_DIGEST_FILE}\"..."
+
+    # For each function declared in each file in the passed directory and
+    # subdirectories of that directory, make a symbolical link in the digest
+    # directory with that function name to that file. Dismantled, this is:
+    #
+    # * "${^ZESHY_AUTOLOAD_DIRNAMES[@]}", expanding to each directory in the list.
+    # * "/**/*",  recursively expanding to each file in such directory.
+    # * "~*.swp", excluding temporary files.
+    # * "(.)", excluding non-plain files.
+    for autoload_function_filename (
+        "${^ZESHY_AUTOLOAD_DIRNAMES[@]}"/**/*~*.swp(.)
+        "${ZESHY_AUTOLOAD_FILENAMES[@]}"
+    ) {
+        # Load the functions this file defines for subsequent compilation.
+#       utter "sourcing \"${autoload_function_filename}\"..."
+        source "${autoload_function_filename}"
+#       utter "sourced \"${autoload_function_filename}\"."
+    }
+
+    # List of all function names declared at this point (i.e., subsequent to
+    # recursively sourcing Zeshy and hence declaring Zeshy functions).
+    list new_function_names; new_function_names=( $(typeset -f +) )
+
+    #FIXME: Add new get_list_difference() and get_list_intersection() functions
+    #to "type/function", leveraging die_unless_list() and return_list(). (Yep!)
+    #Hmm; wait. We're probably better off with difference_lists_into() and
+    #intersect_lists_into() functions accepting a third arg: the target list.
+
+    # The difference between the two lists is the list of all Zeshy functions.
+    # Recompile all such function definitions into the Zeshy digest file. (For
+    # those who care, this is an asymmetric rather than symmetric difference.)
+#   print "autoload function names: ${new_function_names[@]:|ZESHY_OLD_FUNCTION_NAMES}"
+    zcompile -c "${ZESHY_USER_DIGEST_FILE}"\
+        "${new_function_names[@]:|ZESHY_OLD_FUNCTION_NAMES}"
+}
+
+# ....................{ MAIN                               }....................
+compile_zeshy
+
+# --------------------( WASTELANDS                         )--------------------
+    # If "lsb_release" is installed, run it to obtain the distro name of the
+    # current operating system. Most modern distros provide such executable
+    # for exactly this purpose. While crude alternatives to "lsb_release" do
+    # exist (e.g., globbing for filenames matching /etc/*release), it hardly
+    # seems worth the buggy effort so early in the bootstrap process.
+    # Dismantled, this is:
+    #
+    # * "${:-lsb_release}", expanding to the string "lsb_release".
+    # * "${...:c}", expanding to the absolute path of "lsb_release" if installed
+    #   in the current $PATH or only "lsb_release" otherwise.
+    # * "-x", returning true if such path is executable and hence installed.
+    #   Unless the current directory contains an executable "lsb_release", this
+    #   returns true only if ":c" expanded to an absolute path.
+#   if is -x "${${:-lsb_release}:c}" si; then
+        # Lowercase the distro name for dirname comparison.
+#       string distro_name autoload_distro_dir
+#       distro_name="${(L)$(lsb_release -si)}"
+#       autoload_distro_dir="${ZESHY_AUTOLOAD_DISTRO_DIR}/${distro_name}"
+#       print "autoload_distro_dir: ${autoload_distro_dir}"
+
+        # If Zeshy provides distro-specific components, append distro-
+        # specific dirnames and filenames to the corresponding lists.
+#       if is -d "${autoload_distro_dir}" si; then
+#           ZESHY_AUTOLOAD_DIRNAMES+="${autoload_distro_dir}/always"
+#           ZESHY_AUTOLOAD_FILENAMES+=(
+#               "${autoload_distro_dir}/if_installed/"*(e{'[[ $REPLY:t:c == /* ]]'})
+#           ) or true
+#       fi
+#   fi
+    # List of directories recursively containing Zsh scripts containing
+    # autoloadable functions to be compiled into Zeshy's digest file.
+#   ZESHY_AUTOLOAD_DIRNAMES+="${ZESHY_AUTOLOAD_CORE_DIR}"
+
+#   string overlay_dir="${1}"
+#   is -d "${overlay_dir}" si or
+#       die "\"${overlay_dir}\" not found or not a directory"
+#   string source_filename="${1}" target_filename basename
+#   is -f "${source_filename}" si or
+#       die "\"${source_filename}\" not found or not a file"
+#   basename="$(basename "${source_filename}")"
+#   target_filename="${ZESHY_USER_CONFIG_DIR}/${basename}"
+
+    # If not found, make the user-specific Zeshy configuration (and hence dot)
+    # directory and file.
+#   is -d "${ZESHY_USER_CONFIG_DIR}" si or mkdir -p "${ZESHY_USER_CONFIG_DIR}"
+#   is -f "${target_filename}" si or {
+#       utter "fabricating \"${target_filename}\"..."
+#       cp "${source_filename}" "${ZESHY_USER_CONFIG_DIR}/"
+#   }
+
+    #FIXME: We need to do this in "src/import", instead. Probably just:
+    #source "${ZESHY_USER_CONFIG_DIR}/"*
+    # Import such file, hopefully defining all globals declared above.
+#   source "${target_filename}"
+    # List of directories recursively containing Zsh scripts containing
+    # autoloadable functions to be compiled into Zeshy's digest file.
+#   list ZESHY_OVERLAYS
+#   ZESHY_OVERLAYS=( "${ZESHY_AUTOLOAD_CORE_DIR}" )
+
+    # Recursively compile the Zeshy codebase specific to current system and user
+    # state starting from (in order):
+#compile_zeshy_theme() {
+#}
+
+    # List of Zeshy overlays (i.e., system- and user-specific directories
+    # obeying the same structure as Zeshy's top-level "./src" directory). All
+    # files and directories in a Zeshy overlay are ignored except those with the
+    # following Zeshy-specific names:
+    #
+    # * "always", a directory recursively containing only:
+    #   * Subdirectories with arbitrary names and nesting, purely for
+    #     organizational purposes. (Optional.)
+    #   * Zeshy scripts, to be unconditionally compiled into Zeshy's digest
+    #     file. Scripts may reside directly in the top-level "always" directory
+    #     or under optional subdirectories. In either case, Zeshy automatically
+    #     finds and compiles all Zsh functions in all such files.
+    #
+    # recursively containing Zsh scripts containing
+    # autoloadable functions to be compiled into Zeshy's digest file.
+
+    #FIXME: O.K.; technically, this works -- but not here, as we have yet to
+    #autoload Zeshy. This is a fairly complex operation. (Can we reduce it to
+    #more efficient Zsh builtins and ideally simply glob matching?)
+    # Determine whether or not this process is running is a cronjob. This is
+    # adapted from this itworld.com article, "Am I being run by cron?":
+    #        http://www.itworld.com/Comp/3380/nls_unixcron041209/index.html
+    #
+    # Do this prior to uttering imports, as the utter() function requires this.
+#    string cron_pids="$(pgrep -x cron)"
+#    integer grandparent_pid="$(ps -eo ppid,pid= | grep " ${PPID}$" | awk '{print $1}')"
+#    ZESHY_IS_CRONJOB="$(one_if match_multiline "^${cron_pids}$" "${grandparent_pid}")"
+#   echo "cron: ${ZESHY_IS_CRONJOB}; cron_pids: ${cron_pids}; gpid: ${grandparent_pid}"
+
+# All monitoring and modification is silent, efficient, and entirely automatic.
+# to accomodate
+# such changes. Such are silent, efficient, and entirely automatic.
+# efficiently monitors such state for changes,      # * "${distro_command:c}", expanding to the absolute path of
+    #   "lsb_release" if installed or only "lsb_release" otherwise.
+#   string distro_command='lsb_release'
+#   if is -x "${distro_command:c}" si; then
+#FIXME: This is concise enough now to be merged back into "module", which should
+#incidentally be renamed "load" (...I suppose).
+
+    #FIXME: Test for pathological cases: namely, if there *IS* a Zeshy function
+    #currently declared that shouldn't be (e.g., get_zeshy_version()). In such
+    #case, I'm unsure what the proper response is. We currently th
+    #FIXME: See "gwydden/output" for "TODO" comments on substantially
+    #improving the theme support.
+
+# ....................{ AUTOLOADS                          }....................
+#FIXME: Keep the old method about, for a bit.
+    # List set of autoloadable function names defined in such listed files.
+#   list_set autoload_function_names
+#   utter "recursively sourcing \"${ZESHY_OVERLAY_ROOT}\"..."
+
+    # Load "mapfile", a core Zsh module mapping file contents to map values.
+    # It's both brilliant and efficient, an unhappily rare combination. It's
+    # also remarkably dangerous, since accidentally unsetting keys from this
+    # map deletes the corresponding files. Hence, we immediately unload this
+    # module after use.
+#   zmodload zsh/mapfile
+
+    #FIXME: Terrible! Utterly. When enabled, this sporadically fails with an
+    #inscrutible error resembling:
+    #    "(anon):82: bad math expression: operand expected at `/usr/share...'"
+    #File a bug report if this is still the case under recent Zsh versions.
+    # Forcibly prevent harmful ${mapfile} and hence filesystem changes.
+#       typeset -r mapfile
+#       print ${mapfile[/tmp/config]}
+#       print -rl -- ${(f)mapfile[/usr/share/zeshy/src/autoload/if_installed/7z]}
+
+    # For each function declared in each file in the passed directory and
+    # subdirectories of that directory, make a symbolical link in the digest
+    # directory with that function name to that file. Dismantled, this is:
+    #
+    # * "${^ZESHY_AUTOLOAD_DIRNAMES[@]}", expanding to each directory in the list.
+    # * "/**/*",  recursively expanding to each file of this directory.
+    # * "~*.swp", excluding temporary files.
+    # * "(.L+0)", including only non-empty plain files. "mapfile" currently
+    #   fails with error on attempting to expand an empty plain file,
+    #   arguably a bug. Nonetheless, respect its wishes.
+#   for autoload_function_filename (
+#       "${^ZESHY_AUTOLOAD_DIRNAMES[@]}"/**/*~*.swp(.L+0)
+#       "${ZESHY_AUTOLOAD_FILENAMES[@]}"
+#   ) {
+        # Load the functions this file defines for subsequent compilation.
+#           utter "sourcing \"${autoload_function_filename}\"..."
+#       source "${autoload_function_filename}"
+
+        # Append to the list of autoloadable functions all:
+        #
+        # * Explicitly defined functions of form "${function_name}() {".
+        # * Implicitly defined interactive aliases of form
+        #   "interactive_alias ${alias_name}=${alias_expansion}".
+        #
+        # Dismantled, this is:
+        #
+        # * "${(f)mapfile[...]}", expanding to each line of this file.
+        # * "${(M)", ":#", and "}", excluding lines not matching the
+        #   following extended glob expression:
+        #   * "\(\) \{", followed by "() {", signifying a function.
+        #   * "[[:alnum:]_-]##", greedily matching a substring of one or
+        #     more alphanumeric, underscore, and hyphen characters.
+        # * "${" and "%%\(*}", excluding the "() {" suffixing such lines.
+        # * "=?*", greedily matching "=" followed by one or more characters.
+        #
+        # Note: *DO NOT QUOTE THIS EXPRESSION*. Doing so silently expands
+        # this expression to the empty string, though we have no idea why!
+        # Also, do not quote the expansion of ${autoload_function_file} in
+        # this expression. Doing so causes "mapfile" to interpret such
+        # quotes as prefixing and suffixing such filename, thus raising an
+        # exception on not finding such "munged" filename.
+#       autoload_function_names+=(
+#           ${${${(M)${(f)mapfile[${autoload_function_filename}]}:#([[:alnum:]_-]##\(\) \{|interactive_alias [[:alnum:]_-]##=?)*}#interactive_alias }%%[(=]*}
+#               ${${${(M)${(f)mapfile[${autoload_function_filename}]}:#([[:alnum:]_-]##\(\) \{|interactive_alias [[:alnum:]_-]##=?)*}#interactive_alias }%%[(=]*}
+#       )
+#           utter "sourced \"${autoload_function_filename}\"."
+#   }
+
+    # Unload "mapfile", for safety.
+#   zmodload -u zsh/mapfile
+
+    #FIXME: Not quite right. If the user disables
+    #${ZESHY_IS_WRAPPING_CORE_COMMANDS}, then some interactive aliases will not
+    #actually be defined. zcompile() *FAILs* when fed non-extant function names.
+    #To rectify this, we really want to make the prior loop sourcing each file
+    #and matching "autoload_function_names" much, much smarter. First, stop
+    #grepping file contents. If you consider it, all you really need to do is:
+    #
+    #* Before sourcing such file, stuff the set of all function names into a list.
+    #* After! sourcing such file, diff! the set of all function names against
+    #  such list. A new subtract_list_from_list() function would be of help,
+    #  here. The resulting list is the set of all function names such file
+    #  defined. This method may or may not be slower, depending on Zsh. What's
+    #  clear, however, is that it's *MUCH* more resilient and *MUCH* less hacky.
+    #
+    #Ah-ha! Zsh 5.0 bundles a "${left_list:|right_list}" operator subtracting
+    #the two lists. This implies a hard dependency.
+#   is "$(whence -w -- "${1}")" == *': function' si
+#   list ZESHY_OLD_FUNCTION_NAMES; ZESHY_OLD_FUNCTION_NAMES=( $(typeset -f +) )
+
+    # Recompile all such loaded function definitions into the digest file.
+#       print "autoload function names: ${autoload_function_names[@]}"
+#       utter "compiling \"${ZESHY_USER_DIGEST_FILE}\"..."
+#   zcompile -c "${ZESHY_USER_DIGEST_FILE}" "${autoload_function_names[@]}"
+
+# ....................{ WASTELANDS                         }....................
+        #FIXME: This should be a "list_set" rather than "list", for a slight
+        #efficiency (and clarity (and stability!)) improvement.
+#
+        # For clarity, temporarily set the script name to Zeshy.
+#       string ZESHY_SCRIPT_NAME='zeshy'
+
+#       zcompile "${ZESHY_USER_DIGEST_FILE}" "${ZESHY_USER_DIGEST_DIR}"/**/*(@)
+#               ${${${(M)${(f)mapfile[${autoload_function_filename}]}:#([[:alnum:]_-]##\(\) \{|interactive_alias [[:alnum:]_-]##=?)*}#interactive_alias }%%( \(|\=)*}
+            #FIXME: I believe these two mappings can be condensed into one.
+#               ${(f)mapfile[/usr/share/zeshy/src/autoload/if_installed/7z]}
+#               ${(f)mapfile[${autoload_function_filename}]}
+#               ${(M)${(f)mapfile[${autoload_function_filename}]}:#([[:alnum:]_-]##\(\) \{|interactive_alias [[:alnum:]_-]##=?)*}
+#               ${${${(M)${(f)mapfile[${autoload_function_filename}]}:#([[:alnum:]_-]##\(\) \{|interactive_alias [[:alnum:]_-]##=?)*}#interactive_alias }%%( \(|=)*}
+#               ${${${(M)${(f)mapfile[${autoload_function_filename}]}:#interactive_alias [[:alnum:]_-]##=?*}#interactive_alias }%%\=*}
+#               ${${(M)${(f)mapfile[${autoload_function_filename}]}:#[[:alnum:]_-]##\(\) \{}%%\(*}
+#               ${${${(M)${(f)mapfile[/usr/share/zeshy/src/autoload/if_installed/7z]}:#interactive_alias [[:alnum:]_-]##=?*}#interactive_alias }%%\=*}
+#           print "interactive_aliases:"
+#           print -rl -- ${${${(M)${(f)mapfile[${autoload_function_filename}]}:#interactive_alias [[:alnum:]_-]##=*}#interactive_alias }%%\=*}
+
+# --------------------( TODO                               )--------------------
+# * Ultimately, Zeshy should auto-compile the recursive entirety of all Zeshy
+#   function definitions into a single so-called "digest" file at, say,
+#   "~/.zeshy/digest.zwc". Such a file is autoloadable by:
+#       
+#       # ...implicitly autoloading such digest.
+#       fpath=( "~/.zeshy/digest.zwc" "${fpath[@]}" )
+#
+#       # ...explicitly autoloading such digest.
+#       autoload -Uw "~/.zeshy/digest.zwc"
+#
+#   I'm unsure if the former supercedes the latter. (Probably not, no.) Both
+#   required, perhaps.
+#
+#   What's nice about this is that such a digest file appears to come prepended
+#   with a list of all functions defined by such digest, thus rendering
+#   autoloading of digest files terrifically fast. Auto-generating such a digest
+#   on any change to any Zeshy file or directory is, unfortunately, not quite so
+#   easy. We'll need to write something resembling:
+#
+#       if is "$(get_path_mtime "~/.zeshy/digest.zwc") equals SOMETHING si; then
+#           zcompile "~/.zeshy/digest.zwc" "${ZESHY_HOME}/src/"**/*(.)
+#       fi
+#
+#   However, it's unclear just how aggregating multiple files into one handles
+#   initialization code. Clearly, it either doesn't or does but simply lumps all
+#   initialization together. Either case is bad. We'll need to rewrite Zeshy to:
+#
+#   * Perform all non-costly initialization up-front in Zeshy .main or core.
+#   * Perform all costly initialization in the functions requiring such
+#     initialization as the first line of such functions. You know that grind...
+# * Ugh. Current symlink technique doesn't quite work. It's quite close, though.
+#   A working system either:
+#   * Harvests the set of all function names using the current technique *AND*
+#     manually recursively sources all Zeshy files (easy) *AND* uses the "-c"
+#     flag to zcompile to compile all such function names into the digest
+#     (easy). This isn't quite perfect, but it seems pretty darn close.
+#   * Alternatively, create new temporary files in "~/.zeshy/digest/" defining
+#     each such function separately by matching out the definition of such
+#     functions from the existing files. This is somewhat more work, and
+#     demonstrably of no greater benefit than the prior method. I reck'n it'd
+#     work, but I'd rather try to pick the prior low-hanging fruit, first.
+
+
+    #     zrecompile -p\
+    #         -R ~/.zshrc --\
+    #         -M ~/.zcompdump --\
+    #         ~/zsh/comp.zwc ~/zsh/Completion/*/_*
+    #
+    #This does everything for us. Swag, no? Memory map everything, of course.
+    #Oh, and the latter line is the one that applies to us. To quote: "re-create
+    #the file ~/zsh/comp.zwc if any of the files matching the given pattern is
+    #newer than it." We'll need to dynamically construct the arguments to be
+    #passed for the command-specific directories. Shouldn't be hard:
+    #
+    #     list zrecompile_args
+    #     zrecompile_args=( "${generic_dir}.zwc" "${generic_dir}"/**/*(.) )
+    #     for command_dir in "src/auto/command"/*(/); do
+    #         zrecompile_args+=( "${command_dir}.zwc" "${command_dir}"/**/*(.) )
+    #     done
+    #     print "za: ${zrecompile_args[@]}"
+
+    # Automatically recompile all compiled files in function path "${FPATH}" whose
+    # corresponding uncompiled files have since changed.
+    #autoload -U zrecompile
+#   zrecompile -p
+
+        # Make the digest directory, if needed.
+#       utter "composing \"${ZESHY_USER_DIGEST_DIR}\"..."
+#       mkdir -p "${ZESHY_USER_DIGEST_DIR}"
+
+        # Remove all existing symbolic links in the digest directory, if needed.
+#       list digest_symlinks; digest_symlinks=( "${ZESHY_USER_DIGEST_DIR}/"*(@) )
+#       is -n "${digest_symlinks}" si and rm "${digest_symlinks[@]}"
+
+
+#           print "autoload_function_file=${autoload_function_file}"
+#           for autoload_function_name\
+#               ( ${${(M)${(f)mapfile[${autoload_function_file}]}:#[[:alnum:]_-]##\(\) \{}%%\(*} ) {
+#               ln -s\
+#                   "${autoload_function_file}"\
+#                   "${ZESHY_USER_DIGEST_DIR}/${autoload_function_name}"
+#           }
+
+#       is_shell_terminal and print 'Yum!'
+#       zcompile -c "${ZESHY_USER_DIGEST_FILE}" is_shell_terminal
+
+#   zstat +mtime "${1}"
+    # Dismantled, this is:
+    #
+    # * "${pathname}"/**/*, all files and subdirectories of this directory.
+    # * "om", such files and subdirectories in ascending order by mtime.
+    # * "[1]", the first and hence newest such file or subdirectory.
+#   zstat +mtime "${pathname}"/**/*(om[1])
+
+#   touch -m --date=@"${mtime}" "${pathname}"
+
+# void _populate_zeshy_digest_dir_with(char *dirname)
+#
+# Populate Zeshy's digest directory with one symbolic link for each autoloadable
+# function in each file of the passed directory, recursively.
+#_populate_zeshy_digest_dir_with() {
+#    die_unless_one_arg 'expected exactly one dirname'
+#
+#    # For each function declared in each file in the passed directory and
+#    # subdirectories of that directory, make a symbolical link in the digest
+#    # directory with that function name to that file. Dismantled, this is:
+#    #
+#    # * "/**/*", recursively expanding to each file and subdirectory of the
+#    #   passed directory.
+#    # * "~*.(swp)", excluding temporary files.
+#    # * "(.)", including only plain files.
+#    for autoload_function_file\
+#        ( "${ZESHY_AUTOLOAD_ALWAYS_DIR}"/**/*~*.(swp)(.) ) {
+#        # Dismantled, this is:
+#        #
+#        # * "${(f)mapfile["${autoload_function_file}"]}", iteratively
+#        #   expanding to each line of this file.
+#        # * "${(M)", ":#", and "}", excluding lines not matching the
+#        #   following extended glob expression:
+#        #   * "[[:alnum:]_-]##", greedily matching a substring of one or
+#        #     more alphanumeric, underscore, and hyphen characters.
+#        #   * "\(\) \{", followed by "() {", signifying a function.
+#        # * "${" and "%%\(*}", excluding the "() {" suffixing such lines.
+#        for autoload_function_name\
+#            ( "${${(M)${(f)mapfile["${autoload_function_file}"]}:#[[:alnum:]_-]##\(\) \{}%%\(*}" ) {
+#            ln -s\
+#                "${autoload_function_file}"\
+#                "${ZESHY_USER_DIGEST_DIR}/${autoload_function_name}"
+#        }
+#    }
+#}
+
+#       for autoload_command_filename\
+#           ( "${ZESHY_COMMAND_DIR}/"*(e{'[[ $REPLY:t:c == /* ]]'}) ) {
+#           ZESHY_AUTOLOAD_FILENAMES+=( "${autoload_command_filename}" )
+#       }
+
+        #FIXME: Replace with an "rm -rf" once confident this works.
+#           mv "${ZESHY_USER_DIGEST_DIR}" "${ZESHY_DOT_DIR}/tmp/$(date +'%N')"
+
+#_zeshy_autoload_digest_old() {
+    #FIXME: This only applies to developer systems. In production, Zeshy
+    #requires only one initial compilation, thus eliminating the cost of such
+    #recompilation. Ah; I wonder. Wouldn't a "zrecompile -p" immediately after
+    #declaring the "fpath" do this, assuming we'd first compiled all necessary
+    #digests? If so, that would suggest we'd only need a simple test for
+    #
+    #    if not is_file "${ZESHY_USER_DIGEST_FILE}"; then
+    #       # Compile everything anew here! Don't bother checking mtimes.
+    #    fi
+    #
+    #Then, a zrecompile should handle the rest, yes? That would be considerably
+    #more efficient, given Zsh's C-backed implementation. Ah; O.K., it gets even
+    #better. We can entirely reduce this if-conditional to a zrecompile() call
+    #resembling the given example:
+    #
+    #     zrecompile -p\
+    #         -R ~/.zshrc --\
+    #         -M ~/.zcompdump --\
+    #         ~/zsh/comp.zwc ~/zsh/Completion/*/_*
+    #
+    #This does everything for us. Swag, no? Memory map everything, of course.
+    #Oh, and the latter line is the one that applies to us. To quote: "re-create
+    #the file ~/zsh/comp.zwc if any of the files matching the given pattern is
+    #newer than it." We'll need to dynamically construct the arguments to be
+    #passed for the command-specific directories. Shouldn't be hard:
+    #
+    #     list zrecompile_args
+    #     zrecompile_args=( "${generic_dir}.zwc" "${generic_dir}"/**/*(.) )
+    #     for command_dir in "src/auto/command"/*(/); do
+    #         zrecompile_args+=( "${command_dir}.zwc" "${command_dir}"/**/*(.) )
+    #     done
+    #     print "za: ${zrecompile_args[@]}"
+#    utter "detecting \"${ZESHY_USER_DIGEST_FILE}\"..."
+#    integer zeshy_mtime=$(get_path_mtime_recursive "${ZESHY_SRC_HOME}")
+#    if not is_file "${ZESHY_USER_DIGEST_FILE}" or
+#        (( zeshy_mtime != $(get_path_mtime "${ZESHY_USER_DIGEST_FILE}") )); then
+#        utter "compiling \"${ZESHY_USER_DIGEST_FILE}\"..."
+#        # ...the "-." matches all files and symbolic links to files.
+#        zcompile "${ZESHY_USER_DIGEST_FILE}" "${ZESHY_SRC_HOME}"/**/*~*.(swp|zwc)(-.)
+
+#        # Set the mtime of the compiled script to that of the uncompiled
+#        # script to ensure the above conditional fails on future imports.
+#        set_path_mtime "${ZESHY_USER_DIGEST_FILE}" "${zeshy_mtime}"
+#    fi
+
+    # Declare all functions provided by the digest file to be autoloadable.
+#    autoload -w "${ZESHY_USER_DIGEST_FILE}"
+
+    # Prefix "${FPATH}" with the absolute path to the digest file, ensuring Zsh
+    # searches such file for the definition of such functions first. Oddly, Zsh
+    # has no means of directly associating the two.
+#    fpath=( "${ZESHY_USER_DIGEST_FILE}" "${fpath[@]}" )
+#}
