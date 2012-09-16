@@ -8,15 +8,245 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Zeshy rtorrent.
 #
+# --------------------( DESCRIPTION                        )--------------------
+# rtorrent is "...a BitTorrent client for ncurses, using the libtorrent library.
+# The client and library is written in C++ with emphasis on speed and
+# efficiency, while delivering equivalent features to those found in GUI-based
+# clients in an ncurses client."
+#
+# By default, rtorrent has no formal support for:
+#
+# * Daemonization and hence cannot be "detached" from its parent terminal and
+#   attached to a new terminal.
+# * Backgrounding and hence requires a dedicated parent terminal *ALWAYS*
+#   running "rtorrent".
+#
+# Hence, rtorrent behavior fundamentally differs from that of most command line-
+# oriented system and user services. Enter stage left: the canonical terminal
+# multiplexer "screen" and derivatives (e.g., "tmux"). Multiplexers decouple
+# command from terminal lifecycle by allowing commands to be detached from
+# parent terminals and subsequently reattached to new terminals, thus rectifying
+# all deficiencies in rtorrent itself.
+#
 # --------------------( TODO                               )--------------------
-# * Support alternative screen muxers as well (e.g., "tmux").
+# * Support alternative screen muxers (e.g., "tmux" and "dtach", in that order).
+# * Consider enabling the "multiuser" screen option rather than using
+#   ZESHY_RTORRENT_USERNAME-style sudoing. That has several benefits, of which one is the
+#   ability to allow other users to open the deattached rtorrent session.
+# * Perform automatic logging to a file when operating as a cronjob.
 
 # ....................{ ALIASES                            }....................
 is_zeshy_wrapping_core_commands and
 interactive_alias rtorrent='screenify rtorrent'
 interactive_alias rt='rtorrent'
 
+# ....................{ RUNNERS                            }....................
+# void start_rtorrent(string username = ZESHY_RTORRENT_USERNAME)
+#
+# Daemonize "rtorrent" under the passed user (defaulting to
+# ${ZESHY_RTORRENT_USERNAME} if such user exists or the current user otherwise).
+# ${ZESHY_RTORRENT_USERNAME} defaults to "rtorrent", a hypothetical user
+# unlikely to exist on the current machine. Consider either passing or defining
+# ${ZESHY_RTORRENT_USERNAME} to the non-root user you intend to run the
+# "rtorrent" daemon and hence actively manage torrents as. Also see the
+# "rtorrent" file in Zeshy's configuration directory (e.g., "~/.zeshy/config").
+#
+# Foreground a started "rtorrent" daemon by running "rtorrent" as this user.
+# Background a foregrounded "rtorrent" daemon by typing the key combination
+# specific to the terminal multiplexer daemonizing "rtorrent":
+#
+# * If screen, <Ctrl-a d>. "Ctrl-a" is a screen-specific prefix for entering
+#   screen commands and "d" the screen command for detaching (i.e.,
+#   backgrounding) the rtorrent screen session. (C'est simple, non?)
+#
+# Stop a started "rtorrent" daemon by either calling stop_rtorrent(), passing
+# the same user, or typing <Ctrl-q> from a foregrounded "rtorrent" daemon.
+start_rtorrent() {
+    # Validate sanity.
+    die_if_args
+    die_unless_installed rtorrent
+    die_unless_local_user "${ZESHY_RTORRENT_USERNAME}"
+
+    # Stop all "rtorrent" processes running under the requested user. To avoid
+    # false positives, first remove zombie screen sessions.
+    remove_screen_dead_sessions "${ZESHY_RTORRENT_USERNAME}"
+    is_rtorrent_running and stop_rtorrent
+    utter 'starting rtorrent...'
+
+    # If there are other rtorrent screen sessions running, warn and press on.
+    is_rtorrent_running and
+        curse "${rtorrent_process_count} rtorrent screen session(s) already started"
+#   integer rtorrent_process_count
+#   rtorrent_process_count="$(get_rtorrent_process_count)"
+#   (( rtorrent_process_count == 0 )) or
+#       curse "${rtorrent_process_count} rtorrent screen session(s) already started"
+
+    # Start rtorrent as a screen session. Note that screen's argument passing
+    # engine is fragile... Order is important in its list of arguments.
+    run_as "${ZESHY_RTORRENT_USERNAME}"\
+        "'${SCREEN}' -d -m -fa -U -S '${SCREEN_SESSION}' '${RTORRENT}'"
+#       or die_from_rtorrent_start_error
+
+    # Grep the PID of the screen process corresponding to the now-detached
+    # rtorrent session by asking screen itself.
+    string screen_pid
+    screen_pid="$(run_as "${ZESHY_RTORRENT_USERNAME}" "${SCREEN} -list" |\
+        grep --max-count=1 "\.${SCREEN_SESSION}[[:space:]]" |\
+        sed "s/^[[:space:]]*\([0-9][0-9]*\)\.${SCREEN_SESSION}[[:space:]].*$/\1/" -)"
+
+    # If "screen" lists no such rtorrent session for this user, fail.
+    is_pcre_match "${screen_pid}" '^[[:space:]]*$' or
+        die "\"screen\" lists no rtorrent sessions"
+##   if sputter "${screen_pid}" | is_pcre_match '^[[:space:]]*$'; then
+#       curse "\"screen\" lists no rtorrent sessions"
+#       die_from_rtorrent_start_error
+#   fi
+
+    #FIXME: This is generally useful. Shift into the Zeshy Process component.
+    # Unfortunately, ${screen_pid} gives the process ID of the screen process
+    # hosting this rtorrent process rather than that rtorrent process itself. As
+    # halting this rtorrent process requires we have its ID rather than screen's
+    # ID, we now grep for that.
+    #
+    # Note, however, that this rtorrent process may not yet have actually started
+    # up. Therefore, wait a sensible number of seconds for it to start up; if it
+    # fails to do so, fail.
+    integer start_time close_time rtorrent_pid
+    (( close_time = $(get_time_unix) + 8 ))
+    while (( $(get_time_unix) <= close_time )); do
+        # If rtorrent is now running, break.
+        rtorrent_pid=$(pgrep -P "${screen_pid}" -fx "${RTORRENT}" 2>/dev/null)\
+            and break
+
+        # Otherwise, sleep and try again.
+        sleep 1
+    done
+
+    # If rtorrent is still not running, fail.
+    die_unless_nonempty "${rtorrent_pid}"\
+        "no rtorrent process running under \"screen\" PID ${screen_pid}"
+
+    #FIXME: Rename make_dir_safely() to make_dir_if_not_found(). Also, add new
+    #overwrite_text_file_with() and append_text_file_with() functions to
+    #"file/contents/text".
+
+    #FIXME: Implement me. Perhaps we want a new "os/process/pid_file" component
+    #for managing PID files?
+    string pid_filename
+    pid_filename="$(get_pid_file "${ZESHY_RTORRENT_USERNAME}" rtorrent)"
+    overwrite_text_file_with "${pid_filename}" ${rtorrent_pid}
+
+    utter "detached rtorrent PID ${rtorrent_pid} to screen PID ${screen_pid}"
+}
+
+# void stop_rtorrent(string username = ZESHY_RTORRENT_USERNAME)
+#
+# Kill the "rtorrent" daemon under the passed user (defaulting to
+# ${ZESHY_RTORRENT_USERNAME} if such user exists or the current user otherwise).
+# See start_rtorrent() for further details.
+stop_rtorrent() {
+    die 'unimplemented'
+}
+
+# ....................{ UTILITIES                          }....................
+# bool is_rtorrent_running(void)
+#
+# Return true if "screen" shows at least one rtorrent session under the
+# requested user.
+is_rtorrent_running() {
+    die_if_args
+    integer process_count
+    process_count="$(get_rtorrent_process_count)"
+    (( process_count ))
+}
+
+# integer get_rtorrent_process_count(void)
+#
+# Get the number of rtorrent sessions (and hence processes) "screen" maintains
+# under the requested user.
+get_rtorrent_process_count() {
+    die_if_args
+    get_screen_session_count\
+        "${ZESHY_RTORRENT_USERNAME}"\
+        "${ZESHY_RTORRENT_SCREEN_SESSION_NAME}"
+}
+
+#FIXME: Shift to "screen".
+# integer get_screen_session_count(
+#   string session_name, string username = $(get_username))
+#
+# Get the number of "screen" sessions with the passed name under the passed user
+# (defaulting to the current user).
+get_screen_session_count() {
+    # Validate passed arguments.
+    die_unless_one_or_two_args 'expected one session name and optional username'
+    string session_name="${1}" username="${2:-$(get_username)}"
+
+    # Count matching sessions.
+    run_as "${username}" 'screen -list' |
+        get_pcre_line_match_count "^\.${session_name}[[:space:]]"
+}
+
+# void remove_screen_dead_sessions(string username = $(get_username))
+#
+# Remove all dead (i.e., destroyed, killed, zombie) "screen" sessions under the
+# passed user (defaulting to the current user).
+remove_screen_dead_sessions() {
+    # Validate passed arguments.
+    die_unless_at_most_one_arg 'expected optional username'
+    string username="${1:-$(get_username)}"
+
+    #FIXME: Not quite ideal. We probably want to preserve errors returned by the
+    #underlying "su" or "sudo" command but not by "screen -wipe" itself. How?
+    # Remove dead sessions. Since "screen -wipe" returns non-zero exit status if
+    # no such sessions exist, squelch such status with "or true".
+    quietly_as "${username}" 'screen -wipe' or true
+}
+
+#FIXME: Integrates poorly with TRAPZERR(), I'm assuming. Excise?
+# void die_from_rtorrent_start_error()
+#
+# If rtorrent failed to run for any reason other than it is already running
+# under an existing "screen" session, then print this reason by re-running
+# rtorrent as the target user.
+die_from_rtorrent_start_error() {
+    # If no rtorrent process has been screened, run rtorrent to emit an error.
+    if is_rtorrent_running; then
+        if is_nonempty "${screen_pid}"
+        then curse "rtorrent startup error for user ${ZESHY_RTORRENT_USERNAME} under screen PID ${screen_pid}"
+        else curse "rtorrent startup error for user ${ZESHY_RTORRENT_USERNAME}"
+        fi
+
+        run_as "${ZESHY_RTORRENT_USERNAME}" "${RTORRENT}"
+    fi
+
+    #FIXME: Hmm.
+#   exit_with_failure
+}
+
 # --------------------( WASTELANDS                         )--------------------
+#   run_as "${ZESHY_RTORRENT_USERNAME}" 'screen -list' |\
+#       get_pcre_line_match_count "^\.${SCREEN_SESSION}[[:space:]]"
+    # Store its PID into an external file for later use in shutting it down.
+#   make_dir_safely "$(get_dirname "${pid_file}")"
+# After calling this function, foreground the daemonized rtorrent process by
+# simply running "rtorrent" as the passed user.
+# (if somewhat antiquated)
+# As much as one might love rtorrent's murkily ASCII glimmerings, its inability
+# to release
+# under whichbackgrounded or foregrounded to and from the command line.
+# Once you start it, it's always there: consuming one virtual terminal
+# (console) with its murky glimmerings.
+#
+# rtorrent, therefore, cannot be run as a background daemon on system startup.
+# Unless we apply some external trickery! # The external applications "screen" and
+# "dtach" are two such external trickeries. Both allow applications to be
+# detached from the terminal from which they were run and then later
+# reattached to any terminal elsewhere. "dtach" is significantly smaller and
+# simpler than "screen"; however, "screen" is significantly more commonplace
+# and tends to come installed (and pre-configured) on more machines. In the
+# pragmatic interest of minimizing script prerequisites, therefore, this script
+# leverages "screen".
 #   if is_superuser "${username}"; then
 #       string pid_file_dir
 #       pid_file_dir="$(get_first_writable_dir '/run' '/var/run')"
@@ -50,9 +280,9 @@ interactive_alias rt='rtorrent'
 #setting "IFS=':'"), which Zsh *SHOULD* apply to each list member. If we can't
 #do this and instead have...
 
-#global_string ZESHY_RTORRENT_PID_FILE="$(get_pid_file "${ZESHY_RTORRENT_USER}" rtorrent)"
+#global_string ZESHY_RTORRENT_PID_FILE="$(get_pid_file "${ZESHY_RTORRENT_USERNAME}" rtorrent)"
 
-#if is "${RTORRENT_USER}" == root si
-#then ZESHY_RTORRENT_PIDFILE="/var/run/rtorrent.pid"
-#else ZESHY_RTORRENT_PIDFILE="/home/${RTORRENT_USER}/.rtorrent.pid"
+#if is "${ZESHY_RTORRENT_USERNAME}" == root si
+#then ZESHY_pid_file="/var/run/rtorrent.pid"
+#else ZESHY_pid_file="/home/${ZESHY_RTORRENT_USERNAME}/.rtorrent.pid"
 #fi
