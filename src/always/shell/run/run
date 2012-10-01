@@ -7,6 +7,11 @@
 #
 # --------------------( SYNOPSIS                           )--------------------
 # Zeshy Run, handling command, builtin, and function execution.
+#
+# --------------------( TODO                               )--------------------
+# * Add support for 256 color-enabled terminals (e.g., xterm-(256)color,
+#   urxvt-unicode-256color). Oooooooh, man. I'm pretty sure I crawled across
+#   some Zsh code the other day simplifying such support... Hmmmmmmmm.
 
 #FIXME: Document the fact that non-shell-reserved arguments passed to run()
 #should *ALWAYS* be quote-protected by the caller with "${(q)@}". I believe
@@ -106,6 +111,12 @@ run() {
 #   list arg_words
 #   sputter "run (multiple-arg eval): ${args[@]}... (last arg: ${@[-1]}) [before]"
     for ((i = 1; i <= ${#args}; i++)) {
+        #FIXME: Still not quite right. Basically, we should be forcefully escaping
+        #*ALL* unescaped shell-reserved characters -- not merely ", ', and " ". If
+        #the caller would rather no such characters be escaped, then they need to
+        #pass one and only one argument. Basically, this function has three
+        #different modes of operation; we need succinctly document all three, above.
+
         # Quote protection flag "(q)" escapes all shell-reserved characters
         # (e.g., "<", "&", "|"). While useful, such protection conflicts with
         # caller expectations. In this case, callers expect us to interpret
@@ -280,19 +291,23 @@ run_with_options() {
 }
 
 # ....................{ RUNNERS ~ pages                    }....................
+#FIXME: Woops! We've dramatically simplified this by now paging on *ANY*
+#line wrapping. That means we know longer need to determine displayed page
+#length. Clean up documentation.
+
 # string run_paged(
 #   string command_name, string command_arg1, string command_arg2, ...)  --OR--
 #
 # Run the passed command with standard output and error piped to the current
-# pager if such output exceeds the current terminal height or as is (i.e.,
-# without paging) otherwise. This function implements an intelligent pager.
+# pager if such output exceeds either the current terminal height or width or as
+# is (i.e., without paging) otherwise. Hence, this is an intelligent pager.
 #
 # Customary pager commands block on standard input, thus delaying output until
 # after the input command completes operation. Resource-intensive commands not
 # completing immediately (e.g., "ls -R *") thus block paging with no
 # intermediate output until such commands eventually complete. To rectify such
 # interface woes, this function immediately prints all output as received from
-# the passed command to standard error prior to paging such output, if needed.
+# the passed command to standard error prior to paging such output, as needed.
 run_paged() {
     # If not attached to a terminal, run the passed command as is and
     # immediately return without paging.
@@ -332,41 +347,60 @@ run_paged() {
         output="$(run "${@}" 1>&1 1>&2 2>&1)"
     fi
 
-    # Ascertain whether such output's logical line length (i.e., accounting for
-    # implicit wrapping of long lines) exceeds the current terminal height. The
-    # algorithm resembles get_displayed_line_length(), but differs by
-    # immediately stopping iteration on exceeding terminal height rather than
-    # continuing to accumulate total line length. This reduces an otherwise O(N)
-    # algorithm to effectively O(1), assuming non-ludicrous terminal height.
-    list lines; lines=( ${(f)output} )
-    integer displayed_line_length="${#lines}" terminal_height terminal_width
+    # List of output lines.
+    list lines
+    split_lines_to_list "${output}" lines
+
+    # Determine whether such output's logical line length (i.e., accounting for
+    # implicit wrapping of long lines) exceeds the terminal height or physical
+    # line width the terminal width. The algorithm resembles
+    # get_displayed_line_length(), but differs by immediately stopping iteration
+    # on exceeding terminal height or width rather than continuing to accumulate
+    # total line length. This reduces an otherwise O(N) algorithm to effectively
+    # O(1), assuming non-ludicrous terminal height and width.
+    integer\
+        line_height="${#lines}" line_width\
+        terminal_height terminal_width
     terminal_height=$(get_terminal_height)
-#   sputter "lines=${lines[@]}\ndisplayed_line_length=${displayed_line_length}\nterminal_height=${terminal_height}"
-    (( displayed_line_length > terminal_height )) or {
-        # Width of the current terminal, incremented by one to avoid counting
-        # maximally long lines as requiring wrapping.
-        terminal_width=$(get_terminal_width)
-        (( ++terminal_width ))
+    terminal_width=$(get_terminal_width)
+#   sputter "lines=${lines[@]}\nline_height=${line_height}\nterminal_height=${terminal_height}"
 
-        # Calculate line wrapping.
-        for line ("${(f)output}") {
-            (( displayed_line_length += ${#line} / terminal_width ))
-            (( displayed_line_length > terminal_height )) and break
-        }
+    #FIXME: Ugh. Broken. We need to ignore VT100 commands. I've been
+    #searching for a Zsh-specific solution, but have yet to find anything. Ah!
+    #It's not Zsh, but it'll do: sed!
+    #http://www.commandlinefu.com/commands/view/3584/remove-color-codes-special-characters-with-sed
+    #Looks like this should get us close. Let's research it a bit:
+    #sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g"
+    #sed -r "s/\x1B\[([0-9]{1,3}((;[0-9]{1,3})*)?)?[m|K]//g"
+    #I suspect the second is more accurate. Again, research.
+
+    # If the output's line height does not exceed the terminal height, determine
+    # whether or not its maximum line width exceeds the terminal width.
+    # Accumulate wrapped line height and maximum line width until either exceeds
+    # terminal height or width, at which point we know we need to page.
+    (( line_height > terminal_height )) or for line ("${lines[@]}") {
+        line_width=${#line}
+#       sputter "line (width: ${line_width}) ${line}"
+        (( line_width > terminal_width )) and break
     }
+#   sputter "line_height: ${line_height}\nterminal_height: ${terminal_height}"
+#   sputter "line_width: ${line_width}\nterminal_width: ${terminal_width}"
 
-    # If the terminal is sufficiently tall to display all output without paging,
-    # return. Our job is done here, folks.
-#   utter "line length: ${displayed_line_length}\nterminal height: ${terminal_height}"
-    (( displayed_line_length > terminal_height )) or return_true
+    # If the terminal suffices to display output without paging, do not page.
+#   utter "line length: ${line_height}\nterminal height: ${terminal_height}"
+    (( line_height > terminal_height )) or
+    (( line_width  > terminal_width  )) or return_true
 
     # Pager command to be run.
     list pager; pager=( "${PAGER}" )
 
-    # Name of the list with pager options specific to the current pager. If such
-    # list exists, append such options to the pager command to be run.
+    # Pager command name capitalized for use below.
+    string pager_command_name
+    pager_command_name="$(capitalize_string "$(get_basename "${PAGER}")")"
+
+    # List of pager options specific to such pager.
     string pager_options_list_name
-    pager_options_list_name="ZESHY_$(get_basename "${PAGER}")_OPTIONS"
+    pager_options_list_name="ZESHY_${pager_command_name}_OPTIONS"
     is_list "${pager_options_list_name}" and
         pager+=( "${(@P)pager_options_list_name}" )
 
@@ -515,6 +549,15 @@ run_every() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Terminal width plus one to avoid treating maximally long lines as wrapped.
+# terminal_width_plus_one
+# (( terminal_width_plus_one = terminal_width + 1 ))
+        # Test line height.
+#       (( line_height += line_width / terminal_width ))
+#       (( line_height > terminal_height )) and break
+#   (( wrapped_line_height > terminal_height )) or {
+#       (( line_width > maximum_line_width && maximum_line_width = line_width ))
+#       (( maximum_line_width > terminal_width )) and break
     # Localize passed arguments. Do *NOT* call die_unless_at_least_two_args(),
     # as such function suffixes the argument list with piped input. While this
     # is typically what we want, this function already pipes piped input to the

@@ -122,7 +122,7 @@ get_first_lines() {
 }
 
 # string get_last_lines(
-#   string text, int last_line_index = get_line_length(string))
+#   string text, int last_line_index = $(get_line_length string))
 #
 # Get the last n lines (defaulting to the last line) from the passed string.
 get_last_lines() {
@@ -136,7 +136,7 @@ get_last_lines() {
 # string get_lines(
 #   string text,
 #   int start_line_index = 1,
-#   int end_line_index = get_line_length(string))
+#   int end_line_index = $(get_line_length string))
 #
 # Get the list of lines starting at the passed first line number (defaulting to
 # the first line) and concluding at the passed last line number (defaulting to
@@ -151,6 +151,87 @@ get_lines() {
 
     # Return the desired lines. Do *NOT* quote such expansion.
     sputter_newline_delimited ${lines[${beg_line_index},${end_line_index}]}
+}
+
+# ....................{ GETTERS ~ columns                  }....................
+#FIXME: It'd be nice to generalize this to accept arbitrary regular expressions
+#against which to match (e.g., "\s+", matching column delimiters as any run of
+#whitespace). Actually, that suggests a new complementary
+#get_columns_matching_pcre() function.
+
+# string get_columns(
+#   string text,
+#   character column_delimiter,
+#   integer column_index1, integer column_index2, ...)
+#
+# Get the columns with the passed 1-based column indices from the passed string
+# on the passed delimiting character. If passed:
+#
+# * Only one column index, each output line has only the corresponding column.
+# * More than one such index, each output line has the corresponding columns
+#   delimited by the passed delimiting character. Consider splitting each such
+#   line with split_string_to_list() to obtain the resulting columns.
+#
+# This function is roughly analogous to the "cut -f" command.
+get_columns() {
+    # Validate passed arguments.
+    die_unless_at_least_three_args\
+        'expected one string, one column delimiter, and at least one column index'
+    string text="${1}"   column_delimiter="${2}"
+    die_unless_character column_delimiter
+    shift_two_args
+
+    # If passed only one column index, such column is efficiently splittable
+    # with pure Zsh. Do so, Sir Robin! Arguably, we needn't do so in Zsh; the
+    # non-Zsh, POSIX-compatible generalization below suffices for this case.
+    #
+    # But it's fun. And we can. So we do.
+    if is_one_arg; then
+        # Index of the column preceding the passed column.
+        die_unless_positive_decimal "${1}"
+        integer last_column_index=$(( ${1} - 1 ))
+        list lines; lines=( ${(f)text} )
+
+        # Glob expressions matching all columns preceding the passed column and
+        # the passed column. Dismantled, this is:
+        #
+        # * "(...)", a non-match group matching a column including the suffixing
+        #   column delimiter via:
+        #   * "[^${column_delimiter}]#", zero or more characters excluding the
+        #     column delimiter.
+        #   * "(${column_delimiter}|(#e))", a column delimiter or newline.
+        # * "(#c${prior_column_index})", matching such columns up to but not
+        #   including the passed column.
+        # * "(#b)", enabling back references (i.e., match groups) for all
+        #   subsequent groups. Do this as late as possible, for minor and
+        #   probably immeasurable efficiency.
+        # * "([^${column_delimiter}]#)", a match group matching the passed
+        #   column excluding the suffixing column delimiter.
+        string last_columns_glob this_column_glob
+        last_columns_glob="([^${column_delimiter}]#(${column_delimiter}|(#e)))(#c${last_column_index})"
+        this_column_glob="(#b)([^${column_delimiter}]#)(${column_delimiter}|(#e))"
+
+        # Split the passed column.
+        sputter_newline_delimited\
+            ${lines/${~last_columns_glob}${~this_column_glob}*/$match[1]}
+    # Else, defer to "cut". While multiple columns are technically splittable
+    # with pure Zsh, the inefficiency (and complexity) of such hacks is fugly.
+    else
+        # "cut" requires comma-delimited indices, so convert the passed list of
+        # column indices to a comma-delimited string.
+        list   column_indices; column_indices=( "${@}" )
+        string column_indices_with_commas
+        column_indices_with_commas="$(join_list_to_string column_indices ',')"
+
+        # Dismantled, this is:
+        #
+        # * "-d", the passed column delimiter.
+        # * "-f", the munged string of comma-delimited column indices.
+        # * "-s", excluding lines lacking such delimiter.
+        sputter "${text}" | cut -s\
+            -d "${column_delimiter}"\
+            -f "${column_indices_with_commas}"
+    fi
 }
 
 # ....................{ GETTERS ~ words                    }....................
@@ -171,6 +252,200 @@ get_word() {
     sputter "${1[(w)${2:-1}]}"
 }
 
+# ....................{ REMOVERS                           }....................
+# string remove_prefix(string text, string prefix)
+#
+# Remove the passed prefix from the passed string: e.g.,
+#
+#     >>> remove_prefix 'zealia brown' 'zeal'
+#     ia brown
+remove_prefix() {
+    die_unless_two_args 'expected one string and one prefix'
+    sputter "${1##${2}}"
+}
+
+# string remove_suffix(string text, string suffix)
+#
+# Remove the passed suffix from the passed string: e.g.,
+#
+#     >>> remove_suffix 'august derleth' 'leth'
+#     august der
+remove_suffix() {
+    die_unless_two_args 'expected one string and one suffix'
+    sputter "${1%%${2}}"
+}
+
+# string remove_duplicate_lines(string text1, string text2, ...)
+#
+# Remove all duplicate lines from the concatenation of the passed strings.
+# Unlike conventional solutions (e.g., "sort -u", "sort | uniq -u"), this
+# function preserves the line order of returned lines: e.g.,
+#
+#     >>> remove_duplicate_lines 'the Perfect
+#     ...   and
+#     ...   the Perfect
+#     ...   are one Perfect and not two;
+#     ...   nay, are none!'
+#     the Perfect
+#     and
+#     are one Perfect and not two;
+#     nay, are none!
+remove_duplicate_lines() {
+    set_args_to_piped_input
+    die_unless_args 'expected at least one string'
+    sputter_newline_delimited "${(uf)@}"   # this... this is ridiculous!
+}
+
+# string truncate_string(
+#   string text, int maximum_length,
+#   string suffix_if_exceeding_maximum_length = '')
+#
+# Truncate the passed string to the passed length, replacing the end of such
+# string with the passed suffix (defaulting to the empty string) if the passed
+# string exceeds such length: e.g.,
+#
+#     >>> truncate_string 'Fallujah' 7
+#     Falluja
+#     >>> truncate_string 'Fallujah' 7 '...'
+#     Fall...
+truncate_string() {
+    # Localize and validate passed arguments.
+    die_unless_two_or_three_args\
+        'expected one string, one length, and optional suffix'
+    die_unless_positive_decimal "${2}"
+    string text="${1}" suffix_if_exceeding_maximum_length="${3:-}"
+    integer text_length="${#text}" maximum_length="${2}"
+
+    # If the passed string requires no truncation, return the same string.
+    (( text_length > maximum_length )) or {
+        sputter "${text}"
+        return
+    }
+
+    # If a suffix was passed and the passed string is at least as long as such
+    # suffix, truncate by replacing the end of the string with such suffix.
+    if is_nonempty "${suffix_if_exceeding_maximum_length}"; then
+        integer suffix_length="${#suffix_if_exceeding_maximum_length}"
+        if  (( maximum_length >  suffix_length )); then
+            (( maximum_length -= suffix_length ))
+#           print "maximum_length: ${maximum_length}"
+            sputter\
+                "${text[1,${maximum_length}]}${suffix_if_exceeding_maximum_length}"
+            return
+        fi
+    fi
+
+    # Otherwise, truncate without suffix replacement.
+    sputter "${text[1,${maximum_length}]}"
+}
+
+# ....................{ SPLITTERS                          }....................
+# void split_string_to_string_pair(
+#   string text, string delimiter, string variable_name1, string variable_name2)
+#
+# Split the passed string on the first substring of the passed delimiter into:
+#
+# * The string with the former name to the substring preceding such delimiter.
+# * The string with the latter name to the substring following such delimiter.
+#
+# The delimiter may be of any non-zero length: e.g.,
+#
+#     >>> string prefix suffix
+#     >>> split_string_to_string_pair\
+#       'wolfs==head==society' '==' 'prefix' 'suffix'
+#     >>> sputter "prefix: ${prefix}\nsuffix: ${suffix}"
+#     prefix: wolfs
+#     suffix: head==society
+split_string_to_string_pair() {
+    # Validate passed arguments.
+    die_unless_four_args\
+        'expected one delimiter, source string, and target prefix and suffix variable names'
+    string text="${1}" delimiter="${2}" prefix_name="${3}" suffix_name="${4}"
+    die_unless_string "${prefix_name}"
+    die_unless_string "${suffix_name}"
+
+    # If the passed string contains no such delimiter, throw an exception.
+    is "${text}" == *"${delimiter}"* si or
+        die "delimiter \"${delimiter}\" not found in \"${text}\""
+
+    # Split.
+    eval\
+        "${prefix_name}=\"${text%%${delimiter}*}\"; "\
+        "${suffix_name}=\"${text#*${delimiter}}\""
+}
+
+# ....................{ SPLITTERS ~ lists                  }....................
+# string split_string_to_list(
+#   string text, character delimiter, string list_name)
+#
+# Split the passed string on all substrings of the passed delimiting character
+# into the passed list: e.g.,
+#
+#     >>> list array
+#     >>> split_string_to_list 'Obseqious/Deep/Journeys' '/' array
+#     >>> sputter "${array[1]}"
+#     Obseqious
+split_string_to_list() {
+    # Validate passed arguments.
+    die_unless_three_args\
+        'expected one string, one delimiter, and one list name'
+    string text="${1}" delimiter="${2}" list_name="${3}"
+    die_unless_character delimiter
+    die_unless_list "${list_name}"
+
+    # If the passed delimiter is a colon, delimit such delimiter by periods.
+    if is "${delimiter}" == ':' si
+    then eval "${list_name}=( \${(s.:.)text} )"
+    # Otherwise, delimit such delimiter by colons.
+    else eval "${list_name}=( \${(s:${delimiter}:)text} )"
+    fi
+}
+
+# string split_lines_to_list(string lines, string list_name)
+#
+# Split the passed newline-delimited string on newlines into the passed list.
+split_lines_to_list() {
+    # Validate passed arguments, treating piped input as the passed string.
+    # Avoid naming the local string "lines" to avoid dynamic scope conflicts
+    # with caller lists also named "lines". (O, how this hath biteth me hard.)
+    string text list_name
+    if is_piped_input; then
+        utter "piped_input: $(get_piped_input)"
+        die_unless_one_arg 'expected one list name'
+        text="$(get_piped_input)"
+        list_name="${1}"
+    else
+        die_unless_two_args 'expected one string and one list name'
+        text="${1}"
+        list_name="${2}"
+    fi
+    die_unless_list "${list_name}"
+
+    # Split.
+    eval "${list_name}=( \${(f)text} )"
+}
+
+# string split_characters_to_list(string characters, string list_name)
+#
+# Split the passed characters into the passed list: e.g.,
+#
+#     >>> list array
+#     >>> split_characters_to_list 'the storm-blast came' array
+#     >>> sputter "${array[1]} ${array[3]} ${array[13]} ${array[15]}"
+#     t e a t
+#
+# Since Zsh supports list-style character indexing and slicing out of the box,
+# this function is useful only where explicit list types are required.
+split_characters_to_list() {
+    # Validate passed arguments.
+    die_unless_two_args 'expected one string and one list name'
+    string text="${1}" list_name="${2}"
+    die_unless_list "${list_name}"
+
+    # Split with a 0-width delimiter.
+    eval "${list_name}=( \${(s::)text} )"
+}
+
 # ....................{ WRITERS                            }....................
 # string suffix_if_not_already(string text, string suffix)
 #
@@ -188,7 +463,11 @@ suffix_if_not_already() {
 # Horizontally align the passed strings on the passed delimiter (defaulting to a
 # single space) into table columns.
 tabulate() {
+    # Validate passed arguments, treating piped input as the passed string.
+    set_args_to_piped_input
     die_unless_one_or_two_args 'expected one string and optional delimiter'
+
+    # Tabulate.
     if is_one_arg
     then sputter "${1}" | column -t
     else sputter "${1}" | column -t -s "${2}"
@@ -277,73 +556,19 @@ NR == NRHI {
 }'
 }
 
-# ....................{ WRITERS ~ removers                 }....................
-# string remove_prefix(string text, string prefix)
-#
-# Remove the passed prefix from the passed string: e.g.,
-#
-#     >>> remove_prefix 'zealia brown' 'zeal'
-#     ia brown
-remove_prefix() {
-    die_unless_two_args 'expected one string and one prefix'
-    sputter "${1##${2}}"
-}
-
-# string remove_suffix(string text, string suffix)
-#
-# Remove the passed suffix from the passed string: e.g.,
-#
-#     >>> remove_suffix 'august derleth' 'leth'
-#     august der
-remove_suffix() {
-    die_unless_two_args 'expected one string and one suffix'
-    sputter "${1%%${2}}"
-}
-
-# string truncate_string(
-#   string text, int maximum_length,
-#   string suffix_if_exceeding_maximum_length = '')
-#
-# Truncate the passed string to the passed length, replacing the end of such
-# string with the passed suffix (defaulting to the empty string) if the passed
-# string exceeds such length: e.g.,
-#
-#     >>> truncate_string 'Fallujah' 7
-#     Falluja
-#     >>> truncate_string 'Fallujah' 7 '...'
-#     Fall...
-truncate_string() {
-    # Localize and validate passed arguments.
-    die_unless_two_or_three_args\
-        'expected one string, one length, and optional suffix'
-    die_unless_positive_decimal "${2}"
-    string text="${1}" suffix_if_exceeding_maximum_length="${3:-}"
-    integer text_length="${#text}" maximum_length="${2}"
-
-    # If the passed string requires no truncation, return the same string.
-    (( text_length > maximum_length )) or {
-        sputter "${text}"
-        return
-    }
-
-    # If a suffix was passed and the passed string is at least as long as such
-    # suffix, truncate by replacing the end of the string with such suffix.
-    if is_nonempty "${suffix_if_exceeding_maximum_length}"; then
-        integer suffix_length="${#suffix_if_exceeding_maximum_length}"
-        if  (( maximum_length >  suffix_length )); then
-            (( maximum_length -= suffix_length ))
-#           print "maximum_length: ${maximum_length}"
-            sputter\
-                "${text[1,${maximum_length}]}${suffix_if_exceeding_maximum_length}"
-            return
-        fi
-    fi
-
-    # Otherwise, truncate without suffix replacement.
-    sputter "${text[1,${maximum_length}]}"
-}
-
 # --------------------( WASTELANDS                         )--------------------
+    # Validate passed arguments.
+#   print -lr -- "${(uf)@}"
+#   sputter_newline_delimited ${(uf)@}
+#   map unique_lines
+    #list lines; lines=( )
+
+#   foreach line (${(f)@}) {
+#       is_map_key unique_lines "${line}" or {
+#           sputter ${line}
+#           unique_lines[${line}]=
+#       }
+#   }
 # Also, suffix
 #with "_string" for safety (i.e., we might someday want a capitalize_string_list()
 #function, in which case a capitalize_string() function sows confusion).

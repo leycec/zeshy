@@ -9,15 +9,28 @@
 # Zeshy Mount, handling device mounting and unmounting.
 
 # ....................{ ALIASES                            }....................
-#FIXME: Alias "mount" to "mount_safely", or perhaps simply rename the latter the
+#FIXME: Alias "mount" to "mount_nicely", or perhaps simply rename the latter the
 #former and improve such function so as to defer to "command mount" when non-
 #interactive (much like grep()).
-interactive_alias mo='mount_safely'
-interactive_alias umo='unmount_safely'
+interactive_alias mo='mount_nicely'
+interactive_alias umo='unmount_point'
 
 # ....................{ EXCEPTIONS                         }....................
-# void die_if_mount_point(
-#   string pathname, string error_message = 'currently mounted')
+# void die_if_mounted_disk(
+#   string pathname,
+#   string error_message = "not found or not an unmounted disk")
+#
+# Raise an exception unless the passed device file corresponds to an unmounted
+# disk (i.e., neither the disk itself or any partition of such disk is mounted).
+die_if_mounted_disk() {
+    die_unless_one_or_two_args\
+        'expected one pathname and optional error message'
+    string pathname="${1}"
+    is_disk "${pathname}" and not is_disk_mounted "${pathname}" or
+        die "${2:-\"${pathname}\" not found or not an unmounted disk}"
+}
+
+# void die_if_mount_point(string pathname, string error_message = "mounted")
 #
 # Raise an exception if the passed path is a mount point.
 die_if_mount_point() {
@@ -29,34 +42,24 @@ die_if_mount_point() {
         die "${2:-\"${pathname}\" mounted}"
 }
 
-# void die_unless_mountable_point(
-#   string pathname, string error_message = 'not listed by "/etc/fstab"')
+# void die_unless_static_mount_point(
+#   string pathname,
+#   string error_message = "not listed by \"$(get_static_mount_point_file)\"")
 #
 # Raise an exception unless the passed path is listed by "/etc/fstab" and hence
-# mountable without explicitly specifying a source device file.
-die_unless_mountable_point() {
+# static_mount without explicitly specifying a source device file.
+die_unless_static_mount_point() {
     die_unless_one_or_two_args\
         'expected one pathname and optional error message'
     string pathname="${1}"
-    is_mountable_point "${pathname}" or
-        die "${2:-\"${pathname}\" not listed by \"/etc/fstab\"}"
-}
-
-# void die_unless_unmounted_disk(
-#   string pathname, string error_message = 'currently mounted')
-#
-# Raise an exception unless the passed device file corresponds to an unmounted
-# disk (i.e., neither the disk itself or any partition of such disk is mounted).
-die_unless_unmounted_disk() {
-    die_unless_one_or_two_args\
-        'expected one pathname and optional error message'
-    string pathname="${1}"
-    is_disk_device "${pathname}" and not is_disk_mounted "${pathname}" or
-        die "${2:-\"${pathname}\" not found or not an unmounted disk}"
+    is_static_mount_point "${pathname}" or {
+        string static_filename; static_filename="$(get_static_mount_point_file)"
+        die "${2:-\"${pathname}\" not listed in \"${static_filename}\"}"
+    }
 }
 
 # ....................{ TESTS                              }....................
-# bool is_disk_mounted(string pathname)
+# boolean is_disk_mounted(string pathname)
 #
 # Return true if the passed device file corresponds to a mounted disk (i.e.,
 # either the disk itself or some partition of such disk is currently mounted).
@@ -72,7 +75,7 @@ is_disk_mounted() {
       "$(blkid -o list | awk -v DEV="${device_filename}" '$1 == DEV { print $4, $5 }')" si
 }
 
-# bool is_disk_mounted_to(string device_filename, string mount_dirname)
+# boolean is_disk_mounted_to(string device_filename, string mount_dirname)
 #
 # Return true if the device with the passed filename is mounted to the directory
 # with the passed dirname.
@@ -84,7 +87,7 @@ is_disk_mounted_to() {
 
     # If the passed pathname does not correspond to an existing directory, it
     # cannot correspond to a valid mount point.
-    is_disk_device "${device_filename}" and is_dir "${mount_dirname}" or
+    is_disk "${device_filename}" and is_dir "${mount_dirname}" or
         return_false
 
     #FIXME: Also implement without "mountpoint", if feasible.
@@ -94,25 +97,13 @@ is_disk_mounted_to() {
 }
 
 # ....................{ TESTS ~ mount points               }....................
-# bool is_mountable_point(string dirname)
-#
-# Return true if the passed directory is listed by "/etc/fstab" and hence
-# mountable without explicitly specifying a source device file.
-is_mountable_point() {
-    die_unless_one_arg 'expected one dirname'
-    awk -v DIR="${1}" '
-BEGIN { CODE = 1}
-!/^[[:blank:]]*#/ && $2 == DIR { CODE = 0 }
-END { exit CODE }' '/etc/fstab'
-}
-
 #FIXME: Use of "| return_exit_status" below, while amusing, *SHOULD* be
 #completely unnecessary. (I suspect we needed such expressions previously due
 #to internal bugs in Zeshy's TRAPZERR() implementation, hopefully now fixed.
 #Excise "| return_exit_status" below and test again.)
-# bool is_mount_point(string dirname)
+# boolean is_mount_point(string dirname)
 #
-# Return true if the passed directory currently mounts some disk.
+# Return true if some disk is mounted to the passed directory.
 is_mount_point() {
     # Validate passed arguments.
     die_unless_one_arg 'expected one dirname'
@@ -139,9 +130,9 @@ is_mount_point() {
     fi
 }
 
-# bool is_writable_mount_point(string dirname)
+# boolean is_writable_mount_point(string dirname)
 #
-# Return true if the passed directory currently mounts some disk writably.
+# Return true if some disk is writably mounted to the passed directory.
 is_writable_mount_point() {
     # Validate passed arguments.
     die_unless_one_arg 'expected one dirname'
@@ -169,26 +160,20 @@ END { exit CODE }' | return_exit_status
     fi
 }
 
-# ....................{ GETTERS                            }....................
-# string get_static_mount_point_for_disk(string device_filename)
+# boolean is_static_mount_point(string dirname)
 #
-# Get the mount point to which "/etc/fstab" maps the passed disk.
-get_static_mount_point_for_disk() {
-    # Validate passed arguments.
-    die_unless_one_arg 'expected one device filename'
-    string device_filename="${1}"
-    die_unless_disk_device "${device_filename}"
-
-    #FIXME: Should be a pretty trivial implementation via
-    #get_pcre_line_first_match_group(), which we'll want to augment to throw an
-    #exception if no such group matches, possibly accepting an optional error
-    #message (per usual). We'll probably also want a new
-    #get_mount_point_setup_file() returning '/etc/fstab'. Yum.
-    die "Implement me."
+# Return true if the passed directory is listed by "/etc/fstab" and hence
+# mountable without explicitly specifying a source device file.
+is_static_mount_point() {
+    die_unless_one_arg 'expected one dirname'
     string static_filename; static_filename="$(get_static_mount_point_file)"
+    awk -v DIR="${1}" '
+BEGIN { CODE = 1}
+!/^[[:blank:]]*#/ && $2 == DIR { CODE = 0 }
+END { exit CODE }' "${static_filename}"
 }
 
-# ....................{ GETTERS ~ paths                    }....................
+# ....................{ GETTERS                            }....................
 # string get_mount_home(void)
 #
 # Get the absolute path of the canonical directory to which the current user has
@@ -218,11 +203,63 @@ get_static_mount_point_file() {
     sputter "${filename}"
 }
 
+# ....................{ GETTERS ~ mount points             }....................
+# string get_mount_points(void)
+#
+# Get a newline-delimited list of the absolute paths of all mount points.
+get_mount_points() {
+    # The third column of "mount" output gives the desired list. Surprisingly,
+    # such list can contain duplicate mount points: e.g.,
+    #
+    #     # "mount" lists mount point "/" twice.
+    #     >>> mount
+    #     rootfs on / type rootfs (rw)
+    #     /dev/mapper/vg-root on / type ext4 (rw,noatime,data=ordered)
+    #
+    # Hence, filter duplicate lines from the returned string.
+    die_if_args
+    string mount_output; mount_output="$(command mount)"
+    get_columns "${mount_output}" ' ' 3 | remove_duplicate_lines
+}
+
+# string get_mount_point(string mount_point_name)
+#
+# Get the absolute path of the passed mount point. If such point is already an
+# absolute path, return such path as is; otherwise, return the first d
+#get_static_mount_point_for_disk() {
+#    # Validate passed arguments.
+#    die_unless_one_arg 'expected one device filename'
+#    string device_filename="${1}"
+#    die_unless_disk "${device_filename}"
+#        is_absolute_path "${device_filename}" and
+#            die "\"${device_filename}\" not found"
+#        device_filename="$(get_first_device "/dev/disk/by-label/${device_filename}" "/dev/mapper/${device_filename}" "/dev/${device_filename}")"
+#}
+
+# string get_static_mount_point_for_disk(string device_filename)
+#
+# Get the mount point to which "/etc/fstab" maps the passed disk.
+get_static_mount_point_for_disk() {
+    # Validate passed arguments.
+    die_unless_one_arg 'expected one device filename'
+    string device_filename="${1}"
+    die_unless_disk "${device_filename}"
+
+    #FIXME: Should be a pretty trivial implementation via
+    #get_pcre_line_first_match_group(), which we'll want to augment to throw an
+    #exception if no such group matches, possibly accepting an optional error
+    #message (per usual). We'll probably also want a new
+    #get_mount_point_setup_file() returning '/etc/fstab'. Yum.
+    die "Implement me."
+    string static_filename; static_filename="$(get_static_mount_point_file)"
+}
+
 # ....................{ PRINTERS                           }....................
 # string print_mount_points(void)
 #
 # Print a detailed human-readable list of current mount points.
 print_mount_points() {
+    # Validate sanity.
     die_if_args
 
     # Dismantled, this is:
@@ -250,35 +287,27 @@ print_mount_points() {
     #
     # This one-liner inspired by Peteris Krumin's magical bash one-liner at:
     # http://www.catonmat.net/blog/another-ten-one-liners-from-commandlinefu-explained
-    (
+    {
         print 'device directory type flags'
         print '???'
         LC_ALL=C command mount | awk '{$2=$4=""; print}'
-    ) | tabulate | awk -v BANNER="$(utter_banner)" -F'[ ]' '
+    } | tabulate | awk -v BANNER="$(utter_banner)" -F'[ ]' '
 NR == 1 { print }
 NR == 2 { print BANNER }
 NR >= 3 {
     gsub(/\(|\)/, "", $NF)
     gsub(/,/, " ", $NF)
     print
-}'
+}' | run_paged
 }
 
 # ....................{ MOUNTERS                           }....................
-# void unmount_safely(string mount_dirname1, string mount_dirname2, ...)
-#
-# Unmount the passed mount point directories.
-unmount_safely() {
-    die_unless_args 'expected at least one mount dirname'
-    umount -- "${@}"
-}
-
-# void mount_safely(void) --OR--
-# void mount_safely(string mount_dirname) --OR--
-# void mount_safely(
+# void mount_nicely(void) --OR--
+# void mount_nicely(string mount_dirname) --OR--
+# void mount_nicely(
 #   string mount_option1, string mount_option2, ...,
 #   string device_filename) --OR--
-# void mount_safely(
+# void mount_nicely(
 #   string mount_option1, string mount_option2, ...,
 #   string device_filename, string mount_dirname)
 #
@@ -303,20 +332,61 @@ unmount_safely() {
 #   * ...a file with filetype ".iso", mount this file as an ISO image.
 #
 # In other words, this function quasi-intelligently accepts darn near anything.
-mount_safely() {
+mount_nicely() {
     # If no arguments were passed, list all current mount points.
     if is_no_args
     then print_mount_points
-    # If one argument was passed listed by "/etc/fstab" as a mountable point,
+    # If one argument was passed listed by "/etc/fstab" as a static_mount point,
     # mount such point as such.
-    elif is_one_arg and is_mountable_point "${1}"
+    elif is_one_arg and is_static_mount_point "${1}"
     then mount_point "${1}"
     # Otherwise, mount the passed device file to the passed mount point.
     else mount_disk  "${@}"
     fi
 }
 
-# ....................{ MOUNTERS ~ points                  }....................
+#FIXME: Document the fact that, if no such absolute path exists, we iteratively
+#search the list of all mount points for points with such path as a basename.
+# void unmount_point(string mount_dirname1, string mount_dirname2, ...)
+#
+# Unmount the passed mount point directories.
+unmount_point() {
+    die_unless_args 'expected at least one dirname'
+
+    # List of all mount points to be unmounted, after matching the passed globs.
+    list unmount_points
+
+    foreach mount_point ("${@}") {
+        # If this path is a mount point, append it to the list of mount points
+        # to be unmounted.
+        if is_mount_point "${mount_point}"
+        then unmount_points+="${mount_point}"
+        # If this path is absolute but *NOT* a mount point, attempting to match
+        # a mount point suffixed by such path is senseless. Throw an exception.
+        elif is_absolute_path "${mount_point}"
+        then die "\"${mount_point}\" not mounted"
+        # Otherwise, append all match points suffixed by such path to the list
+        # of mount points to be unmounted.
+        else
+            # String of newline-delimited absolute paths of all mount points.
+            list mount_points mount_points_matching
+            get_mount_points | split_lines_to_list mount_points
+
+            # Retain only mount points matching this basename.
+            retain_list_elements_matching mount_points "*/${mount_point}"
+
+            # Append such mount points to the list.
+            unmount_points+=( "${mount_points[@]}" )
+        fi
+    }
+
+    #FIXME: The uttered message isn't quite right for multiple mount points.
+    # Unmount.
+    iteratively utter "unmounting \"${unmount_points[@]}\"..."
+    command unmount -- "${unmount_points[@]}"
+}
+
+# ....................{ MOUNTERS ~ mount points            }....................
 # void mount_writable_boot_dir(void)
 #
 # Mount the "/boot" partition if such partition exists and is not already
@@ -326,7 +396,7 @@ mount_writable_boot_dir() {
     die_if_args
 
     # If "/etc/fstab" maps some device to "/boot", mount such device.
-    if is_mountable_point '/boot'
+    if is_static_mount_point '/boot'
     then mount_writable_point '/boot'
     # Otherwise, raise an exception unless "/boot" is already writable.
     elif not is_writable_dir "${mount_dirname}"
@@ -350,12 +420,13 @@ mount_point() {
     #remounting to an already mounted directory only if such mount point
     #corresponds to the current mapping defined by /etc/fstab. (Annoying, but
     #certainly feasible.)
+
     # If this directory is already a mount point, return immediately.
     # Otherwise, create such directory if needed and ensure its writability.
     is_mount_point "${mount_dirname}" and return_true
-    make_dir_if_not_found      "${mount_dirname}"
-    die_unless_writable_dir    "${mount_dirname}"
-    die_unless_mountable_point "${mount_dirname}"
+    make_dir_if_not_found "${mount_dirname}"
+    die_unless_writable_dir "${mount_dirname}"
+    die_unless_static_mount_point "${mount_dirname}"
 
     # Mount.
     interactively utter\
@@ -450,6 +521,25 @@ mount_disk() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+            #FIXME: New split_lines_to_list(), then:
+            # get_mount_points | split_lines_to_list mount_points
+#           mount_points=( ${(f)"$(get_mount_points)"} )
+            #FIXME: O.K.; now, we need a function filtering elements from one
+            #list into another. Sounds like fun. Something like
+            #remove_list_elements_matching(), yes? Note: this should probably
+            #act in-place on the same list. Callers may always copy it before-
+            #hand, if desiring non-in-place filtering.
+# string get_mount_homes(void)
+#
+# Get the absolute paths of all typical mount point parent directories (e.g.,
+# "/mnt", "/media").
+#get_mount_homes() {
+#    die_if_args
+#    list mount_homes
+#    mount_homes=( '/media' '/mnt' "${HOME}/media" "${HOME}/mnt" )
+#    convert_list_to_restorable_string mount_homes
+#}
+
         #FIXME (new): O.K.; we need a new function testify(). (Clever, no?
         #Also consider falsify(), though that name doesn't accurately describe
         #its purpose.) Call it like this:
@@ -465,7 +555,7 @@ mount_disk() {
         #this function's stack frame as well. It doesn't. Instead, "device_filename"
         #just gets the output of get_first_device(), which in the case of a
         #raised exception is a stack trace. Of course, that isn't a file, so
-        #the subsequent call to die_unless_disk_device() fails as well. This
+        #the subsequent call to die_unless_disk() fails as well. This
         #strikes me as a bug, perhaps corrected by a subsequent Zsh update?
 #
 #       mountpoint -q "${mount_dirname}" | true; return_exit_status
@@ -488,7 +578,7 @@ mount_disk() {
 #       "$(awk '!/^[[:blank:]]*#/ && $2 == "/boot" {print $2}' /etc/fstab)"; then
 #   if is '/boot' == "$(awk '!/^[[:blank:]]*#/ {print $2}' /etc/fstab)" si; then
 
-#is_disk_device "${device_filename}" and 
+#is_disk "${device_filename}" and 
 
 # void mount_iso(string filename)
 #
@@ -521,7 +611,7 @@ mount_disk() {
 #   make_dir_if_not_found "${iso_mount_path}" 
 #   mount -t iso9660 -o 'exec,loop'\
 #       "${iso_filename}" "${iso_mount_path}" or
-#       die "\"${iso_filename}\" not mountable to \"${iso_mount_path}\""
+#       die "\"${iso_filename}\" not static_mount to \"${iso_mount_path}\""
 #}
 #       if is_one_arg and is "${1}" == *.iso si; then
 #           mount_iso "${1}"
