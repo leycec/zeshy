@@ -1,175 +1,121 @@
 #!/usr/bin/env zsh
-# ====================[ terminal                           ]====================
+# ====================[ color                              ]====================
 #
 # --------------------( LICENSE                            )--------------------
 # Copyright 2007-2012 by Cecil Curry.
 # See "COPYING" for additional details.
 #
 # --------------------( SYNOPSIS                           )--------------------
-# Zeshy Terminal, handling terminal emulation attributes (e.g., VT100).
+# Zeshy Terminal Color, handling ANSI and Zsh color codes.
 #
 # --------------------( SEE ALSO                           )--------------------
+# https://en.wikipedia.org/wiki/ANSI_escape_code
+#   Excrutiatingly helpful dissection of ANSI escape codes.
+#
 # http://ciembor.github.com/4bit
-#   4bit, arguably the best (and probably only) terminal color scheme designer.
+#   4bit, arguably the best and probably only terminal color scheme designer.
 #
 # --------------------( TODO                               )--------------------
 # * Add support for 256 color-enabled terminals (e.g., xterm-(256)color,
 #   urxvt-unicode-256color). Oooooooh, man. I'm pretty sure I crawled across
 #   some Zsh code the other day simplifying such support... Hmmmmmmmm.
-
-# ....................{ EXCEPTIONS                         }....................
-# void die_unless_terminal(string error_message = 'not a terminal')
-#
-# Raise an exception unless the current shell is attached to a terminal device.
-die_unless_terminal() {
-    die_unless_at_most_one_arg 'expected optional error message'
-    is_terminal or die "${1:-not attached to a terminal device}"
-}
+# * It looks like KDE's Konsole even supports 24-bit colors! Wild. See:
+#   https://github.com/robertknight/konsole/blob/master/user-doc/README.moreColors
 
 # ....................{ TESTS                              }....................
-# boolean is_terminal(void)
-#
-# Return true if shell output is attached to a terminal device.
-#
-# Never call this function from a subshell (e.g., "$(is_terminal and printeger ok)"!
-# Subshells cannot readily test file descriptors of their parent shells.
-is_terminal() {
-    # Return true if the file descriptor for standard output is open and
-    # attached to a terminal. (Avoid testing standard input, as commands passed
-    # piped input may still be attached to a terminal.)
-    die_if_args
-    is -t ${ZESHY_STDOUT} si
-}
-
 # boolean is_color_terminal(void)
 #
-# Return true if shell output is attached to a terminal device supporting at
-# least 8 common colors: black, white, red, green, blue, yellow, magenta, cyan.
-#
-# Never call this function from a subshell (e.g., "$(is_color_terminal and print
-# ok)"! Subshells cannot readily test file descriptors of their parent shells.
+# Return true if shell output is attached to a polychrome terminal device (i.e.,
+# a terminal device providing more than merely monochrome black and white).
 is_color_terminal() {
     die_if_args
-    is_terminal and (( terminfo[colors] >= 8 ))
+    is_terminal and (( $(get_terminal_color_count) > 2 ))
 }
 
 # ....................{ GETTERS                            }....................
-# integer get_terminal_height(void)
+# integer get_terminal_color_count(void)
 #
-# Get the height in lines of the current terminal device.
-get_terminal_height() {
-    # Do not call die_unless_terminal(), as subshells have no terminals.
-    die_if_args
-    sputter "${LINES}"  # also gettable with "tput lines" (overkill)
+# Get the number of colors supported by the current terminal device.
+get_terminal_color_count() {
+    die_if_args  # also gettable with "echotc Co", but overkill
+    sputter "${terminfo[colors]}"
 }
 
-# integer get_terminal_width(void)
+# ....................{ GETTERS ~ globs                    }....................
+# string get_ansi_color_code_glob(void)
 #
-# Get the width in characters of the current terminal device.
-get_terminal_width() {
-    # Do not call die_unless_terminal(), as subshells have no terminals.
-    die_if_args
-    sputter "${COLUMNS}"  # also gettable with "tput columns" (overkill)
-}
-
-# ....................{ GETTERS                            }....................
-#FIXME: Shift to Zeshy String. For sweet documentation, see:
-#http://stackoverflow.com/questions/10564314/count-length-of-user-visible-string-for-zsh-prompt
-#http://stackoverflow.com/questions/2267155/what-does-sstring-kf1-bbkf-mean
-#Don't forget to attribute! :}
-get_line_width_excluding_zsh_color_codes() {
-    #FIXME: Raise exception if the passed string contains a newline. We should
-    #probably extricate the core logic into a separate remove_zsh_color_codes().
-    die_unless_one_arg 'expected one string'
-    sputter ${#${(S%%)1//%([BSUbfksu]|([FB]|)\{*\})/}}
-}
-
-#FIXME: Rename get_wrapped_line_height(). Unsure it's used anywhere, anyway.
-# integer get_displayed_line_length(string text1, string text2, ...)
-#
-# Get the total number of lines in the passed strings when displayed on the
-# current terminal (i.e., accounting for long lines). This is a number strictly
-# greater than or equal to that returned by get_line_length().
-get_displayed_line_length() {
-    # Validate passed arguments.
-    die_unless_args 'expected at least one string'
-    integer displayed_line_length terminal_width
-    terminal_width_plus_one=$(get_terminal_width)
-    (( ++terminal_width_plus_one ))
-
-    # For each line of the passed string, increment line length by the sum of:
+# Get an extended glob matching ANSI color codes.
+get_ansi_color_code_glob() {
+    # Dismantled, this is:
     #
-    # * "1", for the physical trailing newline.
-    # * The number of logical newlines Zsh injects into such string for wrapping
-    #   purposes, calculated as the physical line length divided by terminal
-    #   width (i.e., maximum logical line length). Add 1 to avoid off-by-one.
-    for line ("${(f)@}") {
-        (( displayed_line_length += 1 + (${#line} / terminal_width) ))
-    }
-
-    # Return such length.
-    sputter ${displayed_line_length}
-}
-
-#FIXME: Provide additional terminfo-based capabilities. See "man terminfo".
-# ....................{ WRITERS                            }....................
-# void clear_terminal_screen(void)
-#
-# Clear the current terminal of all prior output. This function implements a
-# pure-Zsh analogue of the "clear" command.
-clear_terminal_screen() {
+    # * "\x1B\[", matching the 2-byte ANSI Control Sequence Introducer (CSI)
+    #   identical to "<Esc>[" signifying an ANSI escape code.
+    # * (...)m", matching zero or more Select Graphic Rendition (SGR)
+    #   parameters also referred to as color indices:
+    #   * "|", matching the empty string and hence the ANSI escape code
+    #     "CSI m" identical to "<Esc>[0m" resetting all SGR parameters.
+    #   * "[0-9](#c1,3)", matching an 8-bit integer expressed as one to three
+    #     digits as the first SGR parameter.
+    #   * "(;[0-9](#c1,3))##", matching zero or more sequences of a semicolon
+    #     followed by an 8-bit integer as all following SGR parameters.
     die_if_args
-    die_unless_terminal
-
-    # Oddly, the terminfo "clear" capability moves the cursor to the second
-    # rather than first line after clearing the screen. Amend this.
-    echoti clear
-    move_terminal_cursor_to 1 1
+    sputter '\x1B\[(|[0-9](#c1,3)(;[0-9](#c1,3))##)m'
 }
 
-#FIXME: Add support for negative index offsets.
-# void move_terminal_cursor_to(integer column, integer row)
+# string get_ansi_color_code_glob(void)
 #
-# Move the cursor on the current terminal to the passed 1-based column and row
-# indices.
-move_terminal_cursor_to() {
-    # Validate passed arguments.
-    die_unless_two_args 'expected one column and one row index'
-    die_unless_terminal
-    die_unless_nonnegative_decimal "${1}"
-    die_unless_nonnegative_decimal "${2}"
-    integer column="${1}" row="${2}"
-    (( column <= $(get_terminal_width) )) or die\
-        "column ${column} exceeds terminal width $(get_terminal_width)"
-    (( row <= $(get_terminal_height) )) or die\
-        "row ${row} exceeds terminal height $(get_terminal_height)"
+# Get an extended glob matching Zsh color codes. See "Prompt Expansion" under
+# "info zsh" for further details.
+get_zsh_color_code_glob() {
+    # Dismantled, this is:
+    #
+    # * "%(...)", matching a "%"-prefixed prompt escape.
+    # * "[BbSsUu]", matching a bold, standout, or underline parameter.
+    # * "[0-9]##[FfKk]", matching a fore- or background parameter prefixed by
+    #   integer argument consisting of one or more digits.
+    # * "[FfKk]\{?*\}", matching a fore- or background parameter suffixed by:
+    #   * String argument consisting of a well-known color name (e.g., "red").
+    #   * Integer argument consisting of one or more digits.
+    die_if_args
+    sputter '%([BbSsUu]|[0-9]##[FfKk]|[FfKk]\{?*\})'
+}
 
-    # Convert Zsh-style 1-based indices to "terminfo"-style 0-based indices.
-    echoti cup $(( row - 1 )) $(( column - 1 ))
+# ....................{ REMOVERS                           }....................
+# string remove_ansi_color_codes(string text)
+#
+# Remove all ANSI color codes from the passed string. The resulting string will
+# retain non-color ANSI escapes (e.g., "\033[J", clearing from the current
+# cursor to the end of the screen).
+remove_ansi_color_codes() {
+    # Cache the ANSI color glob to a global variable, if not already cached.
+    die_unless_one_arg 'expected one string'
+    noop "${ZESHY_ANSI_COLOR_CODE_GLOB=$(get_ansi_color_code_glob)}"
+    sputter "${1//${~ZESHY_ANSI_COLOR_CODE_GLOB}}"
+}
+
+# string remove_zsh_color_codes(string text)
+#
+# Remove all Zsh color codes from the passed string. The resulting string will
+# retain non-color prompt escapes (e.g., "%D", expanding to the current date).
+remove_zsh_color_codes() {
+    # Cache the ZSH color glob to a global variable, if not already cached.
+    die_unless_one_arg 'expected one string'
+    noop "${ZESHY_ZSH_COLOR_CODE_GLOB=$(get_zsh_color_code_glob)}"
+    sputter "${1//${~ZESHY_ZSH_COLOR_CODE_GLOB}}"
 }
 
 # ....................{ SETUP                              }....................
-setup_terminal() {
-    die_if_args
-    die_unless_terminal
-    setup_terminal_options
-    setup_terminal_colors
-}
-
-setup_terminal_options() {
-    # Permit use of meta characters (i.e., characters setting the high bit).
-    set meta-flag    on
-    set input-meta   on
-    set output-meta  on
-    set convert-meta off
-
-    # Numerous applications complain under long ${TERM} strings (e.g.,
-    # "rtorrent"). Truncate such strings to equivalent abbreviations.
-    is "${TERM}" == 'rxvt-unicode-256color' si and {
-        utter 'truncating ${TERM} to "rxvt-unicode" for safety...'
-        TERM='rxvt-unicode'
-    }
-}
+#FIXME: It'd be nice to avoid having to setup colors. I wonder if, rather than
+#requiring setup_terminal_colors() be called on startup, we couldn't switch to
+#expanding colors by calling color-named functions: e.g., "$(FG_WHITE_BOLD)", or
+#perhaps "$(fg white bold)" or "$(get_foreground_bold_color white)". In any
+#case, such functions initialize internal color structures if necessary and
+#proceed on their way. This is inherently more robust, since of course nothing
+#precludes users from setting "FG_WHITE_BOLD='nonsense!!!!uhoh%P%YYDYDYD%D'"
+#externally, at the moment. Yes, I rather like the
+#"$(get_foreground_bold_color white)" idea. Make it so, good sir! If efficiency
+#actually mattered, such verbosity would be a poor idea. But it absolutely
+#doesn't, so...
 
 # void setup_terminal_colors()
 #
@@ -188,8 +134,12 @@ setup_terminal_colors() {
     #* setup_terminal_no_colors(), if no color support.
     #* setup_terminal_8_colors(), if typical color support.
     #* setup_terminal_256_colors(), if 256 color support.
-    is_color_terminal or return_true
+#   is_color_terminal or return_true
+#   get_terminal_color_count
+    setup_terminal_8_colors
+}
 
+setup_terminal_8_colors() {
     # Colorize "ls" by importing the ${LS_COLORS} global.
     is_installed dircolors and
         source_safely_command_output 'sh' 'dircolors --sh'
@@ -239,7 +189,32 @@ setup_terminal_colors() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
-    #* setup_terminal_colors_to_monochrome(), if no color support.
+#FIXME: Such globs are unlikely to change during runtime. (What would that even
+#mean?) They should be cached to global variables for efficiency.
+#   string glob; glob="$(get_ansi_color_code_glob)"
+#   sputter "${1//${~glob}}"
+#   string glob; glob="$(get_zsh_color_code_glob)"
+#   sputter "${1//${~glob}}"
+# ....................{ GETTERS ~ lines                    }....................
+#FIXME: Shift to Zeshy String.
+#get_line_length_excluding_zsh_color_codes() {
+    #FIXME: Raise exception if the passed string contains a newline. We should
+    #probably extricate the core logic into a separate remove_zsh_color_codes().
+#    die_unless_one_arg 'expected one string'
+#    string glob; glob="$(get_zsh_color_code_glob)"
+#    sputter ${#${(S%%)1//${~glob}}
+#}
+
+#   sputter "${1//\x1B\[([0-9](#c1,2)(;[0-9](#c1,2))(#c0,1))(#c0,1)m}"
+#   sputter "${1//\x1B\[([0-9](#c1,2)(;[0-9](#c1,2))(#c0,1))(#c0,1)[m|K]}"
+# least the eight customary shell colors: black, white, red, green, blue,
+# yellow, magenta, and cyan.
+    # Do not call die_unless_terminal(), as subshells have no terminals.
+    # Do not call die_unless_terminal(), as subshells have no terminals.
+# Avoid calling this function from a subshell (e.g.,
+# "$(is_terminal and print ok)"), as subshells cannot test the file descriptors
+# of their parent shells.    #* setup_terminal_colors_to_monochrome(), if no color support.
+
     #* setup_terminal_colors_to_8_color_polychrome(), if typical color support.
     #* setup_terminal_colors_to_256_color_polychrome(), if 256 color support.
     # Exit status of this command.
