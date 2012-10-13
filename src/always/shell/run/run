@@ -43,161 +43,151 @@ is_runnable() {
 }
 
 # ....................{ RUNNERS                            }....................
+# string run(string command) --OR--
 # string run(string command_name, string command_arg1, string command_arg2, ...)
 #
-# Run the passed command. While Zsh and hence Zeshy already run strings as
-# commands if in command position, strings containing shell-reserved characters
-# (e.g., "|", "<", ">") do not run as expected. This function amends that,
-# conditionally quote-protecting passed arguments as required: e.g.,
+# Run the passed strings concatenated as a single command. Technically, Zsh
+# already runs strings as commands when in command position (i.e., when the
+# first shell word of a command line): e.g.,
 #
-#   # Command to be run, split into multiple parts to make life troublesome.
-#   >>> string command='cat /dev/random | grep'
-#   >>> list grep_args; grep_args=( -E '\{Eschaton Entombed\(\)\}' )
+#     # Print the login message. Happily, this works as expected.
+#     >>> list command_line; command_line=( cat /dev/issue )
+#     >>> "${command_line[@]}"
+#     Caution, feeble entity. You are entering \n.\O (\s \m \r) \t.
 #
-#   # Doubleplusungood. Zsh parses the former as one composite command name and
-#   # the pipe in the latter as a raw command argument. In either case, failure.
-#   >>> ${command} ${grep_args[@]}          # bad!
-#   >>> ${(z)command} ${(q)grep_args[@]}    # equally bad!
+# Sadly, such execution fails on strings containing shell-reserved characters
+# (e.g., "|", "<", ">"): e.g.,
 #
-#   # Ohsonice. Run the expected command.
-#   >>> run "${command}" "${grep_args[@]}"
-#   {Eschaton Entombed()}                   # it could happen...
+#     # Print the first 16 characters of the login message. Unhappily, this does
+#     # not work as expected. (Unless you correctly expected it to fail. Which
+#     # it does -- in spades.)
+#     >>> list command_line; command_line=( cat /etc/issue \| cut -c 1,16 )
+#     >>> "${command_line[@]}"
+#     cat: |: No such file or directory
+#     cat: cut: No such file or directory
 #
-# This function suffers numerous pitfalls, which you don't usually but
-# occasionally need to worry about. Beware the following impenetrable caveats:
+# This function amends such behavior by correctly running all strings as
+# commands regardless of shell-reserved content: e.g.,
 #
-# * When passing a single argument interpolated from a caller-provided list,
-#   expand list elements with ${*} rather than ${@}. The former expands list
-#   elements in place as expected; the latter expands list elements into
-#   multiple arguments rather than a single argument, despite appearances: e.g.,
+#     # Print the first 16 characters of the login message. Aaaand we have worky.
+#     >>> list command_line; command_line=( cat /etc/issue \| cut -c 1,16 )
+#     >>> run "${command_line[@]}"
+#     Caution, feeble
 #
-#   # Doubleplusungood. If "${@}" contains at least two elements, this passes
-#   # run() such elements as discrete arguments and appends " | pv -t" onto the
-#   # final such element. Probably not what you indiscretely expected, eh?
-#   >>> run "${@} | pv -t"
+# This function takes two seemingly similar but substantially different forms:
 #
-#   # Ohsonice. This never does the wrong thing.
-#   >>> run "${*} | pv -t"
+# * If passed one argument, this function evaluates such argument as the entire
+#   command to be run. This requires the caller explicitly construct the entire
+#   command line, including quote protection of command arguments containing
+#   shell-reserved characters: e.g.,
+#
+#     # Run the entropic random number generator until generating a string
+#     # containing shell-reserved characters.
+#     >>> string command_line
+#     >>> command_line="cat /dev/random \| grep -E '\{Eschaton Entombed\(\)\}'"
+#     >>> run "${command_line}"
+#     {Eschaton Entombed()}                   # it could happen...
+#
+#   This form preserves quote protection and hence is generally safer than the
+#   next form, which silently strips one level of such protection. However,
+#   this form is subject to a subtle caveat: when passing a single argument
+#   interpolating a list, expand list elements with "${*}" rather than "${@}".
+#   The former expands list elements in place; the latter appends all list
+#   elements following the first as discrete arguments to this function: e.g.,
+#
+#     # Doubleplusungood. This is equivalent to:
+#     #     run "dd | pv -t" "if=/dev/null" "of=/dev/sda"
+#     >>> set_args dd if=/dev/null of=/dev/sda
+#     >>> run "${@} | pv -t"       # you probably don't want to run this
+#
+#     # Ohsonice. This never does the wrong thing. (But you'll wish it did...)
+#     >>> set_args dd if=/dev/null of=/dev/sda
+#     >>> run "${*} | pv -t"       # you *REALLY* don't want to run this
+#
+# * If passed multiple arguments, this function evaluates the concatenation of
+#   such arguments as the command to be run. This implicitly constructs the
+#   command line on behalf of the caller (which is nice), but requires the
+#   caller explicitly quote protect command arguments containing shell-reserved
+#   characters (which is horrible): e.g.,
+#
+#     # Run the same command. Unhappily, this crashes and burns piquantly. Why?
+#     # Because run() internally calls "eval" which silently strips one level
+#     # of quote protection from the argument to "grep".
+#     >>> list command_line
+#     >>> command_line=( cat /dev/random \| grep -E '\{Eschaton Entombed\(\)\}' )
+#     >>> run "${command_line[@]}"
+#     grep: Entombed()}: No such file or directory
+#
+#     # Run the same command, explicitly quote protecting the argument to "grep".
+#     # Happily, it works. Unhappily, it's user friendliness is.... questionable.
+#     >>> list command_line
+#     >>> command_line=( cat /dev/random \| grep -E ${(q):-\{Eschaton Entombed\(\)\}} )
+#     >>> run "${command_line[@]}"
+#     {Eschaton Entombed()}                   # it could happen... but will it?
+#
+# In either case, avoid passing commands that when run recursively call this
+# function or the equivalent "eval" builtin. Each such call strips one level of
+# quote protection, ultimately resulting in jaberwocky-style gibberish. To
+# protect against such errors, this function avoids evaluating commands that
+# either directly run "run" (i.e., this function) or functions prefixed with
+# "run_" (e.g., "run_quietly", a function internally calling this function).
+#
+# tl;dr
+# -----
+# If passing a single argument, *NEVER INTERPOLATE "${@}" INTO SUCH ARGUMENT*.
+# If passing multiple arguments, *ALWAYS QUOTE PROTECT PASSED ARGUMENTS WITH
+# PARAMETER EXPANSION MODIFIER "(q)"*.
 run() {
     # Validate passed arguments.
     die_unless_args 'expected one command'
 
     # If piped input, pipe such input to the command to be run.
-    is_piped_input and set_args -- pass_piped_input_to "${@}"
+    is_piped_input and set_args -- run_with_piped_input "${@}"
 
-    # If only one argument, evaluate it as is. Clearly, this is the ideal case.
+    # If passed one argument, evaluate as is. Clearly, this is the ideal case.
     is_one_arg and {
-#       sputter "run (single-arg eval): ${@}..."
+#       sputter "run (single-arg eval): ${1}..."
         eval "${1}"
         return_true
     }
 
-    #FIXME: Not quite right. We should probably call "$(get_command_line_name)"
-    #to get the name of the command in command position. *shrug, for the moment*
     # If the argument in command position is either this function name or a
     # "run_"-prefixed function name, assume such argument to be a call to a
     # Zeshy-specific function recursively calling this function. In such case,
     # do *NOT* "eval" such command as the recursive call to this function will
     # do so already. Since each "eval" strips one level of quotes from such
     # command, running such command as is avoids stripping quote protection.
-    list command_line; command_line=( "${(z)@}" )
-    is "${command_line[1]}" == (run|run_?*) si and {
+    string command_name; command_name="$(get_command_line_name "${@}")"
+    is "${command_name}" == run(|_?*) si and {
 #       sputter "run (direct): ${@}... (last arg: ${@[-1]})"
         "${@}"
         return_true
     }
 
-    # Otherwise, we've entered the Clusterfuck Zone. Zsh deals poorly with
-    # quotes in "eval" strings. We can't simply brute-force quote-protection on
-    # all passed arguments (e.g., "eval ${(q)@}"), as that overly quotes passed
-    # arguments the caller expects to remain unquoted (e.g., "2>&1"). Instead,
-    # we implement a crude shell parser selectively quote-protecting only non-
-    # evaluatable strings *NOT* containing reserved characters. YES, THIS IS
-    # AAAAAAAAAABSOLUTELY CRAZY. Fix this, kind Zsh developers. (Fix this now.)
-
-    #FIXME: Shouldn't we be reusing the split apart "${command_line}" from above?
-    list args; args=( "${@}" )
-#   list args; args=( "${(@)@[1,-1]}" )
-#   list arg_words
-#   sputter "run (multiple-arg eval): ${args[@]}... (last arg: ${@[-1]}) [before]"
-    for ((i = 1; i <= ${#args}; i++)) {
-        #FIXME: Still not quite right. Basically, we should be forcefully escaping
-        #*ALL* unescaped shell-reserved characters -- not merely ", ', and " ". If
-        #the caller would rather no such characters be escaped, then they need to
-        #pass one and only one argument. Basically, this function has three
-        #different modes of operation; we need succinctly document all three, above.
-
-        # Quote protection flag "(q)" escapes all shell-reserved characters
-        # (e.g., "<", "&", "|"). While useful, such protection conflicts with
-        # caller expectations. In this case, callers expect us to interpret
-        # such characters according to their shell-reserved meaning rather than
-        # as escaped characters. Hence, escape only the proper subset of shell-
-        # reserved characters not conflicting with such expectations: namely,
-        # single spaces, single quotes, and double quotes. Do so only when such
-        # character has not already been escaped (i.e., prefixed with "\").
-        #
-        # Dismantled, this is:
-        #
-        # * "${args[${i}]//", globally replacing in the current argument.
-        # * "(#b)", enabling back references (i.e., match groups).
-        # * "(...|)", matching as group 1 either:
-        #   * "(#s)", the beginning of the string.
-        #   * "[^\\]", any character other than a "\" escape.
-        # * "([ \'\"]), matching as group 2 the character to be escaped.
-        #
-        # *SUCH REPLACEMENT IS INDELIBLY, INCREDIBLY FRAGILE*. Since this
-        # function comprises the heart of Zeshy operation, take care when
-        # revising such replacement to account for all possible cases. In
-        # particular, see list_path_concisely(). Attempt calling such function
-        # with filenames containing both spaces and unbalanced quotes when
-        # passing arguments as both "${@}" and "${(q)@}". Such replacement
-        # should succeed under both protected and non-protected arguments.
-#       sputter "run (multiple-arg eval): fixing up argument ${i} \"${args[${i}]}\"..."
-        args[${i}]="${args[${i}]//(#b)((#s)|[^\\])([ \'\"])/${match[1]}\\${match[2]}}"
-#       arg_words=( "${(z)args[${i}]}" )
-#       (( ${#arg_words} > 1 )) and {
-#           sputter "run: fixing up \"${args[${i}]}\"..."
-#           args[${i}]="${(q)args[${i}]}"
-#       }
-
-        #FIXME: Clearly, this fails to match all possible shell strings. It
-        #should, however, suffice with immediate needs.
-        #FIXME: Does this accomodate "is" and "si" in passed arguments? We
-        #may need to perform an eval to expand aliases, here.
-        #FIXME: Seems inherently dangerous, actually. Filenames containing
-        #reserved characters as well as spaces or quotes certainly require
-        #quote protection as well. Hmmm.
-
-        # If the current argument contains at least one reserved shell
-        # string (i.e., "<", ">", "||", "&&", or "$" when not preceded by an
-        # escaping "\\" and not enclosed in quotes), ignore such argument.
-        # Quoting such argument destroys its shell interpretation.
-#       is "${args[${i}]}" == (|*[^\\])(*[\<\>\|\&\$\(\)\[\]\{\}]*) si and
-#       is "${args[${i}]}" != (\'*\'|\"*\"|\`*\`) si and continue
-
-        # If the current argument cannot be evaluated, quote such argument
-        # and ensure the result can be. Avoid calling Zeshy functions here
-        # (e.g., run_quietly()), as such functions transitively call this
-        # function. (Ugh!)
-#       eval ": ${args[${i}]}" 1>/dev/null 2>&1 or {
-#           utter "fixing up ${args[${i}]}"
-#           args[${i}]="${(q)args[${i}]}"
-#           eval ": ${args[${i}]}" 1>/dev/null 2>&1 or
-#               die "command \"${@}\" argument \"${arg}\" invalid"
-#       }
-    }
-
+    # Otherwise, passed multiple arguments that *HOPEFULLY* run no command
+    # internally calling either this function or the "eval" builtin.
+    #
+    # This branch previously conditionally quote protected all unescaped shell-
+    # reserved characters in such arguments, thus handling arguments the caller
+    # neglected to explicitly quote protect with "(q)". Unfortunately, such
+    # cleverness was entirely too clever, munging Zsh statements like:
+    #
+    #       run "print $(ls /tmp)"
+    #
+    # Hence, we have elected to do nothing whatsoever, requiring the caller
+    # quote protect user-passed arguments with "(q)".
+    #
+    # You have now entered the Clusterfuck Zone.
 #   sputter "run (multiple-arg eval): ${args[@]}... (last arg: ${@[-1]})"
-    eval "${args[@]}"
-#   eval "${(@)args[1,-1]}"
+    eval "${@}"
 }
 
 # string run_if_runnable(
 #   string command_name, string command_arg1, string command_arg2, ...)
 #
-# Run the passed command if runnable (e.g., if in the current user's ${PATH}).
+# Run the passed command if runnable (e.g., in the current ${PATH}).
 run_if_runnable() {
-    die_unless_args
+    die_unless_args 'expected one command'
     string command_name; command_name="$(get_command_line_name "${@}")"
     is_runnable "${command_name}" and run "${@}"
 }
@@ -333,12 +323,12 @@ run_paged() {
         if is_no_args; then
 #           die_if_args 'expected no command when passed piped input'
 #           output="$(get_piped_input)"
-            get_piped_input_into output
+            set_to_piped_input output
             accurse "${output}"
         # ...at least one argument, run such arguments as a command and pipe the
         # input piped to this function to such command. See below for details.
         else
-            output="$(pass_piped_input_to run "${@}" 1>&1 1>&2 2>&1)"
+            output="$(run_with_piped_input run "${@}" 1>&1 1>&2 2>&1)"
 
             # Per the "CAVEAT" described under Zeshy Pipe, manually ensure
             # is_piped_input() now returns false.
@@ -497,29 +487,29 @@ run_with_progress_timer() {
 # Run the passed command every passed number of seconds.
 run_every() {
     # Localize passed arguments.
-    die_unless_at_least_two_args 'expected one interval and one command'
+    die_unless_at_least_two_args\
+        'expected one duration in seconds and one command'
     die_unless_positive_decimal "${1}"
-    integer seconds=${1}
+    integer every_seconds=${1}
     shift_one_arg
 
-    # If the passed command is in $PATH, run such command under "watch". "watch"
-    # is a POSIX standard command with a nice UI, efficient implementation, and
-    # distro support.
-    if is_installed "$(get_first_word "${@}")"
-    then watch -n ${seconds} -x -- "${@}"
-    # Otherwise, the passed command is a shell-specific builtin or funcion and
-    # must be run manually. For clarity, mimic the "watch" UI.
+    # If the passed command is an external command, run under "watch", a POSIX-
+    # standard command with an efficiently aesthetic CLI supporting only
+    # external commands.
+    if is_installed "$(get_command_line_name "${@}")"
+    then watch -n ${every_seconds} -x -- "${@}"
+    # Otherwise, run under a mimic of the "watch" CLI.
     else
         # Until the user explicitly hits <Ctrl-C>, ...
         while true; do
             #FIXME: Append with a right-aligned timestamp, as under "watch".
             # Mimic the "watch" UI. For efficiency, call "echoti" directly.
             clear_terminal_screen
-            sputter "Every ${seconds}s: ${@}\n"
+            sputter "Every ${every_seconds}s: ${@}\n"
 
             # Run and sleep. (Just like in real life.)
             run "${@}"
-            sleep ${seconds}s
+            sleep ${every_seconds}s
         done
     fi
 }
@@ -580,6 +570,151 @@ run_as() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Otherwise, we've entered the Clusterfuck Zone. Zsh deals poorly with
+    # quotes in "eval" strings. We can't simply brute-force quote-protection on
+    # all passed arguments (e.g., "eval ${(q)@}"), as that overly quotes passed
+    # arguments the caller expects to remain unquoted (e.g., "2>&1"). Instead,
+    # we implement a crude shell parser selectively quote-protecting only non-
+    # evaluatable strings *NOT* containing reserved characters. YES, THIS IS
+    # AAAAAAAAAABSOLUTELY CRAZY. Fix this, kind Zsh developers. (Fix this now.)
+
+# See above examples.
+#
+# Run the passed command. While Zsh and hence Zeshy already run strings as
+# commands if in command position, strings containing shell-reserved characters
+# (e.g., "|", "<", ">") do not run as expected. This function amends that.
+#
+# conditionally quote-protecting passed arguments as required: e.g.,
+#
+#   # Command to be run, split into multiple parts to make life troublesome.
+#   >>> string command='cat /dev/random | grep'
+#   >>> list grep_args; grep_args=( -E '\{Eschaton Entombed\(\)\}' )
+#
+#   # Doubleplusungood. Zsh parses the former as one composite command name and
+#   # the pipe in the latter as a raw command argument. In either case, failure.
+#   >>> ${command} ${grep_args[@]}          # bad!
+#   >>> ${(z)command} ${(q)grep_args[@]}    # equally bad!
+#
+#   # Ohsonice. Run the expected command.
+#   >>> run "${command}" "${grep_args[@]}"
+#   {Eschaton Entombed()}                   # it could happen...
+#
+# This function suffers numerous pitfalls, which you don't usually but
+# occasionally need to worry about. Beware the following impenetrable caveats:
+#
+# * When passing a single argument interpolated from a caller-provided list,
+#   expand list elements with ${*} rather than ${@}. The former expands list
+#   elements in place as expected; the latter expands list elements into
+#   multiple arguments rather than a single argument, despite appearances: e.g.,
+#
+#   # Doubleplusungood. If "${@}" contains at least two elements, this passes
+#   # run() such elements as discrete arguments and appends " | pv -t" onto the
+#   # final such element. Probably not what you indiscretely expected, eh?
+#   >>> run "${@} | pv -t"
+#
+#   # Ohsonice. This never does the wrong thing.
+#   >>> run "${*} | pv -t"
+
+    #FIXME: Not quite right. We should probably call "$(get_command_line_name)"
+    #to get the name of the command in command position. *shrug, for the moment*
+#   list command_line; command_line=( "${(z)@}" )
+#   is "${command_line[1]}" == run(|_?*) si and {
+
+    #FIXME: Shouldn't we be reusing the split apart "${command_line}" from above?
+#   list args; args=( "${@}" )
+#   list args; args=( "${(@)@[1,-1]}" )
+#   list arg_words
+#   sputter "run (multiple-arg eval): ${args[@]}... (last arg: ${@[-1]}) [before]"
+#   for ((i = 1; i <= ${#args}; i++)) {
+        #FIXME: Still not quite right. Basically, we should be forcefully escaping
+        #*ALL* unescaped shell-reserved characters -- not merely ", ', and " ". If
+        #the caller would rather no such characters be escaped, then they need to
+        #pass one and only one argument. Basically, this function has three
+        #different modes of operation; we need succinctly document all three, above.
+        #
+        #*WAAAAAIT*. Wait just a minute. Is all of this extreme effort effectively
+        #equivalent to just calling:
+        #    "${@}"
+        #I mean, we're effectively prohibiting reserved shell characters anyway.
+        #So... I don't see the difference. Simply running "${@}" is obviously a
+        #vast improvement over the computationally expensive and admittedly
+        #error-prone logic below. In fact, reducing to "${@}" allows us to
+        #completely remove the above run_*() logic. Also nice.
+        #
+        #Yes. This strikes me as the way to go. The eval() builtin basically
+        #breaks down completely when passed multiple arguments and hence cannot
+        #be called reliably in such cases. So, don't. Just run "${@}" as is
+        #if passed multiple arguments to sidestep such issues entirely.
+        #
+        #Nice. I've just verified running "${@}" works as expected with builtins.
+        #What're we waiting for...?
+        #
+        #Actually, I'm glad I waited. Drop this entire "for" loop. The remainder
+        #of this function remains the same. This is the best we can do, I'm afraid.
+        #Unfortunately, this sort of ad-hoc dynamic quote protection works in the
+        #average case but generally fails: e.g., if passed "$(ls hello)", we don't
+        #want to quote protect the space in such argument. Hence, stop doing this
+        #altogether. *shrug*
+
+        # Quote protection flag "(q)" escapes all shell-reserved characters
+        # (e.g., "<", "&", "|"). While useful, such protection conflicts with
+        # caller expectations. In this case, callers expect us to interpret
+        # such characters according to their shell-reserved meaning rather than
+        # as escaped characters. Hence, escape only the proper subset of shell-
+        # reserved characters not conflicting with such expectations: namely,
+        # single spaces, single quotes, and double quotes. Do so only when such
+        # character has not already been escaped (i.e., prefixed with "\").
+        #
+        # Dismantled, this is:
+        #
+        # * "${args[${i}]//", globally replacing in the current argument.
+        # * "(#b)", enabling back references (i.e., match groups).
+        # * "(...|)", matching as group 1 either:
+        #   * "(#s)", the beginning of the string.
+        #   * "[^\\]", any character other than a "\" escape.
+        # * "([ \'\"]), matching as group 2 the character to be escaped.
+        #
+        # *SUCH REPLACEMENT IS INDELIBLY, INCREDIBLY FRAGILE*. Since this
+        # function comprises the heart of Zeshy operation, take care when
+        # revising such replacement to account for all possible cases. In
+        # particular, see list_path_concisely(). Attempt calling such function
+        # with filenames containing both spaces and unbalanced quotes when
+        # passing arguments as both "${@}" and "${(q)@}". Such replacement
+        # should succeed under both protected and non-protected arguments.
+#       sputter "run (multiple-arg eval): fixing up argument ${i} \"${args[${i}]}\"..."
+#       args[${i}]="${args[${i}]//(#b)((#s)|[^\\])([ \'\"])/${match[1]}\\${match[2]}}"
+#       arg_words=( "${(z)args[${i}]}" )
+#       (( ${#arg_words} > 1 )) and {
+#           sputter "run: fixing up \"${args[${i}]}\"..."
+#           args[${i}]="${(q)args[${i}]}"
+#       }
+
+        #FIXME: Clearly, this fails to match all possible shell strings. It
+        #should, however, suffice with immediate needs.
+        #FIXME: Does this accomodate "is" and "si" in passed arguments? We
+        #may need to perform an eval to expand aliases, here.
+        #FIXME: Seems inherently dangerous, actually. Filenames containing
+        #reserved characters as well as spaces or quotes certainly require
+        #quote protection as well. Hmmm.
+
+        # If the current argument contains at least one reserved shell
+        # string (i.e., "<", ">", "||", "&&", or "$" when not preceded by an
+        # escaping "\\" and not enclosed in quotes), ignore such argument.
+        # Quoting such argument destroys its shell interpretation.
+#       is "${args[${i}]}" == (|*[^\\])(*[\<\>\|\&\$\(\)\[\]\{\}]*) si and
+#       is "${args[${i}]}" != (\'*\'|\"*\"|\`*\`) si and continue
+
+        # If the current argument cannot be evaluated, quote such argument
+        # and ensure the result can be. Avoid calling Zeshy functions here
+        # (e.g., run_quietly()), as such functions transitively call this
+        # function. (Ugh!)
+#       eval ": ${args[${i}]}" 1>/dev/null 2>&1 or {
+#           utter "fixing up ${args[${i}]}"
+#           args[${i}]="${(q)args[${i}]}"
+#           eval ": ${args[${i}]}" 1>/dev/null 2>&1 or
+#               die "command \"${@}\" argument \"${arg}\" invalid"
+#       }
+#   }
 #   eval ${(q)@}
 #   eval ${@}
 #   ${@}
