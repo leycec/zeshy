@@ -34,61 +34,63 @@
 #   For example: zmv -n '(*).txt' '$1.xtx'  # renames files ending in 'txt' to
 #   end in 'xtx'. Naturally, "zmv" is an autoloadable function: e.g.,
 #   autoload -U zmv
+# * O.K.; so, we should add a new trash_path(), implementing a trash bin-
+#   style move to "~/tmp" (if such path exists) or "/tmp/$(get_username)" if such
+#   path is creatable or already exists and is writable by the current user. This
+#   suggests a new "file/trash" component with getter get_trash_home(). If
+#   trash_path() is called from within get_trash_home(), it should:
+#
+#   * Die unless interactive.
+#   * Manually confirm such removals as under remove_file().
+#
+#   Since such functionality will doubtless enrage a substantial subset of the Zsh
+#   populace (and fair enough), this should be subject to a global boolean
+#   ${ZESHY_IS_RECYCLING}. Consider adding a new "ZESHY_RM_OPTIONS_IF_RECYCLING",
+#   as well. (Though, perhaps we don't need that?) Hmm; but perhaps the existing
+#   ${ZESHY_IS_REPLACING_CORE_COMMANDS} suffices.
+#
+#   Note the implementation needs to be partition-aware; specifically, if the
+#   target partition the target path resides on has insufficient space, ask the
+#   user whether they'd like to remove-in-place. This requires additional
+#   functionality elsewhere; namely:
+#
+#   * A new get_disk_size() in "device/disk", passed a disk device.
+#   * A new get_mount_point_from_path() in "device/disk", passed a pathname. The most
+#     efficient implementation for this function is probably to get a list of all
+#     mount points, dynamically OR such mount points together into a glob pattern
+#     or PCRE, and match such pathname against such pattern. The resulting $match
+#     is the desired mount point.
+#   * A new get_disk_from_mount_point() in "device/disk", passed a mount point
+#     pathname. The most efficient implementation for this function is probably just
+#     to glob the desired column of "blkid -o list" or "mount" for such mount point.
+#     No PCRE required. (Canonicalize the passed mount point first, yes? That
+#     helpfully removes trailing "/", as well.) Then, just call the following pipeline:
+#
+#     integer disk_size
+#     disk_size="$(get_disk_size "$(get_disk_from_mount_point "$(get_mount_point_from_path "${pathname}")")")"
+#     interactive_alias rm='trash_path'
+# * Replace "trash" in the prior discussion with "compost", a verb and noun with
+#   delectable connotations. Also, it would be quite nice if, much like compost,
+#   the compost heap were confined to a user-configurable percentage of total
+#   partition size -- defaulting to, say, 10%. Then configuring such percentage
+#   to 100% gives default Recycle Bin-like behavior (i.e., unintelligently
+#   filling up the entire partition with deleted refuse). The default, of
+#   course, behaves much more intelligently. On reaching full capacity, sort the
+#   immediate subpaths of the compost heap by ascending date and iteratively
+#   delete such subpaths starting from the first in this order until the compost
+#   heap subsides beneath the desired threshold. Behavior precisely resembles a
+#   genuine compost heap, which rather titillates my obscure fancy.
 
 # ....................{ ALIASES                            }....................
-#FIXME: O.K.; so, we should add a new trash_path(), implementing a trash bin-
-#style move to "~/tmp" (if such path exists) or "/tmp/$(get_username)" if such
-#path is creatable or already exists and is writable by the current user. This
-#suggests a new "file/trash" component with getter get_trash_home(). If
-#trash_path() is called from within get_trash_home(), it should:
-#
-#* Die unless interactive.
-#* Manually confirm such removals as under remove_file().
-#
-#Since such functionality will doubtless enrage a substantial subset of the Zsh
-#populace (and fair enough), this should be subject to a global boolean
-#${ZESHY_IS_RECYCLING}. Consider adding a new "ZESHY_RM_OPTIONS_IF_RECYCLING",
-#as well. (Though, perhaps we don't need that?) Hmm; but perhaps the existing
-#${ZESHY_IS_REPLACING_CORE_COMMANDS} suffices.
-#
-#Note the implementation needs to be partition-aware; specifically, if the
-#target partition the target path resides on has insufficient space, ask the
-#user whether they'd like to remove-in-place. This requires additional
-#functionality elsewhere; namely:
-#
-#* A new get_disk_size() in "device/disk", passed a disk device.
-#* A new get_mount_point_from_path() in "device/disk", passed a pathname. The most
-#  efficient implementation for this function is probably to get a list of all
-#  mount points, dynamically OR such mount points together into a glob pattern
-#  or PCRE, and match such pathname against such pattern. The resulting $match
-#  is the desired mount point.
-#* A new get_disk_from_mount_point() in "device/disk", passed a mount point
-#  pathname. The most efficient implementation for this function is probably just
-#  to glob the desired column of "blkid -o list" or "mount" for such mount point.
-#  No PCRE required. (Canonicalize the passed mount point first, yes? That
-#  helpfully removes trailing "/", as well.)
-#
-#Then, just call the following pipeline:
-#
-#integer disk_size
-#disk_size="$(get_disk_size "$(get_disk_from_mount_point "$(get_mount_point_from_path "${pathname}")")")"
-#interactive_alias rm='trash_path'
-
+interactive_abbreviation cr='copy_path_recursively'
 interactive_substitution {c}p='copy_path'
-interactive_alias m='mv -iv'
-interactive_alias rm='remove_file'
-interactive_alias mv='mv -iv'
-#interactive_alias mv='move_path'
-
-#FIXME: These could use copy_path() and copy_path_recursively() functions with
-#corresponding globals ${ZESHY_CP_OPTIONS} and so forth.
-interactive_alias cr='cp --archive --recursive --verbose --update'
+interactive_substitution {m}v='move_path'
 
 # ....................{ EXCEPTIONS                         }....................
 # void die_unless_found(string pathname, string error_message = 'not found')
 #
 # Throw an exception unless the passed path exists.
-die_unless_found() {
+function die_unless_found() {
     die_unless_one_or_two_args\
         'expected one pathname and optional error message'
     string pathname="${1}"
@@ -99,7 +101,7 @@ die_unless_found() {
 # bool is_found(string pathname)
 #
 # Return true if the passed path exists.
-is_found() {
+function is_found() {
     die_unless_one_arg 'expected one pathname'
     is -e "${1}" si
 }
@@ -107,7 +109,7 @@ is_found() {
 # bool is_executable(string pathname)
 #
 # Return true if the passed path exists and is executable by the current user.
-is_executable() {
+function is_executable() {
     die_unless_one_arg 'expected one pathname'
     is -x "${1}" si
 }
@@ -115,7 +117,7 @@ is_executable() {
 # bool is_readable(string pathname)
 #
 # Return true if the passed path exists and is readable by the current user.
-is_readable() {
+function is_readable() {
     die_unless_one_arg 'expected one pathname'
     is -r "${1}" si
 }
@@ -123,7 +125,7 @@ is_readable() {
 # bool is_writable(string pathname)
 #
 # Return true if the passed path exists and is writable by the current user.
-is_writable() {
+function is_writable() {
     die_unless_one_arg 'expected one pathname'
     is -w "${1}" si
 }
@@ -132,7 +134,7 @@ is_writable() {
 #
 # Return true if the passed path is absolute (i.e., begins with an "/"),
 # regardless of whether it actually exists.
-is_absolute_path() {
+function is_absolute_path() {
     die_unless_one_arg 'expected one pathname'
     is "${1[1]}" == '/' si
 }
@@ -151,7 +153,7 @@ is_absolute_path() {
 #   until the resulting path contains no pseudo-directory components.
 # * Expands every symlink in every component of the passed path recursively,
 #   until the resulting path contains no symlinks.
-get_canonical_path() {
+function get_canonical_path() {
     die_unless_one_arg 'expected one pathname'
     string pathname="${1}"
     die_unless_found "${pathname}"
@@ -163,7 +165,7 @@ get_canonical_path() {
 # string get_basename(string pathname)
 #
 # Get the basename of the passed path (i.e., sans parent directory name).
-get_basename() {
+function get_basename() {
     die_unless_one_arg 'expected one pathname'
     sputter "${1:t}"
 }
@@ -171,7 +173,7 @@ get_basename() {
 # string get_dirname(string pathname)
 #
 # Get the dirname of the passed path (i.e., sans basename).
-get_dirname() {
+function get_dirname() {
     die_unless_one_arg 'expected one pathname'
     sputter "${1:h}"
 }
@@ -184,7 +186,7 @@ get_dirname() {
 #
 #     >>> get_basename_sans_filetype '/endymion/hastur.tar.gz'
 #     /endymion/hastur.tar
-get_filename_sans_filetype() {
+function get_filename_sans_filetype() {
     die_unless_one_arg 'expected one filename'
     sputter "${1%.*}"
 }
@@ -201,7 +203,7 @@ get_filename_sans_filetype() {
 #     tar.gz
 #     >>> get_filetype 'pasteur.ar.gz'
 #     gz
-get_filetype() {
+function get_filetype() {
     die_unless_one_arg 'expected one filename'
     string filename="${1}" filetype
     filetype="$(get_filetype_if_found "${filename}")"
@@ -214,7 +216,7 @@ get_filetype() {
 #
 # Get the filetype of the passed filename or the empty string if that filename
 # has no filetype. See get_filetype() for further details.
-get_filetype_if_found() {
+function get_filetype_if_found() {
     # Localize passed arguments.
     die_unless_one_arg 'expected one filename'
     string filename="${1}"
@@ -226,39 +228,52 @@ get_filetype_if_found() {
 
 # ....................{ GETTERS ~ glob qualifiers          }....................
 # string get_first_path_matching_glob_qualifiers(
-#   string match_type_singular, string match_type_plural,
-#   string glob_qualifiers, string pathname1, *pathname2, ...)
+#   string match_type_singular,
+#   string match_type_plural,
+#   string glob_qualifiers,
+#   string pathname1, string pathname2, ...)
 #
-# Get the first pathname in the passed list to successfully match all passed
-# glob qualifiers (e.g., 'w/', matching all owner-writable directories) or
-# raise an exception if no such directory exists. See section "Glob Qualifiers"
-# of "man zshexpn", for glob qualifier reference.
-get_first_path_matching_glob_qualifiers() {
+# Get the first path in the passed list successfully matching all passed glob
+# qualifiers or throw an exception if no such path exists interpolating the
+# passed singular match type if passed only one: e.g.,
+#
+#     # Get the first owner-writable temporary directory.
+#     >>> get_first_path_matching_glob_qualifiers (e.g., 'w/', matching all owner-writable directories) .
+#
+# See section "Glob Qualifiers" of "man zshexpn" for glob qualifier details.
+function get_first_path_matching_glob_qualifiers() {
+    # Validate passed arguments.
+    die_unless_at_least_four_args\
+        'expected one singular label, one plural label, one glob qualifiers string, and at least one pathname'
     string match_type_singular="${1}" match_type_plural="${2}" first_pathname
     shift_two_args
 
+    # If at least one argument matches such glob qualifiers, return the first.
     if first_pathname="$(get_first_path_matching_glob_qualifiers_if_found "${@}")"
-    then print "${first_pathname}"
+    then sputter "${first_pathname}"
+    # Otherwise, throw an exception.
     else
         # Shift the glob qualifier off the argument list, leaving only the list
         # of passed pathnames. While hardly necessary, this simplifies logic.
         shift_one_arg
 
-        if is_at_least_two_args
-        then die "$(join_list_to_legible_truncated_string 'and' "\"${^@}\"") not found or not ${match_type_plural}"
-        else die "\"${1}\" not found or not ${match_type_singular}"
+        # Throw a differing error message depending on argument plurality.
+        if is_one_arg
+        then die "\"${1}\" not found or not ${match_type_singular}"
+        else die "$(join_list_to_legible_truncated_string 'and' "\"${^@}\"") not found or not ${match_type_plural}"
         fi
     fi
 }
 
 # string get_first_path_matching_glob_qualifiers_if_found(
-#   string glob_qualifiers, string pathname1, *pathname2, ...)
+#   string glob_qualifiers,
+#   string pathname1, string pathname2, ...)
 #
 # Get the first pathname in the passed list to successfully match all passed
 # glob qualifiers (e.g., 'r.', matching all owner-readable plain files) or
 # return false if no such directory exists. See section "Glob Qualifiers" of
 # "man zshexpn", for glob qualifier reference.
-get_first_path_matching_glob_qualifiers_if_found() {
+function get_first_path_matching_glob_qualifiers_if_found() {
     die_unless_at_least_two_args\
         'expected at least one glob qualifiers string and one pathname'
 
@@ -280,13 +295,8 @@ get_first_path_matching_glob_qualifiers_if_found() {
     list pathnames; pathnames=( ${^@}(${glob_qualifiers}[1]) ) or true
 
     # If the list of passed pathnames contains at least one writable pathname,
-    # print the first such match; otherwise, raise an exception.
-    is_list_nonempty pathnames and sputter "${pathnames[1]}"
-#   string first_match="$(print ${^@}(${glob_qualifiers}[1]))"
-#   if is_nonempty "${first_match}"
-#   then print     "${first_match}"
-#   else return_false
-#   fi
+    # print the first such match; otherwise, return false.
+    is_list_nonempty pathnames and sputter "${pathnames[1]}" or return_false
 }
 
 # ....................{ GETTERS ~ mtime                    }....................
@@ -297,7 +307,7 @@ get_first_path_matching_glob_qualifiers_if_found() {
 # (i.e., file content for files and the list of files and subdirectories for
 # directories), filename, or permissions. For directories, mtime does *NOT*
 # reflect change of file or subdirectory content or permissions.
-get_modification_time() {
+function get_modification_time() {
     die_unless_one_arg 'expected one pathname'
     zstat +mtime "${1}"
 }
@@ -309,7 +319,7 @@ get_modification_time() {
 # get_modification_time() function. For directories, this reflects the most recent time
 # of recursive path creation or change of path content, filename, or
 # permissions. This function is considerably more costly than get_modification_time().
-get_modification_time_recursive() {
+function get_modification_time_recursive() {
     die_unless_one_arg 'expected one pathname'
     string pathname="${1}"
 
@@ -332,7 +342,7 @@ get_modification_time_recursive() {
 #
 # Set the modification time of the passed path to the passed Unix time
 # (defaulting to the current time).
-set_modification_time() {
+function set_modification_time() {
     # Validate passed arguments.
     die_unless_one_or_two_args\
         'expected one pathname and optional modification time'
@@ -342,51 +352,145 @@ set_modification_time() {
     die_unless_found "${pathname}"
     die_unless_positive_decimal "${mtime}"
 
-    #FIXME: GNU-specific. *shrug*
+    #FIXME: Probably GNU-specific. *collective shrug*
     # Set modification time.
     touch -m --date=@${mtime} -- "${pathname}"
 }
 
-# ....................{ WRITERS ~ copiers                  }....................
-# void copy_path(
-#   string source_pathname, string target_pathname1, string target_pathname2, ...)
+# ....................{ SHIFTERS                           }....................
+# curse_if_shifted_broken_symbolic_links(
+#   string source_pathname1, string source_pathname2, ...,
+#   string target_pathname)
 #
-# Copy the passed source path to the passed target paths. If interactive and the
-# current user has not reconfigured ${ZESHY_CP_OPTIONS_IF_INTERACTIVE[@]},
-# confirm such copy for each already extant target path. If the passed source
-# path is a symbolic link, print errors for target paths that are now broken
-# symbolic links (as is commonly the case when copying symbolic links shallow).
-copy_path() {
-    # Copy.
+# Print a warning for passed source paths that are symbolic links broken by a
+# copy or move to the passed target path. This is a utility function intended to
+# be called only by the copy_path_*() and move_path_*() families of functions.
+curse_if_shifted_broken_symbolic_links() {
+    # Validate passed arguments.
     die_unless_at_least_two_args\
-        'expected one source pathname and at least one target pathnames'
-    run_with_options 'command cp' 'ZESHY_CP_OPTIONS' "${(q)@}"
+        'expected at least one source pathname and one target pathname'
 
-    # Test for broken symbolic link copies.
-    if is_symbolic_link "${1}"; then
-        for filename ("${@[2,-1]}") {
-            if is_broken_symbolic_link "${filename}"; then
-                string filename_target="$(get_symbolic_link_target "${filename}")"
-                curse "symbolic link \"${filename}\" target \"${filename_target}\" not found"
-            fi
-        }
+    # List of shifted pathnames to be tested for broken symbolic links.
+    list shifted_pathnames
+    if is_two_args
+    then shifted_pathnames=( "${2}" )
+    # Dismantled, this is:
+    #
+    # * "${@[-1]}", expanding to the target pathname. Since at least three paths
+    #   were passed and "cp" returned successfully, this is always a dirname.
+    # * "${^@[1,-2]:t}", iteratively expanding to the basename for each passed
+    #   source pathname.
+    else shifted_pathnames=( "${@[-1]}/${^@[1,-2]:t}" )
     fi
+
+    # Print a warning for all shifted paths that are broken symbolic links.
+#   sputter "shifted_pathnames: ${shifted_pathnames[*]}"
+    for shifted_pathname ("${shifted_pathnames[@]}") {
+        is_broken_symbolic_link "${shifted_pathname}" and {
+            string target_pathname
+            target_pathname="$(get_symbolic_link_target "${shifted_pathname}")"
+            curse "symbolic link \"${shifted_pathname}\" target \"${target_pathname}\" not found"
+        }
+    }
+
+    # If the last shifted path is not a broken symbolic link, the prior
+    # conditional returns false. To avoid returning false from this function in
+    # such a case, return true...by force!
+    return_true
+}
+
+# ....................{ SHIFTERS ~ copiers                 }....................
+# void copy_path(
+#   string source_pathname1, string source_pathname2, ...,
+#   string target_pathname)
+#
+# Copy the passed source to target paths "shallowly" (i.e., copying source path
+# symbolic links rather than the targets of such links). Print a warning for
+# symbolic links broken under the target path by such copy.
+function copy_path() {
+    die_unless_at_least_two_args\
+        'expected at least one source pathname and one target pathname'
+    run_with_options 'command cp' 'ZESHY_CP_OPTIONS' "${(q)@}"
+    curse_if_shifted_broken_symbolic_links "${@}"
 }
 
 # void copy_path_physically(
-#   string source_pathname, string target_pathname1, string target_pathname2, ...)
+#   string source_pathname1, string source_pathname2, ...,
+#   string target_pathname)
 #
-# Copy the passed source path to the passed target paths. If the former is a
-# symbolic link, deeply copy the physical path to which that symbolic link
-# transitively links and not the shallow symbolic link itself.
-copy_path_physically() {
+# Copy the passed source to target paths "deeply" (i.e., copying the targets of
+# source path symbolic links rather than such links.
+function copy_path_physically() {
+    # This function copies no symbolic links and hence needn't test brokenness.
     die_unless_at_least_two_args\
-        'expected one source pathname and at least one target pathnames'
+        'expected at least one source pathname and one target pathname'
     list ZESHY_CP_OPTIONS; ZESHY_CP_OPTIONS=( "${ZESHY_CP_OPTIONS[@]}" -L )
     run_with_options 'command cp' 'ZESHY_CP_OPTIONS' "${(q)@}"
 }
 
+# void copy_path_recursively(
+#   string source_pathname1, string source_pathname2, ...,
+#   string target_pathname)
+#
+# Copy the passed source to target paths recursively "shallowly." See
+# copy_path() for further details.
+function copy_path_recursively() {
+    # Defer to copy_path() by temporarily appending recursive options to the
+    # global list accessed by such function.
+    list zeshy_cp_options; zeshy_cp_options=( "${ZESHY_CP_OPTIONS[@]}" )
+    list ZESHY_CP_OPTIONS; ZESHY_CP_OPTIONS=(
+        "${zeshy_cp_options[@]}"
+        "${ZESHY_CP_OPTIONS_IF_RECURSIVE[@]}"
+    )
+    copy_path "${@}"
+}
+
+# ....................{ MOVERS                             }....................
+# void move_path(
+#   string source_pathname1, string source_pathname2, ...,
+#   string target_pathname)
+#
+# Move the passed source to target paths "shallowly" (i.e., moving source path
+# symbolic links rather than the targets of such links). Print a warning for
+# symbolic links broken under the target path by such copy.
+function move_path() {
+    die_unless_at_least_two_args\
+        'expected at least one source pathname and one target pathname'
+    run_with_options 'command mv' 'ZESHY_MV_OPTIONS' "${(q)@}"
+    curse_if_shifted_broken_symbolic_links "${@}"
+}
+
 # --------------------( WASTELANDS                         )--------------------
+    # Move paths.
+    #FIXME: Call a helper function testing for broken symbolic links. See above.
+    # If only two arguments were passed, print a warning if the latter is a
+    # broken symbolic link.
+
+    # Otherwise, print warnings for all passed source paths whose copies in the
+    # last passed argument are broken symbolic links.
+#   for source_pathname ("${@[1,-2]}") {
+#   is_symbolic_link "${1}" and
+#       is_broken_symbolic_link "${filename}" and {
+#           string target; target="$(get_symbolic_link_target "${filename}")"
+#           curse "symbolic link \"${filename}\" target \"${target}\" not found"
+#       }
+#   }
+#   fi
+#FIXME: These could use copy_path() and copy_path_recursively() functions with
+#corresponding globals ${ZESHY_CP_OPTIONS} and so forth.
+#interactive_abbreviation cr='cp --archive --recursive --verbose --update'
+
+# If the former is a
+# symbolic link, copy the physical path to which that symbolic link
+# transitively links rather than the shallow symbolic link itself (i.e., perform a deep rather than shallow copy).
+#If interactive and the
+# current user has not reconfigured ${ZESHY_CP_OPTIONS_IF_INTERACTIVE[@]},
+# confirm such copy for each already extant target path.
+#   string first_match="$(print ${^@}(${glob_qualifiers}[1]))"
+#   if is_nonempty "${first_match}"
+#   then print     "${first_match}"
+#   else return_false
+#   fi
 #interactive_alias c='copy_path'
 #interactive_alias cp='copy_path'
 #   string filetype="$(remove_prefix_matching '*.')"
