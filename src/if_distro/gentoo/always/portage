@@ -11,15 +11,27 @@
 # ....................{ ALIASES                            }....................
 interactive_abbreviation {em}erge='emerge'
 interactive_abbreviation {em}erge{w}orld='emerge_world'
-interactive_abbreviation {em}erge{p}ortage='emerge_portage'
-interactive_abbreviation {e}merge{q}uery{u}se='print_use_flags_matching'
+interactive_abbreviation {em}erge{p}ortage='update_portage'
+interactive_abbreviation {e}merge{q}uery{u}se='print_use_flag_matches'
+
+# ....................{ TESTERS                            }....................
+# boolean is_portage_outdated(void)
+#
+# Return true if the Portage tree is outdated and hence requires an update. This
+# function treats Portage trees older than six hours to be outdated, which may
+# not necessarily coincide with caller expectations of "outdated."
+function is_portage_outdated() {
+    die_if_args
+    (( $(get_path_modification_time "$(get_portage_home)") <\
+       $(get_current_unix_time_offset_by_hours -6) ))
+}
 
 # ....................{ GETTERS                            }....................
 # string get_portage_home(void)
 #
 # Get the absolute path of the top-level Portage directory (e.g.,
 # "/usr/portage").
-get_portage_home() {
+function get_portage_home() {
     die_if_args
     portageq portdir
 }
@@ -28,7 +40,7 @@ get_portage_home() {
 #
 # Get the absolute path of the Portage directory storing binary packages (e.g.,
 # "/usr/portage/packages").
-get_portage_binary_packages_dir() {
+function get_portage_binary_packages_dir() {
     die_if_args
     portageq pkgdir
 }
@@ -37,7 +49,7 @@ get_portage_binary_packages_dir() {
 #
 # Get the absolute path of the Portage directory storing source archives (e.g.,
 # "/usr/portage/distfiles").
-get_portage_source_archives_dir() {
+function get_portage_source_archives_dir() {
     die_if_args
     portageq distdir
 }
@@ -46,7 +58,7 @@ get_portage_source_archives_dir() {
 # void print_use_flag(string use_flag_name)
 #
 # Print all descriptions for the passed USE flag.
-print_use_flag() {
+function print_use_flag() {
     # Validate passed arguments.
     die_unless_one_arg 'expected one USE flag'
     string use_flag="${1}"
@@ -62,58 +74,52 @@ print_use_flag() {
 # void print_use_flag_matches(string grep_pattern)
 #
 # Print all descriptions for USE flags matching the passed "grep" pattern.
-print_use_flag_matches() {
-    # Validate passed arguments.
+function print_use_flag_matches() {
     die_unless_one_arg 'expected one grep pattern'
     grep_path_caselessly "${1}"\
         "$(get_portage_home)/profiles/use."{,local.}desc
 }
 
-# ....................{ EMERGERS                           }....................
-# void emerge_portage(void)
+# ....................{ CHECKERS                           }....................
+# void check_portage(string repository_dir = "$(get_current_dir)")
 #
-# Update the main Portage tree and all added overlays with new ebuilds. Unlike
-# update_gentoo, this only updates rather than installing such ebuilds.
-emerge_portage() {
-    # Validate passed arguments.
-    die_if_args
+# Check the passed Portage repository (defaulting to the repository containing
+# the current directory), for quality assurance.
+check_portage() {
+    die_unless_no_or_one_arg 'expected optional dirname'
 
-    # Prefer "eix-sync" to "emerge". If installed, the former subsumes the
-    # latter and updates the more efficient (and hence preferable) "eix" cache.
-    if is_installed eix
-    then update_eix
-    # Otherwise, update only the main Portage tree and possibly added overlays.
+    if is_no_args
+    then repoman
     else
-        interactively say_first_section 'updating portage'
-        emerge --sync
-
-        is_gentoo_overlay_command_installed and {
-            interactively say_next_section 'updating overlays'
-            update_gentoo_overlays
+        #FIXME: If this becomes a common idiom, it'd be nice to add a new
+        #run_under_dir() function: e.g., "run_under_dir "${1}" repoman".
+        store_current_dir "${1}"
+        {
+            repoman
+        } always {
+            restore_current_dir
         }
     fi
-
-    #FIXME: This appears to take an effectively infinite amount of time with no
-    #appreciable output. I can't be bothered to debug it, at the moment. So...
-    # Update the metadata cache with the contents of updated overlays.
-#   interactively say_next_section 'updating portage metadata...'
-#   egencache --update
 }
 
+# ....................{ EMERGERS                           }....................
 # void emerge_world(void)
 #
-# Update all currently installed packages in the "world" package set (i.e.,
-# the set of all packages explicitly installed at the command line) and
-# transitive dependencies of such packages.
-emerge_world() {
-    #FIXME: It'd be nice to check the mtime of "$(get_portage_home)" and if
-    #older than, say, 6 hours (seems reasonable, a quarter of a day), then
-    #implicitly force a Portage update. That's pretty much what one always wants
-    #to happen, anyway, so... **YES** ~ make this happen, please!
-    # Validate passed arguments.
+# Update:
+#
+# * The main Portage tree and all added overlays with new ebuilds, if such tree
+#   is sufficiently outdated. See is_portage_outdated().
+# * All currently installed packages in the package set "world" (i.e., set of
+#   all packages explicitly installed by a human at the command line).
+# * All transitive dependencies of currently installed packages (i.e., set of
+#   all packages on which currently installed packages directly or indirectly
+#   depend).
+function emerge_world() {
+    # Validate sanity.
     die_if_args
-    interactively say\
-        'consider first synchronizing Portage with "update_portage"'
+
+    # Update the Portage tree, if needed.
+    is_portage_outdated and update_portage
 
     # Update packages with updated ebuilds.
     interactively say_first_section 'updating world'
@@ -135,7 +141,54 @@ emerge_world() {
     dispatch-conf
 }
 
+# void update_portage(void)
+#
+# Update the main Portage tree and all added overlays with new ebuilds. Unlike
+# update_gentoo, this only updates rather than installing such ebuilds.
+function update_portage() {
+    # Validate passed arguments.
+    die_if_args
+
+    # Prefer "eix-sync" to "emerge". If installed, the former subsumes the
+    # latter and updates the more efficient (and hence preferable) "eix" cache.
+    if is_installed eix
+    then update_portage_with_eix
+    # Otherwise, update only the main Portage tree and possibly added overlays.
+    else
+        #FIXME: What's the point in prefixing say commands with "interactively"?
+        interactively say_first_section 'updating portage'
+        emerge --sync
+
+        is_gentoo_overlay_command_installed and {
+            interactively say_next_section 'updating overlays'
+            update_gentoo_overlays
+        }
+    fi
+
+    #FIXME: This appears to take an effectively infinite amount of time with no
+    #appreciable output. I can't be bothered to debug it, at the moment. So...
+    # Update the metadata cache with the contents of updated overlays.
+#   interactively say_next_section 'updating portage metadata...'
+#   egencache --update
+}
+
 # --------------------( WASTELANDS                         )--------------------
+    #FIXME: It'd be nice to check the mtime of "$(get_portage_home)" and if
+    #older than, say, 6 hours (seems reasonable, a quarter of a day), then
+    #implicitly force a Portage update. That's pretty much what one always wants
+    #to happen, anyway, so... **YES** ~ make this happen, please!
+#   interactively say\
+#       'consider first synchronizing Portage with "update_portage"'
+# boolean is_portage_outdated(void)
+#
+# Return true if the Portage tree is outdated and hence requires an update. This
+# function treats Portage trees older than six hours to be outdated, which may
+# not necessarily coincide with caller expectations of "outdated."
+#unction is_portage_outdated() {
+#   die_if_args
+#   (( $(get_path_modification_time "$(get_portage_home)") <\
+#      $(get_current_unix_time_offset_by_hours -6) ))
+#
 #   interactively say_first_section 'updating portage...'
     # Update ebuilds.
 #   update_portage
