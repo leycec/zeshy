@@ -6,7 +6,7 @@
 # See "COPYING" for additional details.
 #
 # --------------------( SYNOPSIS                           )--------------------
-# Zeshy Run, handling command, builtin, and function execution.
+# Evaluate dynamically constructed command lines.
 #
 # --------------------( TODO                               )--------------------
 # * Document the fact that non-shell-reserved arguments passed to run()
@@ -119,15 +119,21 @@ function run() {
     # Validate passed arguments.
     die_unless_args 'expected one command'
 
-    # If piped input, pipe such input to the command to be run.
-    is_piped_input and set_args -- run_with_piped_input "${@}"
-
-    # If passed one argument, evaluate as is. Clearly, this is the ideal case.
+    # If passed one argument, evaluate such argument is. This is the ideal case.
     is_one_arg and {
 #       output "run (single-arg eval): ${1}..."
-        eval "${1}"
+        if is_piped_input
+        then eval "run_with_piped_input ${1}"
+        else eval "${1}"
+#       else
+#           output 'piped no input'
+#           eval "${1}"
+        fi
         return_true
     }
+
+    # If piped input, pipe such input to the command to be run.
+    is_piped_input and set_args 'run_with_piped_input' "${@}"
 
     # If the argument in command position is either this function name or a
     # "run_"-prefixed function name, assume such argument to be a call to a
@@ -259,17 +265,18 @@ function run_with_options() {
         'expected one command prefix, one list name, and optional command arguments'
     string\
         command_line_prefix="${1}"\
-        options_list_name="${2}" interactive_options_list_name
+        options_list_name="${2}" options_list_name_if
     list command_line
     shift_two_args
 
     # Validate passed arguments, uppercasing the desired interactive list name
     # regardless of the original case of the passed list name.
-    is_interactive and
-        interactive_options_list_name="${(U)options_list_name}_IF_INTERACTIVE" or
-        interactive_options_list_name="${(U)options_list_name}_IF_NON_INTERACTIVE"
+    if is_interactive
+    then options_list_name_if="${(U)options_list_name}_IF_INTERACTIVE"
+    else options_list_name_if="${(U)options_list_name}_IF_NON_INTERACTIVE"
+    fi
     die_unless_list "${options_list_name}"
-    die_unless_list "${interactive_options_list_name}"
+    die_unless_list "${options_list_name_if}"
 
     # If passed piped input, propagate such input to the desired command.
     is_piped_input and command_line=( cat '/dev/stdin' \| )
@@ -282,150 +289,13 @@ function run_with_options() {
     command_line+=(
         "${(z)command_line_prefix}"
         "${(@P)options_list_name}"
-        "${(@P)interactive_options_list_name}"
-        -- "${@}"
+        "${(@P)options_list_name_if}" --
+        "${@}"
     )
 
     # Run.
 #   output "run_with_options: ${command_line[@]}..."
     run "${command_line[@]}"
-}
-
-# ....................{ RUNNERS ~ paged                    }....................
-#FIXME: Woops! We've dramatically simplified this by now paging on *ANY*
-#line wrapping. That means we know longer need to determine displayed page
-#length. Clean up documentation.
-#FIXME: Actually, while this is decent, it'd be far better to:
-#
-#* Revert back to the prior logic of only paging when total displayed line
-#  length exceeds terminal height *AND*
-#* When not paging, to visually demarcate wrapped lines (ideally with color? or
-#  perhaps simply with a simple prefix). So, rather than printing:
-#udev                 /dev                      devtmpfs     rw nosuid relatime size=10240k nr_in
-#odes=497142 mode=755
-#  Instead, printing:
-#udev                 /dev                      devtmpfs     rw nosuid relatime size=10240k nr_in
-# ^-> odes=497142 mode=755
-#  Or perhaps simply:
-#udev                 /dev                      devtmpfs     rw nosuid relatime size=10240k nr_in
-# ...odes=497142 mode=755
-#  Or the slightly cleverer:
-#udev                 /dev                      devtmpfs     rw nosuid relatime size=10240k nr...
-# ..._inodes=497142 mode=755
-#  Actually, no. That reads awkwardly. One "..." is sufficient, I should think.
-#  Happily, "yppy" already has appropriate Unicode for the former arrows. In either case, I
-#  prefer the prefixing space on the wrapped line.
-
-# string run_paged(
-#   string command_name, string command_arg1, string command_arg2, ...)  --OR--
-#
-# Run the passed command with standard output and error piped to the current
-# pager if such output exceeds either the current terminal height or width or as
-# is (i.e., without paging) otherwise. Hence, this is an intelligent pager.
-#
-# Customary pager commands block on standard input, thus delaying output until
-# after the input command completes operation. Resource-intensive commands not
-# completing immediately (e.g., "ls -R *") thus block paging with no
-# intermediate output until such commands eventually complete. To rectify such
-# interface woes, this function immediately prints all output as received from
-# the passed command to standard error prior to paging such output, as needed.
-function run_paged() {
-    # If not attached to a terminal, run the passed command as is and
-    # immediately return without paging.
-    is_terminal or {
-#       say "not attached to a terminal"
-        run "${@}"
-        return_true
-    }
-
-    # If passed piped input and...
-    string output
-    if is_piped_input; then
-#       say "received piped input: $(get_piped_input)"
-        # ...no arguments, capture such output without running a command.
-        # Duplicate the behavior of the output capturing below by printing such
-        # output to standard error.
-        if is_no_args; then
-#           die_if_args 'expected no command when passed piped input'
-#           output="$(get_piped_input)"
-            set_string_to_piped_input output
-            outcry "${output}"
-        # ...at least one argument, run such arguments as a command and pipe the
-        # input piped to this function to such command. See below for details.
-        else
-            output="$(run_with_piped_input run "${@}" 1>&1 1>&2 2>&1)"
-
-            # Per the "CAVEAT" described under Zeshy Pipe, manually ensure
-            # is_piped_input() now returns false.
-            close_standard_input
-        fi
-    #FIXME: Hmm; the documentation no longer reflects the reality. Fixmeup.
-    # Otherwise, run the passed command with redirection. Dismantled, this is:
-    #
-    # * "2>&2", preserving standard error prior to its subsequent redirection.
-    # * "2>&1", redirecting standard error to output. Since command substitution
-    #   only captures the latter, only such redirection captures standard error.
-    # * "1>&1", preserving standard output prior to its subsequent redirection.
-    # * "1>&2", redirecting standard output to error. Since command substitution
-    #   only captures the former, this immediately prints all output produced by
-    #   running such command.
-    else
-        die_unless_args 'expected one command'
-#       output "run_paged: ${@}..."
-        output="$(run "${@}" 1>&1 1>&2 2>&1)"
-    fi
-
-    # List of output lines.
-    list lines
-    set_list_to_string_lines lines "${output}"
-
-    # Determine whether such output's logical line length (i.e., accounting for
-    # implicit wrapping of long lines) exceeds the terminal height or physical
-    # line width the terminal width. The algorithm resembles
-    # get_displayed_line_length(), but differs by immediately stopping iteration
-    # on exceeding terminal height or width rather than continuing to accumulate
-    # total line length. This reduces an otherwise O(N) algorithm to effectively
-    # O(1), assuming non-ludicrous terminal height and width.
-    integer\
-        output_height="${#lines}" output_width\
-        terminal_height terminal_width
-    terminal_height=$(get_terminal_height)
-    terminal_width=$(get_terminal_width)
-#   output "lines=${lines[@]}\noutput_height=${output_height}\nterminal_height=${terminal_height}"
-
-    # If the output's line height does not exceed the terminal height, determine
-    # whether or not its maximum line width exceeds the terminal width.
-    # Accumulate wrapped line height and maximum line width until either exceeds
-    # terminal height or width, at which point we know we need to page.
-    (( output_height > terminal_height )) or for line ("${lines[@]}") {
-        # Remove ANSI color codes prior to testing line length.
-        output_width=${#$(remove_ansi_color_codes "${line}")}
-#       output "line (width: ${output_width}) ${line}"
-        (( output_width > terminal_width )) and break
-    }
-#   output "output_height: ${output_height}\nterminal_height: ${terminal_height}"
-#   output "output_width: ${output_width}\nterminal_width: ${terminal_width}"
-
-    # If the terminal suffices to display output without paging, do not page.
-#   say "line length: ${output_height}\nterminal height: ${terminal_height}"
-    (( output_height > terminal_height )) or
-    (( output_width  > terminal_width  )) or return_true
-
-    # Pager command to be run.
-    list pager; pager=( "${PAGER}" )
-
-    # Pager command name capitalized for use below.
-    string pager_command_name
-    pager_command_name="$(capitalize_string "$(get_basename "${PAGER}")")"
-
-    # List of pager options specific to such pager.
-    string pager_options_list_name
-    pager_options_list_name="ZESHY_${pager_command_name}_OPTIONS"
-    is_list "${pager_options_list_name}" and
-        pager+=( "${(@P)pager_options_list_name}" )
-
-    # Page.
-    output "${output}" | "${pager[@]}"
 }
 
 # ....................{ RUNNERS ~ priority                 }....................
