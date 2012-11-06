@@ -119,22 +119,6 @@ function run() {
     # Validate passed arguments.
     die_unless_args 'expected one command'
 
-    # If passed one argument, evaluate such argument is. This is the ideal case.
-    is_one_arg and {
-#       output "run (single-arg eval): ${1}..."
-        if is_piped_input
-        then eval "run_with_piped_input ${1}"
-        else eval "${1}"
-#       else
-#           output 'piped no input'
-#           eval "${1}"
-        fi
-        return_true
-    }
-
-    # If piped input, pipe such input to the command to be run.
-    is_piped_input and set_args 'run_with_piped_input' "${@}"
-
     # If the argument in command position is either this function name or a
     # "run_"-prefixed function name, assume such argument to be a call to a
     # Zeshy-specific function recursively calling this function. In such case,
@@ -142,28 +126,45 @@ function run() {
     # do so already. Since each "eval" strips one level of quotes from such
     # command, running such command as is avoids stripping quote protection.
     string command_name; command_name="$(get_command_line_name "${@}")"
-    is "${command_name}" == run(|_?*) si and {
+    is "${command_name}" == 'run'(|'_'?*) si and {
 #       output "run (direct): ${@}... (last arg: ${@[-1]})"
-        "${@}"
+        # If passed a composite command line as a single argument, split such
+        # command line into shell words prior to execution by Zsh.
+        if is_one_arg
+        then "${(z)@}"
+        # Otherwise, assume the passed arguments already correspond to valid
+        # shell words whose concatenation produces the desired command line.
+        else "${@}"
+        fi
+
+        # Get us out of here, Jim.
         return_true
     }
 
-    # Otherwise, passed multiple arguments that *HOPEFULLY* run no command
-    # internally calling either this function or the "eval" builtin.
+    # If passed one argument, evaluation of such argument as a composite command
+    # line is generally safe. If passed multiple arguments, evaluation of the
+    # concatenation of such arguments into a composite command line is generally
+    # unsafe unless the caller read, understood, and adhered to the prior
+    # documentation; in particular, such command line *HOPEFULLY* runs no
+    # command internally calling either this function or the "eval" builtin.
     #
-    # This branch previously conditionally quote protected all unescaped shell-
-    # reserved characters in such arguments, thus handling arguments the caller
-    # neglected to explicitly quote protect with "(q)". Unfortunately, such
-    # cleverness was entirely too clever, munging Zsh statements like:
+    # To improve safety, this function previously conditionally quote protected
+    # unescaped shell-reserved characters in such arguments, thus handling
+    # arguments the caller neglected to explicitly quote protect with "(q)".
+    # Unfortunately, such cleverness uncleverly munged valid Zsh statements:
+    # e.g.,
     #
+    #       # Quote protecting the " " in "ls /tmp" produces unexpected results.
     #       run "print $(ls /tmp)"
     #
-    # Hence, we have elected to do nothing whatsoever, requiring the caller
-    # quote protect user-passed arguments with "(q)".
+    # Hence, this function now elects to do nothing whatsoever, requiring the
+    # caller quote protect user-passed arguments with "(q)".
     #
     # You have now entered the Clusterfuck Zone.
-#   output "run (multiple-arg eval): ${args[@]}... (last arg: ${@[-1]})"
-    eval "${@}"
+    if is_piped_input
+    then run_with_piped_input eval "${@}"
+    else eval "${@}"
+    fi
 }
 
 # string run_if_runnable(
@@ -212,6 +213,9 @@ function run_backgrounded() {
     run "${@}" &
 }
 
+#FIXME: Unfortunately, the disowned command fails to run under the current
+#working directory. Why? Certainly, we should be able to set such directory
+#manually from within the disowned shell.
 # void run_disowned(
 #   string command_name, string command_arg1, string command_arg2, ...)
 #
@@ -235,7 +239,32 @@ function run_disowned() {
     #     # disowned job. While disowned, some subshell owns such job and hence
     #     # deletes such file after job completion.
     #     (run cat =(head -64 /dev/urandom)) &!
-    (run "${@}") &!
+#   output "running disowned: ${@}"
+    ( run "${@}" ) &!
+}
+
+# ....................{ RUNNERS ~ directory                }....................
+# void run_under_dir(
+#   string dirname,
+#   string command_name, string command_arg1, string command_arg2, ...)
+#
+# Run the passed command under the passed directory.
+function run_under_dir() {
+    # Validate passed arguments.
+    die_unless_at_least_two_args 'expected one dirname and one command '
+    string dirname="${1}"
+    shift_one_arg
+
+    # Temporarily change to the passed directory, run the passed command, and
+    # change back to the prior directory. Call the latter function in an
+    # "always" block to ensure such restoration in the event of an exception.
+    set_current_dir "${dirname}"
+    {
+#       output "running under \"${dirname}\": ${@}"
+        run "${@}"
+    } always {
+        restore_current_dir
+    }
 }
 
 # ....................{ RUNNERS ~ options                  }....................
@@ -381,11 +410,11 @@ function run_with_progress_timer() {
 #
 # Run the passed command every passed number of seconds.
 function run_every() {
-    # Localize passed arguments.
+    # Validate passed arguments.
     die_unless_at_least_two_args\
         'expected one duration in seconds and one command'
-    die_unless_string_integer_positive "${1}"
-    integer every_seconds=${1}
+    string every_seconds="${1}"
+    die_unless_string_integer_positive "${every_seconds}"
     shift_one_arg
 
     # If the passed command is an external command, run under "watch", a POSIX-
@@ -424,7 +453,7 @@ function run_as_superuser() {
 #
 # Run the passed command as the passed user.
 function run_as() {
-    # Localize passed arguments, stripping off the prefixing username.
+    # Validate passed arguments, stripping off the prefixing username.
     die_unless_at_least_two_args 'expected one username and one command'
     string username="${1}"
     shift_one_arg
@@ -436,35 +465,77 @@ function run_as() {
         return_true
     }
 
-    # Command line to run. Dismantled, this is:
-    #
-    # * "Q", stripping one level of quote protection from the passed parameters,
-    #   undoing prior "(q)" quote protection.
-    # * "z", splitting such parameters into Zsh-specific words.
-#   output_unescaped "command line: ${@}"
-    list command_line; command_line=( "${(z)@}" )
-#   list command_line; command_line=( "${(Qz)@}" )
-
-    #FIXME: Insufficient. Consider "LC_ALL=C ls".
     # Command name to run.
-    string command_name="${command_line[1]}"
+    string command_name; command_name="$(get_command_line_name "${@}")"
 
     #FIXME: Insufficient. Zsh builtins and functions should be executable as
     #other users, though it's probably non-trivial to do so. Perhaps prefix the
     #command line with "zeshy" and augment "bin/zeshy" to handle passed commands?
+    #Yes, yes... something like this be close to it:
+    #
+    #   is_installed "${command_name}" or sudo -E "zeshy -c '${*}'"
+    #
+    #Of course, that's not *QUITE* right. If ${*} contains either '"' or "'"
+    #characters, we need to quote protect such characters (and *ONLY* such
+    #characters, yes?) Contemplate.
     die_unless_installed "${command_name}"
 
     # If the target user is the superuser, use "sudo" to take advantage of
     # password caching. Avoid "@", as that splits the command line into discrete
     # arguments. "sudo" and "su" can split their own arguments, thank you.
     if is_superuser "${username}" and is_installed sudo
-    then sudo -E  "${command_line}"
+    then sudo -E  "${*}"
     # Otherwise, use "su".
-    else su -p -c "${command_line}" "${username}"
+    else su -p -c "${*}" "${username}"
     fi
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Command line to run. Dismantled, this is:
+    #
+    # * "Q", stripping one level of quote protection from the passed parameters,
+    #   undoing prior "(q)" quote protection.
+    # * "z", splitting such parameters into Zsh-specific words.
+#   output_unescaped "command line: ${@}"
+#   list command_line; command_line=( "${(z)@}" )
+#   list command_line; command_line=( "${(Qz)@}" )
+    #FIXME: Insufficient. Consider "LC_ALL=C ls".
+
+#   output "PWD: ${PWD}"
+#       output "PWD: ${PWD}"
+#       set_current_dir "$(get_current_dir)"
+    # If passed one argument, evaluate such argument is. This is the ideal case.
+#   is_one_arg and {
+#       output "run (single-arg eval): ${1}..."
+#       if is_piped_input
+#       then eval "run_with_piped_input ${1}"
+#       else eval "${1}"
+##       else
+##           output 'piped no input'
+##           eval "${1}"
+#       fi
+#       return_true
+#   }
+
+    # If piped input, pipe such input to the command to be run.
+#   is_piped_input and set_args 'run_with_piped_input' "${@}"
+
+    # Otherwise, passed multiple arguments that *HOPEFULLY* run no command
+    # internally calling either this function or the "eval" builtin.
+    #
+    # This branch previously conditionally quote protected all unescaped shell-
+    # reserved characters in such arguments, thus handling arguments the caller
+    # neglected to explicitly quote protect with "(q)". Unfortunately, such
+    # cleverness was entirely too clever, munging Zsh statements like:
+    #
+    #       run "print $(ls /tmp)"
+    #
+    # Hence, we have elected to do nothing whatsoever, requiring the caller
+    # quote protect user-passed arguments with "(q)".
+    #
+    # You have now entered the Clusterfuck Zone.
+#   output "run (multiple-arg eval): ${args[@]}... (last arg: ${@[-1]})"
+#   eval "${@}"
     # Otherwise, we've entered the Clusterfuck Zone. Zsh deals poorly with
     # quotes in "eval" strings. We can't simply brute-force quote-protection on
     # all passed arguments (e.g., "eval ${(q)@}"), as that overly quotes passed
