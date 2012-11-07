@@ -132,8 +132,8 @@ export ZESHY_OVERLAY_ROOT="${ZESHY_HOME}/src"
 
 # ....................{ OPTIONS                            }....................
 # Enforce strictness, as under conventional high-level languages.
-setopt no_unset           # attempting to expand unset parameters raises an error
-setopt warn_create_global # attempting to set untyped parameters raises an error
+setopt no_unset           # exception on attempting to expand unset parameters
+setopt warn_create_global # warning on attempting to set undeclared parameters
 
 # Core parsing.
 setopt no_ksh_arrays     # enable 1-based lists subscriptable without braces
@@ -252,8 +252,8 @@ zmodload -F zsh/stat b:zstat
 # Black box module exposing Zsh's C-based internal dictionaries as Zsh-based
 # associative arrays, including:
 #
-# * "$funcstack", having the current function call stack for user inspection.
-# * "$functions", having the current set of all functions for redefinition and
+# * ${funcstack}, having the current function call stack for user inspection.
+# * ${functions}, having the current set of all functions for redefinition and
 #   subsequent restoration of alternate function definitions.
 zmodload zsh/parameter
 
@@ -287,15 +287,11 @@ alias return_false="return ${ZESHY_FAILURE_CODE}"
 #the currently enabled theme. Make it so with a sprinkle of ANSI excellence.
 
 # ....................{ PRINTERS                           }....................
-# For safety, trap functions and functions transitively called by such functions
-# require only Zsh functionality (i.e., no Zeshy-specific syntactic sugar). This
-# comprises all functions defined up to and including the "TRAPS" section.
+# Declare placeholder functions to be overridden after loading the Zeshy digest.
 
 # void say(string message = '')
 #
-# Print the passed message suffixed by a trailing newline to the notice stream
-# of the cron logging facility if a cron-job and to the standard output stream
-# otherwise.
+# Print the passed message suffixed by a trailing newline to standard output.
 function say() {
     print -- "zeshy: ${@}"
 }
@@ -315,39 +311,49 @@ function cry() {
 }
 
 # ....................{ PRINTERS ~ stack                   }....................
-# string print_stack_trace(string message = "")
+#FIXME: Should handle optional messages to print_call_stack_trace(). Hmm; those
+#really are a nuisance; do we really want them?
+# string print_current_exception(void)
 #
-# Print to standard error a trace of the current call stack of all stack frames
-# (i.e., previously called functions, sourced files, and "eval" statement),
-# excluding the stack frame of the call to this function.
+# Print the current exception to standard error.
+function print_current_exception() {
+    print "\n"
+    [[ -n "${ZESHY_IS_PRINTING_STACK_TRACE_ON_ERROR-}" ]] &&
+        print_call_stack_trace
+}
+
+# string print_call_stack_trace(string message = '')
 #
-# Printing to standard error rather than output ensures that stack traces
-# printed within command substitution (e.g., by thrown exceptions and/or errors)
-# are not hidden by such substitution: e.g.,
+# Print a trace of the current call stack consisting of all previously called
+# functions, sourced files, and "eval" statements in the current call path to
+# standard error, excluding only the stack frame of the caller's call to this
+# function. Printing to standard error rather than output ensures that calling
+# this function from command substitutions (e.g., "$(get_zsh_version)") prints
+# to the terminal device attached to the current shell, without requiring the
+# caller to explicitly perform such printing: e.g.,
 #
 #     # Assuming neither "/spider" or "/murphy" exist, the following command
-#     # substitution internally throws an exception printing a stack trace.
+#     # substitution throws an exception printing a call stack trace to
+#     # standard error without effort on our behalf.
 #     >>> string first_file; first_file="$(get_first_file /spider /murphy)"
-function print_stack_trace() {
-    # Localize passed arguments.
+function print_call_stack_trace() {
+    # Validate passed arguments.
     (( # <= 1 )) || die 'expected at most one optional message'
-    integer i\
-        fileline fileline_first\
-        funcstack_size=${#funcstack}
-    local filename\
-        funcname funcname_first\
-        frame_prefix='    \\_'
-#       ZESHY_SCRIPT_NAME='print_stack_trace'\
+    integer funcstack_size=${#funcstack} i fileline fileline_first
+    local frame_prefix='    \\_' filename funcname funcname_first
+
+    # Redefine cry() in a manner consistent with this function.
+    function cry() { print -- "print_call_stack_trace: ${*}" 1>&2; }
 
     # Omit the current function call by starting from the second stack frame.
     # If there exists no such frame, return with failure.
     (( funcstack_size >= 2 )) || {
-        print -- 'print_stack_trace: call stack empty.' 1>&2
+        cry 'call stack empty'
         return_false
     }
 
     # Print a prefixing header with the passed message.
-    print -- "\nprint_stack_trace: ${1:-}" 1>&2
+    cry "${1:-}" 1>&2
 
     # Print the current call stack.
     for (( i = 2; i <= funcstack_size; i++ )) {
@@ -375,75 +381,6 @@ function print_stack_trace() {
         # Indent the next stack frame one space to the right.
         frame_prefix=" ${frame_prefix}"
     }
-
-    #FIXME: Sadly, this isn't quite right. The line number appears to be
-    #relative to the original function definition in the source file. Here's a
-    #simple test:
-    #    command dirs -p | number_lines_highlighting_line 0
-    #Zsh reports the failing command on a line number that could only be the
-    #original file including comments and blank lines. Sadly, that means we
-    #can't reliably highlight line numbers for any functions except those defined
-    #in the Zeshy digest. It also means we have to manually map the function
-    #name to the exact block of code in the exact Zeshy file defining such
-    #function, taking into account things like conditional themes. (Commands
-    #needn't be considered. But themes must.) It's all highly annoying, and
-    #frankly somewhat out of bounds at the moment.
-    #
-    #How about this: for the moment, drop the line number highlighting. It's
-    #erroneous and unhelpful. When time permits re-implement this conditional to:
-    #
-    #* If this function is a Zeshy function (i.e., is compiled into the Zeshy
-    #  digest), perform the above behavior with line number highlighting using
-    #  "awk" and a similar script to below.
-    #* Otherwise, print a code listing with no such highlighting using "nl".
-    #
-    #Because this probably relies on advanced Zeshy functionality not readily
-    #implementable without access to the Zeshy codebase, we should segregate
-    #this into an autoload function (say, print_function_highlighting_line()).
-    #Then test here for the existence of such function. If available, call it;
-    #otherwise, do nothing. (No error, if it doesn't exist yet.)
-
-    # If the most recent stack frame signifies an existing function, print that
-    # function's definition to standard error as line-numbered code. Since line
-    # numbers in stack frames start from the first line of such definition while
-    # the default printer for such definitions starts from the prior line
-    # declaring the function name, do *NOT* number the first printed line.
-    if [[ -n "${ZESHY_IS_DEBUG-}" && -n "${funcname_first}" &&\
-          "$(whence -w -- "${funcname_first}")" == *': function' ]]; then
-        print -- "\n${funcname_first}() failed on line ${fileline_first}."
-        whence -f -- "${funcname_first}" | awk -vNRBAD=${fileline_first} '
-# If the function name, print a hyphen in place of the current line number
-# followed by the name.
-NR == 1 {
-    printf("%6s   %s\n", "-", $0)
-}
-# If any line other than the erroneous line, print the current line number
-# followed by the line. (Due to the prefixing function name declaration, the
-# current line number is one larger than expected. Subtract one for comparison.)
-NR > 1 && NR-1 != NRBAD {
-    # If this line is "}" and hence the end of this function definition, print
-    # hyphens in place of the current line number followed by the "}".
-    if ($0 == "}") {
-        NREND=NR
-        gsub(/./, "-", NREND)
-        printf("%6s   }\n", NREND)
-    }
-    else {
-        printf("%6d   %s\n", NR-1, $0)
-    }
-}
-# If the erroneous line, print the current line number prefixed and suffixed by
-# pleasing ASCII arrows. (What? YOU CAN DO BETTER!?)
-NR-1 == NRBAD {
-    # Number of digits in the current line number.
-    NRLEN = length(NR-1);
-         if (NRLEN==1) {NRNOW = " <-~ " NR-1}
-    else if (NRLEN==2) {NRNOW = "<-~ " NR-1}
-    else if (NRLEN==3) {NRNOW = "<- " NR-1}
-    else               {NRNOW = NR-1}       # if true, your function is horrid.
-    printf("%s ~->   %s\n", NRNOW, $0)
-}' 2>&1
-    fi
 }
 
 # ....................{ TRAPS                              }....................
@@ -454,7 +391,7 @@ function TRAPINT() {
     integer signal_number=${1}
 
     # Print a complete stack trace.
-    print_stack_trace
+    print_call_stack_trace
 
     # Store the interrupted line in the history. By default, Zsh omits such
     # lines -- somewhat unhelpfully. Dismantled, this is:
@@ -490,7 +427,7 @@ function TRAPINT() {
 # returning non-zero exit status. Such unwind exits all intermediate subshells
 # (e.g., non-interactive Zeshy functions or scripts) to the originating shell
 # (e.g., the interactive Zeshy or Zsh shell transitively responsible for running
-# the failed command).
+# the failed command), but not necessarily any other active shell.
 #
 # Unlike "setopt ERR_RETURN", this prints stack traces. Unlike "setopt
 # ERR_EXIT", this merely unwinds the call stack rather than coercively exiting
@@ -509,9 +446,9 @@ function TRAPZERR() {
     # this function was not called directly from the prompt), prefix such trace
     # with that function's name and exit status; otherwise, no such prefix.
     if (( ${#funcstack} >= 2 ))
-    then print_stack_trace\
+    then print_call_stack_trace\
         "\"${funcstack[2]}\" failed with exit status ${exit_status}."
-    else print_stack_trace
+    else print_call_stack_trace
     fi
 
     # Mimic "setopt ERR_RETURN". See "man zshoptions" for further details.
@@ -557,9 +494,9 @@ function die() {
 
     # Print a complete stack trace.
     if (( ${#funcstack} >= 2 ))
-    then print_stack_trace\
+    then print_call_stack_trace\
         "\"${funcstack[2]}\" failed with exit status ${exit_status}."
-    else print_stack_trace
+    else print_call_stack_trace
     fi
 
     # If called under an interactive shell, unwind the call stack to return the
@@ -598,6 +535,13 @@ source_zeshy_component alias global autoload
 setup_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+# For safety, trap functions and functions transitively called by such functions
+# require only Zsh functionality (i.e., no Zeshy-specific syntactic sugar). This
+# comprises all functions defined up to and including the "TRAPS" section.
+
+# the notice stream
+# of the cron logging facility if a cron-job and to the standard output stream
+# otherwise.
 #say 'finalizing aliases...'
 #source "${ZESHY_OVERLAY_ROOT}/alias"
 #say 'finalizing globals...'
@@ -619,7 +563,7 @@ setup_zeshy
 #FIXME: *BRILLIANT IDEA*. Stack traces are great. But, with longer function
 #implementations, output like:
 #
-#   print_stack_trace: make_and_install_kernel() failed with exit status 1
+#   print_call_stack_trace: make_and_install_kernel() failed with exit status 1
 #        \_ TRAPZERR() { /root/.zeshy/digest.zwc/make_and_install_kernel: 34 }
 #         \_ make_and_install_kernel() { /bin/zsh: 130 }
 #
@@ -628,7 +572,7 @@ setup_zeshy
 #implementation and discern just where the fault lies. Hence, a solution:
 #
 #* Add a new "ZESHY_DEBUG" config global. (Think we might have one already, yes?)
-#* If enabled, print_stack_trace() should implicitly with no external effort
+#* If enabled, print_call_stack_trace() should implicitly with no external effort
 #  append something resembling "which ${funcname[2]}" to its output. That's
 #  closer to what we want, but still incomplete: "which" has no option for
 #  prefixing each line of output with its line number, which is what we need.
@@ -742,7 +686,7 @@ setup_zeshy
 #however, I can only assume this is somehow the intended behavior. Nonetheless,
 #file a mailing list comment.
 #trap TRAPZERR ZERR
-#trap 'print_stack_trace; throw ZeshyException' ZERR
+#trap 'print_call_stack_trace; throw ZeshyException' ZERR
 
 #   if is_interactive
 #   then return $(( ${exit_status} + 128 + ${signal_number} ))
@@ -1121,7 +1065,7 @@ setup_zeshy
 
         # Print the passed error message followed by a complete backtrace.
 #   cry "${@}"
-#   print_stack_trace
+#   print_call_stack_trace
  #
     # Shells differentiate
     # fatal from non-fatal errors by setting the high bit (i.e., 2^7 = 128).

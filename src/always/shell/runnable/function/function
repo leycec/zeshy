@@ -6,54 +6,114 @@
 # See "COPYING" for additional details.
 #
 # --------------------( SYNOPSIS                           )--------------------
-# Inspect function names, definitions, and related metadata.
+# Handle functions and function metadata (e.g., disabled, enabled).
 
-# ....................{ TESTS                              }....................
+# ....................{ EXCEPTIONS                         }....................
+# void die_unless_function(
+#   string function_name,
+#   string error_message = "\"${function_name}\" not a function")
+#
+# Throw an exception unless the passed function exists.
+function die_unless_function() {
+    die_unless_one_or_two_args\
+        'expected one function name and optional error message'
+    string function_name="${1}"
+    is_function "${function_name}" or
+        die "${2:-\"${function_name}\" not a function}"
+}
+
+# ....................{ TESTERS                            }....................
 # boolean is_function(string function_name)
 #
-# Return true if a function with the passed name exists.
+# Return true if the passed function exists.
 function is_function() {
     die_unless_one_arg 'expected one function name'
     run_quietly typeset -f -- "${1}"
 }
 
-# ....................{ GETTERS                            }....................
-# string get_functions_matching(string glob)
+# ....................{ PRINTERS                           }....................
+# string print_function_line_contextually(
+#   string function_name, integer line_number)
 #
-# Get all function names matching the passed glob, delimited by newlines: e.g.,
-#
-#     >>> get_functions_matching 'get_z*s*h*_version'
-#     get_zeshy_version
-#     get_zsh_version
-function get_functions_matching() {
+# Print the passed line of the passed function contextually. If such function is
+# sufficiently small (e.g., less than six lines), print the complete function
+# definition; otherwise, print only the passed line and some number of lines
+# preceding and succeeding such line of such function definition as context.
+function print_function_line_contextually() {
     # Validate passed arguments.
-    die_unless_one_arg 'expected one glob'
+    die_unless_two_args 'expected one function name and one line number'
+    string function_name="${1}" line_number="${2}"
+    die_unless_function "${function_name}"
+    die_unless_string_integer_positive "${line_number}"
 
-    # Match such glob. Dismantled, this is:
+    #FIXME: Sadly, this isn't quite right. The line number appears to be
+    #relative to the original function definition in the source file. Here's a
+    #simple test:
+    #    command dirs -p | number_lines_highlighting_line 0
+    #Zsh reports the failing command on a line number that could only be the
+    #original file including comments and blank lines. Sadly, that means we
+    #can't reliably highlight line numbers for any functions except those defined
+    #in the Zeshy digest. It also means we have to manually map the function
+    #name to the exact block of code in the exact Zeshy file defining such
+    #function, taking into account things like conditional themes. (Commands
+    #needn't be considered. But themes must.) It's all highly annoying, and
+    #frankly somewhat out of bounds at the moment.
     #
-    # * "-fm", matching only function names (rather than all "object" names).
-    # * "+", printing only function names (rather than function definitions).
-    typeset -fm '+' -- "${1}"
+    #How about this: for the moment, drop the line number highlighting. It's
+    #erroneous and unhelpful. When time permits re-implement this conditional to:
+    #
+    #* If this function is a Zeshy function (i.e., is compiled into the Zeshy
+    #  digest), perform the above behavior with line number highlighting using
+    #  "awk" and a similar script to below.
+    #* Otherwise, print a code listing with no such highlighting using "nl".
+    #
+    #Because this probably relies on advanced Zeshy functionality not readily
+    #implementable without access to the Zeshy codebase, we should segregate
+    #this into an autoload function (say, print_function_highlighting_line()).
+    #Then test here for the existence of such function. If available, call it;
+    #otherwise, do nothing. (No error, if it doesn't exist yet.)
+
+    # If the most recent stack frame signifies an existing function, print that
+    # function's definition to standard error as line-numbered code. Since line
+    # numbers in stack frames start from the first line of such definition while
+    # the default printer for such definitions starts from the prior line
+    # declaring the function name, do *NOT* number the first printed line.
+    if [[ -n "${ZESHY_IS_DEBUG-}" && -n "${funcname_first}" &&\
+          "$(whence -w -- "${funcname_first}")" == *': function' ]]; then
+        print -- "\n${funcname_first}() failed on line ${fileline_first}."
+        whence -f -- "${funcname_first}" | awk -vNRBAD=${fileline_first} '
+# If the function name, print a hyphen in place of the current line number
+# followed by the name.
+NR == 1 {
+    printf("%6s   %s\n", "-", $0)
 }
-
-# ....................{ SETTERS                            }....................
-# void set_list_to_function_names_matching(string list_name, string glob)
-#
-# Set the passed list to all function names matching the passed glob: e.g.,
-#
-#     >>> list function_names
-#     >>> set_list_to_function_names_matching function_names 'test_z[aeou]shy'
-#     >>> output ${function_names[1]}
-#     test_zeshy
-function set_list_to_function_names_matching() {
-    # Validate passed arguments.
-    die_unless_two_args 'expected one list name and one glob'
-    string list_name="${1}" __glob__="${2}" function_names
-    die_unless_list "${list_name}"
-
-    # Match such glob.
-    function_names="$(get_functions_matching "${__glob__}")"
-    set_list_to_string_lines "${list_name}" "${function_names}"
+# If any line other than the erroneous line, print the current line number
+# followed by the line. (Due to the prefixing function name declaration, the
+# current line number is one larger than expected. Subtract one for comparison.)
+NR > 1 && NR-1 != NRBAD {
+    # If this line is "}" and hence the end of this function definition, print
+    # hyphens in place of the current line number followed by the "}".
+    if ($0 == "}") {
+        NREND=NR
+        gsub(/./, "-", NREND)
+        printf("%6s   }\n", NREND)
+    }
+    else {
+        printf("%6d   %s\n", NR-1, $0)
+    }
+}
+# If the erroneous line, print the current line number prefixed and suffixed by
+# pleasing ASCII arrows. (What? YOU CAN DO BETTER!?)
+NR-1 == NRBAD {
+    # Number of digits in the current line number.
+    NRLEN = length(NR-1);
+         if (NRLEN==1) {NRNOW = " <-~ " NR-1}
+    else if (NRLEN==2) {NRNOW = "<-~ " NR-1}
+    else if (NRLEN==3) {NRNOW = "<- " NR-1}
+    else               {NRNOW = NR-1}       # if true, your function is horrid.
+    printf("%s ~->   %s\n", NRNOW, $0)
+}' 2>&1
+    fi
 }
 
 # ....................{ NAMESPACES                         }....................
