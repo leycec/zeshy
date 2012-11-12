@@ -1,0 +1,732 @@
+#!/usr/bin/env zsh
+# ====================[ script                             ]====================
+#
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2012 by Cecil Curry.
+# See "COPYING" for additional details.
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Handle shell scripts, executable text files implemented in some shell
+# scripting language (e.g., Zeshy, Zsh, Bash, Bourne).
+
+#FIXME: This has utterly nothing to do with this component, but either
+#"-o EMACS" or "-o VI" should be enabled depending on ${EDITOR}. Make it so! So?
+
+# ....................{ EXCEPTIONS                         }....................
+# string die_unless_shell_script(
+#   string pathname,
+#   string error_message = "\"${pathname}\" not a shell script")
+#
+# Throw an exception unless the passed path exists and is a shell script (i.e.,
+# a text file whose first line is a "#!"-prefixed shebang line).
+function die_unless_shell_script() {
+    die_unless_one_or_two_args\
+        'expected one pathname and optional error message'
+    string pathname="${1}"
+    is_shell_script "${pathname}" or
+        die "${2:-\"${pathname}\" not a shell script}"
+}
+
+# ....................{ TESTERS                            }....................
+# boolean is_shell_script(string pathname)
+#
+# Return true if the passed path exists and is a shell script (i.e., a text file
+# whose first line is a "#!"-prefixed shebang line).
+function is_shell_script() {
+    die_unless_one_arg 'expected one pathname'
+    string pathname="${1}"
+    is_text_file "${pathname}" and
+        run_quietly get_shell_script_shebang_command_if_found "${pathname}"
+}
+
+# ....................{ GETTERS                            }....................
+# string get_shell_script_defining_function(string function_name)
+#
+# Get the absolute path of the shell script defining the passed function if some
+# script with basename such function name resides in some directory listed by
+# global list ${fpath} or throw an exception. If multiple scripts match such
+# function name, arbiratrily get the absolute path of the first such script
+# listed by ${fpath}: e.g.,
+#
+#     >>> get_shell_script_defining_function zsh-mime-handler
+#     /usr/share/zsh/4.3.11/functions/MIME/zsh-mime-handler
+function get_shell_script_defining_function() {
+    # Validate passed arguments.
+    die_unless_one_arg 'expected one function name'
+    string function_name="${1}"
+
+    # Dismantled, this is:
+    #
+    # * "^", iteratively expanding to each directory listed by ${fpath}.
+    # * "(N)", excluding non-extant filenames.
+    list shell_scripts; shell_scripts=( ${^fpath}"/${function_name}"(.N) )
+
+    # If no shell script defines such function, throw an exception; otherwise,
+    # print the absolute path of the first such script.
+#   say "filename_matches: \"${filename_matches[@]}\""
+    die_unless_list_nonempty shell_scripts\
+        "shell script defining ${function_name}() not found"
+    output "${shell_scripts[1]}"
+}
+
+# ....................{ GETTERS ~ shebang                  }....................
+# string get_shell_script_shebang_command_if_found(string filename)
+#
+# Get the first line excluding prefixing "#!" of the passed shell script if such
+# line is prefixed with "#!" or return false: e.g.,
+#
+#     >>> get_shell_script_shebang_command_if_found '/etc/zsh/zshrc'
+#     /usr/bin/env zsh
+function get_shell_script_shebang_command_if_found() {
+    # Validate passed arguments. Avoid calling die_unless_shell_script(), which
+    # transitively calls this function.
+    die_unless_one_arg 'expected one filename'
+    string filename="${1}" shebang_command
+    die_unless_text_file "${filename}"
+
+    # Get such command or fail trying.
+    if run_with_mapfile "shebang_command=\"\$(get_string_match_if_found\
+        \"\${mapfile[\${filename}]}\"\
+        '(#s)\#!([^${ZESHY_CHARACTER_NEWLINE}]#)*')\""
+    then output "${shebang_command}"
+    else return_false
+    fi
+}
+
+# string get_shell_script_shebang_command_name_if_found(string filename)
+#
+# Get the command name of the shebang line in the passed shell script if such
+# script contains such a line or return false. If the first word of such line
+# is either "/bin/env" or "/usr/bin/env", the command name is the second word of
+# such line (e.g., the "mercy" in "#!/usr/bin/env mercy fields"); otherwise, the
+# command name is the basename of the first word of such line (e.g., the
+# "nephilim" in "#!/bin/nephilim sisters"): e.g.,
+#
+#     >>> get_shell_script_shebang_command_name_if_found '/etc/zsh/zshrc'
+#     zsh
+function get_shell_script_shebang_command_name_if_found() {
+    # Validate passed arguments.
+    die_unless_one_arg 'expected one filename'
+    string command command_name
+    list words
+
+    # If such script contains a shebang command, get such command's name.
+    if command="$(get_shell_script_shebang_command_if_found "${1}")"
+    then
+        # Split such command into words and get the basename of the first.
+        set_list_to_string_split_on_words words "${command}"
+        command_name="$(get_basename "${words[1]}")"
+
+        # If such basename is "env", the command name is the following word.
+        if is "${command_name}" == 'env' si
+        then output "${words[2]}"
+        # Otherwise, such basename is the command name.
+        else output "${command_name}"
+        fi
+    # Otherwise, fail.
+    else return_false
+    fi
+}
+
+# ....................{ SOURCERS                           }....................
+# string source_shell_script(string filename, string arg1, string arg2, ...)
+#
+# Source the passed shell script with the passed arguments, reading and
+# executing all commands in such script under the current shell. If such script:
+#
+# * Contains a shebang line referencing:
+#   * A supported non-Zeshy shell (e.g., "#!/usr/bin/env zsh", "#!/bin/bash"),
+#     source such script "safely" by emulating the shell environment expected by
+#     such script with default shell options and traps. In particular, revert to
+#     traditional shell execution of commands by not throwing exceptions on
+#     commands returning non-zero exit status.
+#   * An unsupported non-Zeshy shell (e.g., "#!/usr/bin/env fish", "#!/bin/es"),
+#     throw an exception. Such scripts cannot currently be reliably emulated
+#     under Zsh and hence cannot be sourced under the current shell. Consider
+#     explicitly running such scripts under the desired shell (e.g.,
+#     "fish odd_fellows_rest.fish").
+#   * Zeshy (e.g., "#!/usr/bin/env zeshy"), source such script as is (i.e.,
+#     under the current shell environment, with no such emulation).
+# * Contains no shebang line, assume such script to be a Zeshy shell script and
+#   source such script as is, as above.
+#
+# See source_shell_script_emulated_under_shell() for further details on shell
+# emulation.
+function source_shell_script() {
+    # Validate passed arguments. Avoid calling die_unless_shell_script(), whose
+    # implementation duplicates our parsing of the script shebang line here.
+    die_unless_args 'expected one script filename and optional script arguments'
+    string filename="${1}" filetype shell_name shebang_command_name
+    die_unless_text_file "${filename}"
+#   say "filename: ${filename}\nfiletype: ${filetype}"
+
+    # Identify the shell to be emulated. If such script's filetype matches an
+    # emulatable shell, assume such shell.
+    filetype="$(get_file_type_if_found "${filename}")"
+    if is_string_match "${filetype}" "${ZESHY_GLOB_SOURCEABLE_SHELLS}"
+    then shell_name="${filetype}"
+    # If such script contains a shebang line matching an emulatable shell,
+    # assume such shell.
+    elif shebang_command_name="$(get_shell_script_shebang_command_name_if_found\
+        "${filename}")"
+    then shell_name="$(get_string_match_if_found\
+            "${shebang_command_name}" "${ZESHY_GLOB_SOURCEABLE_SHELLS}")" or
+        die "script \"${filename}\" requiring unknown shell \"${shebang_command_name}\" not sourceable"
+    # Otherwise, assume such script to be Zeshy.
+    else
+        cry "script \"${filename}\" lacking shebang line assumed to be a Zeshy script"
+        shell_name='zeshy'
+    fi
+
+    # Source such script emulated under such shell.
+    source_shell_script_emulated_under_shell "${@}" "${shell_name}"
+}
+
+# string source_shell_script_defining_function(
+#   string filename, string arg1, string arg2, ...)
+#
+# Source the shell script defining the passed function with the passed
+# arguments, reading and executing all commands in such script under the current
+# shell. See:
+#
+# * get_shell_script_defining_function() for details on finding such script.
+# * source_shell_script() for details on sourcing such script.
+function source_shell_script_defining_function() {
+    # Validate passed arguments.
+    die_unless_args 'expected one function name and optional script arguments'
+    string function_name="${1}" filename shell_name shebang_command_name
+    shift_one_arg
+
+    # Get the absolute path of the shell script defining the passed function.
+    filename="$(get_shell_script_defining_function "${function_name}")"
+#   output "shell script defining ${function_name}(): ${filename}"
+
+    # Identify the shell to be emulated. Such script's basename is a function
+    # name and hence cannot be suffixed by a filetype, so the only available
+    # identifier is a shebang line if found. Attempt to find such line.
+    if shebang_command_name="$(get_shell_script_shebang_command_if_found\
+        "${filename}")"
+    then shell_name="$(get_string_match_if_found\
+            "${shebang_command_name}" "${ZESHY_GLOB_SOURCEABLE_SHELLS}")" or
+        die "script \"${filename}\" requiring unknown shell \"${shebang_command_name}\" not sourceable"
+    # Technically, another crude identifier exists: if such script resides under
+    # a directory named "zsh", assume such shell to be zsh.
+    elif is_string_containing "${filename}" '/zsh/'
+    then shell_name='zsh'
+    # Otherwise, assume such shell to be Zeshy.
+    else
+        cry "script \"${filename}\" lacking shebang line assumed to be a Zeshy script"
+        shell_name='zeshy'
+    fi
+
+    # Source such script emulated under such shell.
+    source_shell_script_emulated_under_shell\
+        "${filename}" "${@}" "${shell_name}"
+}
+
+# string source_shell_script_emulated_under_shell(
+#   string filename, string arg1, string arg2, ...,
+#   string shell_command_name)
+#
+# Source the passed shell script with the passed arguments emulated under the
+# passed shell command, reading and executing all commands in such script under
+# the current shell. Since Zsh emulates only some (but not all) shell commands,
+# this function maps the passed shell command to a Zsh-emulated shell command as
+# follows:
+#
+# /======================^============================\
+# | passed shell command | emulated shell environment |
+# <======================+============================>
+# | ash                  | sh                         |
+# | bash                 | bash*                      |
+# | csh                  | csh                        |
+# | dash                 | sh                         |
+# | mksh                 | ksh                        |
+# | pdksh                | ksh                        |
+# | resh                 | sh                         |
+# | tcsh                 | csh                        |
+# | sh                   | sh                         |
+# | zeshy                | NONE                       |
+# | zsh                  | zsh                        |
+# \======================+============================/
+#
+# * Unfortunately, zsh currently emulates bash as sh (i.e., Bourne shell). Since
+#   this is rarely desirable, Zeshy improves such emulation by enabling bash-
+#   specific shell options (e.g., "ksh_glob", "no_sh_glob"). While imperfect,
+#   this is probably the best we can currently do. Consider explicitly running
+#   bash scripts under bash (e.g., "bash sonic_excess_in_its_purest_form.bash").
+function source_shell_script_emulated_under_shell() {
+    # Validate passed arguments. Avoid calling die_unless_shell_script(), whose
+    # implementation duplicates our parsing of the script shebang line here.
+    die_unless_at_least_two_args\
+        'expected one script filename, optional script arguments, and one shell name'
+    string filename="${1}" shell_name="${@[-1]}"
+    die_unless_text_file "${filename}"
+    pop_one_arg
+
+    # Map the passed shell command to the closest Zsh-emulatable shell command.
+    case "${shell_name}" in
+    # If such shell is supported under a generic zsh-recognized name, map
+    # the former to latter.
+    (a|da|re)sh) shell_name='sh';;
+    tcsh) shell_name='csh';;
+    (m|pd)ksh) shell_name='ksh';;
+    esac
+
+    # Source such script under such emulation. Dismantled, this is:
+    #
+    # * "-L", localizing the redefinition of TRAPZERR() to this block.
+    # * "-R", resetting shell options to the default expected by such shell.
+    #
+    # Do not redefine TRAPINT(); printing stack traces on user interrupts
+    # is universally useful and not conflicting with script expectations.
+    {
+        case "${shell_name}" in
+        # If a bash shell script, attempt Bourne shell emulation with bash-
+        # specific builtins and options courtesy
+        # http://zshwiki.org/home/convert/bash. Since such emulation is
+        # admittedly imperfect (actually, terrible), print a warning.
+        bash)
+            #FIXME: The bash_source() function defined at the prior URL defines
+            #additional aliases (e.g., "alias shopt=':'"). Unfortunately, Zeshy
+            #currently has no means of temporarily defining aliases and then
+            #restoring the prior definition if already defined. We'll need some
+            #such mechanism prior to defining such aliases, clearly.
+            cry "sourcing bash script \"${filename}\" as a Bourne script"
+            emulate -LR sh
+            localize_shell_options ksh_glob no_sh_glob brace_expand;;
+        # If a shell explicitly emulatable by Zsh, do so.
+        ${~ZESHY_GLOB_EMULATABLE_SHELLS})
+            emulate -LR "${shell_name}";;
+        # Otherwise, this function failed to properly map such script's specific
+        # shell to a Zsh-supported shell; throw an exception.
+        *) die "script \"${filename}\" requiring unmapped shell \"${shell_name}\" not sourceable";;
+        esac
+
+        # Temporarily cease throwing exceptions on non-zero exit status.
+        TRAPZERR() { return $(( 128 + ${1} )) }
+
+        # Source such script under such emulation.
+        PATH="${PATH}:${FPATH}" source -- "${@}"
+    }
+
+    # The above emulation of traditional TRAPZERR() behavior persists both while
+    # running commands in such script, which is wise, *AND* processing the exit
+    # status of such script, which is unwise. In the latter case, non-zero exit
+    # status fails to signal ZERR. Manually test such status and, if non-zero,
+    # throw the expected exception.
+    integer exit_status=${?}
+    (( exit_status == ZESHY_SUCCESS_CODE )) or
+        die "sourcing \"${@}\" failed with exit status ${exit_status}"
+}
+
+#FIXME: This really begs for a compelety different function name.
+# string source_shell_script_command_output(
+#   string shell_name,
+#   string command_name, string command_arg1, string command_arg2, ...)
+#
+# Emulate the passed command under the passed shell (e.g., "sh", "csh") and, if
+# successful, source the command's standard output.
+function source_shell_script_command_output() {
+    # Validate passed arguments.
+    die_unless_at_least_two_args\
+        'expected at least one shell name and one command name'
+    string shell_name="${1}"
+    shift_one_arg
+
+    #FIXME: Refer to the previously defined glob.
+    is "${shell_name}" == (zsh|sh|ksh|csh) si or
+        die "\"${shell_name}\" not an emulatable shell"
+#   string command_name="${1}"
+#   die_unless_installed "${command_name}"
+
+    # Source safely.
+    emulate -R "${shell_name}" -c "eval \$(${@})"
+}
+
+# ....................{ SOURCERS ~ once                    }....................
+#FIXME: Poor verb choice. Rename to source_shell_scripts_once().
+# void requires(string filename1, string filename2, ...)
+#
+# Import all passed scripts.
+function requires() {
+    die_unless_args 'expected at least one script name'
+    for script_name ("${@}") require "${script_name}"
+}
+
+#FIXME: Poor verb choice. Rename to source_shell_script_once() and all functions below.
+# void require(string pathname, string arguments)
+#
+# Conditionally import the passed file or directory, if not previously imported
+# by this function or externally modified since such import. We pass the passed
+# arguments to all files imported in this manner.
+#
+# If the passed path is relative, we look for such path first under the current
+# working directory and then Zeshy's root directory (e.g., "/usr/share/zeshy/").
+# We then resolve the exact Zeshy script(s) to be imported as follows:
+#
+# * If the passed path is an existing file, import such file.
+# * If the passed path is an existing directory:
+#   * Containing a file named "${ZESHY_MAIN_SCRIPT_BASENAME}", import such file.
+#   * Otherwise, import all files such directory contains.
+# * Otherwise, die.
+#
+# This function mimics the import() built-in of most high-level languages. To
+# avoid conflict with ImageMagick's "import" command, we prefer "require".
+#
+# --------------------( VARIABLES                          )--------------------
+# This function defines local variables, which imported scripts may safely
+# access for informative path metadata: namely,
+#
+# * "zeshy_script_name", having the relative path to the imported script under
+#   "${ZESHY_HOME}/src".
+# * "zeshy_script_path", having the absolute path to the imported script.
+# * "zeshy_script_mtime", having the modification time of the imported script.
+#
+# --------------------( EXAMPLES                           )--------------------
+#     # Implicitly imports the Zeshy script "zeshy/os/.main".
+#     >>> require zeshy/os
+function require() {
+    # Validate passed arguments.
+    die_unless_at_least_one_arg\
+        'expected one pathname and optional script options'
+#   say "requireing ${1}..."
+
+    # Passed script name. Shift it off the argument stack, to allow us to pass
+    # this script the set of all remaining arguments on sourcing it below.
+    string zeshy_script_name="${1}"; shift
+
+    # Path to this script.
+    string zeshy_script_path
+
+    # If the passed script name is either an absolute path or an existing relative
+    # path, try to import it as is.
+    if is_path_absolute "${zeshy_script_name}" or
+       is_path         "${zeshy_script_name}"
+    then zeshy_script_path="${zeshy_script_name}"
+    # Otherwise, try to import a Zeshy component having that script name.
+    else zeshy_script_path="${ZESHY_HOME}/src/${zeshy_script_name}"
+    fi
+
+    # Delegate to helper functions depending on path type.
+    if is_dir "${zeshy_script_path}"
+    then require_dir  "${zeshy_script_path}" "${@}"
+    else require_file "${zeshy_script_path}" "${@}"
+    fi
+}
+
+# void require_dir(string dirname, string arguments)
+#
+# Conditionally import the passed directory. See require() for details.
+function require_dir() {
+    # Validate passed arguments.
+    die_unless_at_least_one_arg\
+        'expected one dirname and optional import options'
+    string zeshy_script_dir="${1}"; shift
+    die_unless_dir "${zeshy_script_dir}"
+    string zeshy_main_script="${zeshy_script_dir}/${ZESHY_MAIN_SCRIPT_BASENAME}"
+
+    # If this directory contains a main script, import only such script;
+    # otherwise, import all children of such directory.
+    if is_file "${zeshy_main_script}"
+    then require_file         "${zeshy_main_script}" "${@}"
+    else require_dir_children "${zeshy_script_dir}"  "${@}"
+    fi
+}
+
+# void require_dir_children(string dirname, string arguments)
+#
+# Conditionally import all files and directories under the passed directory.
+function require_dir_children() {
+    # Validate passed arguments.
+    die_unless_at_least_one_arg\
+        'expected one dirname and optional import options'
+    string zeshy_script_dir="${1}"; shift
+    die_unless_dir "${zeshy_script_dir}"
+
+    #FIXME: Hmmm; no need to include "zwc", I should think. No?
+    # Dismantled, this imports all files in this directory subject to:
+    #
+    # * "(^D@)", excluding dotfiles and symbolic links.
+    # * "~*.(swp|zwc)", excluding files with filetype "swp" or "zwc".
+    for zeshy_script_dir_child ( "${zeshy_script_dir}"/*(^D@)~*.(swp|zwc) ) {
+        require "${zeshy_script_dir_child}" "${@}"
+    }
+}
+
+#global_string ZESHY_CACHE_COMPILATION_DIR="${ZESHY_DOT_DIR}/compilation"
+#FIXME: Add support for zcompile(). Pass "-M" if the passed file matches
+# */zeshy/src/* and "-R" otherwise.
+# void require_file(string filename, string arguments)
+#
+# Conditionally import the passed file. See require() for details.
+function require_file() {
+    # Validate passed arguments.
+    die_unless_at_least_one_arg\
+        'expected one filename and optional import options'
+    string zeshy_script_path="${1}"; shift
+    die_unless_file "${zeshy_script_path}"
+
+    # Canonicalize the path so as to ensure the dictionary lookup below
+    # successfully compares it against a previously canonicalized path.
+    zeshy_script_path="$(canonicalize_path "${zeshy_script_path}")"
+
+    # Modification time of this script.
+    integer zeshy_script_mtime
+    zeshy_script_mtime="$(get_path_mtime "${zeshy_script_path}")"
+
+    global_map ZESHY_REQUIRED_PATH_TO_MTIME
+
+    # If this script has not yet been imported or has been but has changed since
+    # being imported, (re)import this script.
+    if is -z\
+        "${ZESHY_REQUIRED_PATH_TO_MTIME[(I)"${zeshy_script_path}"]}" or
+        "${ZESHY_REQUIRED_PATH_TO_MTIME["${zeshy_script_path}"]}" -ne\
+        "${zeshy_script_mtime}" si; then
+        # If the script corresponds to a command-specific script under
+        # "zeshy/command" excluding the top-level ".main" script, ensure this
+        # command is actually installed.
+        if is "${zeshy_script_path}" == */zeshy/command/* si; then
+            string command_name="${zeshy_script_path#*/zeshy/command/}"
+            is "${command_name}" == "${ZESHY_MAIN_SCRIPT_BASENAME}" si or
+                die_unless_installed "${command_name}"
+        fi
+
+        # Record this script as being imported prior to doing so, thus
+        # preventing infinitely recursive reimportation should this or another
+        # script imported by this script attempt to import this script again.
+        ZESHY_REQUIRED_PATH_TO_MTIME["${zeshy_script_path}"]="${zeshy_script_mtime}"
+
+        #FIXME: Technically, this works. Sadly, Zsh exposes no explicit
+        #mechanism for sourcing zcompiled scripts. (Odd, we know.) Rather, one
+        #can only use such scripts with the fpath-enabled autoload mechanism.
+        # Absolute path to the file caching the compilation of this script.
+#       string zeshy_script_compiled_path="${ZESHY_CACHE_COMPILATION_DIR}${zeshy_script_path}.zwc"
+
+        # If this script has not yet been compiled or has been but has changed since
+        # being compiled, (re)compile this script.
+#       if is not -f "${zeshy_script_compiled_path}" or\
+#           ${zeshy_script_mtime} -ne\
+#           $(get_path_mtime "${zeshy_script_compiled_path}") si; then
+#           # zcompile() refuses to create directory structure, so do so for it.
+#           make_dir_if_not_found "$(dirname "${zeshy_script_compiled_path}")"
+
+#           say "compiling \"${zeshy_script_path}\" to \"${zeshy_script_compiled_path}\"..."
+#           say "compiling \"${zeshy_script_path}\"..."
+#           zcompile "${zeshy_script_compiled_path}" "${zeshy_script_path}"
+
+            # Set the mtime of the compiled script to that of the uncompiled
+            # script to ensure the above conditional fails on future imports.
+#           set_path_mtime "${zeshy_script_compiled_path}" ${zeshy_script_mtime}
+#       fi
+#       source "${zeshy_script_compiled_path}" "${@}"
+
+        # Do so.
+        say "requiring \"${zeshy_script_path}\"..."
+        source "${zeshy_script_path}" "${@}"
+    fi
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#         if shebang_command_name="$(get_string_match_if_found\
+#           "${shebang_command}"\
+#           '(/usr|)/bin/env[[:space:]]##([^[:space:]]##)')"
+#       then output "${shebang_command_name}"
+#       elif shebang_command_name="$(get_string_match_if_found\
+#           "${shebang_command}"\
+#           '(/usr|)/bin/env[[:space:]]##([^[:space:]]##)')"
+#       then output "${shebang_command_name}"
+#       else return_false
+
+# Safely source the passed non-Zeshy script by emulating the shell environment
+# expected by that script with default shell options and traps (e.g., a script
+# "mandibles_of_joy.sh" expects a Bourne rather than Zsh shell environment).
+#       string glob="[/ ](${emulatable_shells})((#e)| )" shebang
+#       string regex="^.*[/ ](${emulatable_shells})($| )" shebang_command
+        #FIXME: Insufficient. Search, say, the first eight lines for a shebang.
+        #This suggests a call pipeline resembling:
+        #  shebang_line="$(get_text_file_contents_line_matching_pcre "$(get_text_file_lines "${filename}" 1 8)" "${shebang_regex}")"
+#       shebang_line="$(get_text_file_first_line "${filename}")"
+#           shell="${match[1]}"
+#       output "shebang_line: ${shebang_line}"
+#       output "shell=${shell}"
+    #FIXME: Hmm; this appears to be fixed under zsh 5.0.0. Verify. Wait; no.
+    #This should be expected behavior, given the prior TRAPZERR() statement.
+    # Interestingly, Zsh fails to signal ZERR when the sourced script fails with
+    # non-zero exit status. Let's signal ZERR ourselves, shall we?
+
+#If the passed filename is not absolute, convert
+    # such filename to an absolute path by searching the current working
+    # directory, ${PATH}, and ${FPATH} (in that order) for such basename.# string get_shell_script_path(string script_name)
+#
+# Get the absolute path of the passed script if in at least one path listed
+# below or throw an exception. If in multiple such paths, get the first such
+# path. If the passed name is the absolute path of a text file, return such file
+# as is. Otherwise, this function generalizes get_autoload_path() by searching
+# for (in order):
+#
+# * Any file in the current working directory with such name.
+# * Any file in the current user's ${PATH} with such name (i.e., a command).
+# * Any file in the current user's ${FPATH} with such name (i.e., an autoload).
+#function get_shell_script_path() {
+    # Validate passed arguments.
+#    die_unless_one_arg 'expected one filename'
+#    string filename="${1}"
+
+    # If such name is the absolute path of a text file, return such name as is.
+#    if is_path_absolute "${filename}"; then
+#        die_unless_text_file "${filename}"
+#        output "${filename}"
+    # Otherwise, iteratively search the described paths for such file.
+#    else
+#        list script_paths; script_paths=( "${PWD}" "${path[@]}" "${fpath[@]}" )
+#        get_shell_script_autoload_path "${filename}" script_paths
+#    fi
+#}
+
+# string get_shell_script_defining_function(
+#   string function_name, string autoload_dirs_list_name = 'fpath')
+#
+# Get the absolute path of the shell script defining the passed function if under at least one
+# path in the passed list of paths or throw an exception. If under multiple such
+# paths, get the first such path: e.g.,
+#
+#     >>> get_shell_script_autoload_path zsh-mime-handler
+#     /usr/share/zsh/4.3.11/functions/MIME/zsh-mime-handler
+#function get_shell_script_defining_function() {
+    # Validate passed arguments, discarding all but the basename of the passed
+    # filename.
+#    die_unless_one_or_two_args\
+#        'expected one basename and optional list name'
+#    string basename autoload_dirs_list_name="${2:-fpath}"
+#    basename="$(get_path_basename "${1}")"
+
+    # Dismantled, this is:
+    #
+    # * "filename_matches_list_name", the name of the list listing all
+    #   directories to be searched for the passed autoload.
+    # * "(@P)", expanding to such list.
+    # * "^", iteratively expanding to each such directory.
+    # * "/${filename}", concatenating the passed autoload to each such
+    #   directory, producing a possible absolute path to such autoload.
+    # * "(N)", ignoring non-extant such absolute paths.
+#    list filename_matches
+#    filename_matches=( ${^${(@P)autoload_dirs_list_name}}"/${basename}"(N) )
+#   filename_matches=( ${^fpath}/"${filename}"(N) )
+
+    # Throw an exception if no path in the passed list of paths has such script.
+#   say "filename_matches: \"${filename_matches[@]}\""
+#   is_list filename_matches or print 'ugug!'
+#    die_unless_list_nonempty filename_matches
+#        "autoloadable script \"${basename}\" not found"
+
+    # Print the first such path.
+#    output "${filename_matches[1]}"
+#}
+
+# string source_shell_script_(string filename, string arg1, string arg2, ...)
+#
+# Source the passed shell script with the passed arguments, reading and
+# executing all commands in such script under the current shell. If such script:
+
+    #FIXME: Not quite right. We clearly need to allow "bash", for example. To do
+    #so, just match the glob '[a-z]##sh'. The emulate() builtin is smart enough
+    #to default to "zsh", if all else fails.
+# Safely source the passed non-Zeshy script by emulating the shell environment
+# expected by that script with default shell options and traps (e.g., a script
+# "mandibles_of_joy.sh" expects a Bourne rather than Zsh shell environment).
+# Zeshy throws such exceptions, necessitating rendering non-Zeshy shell scripts
+# expecting traditional unsafe behavior inoperable.
+#     regardless of non-zero exit status. (Zeshy implicitly throws exceptions on
+#     command returning such status.)
+#FIXME: WAIT; WAIT; WAIT. This distinction between Zeshy and non-Zeshy is
+#hideous. Why? Because *we* can programmatically determine which is required by
+#simple analysis of the she-bang. (We need better she-bang functions, by the
+#way.) If the she-bang ends in either "/zeshy" or " zeshy", we have a Zeshy
+#script on our hands and need to just source it as is. Otherwise, we need to
+#source it under emulation appropriate to that shell. Roll all of this into one
+#common function named simply source_shell_script().
+
+# string source_zeshy_script(
+#   string script_filename, string script_arg1, string script_arg2, ...)
+#
+# Source the passed Zeshy script with the passed arguments. Avoid calling this
+# function with non-Zeshy shell scripts, which often behave unexpectedly under
+# the default Zeshy shell environment. Zeshy implicitly throws an exception on a
+# command returning non-zero exit status, rendering non-Zeshy shell scripts
+# expecting conventional unsafe behavior inoperable. Consider calling
+# source_shell_script() instead, in such cases.
+#function source_zeshy_script() {
+#    die_unless_args 'expected one script filename and optional script arguments'
+#    source -- "${@}"
+#}
+
+# string source_zeshy_scripts(
+#   string script_filename1, string script_filename2, ...)
+#
+# Source the passed Zeshy scripts. See source_zeshy_script() for details.
+#function source_zeshy_scripts() {
+#    die_unless_args 'expected at least one script filename'
+#    for filename ("${@}") { source -- "${filename}" }
+#}
+
+# void zeshy_initialize_imports(void)
+#
+# Initialize the imports dictionary, used by the require() function. This is a
+# global dictionary mapping from imported script name to the mtime (i.e.,
+# modification time) of the script at the time of importation. The require()
+# function adds script names to this dictionary on importing those scripts so
+# as to record having done so. This record keeping allows that function to
+# avoid importing already imported scripts.
+#
+# Zeshy Shell requires we separate this initialization into a distinct function,
+# for hitherto inexplicable reasons. (There be subtle dragons aboot.)
+#zeshy_initialize_imports() {
+#    die_if_args
+
+#    # Explicitly empty the dictionary. This is irrelevant on the first call to
+#    # this function, but definitely matters on subsequent calls!
+#    global_map ZESHY_REQUIRED_PATH_TO_MTIME; ZESHY_REQUIRED_PATH_TO_MTIME=( )
+#}
+
+#   elif is_path          "${PWD}/${zeshy_script_name}"
+#   then zeshy_script_path="${PWD}/${zeshy_script_name}"
+
+    # Initialize the imports dictionary used by the zimport() function.
+#   zeshy_initialize_imports
+
+    # Inform the user that this script is being imported. This script is usually
+    # sourced via the Zsh source() built-in rather than the Zeshy zimport()
+    # function; thus, our failure to do this here would require callers do this
+    # there, prior to their sourcing this script.
+    #
+    # Distinguish the former from the latter by noting whether the
+    # "${zeshy_script_mtime}" variable has been set or not; if it has, this script
+    # was sourced via zimport() rather than source().
+#   is_undeclared 'zeshy_script_mtime' or say "loading \"${zeshy_core_path}\"..."
+
+    #FIXME: Replace with single call to run_with_mapfile().
+#   if shebang_line="$(get_string_match_if_found\
+#       "${mapfile[${pathname}]}"\
+#       "([^${ZESHY_CHARACTER_NEWLINE}]#)")"
+#   if run_with_mapfile "shebang_line=\"\$(get_string_match_if_found\
+#       \"\${mapfile[\${filename}]}\"\
+#       '[#]!([^${ZESHY_CHARACTER_NEWLINE}]#)')\""
+#       '\#!([^$'\n']#)')\""
+#   then output "${shebang_line}"
+#   else return_false
+#   fi
+#   run_with_mapfile "get_string_match_if_found\
+#       \"\${mapfile[\${filename}]}\"\
+#       '[#]!([^${ZESHY_CHARACTER_NEWLINE}]#)'"
+#   load_mapfile
+#   get_string_match_if_found\
+#       "${mapfile[${filename}]}" "(#s)\#!([^${ZESHY_CHARACTER_NEWLINE}]#)*"
+#   unload_mapfile
+#   list lines; set_list_to_text_file_lines lines "${pathname}"
+#   if is_string_prefix "${lines[1]}" '#!'
+#   then output "${lines[1]}"
+#   else return_false
+#   fi
+
+    # Technically, we could implement this with pure-Zsh.
