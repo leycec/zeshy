@@ -129,29 +129,60 @@ function get_shell_script_shebang_command_name_if_found() {
 }
 
 # ....................{ SOURCERS                           }....................
+# string source_shell_script_defining_function(
+#   string function_name,
+#   string filename, string arg1, string arg2, ...)
+#
+# Source the shell script defining the passed function with the passed
+# arguments, reading and executing all commands in such script under the current
+# shell. See:
+#
+# * get_shell_script_defining_function() for discussion on finding such script.
+# * source_shell_script() for discussion on sourcing such script.
+function source_shell_script_defining_function() {
+    # Validate passed arguments.
+    die_unless_args 'expected one function name and optional script arguments'
+    string function_name="${1}" filename
+    shift_one_arg
+
+    # Source such script.
+    filename="$(get_shell_script_defining_function "${function_name}")"
+    source_shell_script "${filename}" "${@}"
+}
+
 # string source_shell_script(string filename, string arg1, string arg2, ...)
 #
 # Source the passed shell script with the passed arguments, reading and
 # executing all commands in such script under the current shell. If such script:
 #
-# * Contains a shebang line referencing:
-#   * A supported non-Zeshy shell (e.g., "#!/usr/bin/env zsh", "#!/bin/bash"),
-#     source such script "safely" by emulating the shell environment expected by
-#     such script with default shell options and traps. In particular, revert to
-#     traditional shell execution of commands by not throwing exceptions on
-#     commands returning non-zero exit status.
-#   * An unsupported non-Zeshy shell (e.g., "#!/usr/bin/env fish", "#!/bin/es"),
-#     throw an exception. Such scripts cannot currently be reliably emulated
-#     under Zsh and hence cannot be sourced under the current shell. Consider
-#     explicitly running such scripts under the desired shell (e.g.,
-#     "fish odd_fellows_rest.fish").
-#   * Zeshy (e.g., "#!/usr/bin/env zeshy"), source such script as is (i.e.,
-#     under the current shell environment, with no such emulation).
-# * Contains no shebang line, assume such script to be a Zeshy shell script and
-#   source such script as is, as above.
+# * Has a filetype matching an emulatable shell, emulate such shell.
+# * Contains a shebang line matching an emulatable shell, emulate such shell.
+# * Contains no shebang line but transitively resides under a directory with
+#   basename matching an emulatable shell (e.g., "zsh" in the case of
+#   "/usr/share/zsh/5.0.0/functions/TCP/tcp_log"), emulate such shell.
+# * Otherwise, throw an exception.
 #
-# See source_shell_script_emulated_under_shell() for further details on shell
-# emulation.
+# An "emulatable shell" is any shell with name matching a key of global map
+# ${ZESHY_MAP_SHELL_NAME_TO_EMULATABLE_SHELL_NAME} (e.g., since
+# ${ZESHY_MAP_SHELL_NAME_TO_EMULATABLE_SHELL_NAME[tcsh]} exists, tcsh is an
+# emulatable shell).
+#
+# If such script requires a non-emulatable shell (e.g., with a shebang line
+# resembling "#!/usr/bin/env fish" or "#!/bin/es"), throw an exception. Such
+# scripts cannot be reliably emulated under Zsh and hence cannot be sourced
+# under the current shell. Consider explicitly running such scripts under the
+# appropriate shell (e.g., "fish odd_fellows_rest.fish").
+#
+# If such script requires an emulatable non-Zeshy shell (e.g., with a shebang
+# line resembling "#!/usr/bin/env zsh" or "#!/bin/bash"), source such script
+# "safely" by emulating the default environment consisting of builtins, options,
+# and traps specific to such shell. In particular, revert to customary shell
+# execution of commands by not throwing exceptions on non-zero exit status.
+#
+# If such script requires Zeshy (e.g., with a shebang line resembling
+# "#!/usr/bin/env zeshy"), source such script as is without emulation.
+#
+# See source_shell_script_under_shell() for further discussion on emulation.
 function source_shell_script() {
     # Validate passed arguments. Avoid calling die_unless_shell_script(), whose
     # implementation duplicates our parsing of the script shebang line here.
@@ -163,115 +194,72 @@ function source_shell_script() {
     # Identify the shell to be emulated. If such script's filetype matches an
     # emulatable shell, assume such shell.
     filetype="$(get_file_type_if_found "${filename}")"
-    if is_string_match "${filetype}" "${ZESHY_GLOB_SOURCEABLE_SHELLS}"
+    if is_string_match "${filetype}" "${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY}"
     then shell_name="${filetype}"
     # If such script contains a shebang line matching an emulatable shell,
     # assume such shell.
     elif shebang_command_name="$(get_shell_script_shebang_command_name_if_found\
         "${filename}")"
     then shell_name="$(get_string_match_if_found\
-            "${shebang_command_name}" "${ZESHY_GLOB_SOURCEABLE_SHELLS}")" or
-        die "script \"${filename}\" requiring unknown shell \"${shebang_command_name}\" not sourceable"
-    # Otherwise, assume such script to be Zeshy.
-    else
-        cry "script \"${filename}\" lacking shebang line assumed to be a Zeshy script"
-        shell_name='zeshy'
+        "${shebang_command_name}" "*(${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY})*")" or
+        die "shell \"${shebang_command_name}\" required by \"${filename}\" not emulatable"
+    # If such script transitively resides in a directory with basename matching
+    # an emulatable shell, assume such shell.
+    elif shell_name="$(get_string_match_if_found\
+        "${filename}" "*/(${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY})/*")"
+    then noop
+    # Otherwise, throw an exception.
+    else die "\"${filename}\" contains no shebang line"
     fi
 
     # Source such script emulated under such shell.
-    source_shell_script_emulated_under_shell "${@}" "${shell_name}"
+    source_shell_script_under_shell "${@}" "${shell_name}"
 }
 
-# string source_shell_script_defining_function(
-#   string filename, string arg1, string arg2, ...)
-#
-# Source the shell script defining the passed function with the passed
-# arguments, reading and executing all commands in such script under the current
-# shell. See:
-#
-# * get_shell_script_defining_function() for details on finding such script.
-# * source_shell_script() for details on sourcing such script.
-function source_shell_script_defining_function() {
-    # Validate passed arguments.
-    die_unless_args 'expected one function name and optional script arguments'
-    string function_name="${1}" filename shell_name shebang_command_name
-    shift_one_arg
-
-    # Get the absolute path of the shell script defining the passed function.
-    filename="$(get_shell_script_defining_function "${function_name}")"
-#   output "shell script defining ${function_name}(): ${filename}"
-
-    # Identify the shell to be emulated. Such script's basename is a function
-    # name and hence cannot be suffixed by a filetype, so the only available
-    # identifier is a shebang line if found. Attempt to find such line.
-    if shebang_command_name="$(get_shell_script_shebang_command_if_found\
-        "${filename}")"
-    then shell_name="$(get_string_match_if_found\
-            "${shebang_command_name}" "${ZESHY_GLOB_SOURCEABLE_SHELLS}")" or
-        die "script \"${filename}\" requiring unknown shell \"${shebang_command_name}\" not sourceable"
-    # Technically, another crude identifier exists: if such script resides under
-    # a directory named "zsh", assume such shell to be zsh.
-    elif is_string_containing "${filename}" '/zsh/'
-    then shell_name='zsh'
-    # Otherwise, assume such shell to be Zeshy.
-    else
-        cry "script \"${filename}\" lacking shebang line assumed to be a Zeshy script"
-        shell_name='zeshy'
-    fi
-
-    # Source such script emulated under such shell.
-    source_shell_script_emulated_under_shell\
-        "${filename}" "${@}" "${shell_name}"
-}
-
-# string source_shell_script_emulated_under_shell(
+# string source_shell_script_under_shell(
 #   string filename, string arg1, string arg2, ...,
 #   string shell_command_name)
 #
 # Source the passed shell script with the passed arguments emulated under the
 # passed shell command, reading and executing all commands in such script under
 # the current shell. Since Zsh emulates only some (but not all) shell commands,
-# this function maps the passed shell command to a Zsh-emulated shell command as
-# follows:
-#
-# /======================^============================\
-# | passed shell command | emulated shell environment |
-# <======================+============================>
-# | ash                  | sh                         |
-# | bash                 | bash*                      |
-# | csh                  | csh                        |
-# | dash                 | sh                         |
-# | mksh                 | ksh                        |
-# | pdksh                | ksh                        |
-# | resh                 | sh                         |
-# | tcsh                 | csh                        |
-# | sh                   | sh                         |
-# | zeshy                | NONE                       |
-# | zsh                  | zsh                        |
-# \======================+============================/
+# this function maps the passed shell command to a Zsh-emulated shell command
+# according to global map ${ZESHY_MAP_SHELL_NAME_TO_EMULATABLE_SHELL_NAME}.
 #
 # * Unfortunately, zsh currently emulates bash as sh (i.e., Bourne shell). Since
 #   this is rarely desirable, Zeshy improves such emulation by enabling bash-
 #   specific shell options (e.g., "ksh_glob", "no_sh_glob"). While imperfect,
 #   this is probably the best we can currently do. Consider explicitly running
 #   bash scripts under bash (e.g., "bash sonic_excess_in_its_purest_form.bash").
-function source_shell_script_emulated_under_shell() {
-    # Validate passed arguments. Avoid calling die_unless_shell_script(), whose
-    # implementation duplicates our parsing of the script shebang line here.
+function source_shell_script_under_shell() {
+    # Validate passed arguments.
     die_unless_at_least_two_args\
         'expected one script filename, optional script arguments, and one shell name'
     string filename="${1}" shell_name="${@[-1]}"
     die_unless_text_file "${filename}"
     pop_one_arg
 
-    # Map the passed shell command to the closest Zsh-emulatable shell command.
-    case "${shell_name}" in
-    # If such shell is supported under a generic zsh-recognized name, map
-    # the former to latter.
-    (a|da|re)sh) shell_name='sh';;
-    tcsh) shell_name='csh';;
-    (m|pd)ksh) shell_name='ksh';;
-    esac
+    # Source such script under such shell, quote-protecting such script and
+    # script arguments for safety against the brute ravages of run().
+    run_under_shell 'source -- ' "${(q)@}" "${shell_name}"
+}
+
+# ....................{ RUNNERS                            }....................
+# string run_under_shell(
+#   string command_name, string command_arg1, string command_arg2, ...,
+#   string shell_name)
+#
+# Run the passed command emulated under the passed shell.
+function run_under_shell() {
+    # Validate passed arguments.
+    die_unless_at_least_two_args 'expected one command and one shell name'
+    string shell_name="${@[-1]}"
+    pop_one_arg
+
+    # Map the passed shell to the closest Zsh-emulatable shell.
+    shell_name="$(get_map_key_value_if_found\
+        ZESHY_MAP_SHELL_NAME_TO_EMULATABLE_SHELL_NAME "${shell_name}")" or
+        die "shell \"${shell_name}\" not emulatable"
 
     # Source such script under such emulation. Dismantled, this is:
     #
@@ -296,18 +284,18 @@ function source_shell_script_emulated_under_shell() {
             emulate -LR sh
             localize_shell_options ksh_glob no_sh_glob brace_expand;;
         # If a shell explicitly emulatable by Zsh, do so.
-        ${~ZESHY_GLOB_EMULATABLE_SHELLS})
+        ${~ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY})
             emulate -LR "${shell_name}";;
         # Otherwise, this function failed to properly map such script's specific
         # shell to a Zsh-supported shell; throw an exception.
-        *) die "script \"${filename}\" requiring unmapped shell \"${shell_name}\" not sourceable";;
+        *) die "shell \"${shell_name}\" not mapped to an emulatable shell";;
         esac
 
         # Temporarily cease throwing exceptions on non-zero exit status.
         TRAPZERR() { return $(( 128 + ${1} )) }
 
-        # Source such script under such emulation.
-        PATH="${PATH}:${FPATH}" source -- "${@}"
+        # Run such command under such emulation.
+        run "${@}"
     }
 
     # The above emulation of traditional TRAPZERR() behavior persists both while
@@ -320,42 +308,19 @@ function source_shell_script_emulated_under_shell() {
         die "sourcing \"${@}\" failed with exit status ${exit_status}"
 }
 
-#FIXME: This really begs for a compelety different function name.
-# string source_shell_script_command_output(
-#   string shell_name,
-#   string command_name, string command_arg1, string command_arg2, ...)
-#
-# Emulate the passed command under the passed shell (e.g., "sh", "csh") and, if
-# successful, source the command's standard output.
-function source_shell_script_command_output() {
-    # Validate passed arguments.
-    die_unless_at_least_two_args\
-        'expected at least one shell name and one command name'
-    string shell_name="${1}"
-    shift_one_arg
-
-    #FIXME: Refer to the previously defined glob.
-    is "${shell_name}" == (zsh|sh|ksh|csh) si or
-        die "\"${shell_name}\" not an emulatable shell"
-#   string command_name="${1}"
-#   die_unless_installed "${command_name}"
-
-    # Source safely.
-    emulate -R "${shell_name}" -c "eval \$(${@})"
-}
-
 # ....................{ SOURCERS ~ once                    }....................
-#FIXME: Poor verb choice. Rename to source_shell_scripts_once().
-# void requires(string filename1, string filename2, ...)
+#FIXME: All functions below are effectively broken and require testing.
+# string source_shell_scripts_once(string filename1, string filename2, ...)
 #
-# Import all passed scripts.
-function requires() {
+# Source the passed shell scripts "once" (i.e., not sourcing scripts already
+# sourced under the current shell).
+function source_shell_scripts_once() {
     die_unless_args 'expected at least one script name'
     for script_name ("${@}") require "${script_name}"
 }
 
-#FIXME: Poor verb choice. Rename to source_shell_script_once() and all functions below.
-# void require(string pathname, string arguments)
+# string source_shell_script_once(
+#   string filename, string arg1, string arg2, ...)
 #
 # Conditionally import the passed file or directory, if not previously imported
 # by this function or externally modified since such import. We pass the passed
@@ -371,8 +336,7 @@ function requires() {
 #   * Otherwise, import all files such directory contains.
 # * Otherwise, die.
 #
-# This function mimics the import() built-in of most high-level languages. To
-# avoid conflict with ImageMagick's "import" command, we prefer "require".
+# This function mimics the import() builtin of high-level languages (e.g., Python).
 #
 # --------------------( VARIABLES                          )--------------------
 # This function defines local variables, which imported scripts may safely
@@ -385,8 +349,8 @@ function requires() {
 #
 # --------------------( EXAMPLES                           )--------------------
 #     # Implicitly imports the Zeshy script "zeshy/os/.main".
-#     >>> require zeshy/os
-function require() {
+#     >>> source_shell_script_once zeshy/os
+function source_shell_script_once() {
     # Validate passed arguments.
     die_unless_at_least_one_arg\
         'expected one pathname and optional script options'
@@ -410,12 +374,13 @@ function require() {
 
     # Delegate to helper functions depending on path type.
     if is_dir "${zeshy_script_path}"
-    then require_dir  "${zeshy_script_path}" "${@}"
-    else require_file "${zeshy_script_path}" "${@}"
+    then source_shell_script_once_dir  "${zeshy_script_path}" "${@}"
+    else source_shell_script_once_file "${zeshy_script_path}" "${@}"
     fi
 }
 
-# void require_dir(string dirname, string arguments)
+# string source_shell_script_once_dir(
+#   string dirname, string arguments)
 #
 # Conditionally import the passed directory. See require() for details.
 function require_dir() {
@@ -434,7 +399,7 @@ function require_dir() {
     fi
 }
 
-# void require_dir_children(string dirname, string arguments)
+# string require_dir_children(string dirname, string arguments)
 #
 # Conditionally import all files and directories under the passed directory.
 function require_dir_children() {
@@ -528,6 +493,154 @@ function require_file() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# To avoid conflict with ImageMagick's "import" command, we prefer "require".
+#FIXME: Replace with references to run_under_shell(); then excise.
+# string source_shell_script_command_output(
+#   string shell_name,
+#   string command_name, string command_arg1, string command_arg2, ...)
+#
+# Emulate the passed command under the passed shell (e.g., "sh", "csh") and, if
+# successful, source the command's standard output.
+#function source_shell_script_command_output() {
+    # Validate passed arguments.
+#    die_unless_at_least_two_args\
+#        'expected at least one shell name and one command name'
+#    string shell_name="${1}"
+#    shift_one_arg
+
+    #FIXME: Refer to the previously defined glob.
+#    is "${shell_name}" == (zsh|sh|ksh|csh) si or
+#        die "\"${shell_name}\" not an emulatable shell"
+#   string command_name="${1}"
+#   die_unless_installed "${command_name}"
+
+    # Source safely.
+#    emulate -R "${shell_name}" -c "eval \$(${@})"
+#}
+
+# Avoid calling die_unless_shell_script(), whose
+    # implementation duplicates our parsing of the script shebang line here.#       PATH="${PATH}:${FPATH}" source -- "${@}"
+#   * A supported non-Zeshy shell (e.g., "#!/usr/bin/env zsh", "#!/bin/bash"),
+#     source such script "safely" by emulating the shell environment expected by
+#     such script with default shell options and traps. In particular, revert to
+#     traditional shell execution of commands by not throwing exceptions on
+#     commands returning non-zero exit status.
+#   * An unsupported non-Zeshy shell (e.g., "#!/usr/bin/env fish", "#!/bin/es"),
+#     throw an exception. Such scripts cannot currently be reliably emulated
+#     under Zsh and hence cannot be sourced under the current shell. Consider
+#     explicitly running such scripts under the desired shell (e.g.,
+#     "fish odd_fellows_rest.fish").
+#   * Zeshy (e.g., "#!/usr/bin/env zeshy"), source such script as is (i.e.,
+#     under the current shell environment, with no such emulation).
+    #FIXME: Actually, can't we just shift the "zsh"-specific conditional below
+    #into the prior function and then just call that?
+    # Identify the shell to be emulated. Such script's basename is a function
+    # name and hence cannot be suffixed by a filetype, so the only available
+    # identifier is a shebang line if found. Attempt to find such line.
+#   if shebang_command_name="$(get_shell_script_shebang_command_if_found\
+#       "${filename}")"
+#   then shell_name="$(get_string_match_if_found\
+#       "${shebang_command_name}" "${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY}")" or
+#       die "script \"${filename}\" requiring unknown shell \"${shebang_command_name}\" not sourceable"
+    # Technically, another crude identifier exists: if such script resides under
+    # a directory named "zsh", assume such shell to be zsh.
+#   elif is_string_containing "${filename}" '/zsh/'
+#   then shell_name='zsh'
+    # Otherwise, assume such shell to be Zeshy.
+#   else
+#       cry "script \"${filename}\" lacking shebang line assumed to be a Zeshy script"
+#       shell_name='zeshy'
+#   fi
+
+        # If a shell explicitly emulatable by Zsh, do so.
+#       ${~ZESHY_GLOB_EMULATABLE_SHELLS})
+#           emulate -LR "${shell_name}";;
+        # Otherwise, this function failed to properly map such script's specific
+        # shell to a Zsh-supported shell; throw an exception.
+#       *) die "script \"${filename}\" requiring unmapped shell \"${shell_name}\" not sourceable";;
+# follows:
+#
+# /======================^============================\
+# | passed shell command | emulated shell environment |
+# <======================+============================>
+# | ash                  | sh                         |
+# | bash                 | bash*                      |
+# | csh                  | csh                        |
+# | dash                 | sh                         |
+# | mksh                 | ksh                        |
+# | pdksh                | ksh                        |
+# | resh                 | sh                         |
+# | tcsh                 | csh                        |
+# | sh                   | sh                         |
+# | zeshy                | NONE                       |
+# | zsh                  | zsh                        |
+# \======================+============================/
+#FIXME: Replace with a simple map. This is overkill. Extreme overkill.
+# string map_shell_to_emulatable_shell(string shell_name)
+#
+# Get the Zsh-emulatable shell closest in ancestry and hence operation to the
+# passed shell if a sufficiently close shell exists (e.g., if passed "tcsh",
+# return "csh") or throw an exception (e.g., if passed "fish", throw an
+# exception). The emulate() builtin supports only a subset of available shells,
+# requiring all other shells be mapped to the "closest" supported shell: e.g.,
+#
+#     >>> map_shell_to_emulatable_shell tcsh
+#     csh
+#     >>> map_shell_to_emulatable_shell fish
+#     map_shell_to_emulatable_shell: shell "fish" not mappable to an emulatable shell
+#function map_shell_to_emulatable_shell() {
+#function get_shell_emulating_shell() {
+    # Validate passed arguments.
+#    die_unless_one_arg 'expected one shell name'
+#    string shell_name="${1}"
+
+    #FIXME: New die_unless_shell_emulatable_() function, yes? Also, rename
+    #${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY} to ${ZESHY_GLOB_SHELL_SOURCEABLE}?
+#    is_string_match "${shell_name}" "${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY}" or
+#        die "shell \"${shell_name}\" not mappable to an emulatable shell"
+
+    # Map the passed shell command to the closest Zsh-emulatable shell command.
+#    case "${shell_name}" in
+    # If such shell is supported under a generic zsh-recognized name, map
+    # the former to latter.
+#    (a|da|re)sh) output 'sh';;
+#    tcsh) output 'csh';;
+#    (m|pd)ksh) output 'ksh';;
+#    *) output "${shell_name}"
+#    esac
+#}
+#   case "${shell_name}" in
+    # If such shell is supported under a generic zsh-recognized name, map
+    # the former to latter.
+#   (a|da|re)sh) shell_name='sh';;
+#   tcsh) shell_name='csh';;
+#   (m|pd)ksh) shell_name='ksh';;
+#   esac
+
+
+# string source_shell_script_command_output(
+#   string shell_name,
+#   string command_name, string command_arg1, string command_arg2, ...)
+#
+# Emulate the passed command under the passed shell (e.g., "sh", "csh") and, if
+# successful, source the command's standard output.
+#function source_shell_script_command_output() {
+    # Validate passed arguments.
+#    die_unless_at_least_two_args\
+#        'expected at least one shell name and one command name'
+#    string shell_name="${1}"
+#    shift_one_arg
+
+    #FIXME: Refer to the previously defined glob.
+#    is "${shell_name}" == (zsh|sh|ksh|csh) si or
+#        die "\"${shell_name}\" not an emulatable shell"
+#   string command_name="${1}"
+#   die_unless_installed "${command_name}"
+
+    # Source safely.
+#    emulate -R "${shell_name}" -c "eval \$(${@})"
+#}
+
 #         if shebang_command_name="$(get_string_match_if_found\
 #           "${shebang_command}"\
 #           '(/usr|)/bin/env[[:space:]]##([^[:space:]]##)')"
