@@ -193,8 +193,8 @@ function source_shell_script() {
 
     # Identify the shell to be emulated. If such script's filetype matches an
     # emulatable shell, assume such shell.
-    filetype="$(get_file_type_if_found "${filename}")"
-    if is_string_match "${filetype}" "${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY}"
+    if filetype="$(get_file_type_if_matching\
+        "${filename}" "${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY}")"
     then shell_name="${filetype}"
     # If such script contains a shebang line matching an emulatable shell,
     # assume such shell.
@@ -268,231 +268,57 @@ function run_under_shell() {
     #
     # Do not redefine TRAPINT(); printing stack traces on user interrupts
     # is universally useful and not conflicting with script expectations.
-    {
-        case "${shell_name}" in
-        # If a bash shell script, attempt Bourne shell emulation with bash-
-        # specific builtins and options courtesy
-        # http://zshwiki.org/home/convert/bash. Since such emulation is
-        # admittedly imperfect (actually, terrible), print a warning.
-        bash)
-            #FIXME: The bash_source() function defined at the prior URL defines
-            #additional aliases (e.g., "alias shopt=':'"). Unfortunately, Zeshy
-            #currently has no means of temporarily defining aliases and then
-            #restoring the prior definition if already defined. We'll need some
-            #such mechanism prior to defining such aliases, clearly.
-            cry "sourcing bash script \"${filename}\" as a Bourne script"
-            emulate -LR sh
-            localize_shell_options ksh_glob no_sh_glob brace_expand;;
-        # If a shell explicitly emulatable by Zsh, do so.
-        ${~ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY})
-            emulate -LR "${shell_name}";;
-        # Otherwise, this function failed to properly map such script's specific
-        # shell to a Zsh-supported shell; throw an exception.
-        *) die "shell \"${shell_name}\" not mapped to an emulatable shell";;
-        esac
+    case "${shell_name}" in
+    # If a bash shell script, attempt Bourne shell emulation with bash-
+    # specific builtins and options courtesy
+    # http://zshwiki.org/home/convert/bash. Since such emulation is
+    # admittedly imperfect (actually, terrible), print a warning.
+    bash)
+        #FIXME: The bash_source() function defined at the prior URL defines
+        #additional aliases (e.g., "alias shopt=':'"). Unfortunately, Zeshy
+        #currently has no means of temporarily defining aliases and then
+        #restoring the prior definition if already defined. We'll need some
+        #such mechanism prior to defining such aliases, clearly.
+        emulate -LR sh
+        localize_shell_options ksh_glob no_sh_glob brace_expand;;
+    # If a shell explicitly emulatable by Zsh, do so.
+    ${~ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY})
+        emulate -LR "${shell_name}";;
+    # Otherwise, this function failed to properly map such script's required
+    # shell to a Zsh-supported shell; throw an exception.
+    *) die "shell \"${shell_name}\" not mapped to an emulatable shell";;
+    esac
 
-        # Temporarily cease throwing exceptions on non-zero exit status.
-        TRAPZERR() { return $(( 128 + ${1} )) }
+    # Temporarily cease throwing exceptions on non-zero exit status.
+    TRAPZERR() { return $(( 128 + ${1} )) }
 
-        # Run such command under such emulation.
-        run "${@}"
-    }
+    # Run such command under such emulation. Note that the above emulation of
+    # traditional TRAPZERR() behaviour persists while running such command,
+    # which is helpful, *AND* processing the exit status such command returns,
+    # which is unhelpful. In the latter case, non-zero exit status fails to
+    # signal ZERR. Manually test such status and, if non-zero, throw the
+    # expected exception.
+    run "${@}" or die "\"${@}\" failed with exit status ${?}"
+}
 
+# --------------------( WASTELANDS                         )--------------------
+#       source --  /usr/share/zsh/5.0.0/functions/MIME/zsh-mime-setup -f
+#       "${(z)@}"
+#       run "${@}"
+#   string exit_status="${?}"
+#   integer exit_status=${?}
+#       print 'okok'
     # The above emulation of traditional TRAPZERR() behavior persists both while
     # running commands in such script, which is wise, *AND* processing the exit
     # status of such script, which is unwise. In the latter case, non-zero exit
     # status fails to signal ZERR. Manually test such status and, if non-zero,
     # throw the expected exception.
-    integer exit_status=${?}
-    (( exit_status == ZESHY_SUCCESS_CODE )) or
-        die "sourcing \"${@}\" failed with exit status ${exit_status}"
-}
-
-# ....................{ SOURCERS ~ once                    }....................
-#FIXME: All functions below are effectively broken and require testing.
-# string source_shell_scripts_once(string filename1, string filename2, ...)
-#
-# Source the passed shell scripts "once" (i.e., not sourcing scripts already
-# sourced under the current shell).
-function source_shell_scripts_once() {
-    die_unless_args 'expected at least one script name'
-    for script_name ("${@}") require "${script_name}"
-}
-
-# string source_shell_script_once(
-#   string filename, string arg1, string arg2, ...)
-#
-# Conditionally import the passed file or directory, if not previously imported
-# by this function or externally modified since such import. We pass the passed
-# arguments to all files imported in this manner.
-#
-# If the passed path is relative, we look for such path first under the current
-# working directory and then Zeshy's root directory (e.g., "/usr/share/zeshy/").
-# We then resolve the exact Zeshy script(s) to be imported as follows:
-#
-# * If the passed path is an existing file, import such file.
-# * If the passed path is an existing directory:
-#   * Containing a file named "${ZESHY_MAIN_SCRIPT_BASENAME}", import such file.
-#   * Otherwise, import all files such directory contains.
-# * Otherwise, die.
-#
-# This function mimics the import() builtin of high-level languages (e.g., Python).
-#
-# --------------------( VARIABLES                          )--------------------
-# This function defines local variables, which imported scripts may safely
-# access for informative path metadata: namely,
-#
-# * "zeshy_script_name", having the relative path to the imported script under
-#   "${ZESHY_HOME}/src".
-# * "zeshy_script_path", having the absolute path to the imported script.
-# * "zeshy_script_mtime", having the modification time of the imported script.
-#
-# --------------------( EXAMPLES                           )--------------------
-#     # Implicitly imports the Zeshy script "zeshy/os/.main".
-#     >>> source_shell_script_once zeshy/os
-function source_shell_script_once() {
-    # Validate passed arguments.
-    die_unless_at_least_one_arg\
-        'expected one pathname and optional script options'
-#   say "requireing ${1}..."
-
-    # Passed script name. Shift it off the argument stack, to allow us to pass
-    # this script the set of all remaining arguments on sourcing it below.
-    string zeshy_script_name="${1}"; shift
-
-    # Path to this script.
-    string zeshy_script_path
-
-    # If the passed script name is either an absolute path or an existing relative
-    # path, try to import it as is.
-    if is_path_absolute "${zeshy_script_name}" or
-       is_path         "${zeshy_script_name}"
-    then zeshy_script_path="${zeshy_script_name}"
-    # Otherwise, try to import a Zeshy component having that script name.
-    else zeshy_script_path="${ZESHY_HOME}/src/${zeshy_script_name}"
-    fi
-
-    # Delegate to helper functions depending on path type.
-    if is_dir "${zeshy_script_path}"
-    then source_shell_script_once_dir  "${zeshy_script_path}" "${@}"
-    else source_shell_script_once_file "${zeshy_script_path}" "${@}"
-    fi
-}
-
-# string source_shell_script_once_dir(
-#   string dirname, string arguments)
-#
-# Conditionally import the passed directory. See require() for details.
-function require_dir() {
-    # Validate passed arguments.
-    die_unless_at_least_one_arg\
-        'expected one dirname and optional import options'
-    string zeshy_script_dir="${1}"; shift
-    die_unless_dir "${zeshy_script_dir}"
-    string zeshy_main_script="${zeshy_script_dir}/${ZESHY_MAIN_SCRIPT_BASENAME}"
-
-    # If this directory contains a main script, import only such script;
-    # otherwise, import all children of such directory.
-    if is_file "${zeshy_main_script}"
-    then require_file         "${zeshy_main_script}" "${@}"
-    else require_dir_children "${zeshy_script_dir}"  "${@}"
-    fi
-}
-
-# string require_dir_children(string dirname, string arguments)
-#
-# Conditionally import all files and directories under the passed directory.
-function require_dir_children() {
-    # Validate passed arguments.
-    die_unless_at_least_one_arg\
-        'expected one dirname and optional import options'
-    string zeshy_script_dir="${1}"; shift
-    die_unless_dir "${zeshy_script_dir}"
-
-    #FIXME: Hmmm; no need to include "zwc", I should think. No?
-    # Dismantled, this imports all files in this directory subject to:
-    #
-    # * "(^D@)", excluding dotfiles and symbolic links.
-    # * "~*.(swp|zwc)", excluding files with filetype "swp" or "zwc".
-    for zeshy_script_dir_child ( "${zeshy_script_dir}"/*(^D@)~*.(swp|zwc) ) {
-        require "${zeshy_script_dir_child}" "${@}"
-    }
-}
-
-#global_string ZESHY_CACHE_COMPILATION_DIR="${ZESHY_DOT_DIR}/compilation"
-#FIXME: Add support for zcompile(). Pass "-M" if the passed file matches
-# */zeshy/src/* and "-R" otherwise.
-# void require_file(string filename, string arguments)
-#
-# Conditionally import the passed file. See require() for details.
-function require_file() {
-    # Validate passed arguments.
-    die_unless_at_least_one_arg\
-        'expected one filename and optional import options'
-    string zeshy_script_path="${1}"; shift
-    die_unless_file "${zeshy_script_path}"
-
-    # Canonicalize the path so as to ensure the dictionary lookup below
-    # successfully compares it against a previously canonicalized path.
-    zeshy_script_path="$(canonicalize_path "${zeshy_script_path}")"
-
-    # Modification time of this script.
-    integer zeshy_script_mtime
-    zeshy_script_mtime="$(get_path_mtime "${zeshy_script_path}")"
-
-    global_map ZESHY_REQUIRED_PATH_TO_MTIME
-
-    # If this script has not yet been imported or has been but has changed since
-    # being imported, (re)import this script.
-    if is -z\
-        "${ZESHY_REQUIRED_PATH_TO_MTIME[(I)"${zeshy_script_path}"]}" or
-        "${ZESHY_REQUIRED_PATH_TO_MTIME["${zeshy_script_path}"]}" -ne\
-        "${zeshy_script_mtime}" si; then
-        # If the script corresponds to a command-specific script under
-        # "zeshy/command" excluding the top-level ".main" script, ensure this
-        # command is actually installed.
-        if is "${zeshy_script_path}" == */zeshy/command/* si; then
-            string command_name="${zeshy_script_path#*/zeshy/command/}"
-            is "${command_name}" == "${ZESHY_MAIN_SCRIPT_BASENAME}" si or
-                die_unless_installed "${command_name}"
-        fi
-
-        # Record this script as being imported prior to doing so, thus
-        # preventing infinitely recursive reimportation should this or another
-        # script imported by this script attempt to import this script again.
-        ZESHY_REQUIRED_PATH_TO_MTIME["${zeshy_script_path}"]="${zeshy_script_mtime}"
-
-        #FIXME: Technically, this works. Sadly, Zsh exposes no explicit
-        #mechanism for sourcing zcompiled scripts. (Odd, we know.) Rather, one
-        #can only use such scripts with the fpath-enabled autoload mechanism.
-        # Absolute path to the file caching the compilation of this script.
-#       string zeshy_script_compiled_path="${ZESHY_CACHE_COMPILATION_DIR}${zeshy_script_path}.zwc"
-
-        # If this script has not yet been compiled or has been but has changed since
-        # being compiled, (re)compile this script.
-#       if is not -f "${zeshy_script_compiled_path}" or\
-#           ${zeshy_script_mtime} -ne\
-#           $(get_path_mtime "${zeshy_script_compiled_path}") si; then
-#           # zcompile() refuses to create directory structure, so do so for it.
-#           make_dir_if_not_found "$(dirname "${zeshy_script_compiled_path}")"
-
-#           say "compiling \"${zeshy_script_path}\" to \"${zeshy_script_compiled_path}\"..."
-#           say "compiling \"${zeshy_script_path}\"..."
-#           zcompile "${zeshy_script_compiled_path}" "${zeshy_script_path}"
-
-            # Set the mtime of the compiled script to that of the uncompiled
-            # script to ensure the above conditional fails on future imports.
-#           set_path_mtime "${zeshy_script_compiled_path}" ${zeshy_script_mtime}
-#       fi
-#       source "${zeshy_script_compiled_path}" "${@}"
-
-        # Do so.
-        say "requiring \"${zeshy_script_path}\"..."
-        source "${zeshy_script_path}" "${@}"
-    fi
-}
-
-# --------------------( WASTELANDS                         )--------------------
+#   (( exit_status == ZESHY_SUCCESS_CODE )) or
+#       die "\"${@}\" failed with exit status ${exit_status}"
+#   if filetype="$(get_file_type_if_found "${filename}")" and
+#      is_string_match "${filetype}" "${ZESHY_GLOB_SHELL_EMULATABLE_INDIRECTLY}"
+#           cry "sourcing bash script \"${filename}\" as a Bourne script"
+#           cry "emulating bash as a Bourne script"
 # To avoid conflict with ImageMagick's "import" command, we prefer "require".
 #FIXME: Replace with references to run_under_shell(); then excise.
 # string source_shell_script_command_output(
