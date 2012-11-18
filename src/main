@@ -94,9 +94,46 @@
 #   * Perform all costly initialization in the functions requiring such
 #     initialization as the first line of such functions. You know that grind...
 
+# ....................{ PATHS                              }....................
+# Delete all Zeshy-specific globals defined by and imported from the parent
+# shell, locally preserving global ${ZESHY_HOME} for subsequent use. Failure to
+# delete such globals results in a subtle issue when compiling the Zeshy digest
+# file, which persists such globals to startup_zeshy_globals() by differencing
+# the lists of globals defined before and after such compilation. Failing to
+# delete such globals ensures the two lists to be effectively identical, thus
+# preventing persistence of Zeshy globals into the Zeshy digest file.
+#
+# See undefine_variable_matching() for details on variable deletion.
+local zeshy_home="${ZESHY_HOME-}"
+typeset +r -m 'ZESHY_*'
+unset      -m 'ZESHY_*'
+#typeset -p -m 'ZESHY_*'
+
+# Restore ${ZESHY_HOME}, deleting the temporary ${zeshy_home}. We're good to go.
+typeset +gx ZESHY_HOME="${zeshy_home}"
+unset zeshy_home
+
+#FIXME: Woops. This is pretty much completely wrong for actual Zeshy
+#installations (e.g., into "/usr/share/zeshy", containing the current contents
+#of "~/zsh/zeshy/src"). ZESHY_HOME and ZESHY_OVERLAY_ROOT should *ALWAYS* be the
+#same exact thing. Hence, remove the latter and set the former as follows:
+#
+#[[ -n "${ZESHY_HOME-}" ]] || export ZESHY_HOME="${0:h}"(:A)
+#
+#We should probably remove all setting of such variable from
+#"etc/{zlogin,zprofile,zshrc}", perhaps suggesting "etc/{zlogin,zshrc}" should
+#be removed entirely and "etc/zprofile" reduced to just running "zeshy". (Or is
+#perhaps just "etc/zshrc" reduced to running "zeshy" and the others removed?)
+
+# Absolute directory of the Zeshy codebase.
+[[ -n "${ZESHY_HOME}" ]] || ZESHY_HOME="${0:h}/.."(:A)
+
+# Absolute directory of the Zeshy library.
+typeset -gx ZESHY_OVERLAY_ROOT="${ZESHY_HOME}/src"
+
 # ....................{ SANITY                             }....................
 # Oldest Zsh version under which Zeshy runs without error.
-typeset -x ZESHY_NEEDS_ZSH_VERSION=5.0.0
+typeset -gx ZESHY_NEEDS_ZSH_VERSION=5.0.0
 
 # Exit with fatal error if not running such version.
 autoload -U is-at-least
@@ -112,38 +149,25 @@ if ! is-at-least ${ZESHY_NEEDS_ZSH_VERSION}; then
     fi
 fi
 
-# ....................{ PATHS                              }....................
-#FIXME: Woops. This is pretty much completely wrong for actual Zeshy
-#installations (e.g., into "/usr/share/zeshy", containing the current contents
-#of "~/zsh/zeshy/src"). ZESHY_HOME and ZESHY_OVERLAY_ROOT should *ALWAYS* be the
-#same exact thing. Hence, remove the latter and set the former as follows:
-#
-#[[ -n "${ZESHY_HOME-}" ]] || export ZESHY_HOME="${0:h}"(:A)
-#
-#We should probably remove all setting of such variable from
-#"etc/{zlogin,zprofile,zshrc}", perhaps suggesting "etc/{zlogin,zshrc}" should
-#be removed entirely and "etc/zprofile" reduced to just running "zeshy". (Or is
-#perhaps just "etc/zshrc" reduced to running "zeshy" and the others removed?)
-
-# Absolute directory of the Zeshy codebase.
-[[ -n "${ZESHY_HOME-}" ]] || export ZESHY_HOME="${0:h}/.."(:A)
-
-# Absolute directory of the Zeshy library.
-export ZESHY_OVERLAY_ROOT="${ZESHY_HOME}/src"
-
 # ....................{ OPTIONS                            }....................
 # Enforce strictness, as under conventional high-level languages.
 setopt no_unset           # exception on attempting to expand unset parameters
 setopt warn_create_global # warning on attempting to set undeclared parameters
 
-# Core parsing.
-setopt no_ksh_arrays     # enable 1-based lists subscriptable without braces
-setopt no_ksh_autoload   # treat autoloaded files as function definitions
-setopt no_ksh_typeset    # enable word splitting on variable assignment
-setopt magic_equal_subst # enable filename expansion on "="-prefixed strings
-setopt short_loops       # enable "for ... (...) { ... }"-style shell constructs
+# Variable assignment.
+setopt no_ksh_typeset     # perform word splitting on variable assignment
 
-# Core quoting.
+# Avoid printing previously assigned variables when calling typeset() with
+# variables with no new assignments (e.g., "typeset specular_reflection").
+setopt typeset_silent
+
+# Shell parsing.
+setopt no_ksh_arrays      # enable 1-based lists subscriptable without braces
+setopt no_ksh_autoload    # treat autoloaded files as function definitions
+setopt magic_equal_subst  # enable filename expansion on "="-prefixed strings
+setopt short_loops        # enable "for ... (...) { ... }"-style shell constructs
+
+# Shell quoting.
 setopt no_csh_junkie_quotes  # allow unescaped newlines in quotes
 setopt no_sh_word_split  # do not field split unquoted parameters
 setopt rc_quotes         # parse '' as ' in single quotes (e.g., '''' == "'")
@@ -621,25 +645,48 @@ function source_zeshy_script() {
             filename="${ZESHY_OVERLAY_ROOT}/${filename}"
 
         # Source such Zeshy script.
-        [[ -f "${filename}" ]] || die "\"${filename}\" not a zeshy script"
         source -- "${filename}"
     }
 }
 
 # ....................{ BOOTSTRAP                          }....................
+# List of all Zeshy-specific globals defined while sourcing Zeshy, if
+# recompiling the Zeshy digest file. Defining such list globally permits us to
+# undefine such globals in a global context, below.
+typeset -a ZESHY_GLOBAL_NAMES
+
 # Bootstrap Zeshy by loading core aliases, globals, and autoloads, the minimal
 # clique of Zeshy components. All subsequent Zeshy functions are implicitly
 # loaded on the first call to such functions by the autoload system.
 source_zeshy_script alias global autoload
 
-# Having now compiled Zeshy's digest file and hence defined all autoloads
-# applicable to the current user, call a top-level autoload finalizing setup.
+# If recompiling the Zeshy digest file and hence sourcing Zeshy scripts
+# defining globals, undefine such globals prior to initializing Zeshy. Why?
+# The reason may be subtle, but the logic flows like butter. Zeshy may and
+# typically does declare globals to be read-only. Understandably, Zsh fails on
+# attempting to redefine such globals. The subsequent call to startup_zeshy()
+# and hence startup_zeshy_globals() does just that, requiring such globals be
+# undefined prior to such calls. Oh, 'tis all a tad silly and worm-bitten, but
+# so goes life in the tranche of code trenches.
+(( #ZESHY_GLOBAL_NAMES )) and {
+    unfreeze_variable "${ZESHY_GLOBAL_NAMES[@]}"
+    undefine_variable "${ZESHY_GLOBAL_NAMES[@]}"
+    undefine_variable ZESHY_GLOBAL_NAMES
+}
+
+# Initialize Zeshy, having recompiled the Zeshy digest file above and hence
+# defined all autoloads applicable to the current user.
 startup_zeshy
 
 #FIXME: Kill this. Kill this soon. (You know you want to...)
 setup_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+#[[ -n "${ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY+x}" ]] and {
+#    print 'Eh??!?!?'
+#    typeset -p ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY
+#}
+#       [[ -f "${filename}" ]] || die "\"${filename}\" not a zeshy script"
 # ....................{ TRAPS ~ errors                     }....................
 # void source_zeshy_component(
 #   string component_name1, string component_name2, ...)

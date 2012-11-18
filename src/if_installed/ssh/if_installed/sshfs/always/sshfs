@@ -6,70 +6,66 @@
 # See "COPYING" for additional details.
 #
 # --------------------( SYNOPSIS                           )--------------------
-# Zsh SSHfuse, mounting and unmounting remote SSH hosts to and from local
+# Handle SSHfuse, mounting and unmounting remote SSH hosts to and from local
 # SSHfuse-managed mount points.
 #
 # --------------------( TODO                               )--------------------
 # * This component requires quite a bit of updating. It no longers complies with
-#   current Zeshy style *AT ALL*, and is doing pretty much everything "wrong."
+#   current Zeshy style *AT ALL*, and is doing pretty much everything wrong.
 
 # ....................{ ALIASES                            }....................
-interactive_alias sshfs='sshfs -o allow_other,kernel_cache,reconnect,transform_symlinks,compression=yes,cache_timeout=256,cache_stat_timeout=16,cache_dir_timeout=16,cache_link_timeout=16,idmap=user,workaround=rename'
+#FIXME: Terrible. Just terrible. Replace with proper configuration file setting.
+interactive_substitution sshfs='sshfs -o allow_other,kernel_cache,reconnect,transform_symlinks,compression=yes,cache_timeout=256,cache_stat_timeout=16,cache_dir_timeout=16,cache_link_timeout=16,idmap=user,workaround=rename'
 interactive_alias sshfs-umount='fusermount -uz'
-interactive_alias sshm='ssh-mount'
-interactive_alias sshu='ssh-umount'
 
-#FIXME: Move all such configuration into "${HOME}/.zeshy/config" file.
+interactive_abbreviation {sshm}ount='mount_ssh_host'
+interactive_abbreviation {sshu}mount='unmount_ssh_host'
+
 # ....................{ CONFIGURATION                      }....................
-# Root directory to which SSH hosts will be mounted.
-global_string MOUNT_ROOT="/mnt"
-
-# List of absolute paths to "ssh_config" files. Note that order is important:
-# later file content overrides that of earlier.
-global_list SSH_CONFIGS
-SSH_CONFIGS=( '/etc/ssh/ssh_config' "${HOME}/.ssh/ssh_config" )
-
+#FIXME: Move all such configuration into an "sshfs" file.
 # Global maps from SSH hostname to the local and remote pathnames at which that
 # hostname is to be mounted under SSHfs. SSH hostnames correspond to "Host"
 # options in "/etc/ssh/ssh_config".
-global_map SSH_HOST_TO_LOCAL_PATH;  SSH_HOST_TO_LOCAL_PATH=()
-global_map SSH_HOST_TO_REMOTE_PATH; SSH_HOST_TO_REMOTE_PATH=()
+global_map ZESHY_SSH_HOST_TO_LOCAL_PATH;  ZESHY_SSH_HOST_TO_LOCAL_PATH=()
+global_map ZESHY_SSH_HOST_TO_REMOTE_PATH; ZESHY_SSH_HOST_TO_REMOTE_PATH=()
 
 # Custom mappings for the above associative arrays. The _sshfs_main()
 # function will define acceptable defaults for all other mappings.
-SSH_HOST_TO_REMOTE_PATH[gwydden]='/'
-SSH_HOST_TO_REMOTE_PATH[rhuddin]='/'
+ZESHY_SSH_HOST_TO_REMOTE_PATH[gwydden]='/'
+ZESHY_SSH_HOST_TO_REMOTE_PATH[rhuddin]='/'
+
+#FIXME: This... this is awful. Replace with a function getting such files.
+# List of absolute paths to "ssh_config" files. Note that order is important:
+# later file content overrides that of earlier.
+global_list ZESHY_SSH_CONFIGS
+ZESHY_SSH_CONFIGS=( '/etc/ssh/ssh_config' "${HOME}/.ssh/ssh_config" )
 
 # ....................{ [UN]MOUNTING                       }....................
 # Define high-level "front-facing" functions serving as this file's command-
 # line interface to common users.
 
-# void ssh-mount(string hostname)
+# void mount_ssh_host(string hostname)
 #
 # Mount the passed SSH hostname to its corresponding local mount point.
-ssh-mount() {
+function mount_ssh_host() {
+    # Validate passed arguments.
     die_unless_one_arg 'expected exactly one SSH hostname'
-
     string SSH_HOST="${1}"
     string\
-        LOCAL_PATH="$SSH_HOST_TO_LOCAL_PATH[$SSH_HOST]"\
-        REMOTE_PATH="$SSH_HOST_TO_REMOTE_PATH[$SSH_HOST]"
+        LOCAL_PATH="$ZESHY_SSH_HOST_TO_LOCAL_PATH[$SSH_HOST]"\
+        REMOTE_PATH="$ZESHY_SSH_HOST_TO_REMOTE_PATH[$SSH_HOST]"
     [ -n "$LOCAL_PATH" ] || die "\"$SSH_HOST\" not a recognized host!"
 
-    if not is_dir "${LOCAL_PATH}" ]; then
-        string USER_NAME=$(whoami)
-
+    is_dir "${LOCAL_PATH}" or {
         say "creating \"$LOCAL_PATH\"..."
-        sudo mkdir --parents "$LOCAL_PATH" ||
-            die "\"$LOCAL_PATH\" cannot be created!"
-        sudo chown "$USER_NAME" "$LOCAL_PATH" || 
-            die "\"$LOCAL_PATH\" cannot be chowned by \"$USER_NAME\"!"
-    fi
+        sudo mkdir --parents "$LOCAL_PATH"
+        sudo chown "$(get_current_user)" "$LOCAL_PATH"
+    }
 
-    ssh-umount "$SSH_HOST"
+    unmount_ssh_host "${SSH_HOST}"
 
     # Load the "fuse" kernel module, if compiled as a module and not already loaded.
-    if not grep -qw fuse /proc/filesystems; then
+    grep -qw fuse /proc/filesystems or {
         # If the "/etc/init.d/fuse" initscript exists, preferentially run that.
         if [[ -x "/etc/init.d/fuse" ]]; then
             sudo  "/etc/init.d/fuse" restart  ||
@@ -79,7 +75,7 @@ ssh-mount() {
             sudo modprobe --quiet fuse ||
                 die "\"fuse\" kernel module cannot be loaded!"
         fi
-    fi
+    }
 
     # Mount the passed SSH hostname.
     say "mounting \"$SSH_HOST\" to \"$LOCAL_PATH\"..."
@@ -87,14 +83,14 @@ ssh-mount() {
       die "\"$SSH_HOST\" cannot be mounted to \"$LOCAL_PATH\"!"
 }
 
-# void ssh-umount(string hostname)
+# void unmount_ssh_host(string hostname)
 #
 # Unmount the passed SSH hostname from its corresponding local mount point.
-ssh-umount() {
-    die_unless_one_arg die 'expected exactly one SSH hostname'
-
-    local SSH_HOST="$1"
-    local LOCAL_PATH="$SSH_HOST_TO_LOCAL_PATH[$SSH_HOST]"
+function unmount_ssh_host() {
+    # Validate passed arguments.
+    die_unless_one_arg 'expected exactly one SSH hostname'
+    string SSH_HOST="$1" LOCAL_PATH
+    LOCAL_PATH="$ZESHY_SSH_HOST_TO_LOCAL_PATH[$SSH_HOST]"
     [ -n "$LOCAL_PATH" ] || die "\"$SSH_HOST\" not a recognized host!"
 
     # Unmount the passed SSH hostname only if already mounted.
@@ -105,32 +101,44 @@ ssh-umount() {
     fi
 }
 
-# ....................{ MAIN                               }....................
-set_default_sshfs_mappings() {
-    string ssh_hosts ssh_host
+# ....................{ STARTUP                            }....................
+append_zeshy_startup_command startup_zeshy_sshfs_mappings
 
-    # Split the scalar string of paths "$SSH_CONFIGS" on colons with (s.:.).
-    for ssh_config ("${SSH_CONFIGS[@]}") {
+function startup_zeshy_sshfs_mappings() {
+    #FIXME: This is basically fundamentally broken. I can't be bothered at the
+    #moment, so... You know what to do, men.
+    return_true
+
+    # Validate sanity.
+    die_if_args
+    string ssh_hosts ssh_host mount_home
+    mount_home="$(get_mount_home)"
+
+    # Split the scalar string of paths "$ZESHY_SSH_CONFIGS" on colons with (s.:.).
+    for ssh_config ("${ZESHY_SSH_CONFIGS[@]}") {
         is_file "${ssh_config}" or break
-        
+
+        #FIXME: Where to even begin.
         # Extract a space-delimited set of all "Hosts" defined by this "ssh_config".
         ssh_hosts="$(grep --extended-regexp 'Host[ \t]' "${ssh_config}" | cut --delimiter=' ' --fields=2 | tr '\n' ' ' | tr --delete '*')"
-        
+
         # Split the scalar string of words "$ssh_hosts" on spaces with '='.
         for ssh_host (${(z)ssh_hosts}) {
-            is_map_key 'SSH_HOST_TO_LOCAL_PATH' "${ssh_host}" or
-                # Do not append a terminating '/' onto mount points. Why? We later grep
-                # "/etc/mtab" for existing mount points and, since that file also does not
-                # append the same terminating '/', must thus ensure the two paths conform.
-                SSH_HOST_TO_LOCAL_PATH[${ssh_host}]="${MOUNT_ROOT}/${ssh_host}"
-
-            is_map_key 'SSH_HOST_TO_REMOTE_PATH' "${ssh_host}" or
-                SSH_HOST_TO_REMOTE_PATH[${ssh_host}]=
+            # Do not append a terminating '/' onto mount points. Why? We later grep
+            # "/etc/mtab" for existing mount points and, since that file also does not
+            # append the same terminating '/', must thus ensure the two paths conform.
+            is_map_key ZESHY_SSH_HOST_TO_LOCAL_PATH "${ssh_host}" or
+                ZESHY_SSH_HOST_TO_LOCAL_PATH[${ssh_host}]="${mount_home}/${ssh_host}"
+            is_map_key ZESHY_SSH_HOST_TO_REMOTE_PATH "${ssh_host}" or
+                ZESHY_SSH_HOST_TO_REMOTE_PATH[${ssh_host}]=
         }
     }
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# Root directory to which SSH hosts will be mounted.
+#global_string ZESHY_MOUNT_ROOT="/mnt"
+
 # Define low-level aliases. You may call these aliases directly; in general,
 # however, it will probably be more expedient to call the higher-level
 # "ssh-mount" and "ssh-umount" to perform SSH host mounting and unmounting.
