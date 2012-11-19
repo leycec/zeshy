@@ -87,34 +87,58 @@
 # Compile Zeshy's digest file from system-wide and user-specific Zeshy overlays.
 function compile_zeshy() {
     # Validate sanity.
-    die_if_args
+    (( # == 0 )) || die 'no arguments expected'
+
+    # Lists of all Zeshy-specific aliases, functions, and globals. Defining such
+    # lists globally:
+    #
+    # * Implicitly exports such lists to child shells, which on receiving such
+    #   globals may use their contents to undefine aliases, functions, and other
+    #   globals imported from the parent shell.
+    # * Permits us to undefine such globals in a global context below. See the
+    #   tail of this file.
+    #
+    # Zsh treats suffix aliases differently from normal and global aliases, so
+    # differentiate the former from the latter.
+    export -a\
+        ZESHY_ALIAS_NAMES\
+        ZESHY_SUFFIX_ALIAS_NAMES\
+        ZESHY_FUNCTION_NAMES\
+        ZESHY_GLOBAL_NAMES
+#   print '===ZESHY_FUNCTION_NAMES==='
+#   typeset -p ZESHY_FUNCTION_NAMES
 
     # List of directories recursively containing Zsh scripts containing
     # autoloadable functions to be compiled into Zeshy's digest file.
-    list ZESHY_AUTOLOAD_DIRNAMES
+    local -a ZESHY_AUTOLOAD_DIRNAMES
 
     # List of Zsh scripts containing autoloadable functions to be so compiled.
-    list ZESHY_AUTOLOAD_FILENAMES
+    local -a ZESHY_AUTOLOAD_FILENAMES
 
     # FIFO stack of Zeshy overlays.
-    list ZESHY_OVERLAY_STACK
+    local -a ZESHY_OVERLAY_STACK
 
     # List of all currently declared aliases, functions, and globals declared
     # *BEFORE* sourcing and compiling Zeshy.
-    list ZESHY_ALIAS_NAMES_OLD ZESHY_FUNCTION_NAMES_OLD ZESHY_GLOBAL_NAMES_OLD
+    local -a\
+        ZESHY_ALIAS_NAMES_OLD\
+        ZESHY_SUFFIX_ALIAS_NAMES_OLD\
+        ZESHY_FUNCTION_NAMES_OLD\
+        ZESHY_GLOBAL_NAMES_OLD
 
     # List of all currently declared aliases, functions, and globals declared
     # *AFTER* sourcing and compiling Zeshy. See compile_zeshy() for details.
-    list ZESHY_ALIAS_NAMES_NEW ZESHY_GLOBAL_NAMES_NEW ZESHY_FUNCTION_NAMES_NEW
-
-    # List of all Zeshy-specific aliases.
-    list ZESHY_ALIAS_NAMES
+    local -a\
+        ZESHY_ALIAS_NAMES_NEW\
+        ZESHY_SUFFIX_ALIAS_NAMES_NEW\
+        ZESHY_FUNCTION_NAMES_NEW\
+        ZESHY_GLOBAL_NAMES_NEW
 
     # Lowercase name of the current *nix distribution.
-    string ZESHY_DISTRO_NAME
+    local ZESHY_DISTRO_NAME
 
     # Glob expression matching only Zeshy-specific Zsh scripts.
-    string ZESHY_SCRIPT_GLOB
+    local ZESHY_SCRIPT_GLOB
 
     # Initialize such variables.
     compile_zeshy_startup
@@ -136,13 +160,7 @@ function compile_zeshy() {
 # Prepare the current shell environment for digest compilation.
 function compile_zeshy_startup() {
     # Validate sanity.
-    die_if_args
-
-    # Recompilation optimizations require Zeshy to *NOT* have been autoloaded at
-    # this point... Throw an exception if Zeshy has been. While this should
-    # never be the case, one can't be too careful in a bitwise world.
-    typeset -f get_zeshy_version &>/dev/null and
-        die "get_zeshy_version() and hence Zeshy already autoloaded"
+    (( # == 0 )) || die 'no arguments expected'
 
     # Since recursion is prohibitively expensive, perform a non-recursive depth-
     # first search of overlays starting from the following tree roots (in order):
@@ -150,26 +168,25 @@ function compile_zeshy_startup() {
     # * The system-wide Zeshy root.
     # * The user-specific Zeshy root, if found.
     ZESHY_OVERLAY_STACK=( "${ZESHY_OVERLAY_ROOT}" )
-    is -d "${ZESHY_USER_OVERLAY_ROOT}" si and
+    [[ -d "${ZESHY_USER_OVERLAY_ROOT}" ]] &&
         ZESHY_OVERLAY_STACK+="${ZESHY_USER_OVERLAY_ROOT}"
+
+    # Set a list of aliases, functions, and globals prior to sourcing Zeshy.
+    ZESHY_ALIAS_NAMES_OLD=( ${(f)"$(alias +)"} )
+    ZESHY_SUFFIX_ALIAS_NAMES_OLD=( ${(f)"$(alias +s)"} )
 
     # Dismantled, this is:
     #
-    # * "+f", listing only newline-delimited function names.
+    # * "+f", listing newline-delimited function names.
     # * "(f)", splitting such list on newlines.
     ZESHY_FUNCTION_NAMES_OLD=( ${(f)"$(typeset +f)"} )
 
-    # The alias() builtin lists only regular and global names with option "+"
-    # and only suffix alias names with option "+s". Split the output of both on
-    # newlines to get all regular, global, and suffix aliases.
-    ZESHY_ALIAS_NAMES_OLD=( ${(f)"$(alias +; alias +s)"} )
-#   print -l "ZESHY_ALIAS_NAMES_OLD: " "${ZESHY_ALIAS_NAMES_OLD[@]}"
-
-    # Zeshy declares globals to be globally exported (e.g., "typeset -gx") rather
-    # than merely as globals or exports (i.e., "typeset -g" or "typeset -x"). For
-    # disambiguity, list only the former.
-    ZESHY_GLOBAL_NAMES_OLD=( ${(f)"$(typeset +x)"} )
-#   print -l "ZESHY_GLOBAL_NAMES_OLD: " "${ZESHY_GLOBAL_NAMES_OLD[@]}"
+    # Dismantled, this is:
+    #
+    # * "+gx", listing newline-delimited globally exported variable names.
+    # * "(f)", splitting such list on newlines.
+    ZESHY_GLOBAL_NAMES_OLD=( ${(f)"$(typeset +gx)"} )
+#   print -l "===ZESHY_GLOBAL_NAMES_OLD===" "${ZESHY_GLOBAL_NAMES_OLD[@]}"
 
     #FIXME: BSD installs no such command, so this clearly fails to suffice.
     #We'll probably want to just import the entire get_distro_name() command.
@@ -186,11 +203,29 @@ function compile_zeshy_startup() {
     # * "-x", returning true if such path is executable and hence installed.
     #   Unless the current directory contains an executable "lsb_release", this
     #   returns true only if ":c" expanded to an absolute path.
-    is -x "${${:-lsb_release}:c}" si and
+    [[ -x "${${:-lsb_release}:c}" ]] &&
         ZESHY_DISTRO_NAME="${(L)$(lsb_release -si)}"
 
     # Glob expression matching only Zeshy-specific Zsh scripts.
     ZESHY_SCRIPT_GLOB='*~*.swp(.)'
+}
+
+#FIXME: Shift to "variable/variable".
+# string get_variable_names_global(void)
+#
+# Get a newline-delimited list of all currently defined global variable names.
+function get_variable_names_global() {
+    # Dismantled, this is:
+    #
+    # * "+g +", listing newline-delimited global names, each such line prefixed
+    #   by zero or more space-delimited attributes (e.g., "ZSH_VERSION",
+    #   "integer 10 readonly ZESHY_AND_THE_BLOOD_DIMMED_TIDE").
+    # * "(f)", splitting such list on newlines.
+    # * "##* ", removing the space-delimited attributes from each line.
+    die_if_args
+
+    #FIXME: Rename to output_delimited_by_newline().
+    output_newline_delimited "${${(f)"$(typeset +g +)"}##* }"
 }
 
 # void compile_zeshy_digest(void)
@@ -202,7 +237,7 @@ function compile_zeshy_startup() {
 # functions to be compiled into the digest. (Without compunction, compile it!)
 function compile_zeshy_digest() {
     # Validate sanity.
-    die_if_args
+    (( # == 0 )) || die 'no arguments expected'
     say "recompiling \"${ZESHY_USER_DIGEST_FILE}\"..."
 
     # For each function declared in each file in the passed directory and
@@ -223,38 +258,33 @@ function compile_zeshy_digest() {
 #       say "sourced \"${autoload_function_filename}\"."
     }
 
-    # The difference between each new and old list of aliases and variables is
-    # the list of all Zeshy-specific aliases and exported variables, which the
+    # The lists of Zeshy-specific aliases and globals are the asymmetric
+    # differences of the old from new lists of aliases and globals, which the
     # make_zeshy_functions() requires for synthesizing new functions. Delay
-    # calculating the list of all Zeshy-specific functions until after
-    # synthesizing such functions below.
-    ZESHY_ALIAS_NAMES_NEW=( ${(f)"$(alias +; alias +s)"} )
-    ZESHY_GLOBAL_NAMES_NEW=( ${(f)"$(typeset +x)"} )
+    # calculating the list of Zeshy-specific functions until doing so.
+    ZESHY_ALIAS_NAMES_NEW=( ${(f)"$(alias +)"} )
+    ZESHY_SUFFIX_ALIAS_NAMES_NEW=( ${(f)"$(alias +s)"} )
+    ZESHY_GLOBAL_NAMES_NEW=( ${(f)"$(typeset +gx)"} )
+#   ZESHY_GLOBAL_NAMES_NEW=( ${${(f)"$(typeset +g +)"}##* } )
     ZESHY_ALIAS_NAMES=(
         "${ZESHY_ALIAS_NAMES_NEW[@]:|ZESHY_ALIAS_NAMES_OLD}" )
+    ZESHY_SUFFIX_ALIAS_NAMES=(
+        "${ZESHY_SUFFIX_ALIAS_NAMES_NEW[@]:|ZESHY_SUFFIX_ALIAS_NAMES_OLD}" )
     ZESHY_GLOBAL_NAMES=(
         "${ZESHY_GLOBAL_NAMES_NEW[@]:|ZESHY_GLOBAL_NAMES_OLD}" )
-#   output "ZESHY_ALIAS_NAMES_NEW: "; output_newline_delimited "${ZESHY_ALIAS_NAMES_NEW[@]}"
-#   output "ZESHY_ALIAS_NAMES: "; output_newline_delimited "${ZESHY_ALIAS_NAMES[@]}"
-#   output "ZESHY_GLOBAL_NAMES_OLD: "; output_newline_delimited "${ZESHY_GLOBAL_NAMES_OLD[@]}"
-#   output "ZESHY_GLOBAL_NAMES_NEW: "; output_newline_delimited "${ZESHY_GLOBAL_NAMES_NEW[@]}"
-#   output "ZESHY_GLOBAL_NAMES: "; output_newline_delimited "${ZESHY_GLOBAL_NAMES[@]}"
+
+    #FIXME: Erhm; how? We need to exclude:
+    #REPLY|MATCH|MBEGIN|MEND|match|mbegin|mend
+    # Filter canonical Zsh globals from the list of Zeshy-specific globals.
+    local glob_zsh_global_names='REPLY|MATCH|MBEGIN|MEND|match|mbegin|mend'
+    ZESHY_GLOBAL_NAMES=( "${ZESHY_GLOBAL_NAMES[@]:#${~glob_zsh_global_names}}" )
+#   print -l "===ZESHY_GLOBAL_NAMES===" "${ZESHY_GLOBAL_NAMES[@]}"
 
     # Synthesize the final set of Zeshy-specific functions.
     make_zeshy_functions
 
-    # The difference between each new and old list of functions is the list of
-    # all Zeshy-specific aliases, functions, and exported variables. Recompile all
-    # such function definitions into the Zeshy digest file. (For
-    # those who care, this is an asymmetric rather than symmetric difference.)
-    ZESHY_FUNCTION_NAMES_NEW=( ${(f)"$(typeset +f)"} )
-#   {
-#       print -rl -- "================[old function names]================" "${ZESHY_FUNCTION_NAMES_OLD[@]}"
-#       print -rl -- "================[new function names]================" "${ZESHY_FUNCTION_NAMES_NEW[@]}"
-#       print -rl -- "================[dif function names]================" "${ZESHY_FUNCTION_NAMES_NEW[@]:|ZESHY_FUNCTION_NAMES_OLD}"
-#   } | less
-    zcompile -c "${ZESHY_USER_DIGEST_FILE}"\
-        "${ZESHY_FUNCTION_NAMES_NEW[@]:|ZESHY_FUNCTION_NAMES_OLD}"
+    # Recompile all Zeshy-specific functions into the Zeshy digest file.
+    zcompile -c -- "${ZESHY_USER_DIGEST_FILE}" "${ZESHY_FUNCTION_NAMES[@]}"
 }
 
 # ....................{ COMPILERS ~ overlays               }....................
@@ -273,13 +303,13 @@ function compile_zeshy_digest() {
 #     contain Zsh scripts, but not both.)
 function compile_zeshy_overlay() {
     # Validate passed arguments.
-    die_unless_one_arg 'expected one overlay dir'
-    string overlay_dir="${1}"
-    is -d "${overlay_dir}" si or die "\"${overlay_dir}\" not a directory"
+    (( # == 1 )) || die 'expected one overlay dirname'
+    local overlay_dir="${1}"
+    [[ -d "${overlay_dir}" ]] || die "\"${overlay_dir}\" not a directory"
     say "overlaying \"${overlay_dir}\"..."
 
     # Absolute paths of overlay subdirectories.
-    string\
+    local\
         overlay_main_dir="${overlay_dir}/always"\
         overlay_theme_dir="${overlay_dir}/if_theme/${ZESHY_THEME:-vanilla}"
 
@@ -294,7 +324,7 @@ function compile_zeshy_overlay() {
     compile_zeshy_overlay_configs "${overlay_dir}"
 
     # Append this overlay's main directory as autoloadable, if found.
-    is -d "${overlay_main_dir}" si and
+    [[ -d "${overlay_main_dir}" ]] &&
         ZESHY_AUTOLOAD_DIRNAMES+="${overlay_main_dir}"
 
     # Append this overlay's command directory to appropriate lists, if found.
@@ -302,7 +332,7 @@ function compile_zeshy_overlay() {
 
     # Append the subdirectory of this overlay's theme directory matching the
     # user's currently configured theme to the overlay stack, if found.
-    is -d "${overlay_theme_dir}" si and\
+    [[ -d "${overlay_theme_dir}" ]] &&
         ZESHY_OVERLAY_STACK+="${overlay_theme_dir}"
 
     # Append the subdirectory of this overlay's distro directory matching the
@@ -310,9 +340,9 @@ function compile_zeshy_overlay() {
     #
     # Do this after all other overlay logic, allowing distro-specific
     # redefinition of generic functionality.
-    is -n "${ZESHY_DISTRO_NAME}" si and {
-        string overlay_distro_dir="${overlay_dir}/if_distro/${ZESHY_DISTRO_NAME}"
-        is -d "${overlay_distro_dir}" si and
+    [[ -n "${ZESHY_DISTRO_NAME}" ]] && {
+        local overlay_distro_dir="${overlay_dir}/if_distro/${ZESHY_DISTRO_NAME}"
+        [[ -d "${overlay_distro_dir}" ]] &&
             ZESHY_OVERLAY_STACK+="${overlay_distro_dir}"
     }
 }
@@ -327,9 +357,9 @@ function compile_zeshy_overlay() {
 #   change such files.
 function compile_zeshy_overlay_configs() {
     # Validate passed arguments.
-    die_unless_one_arg 'expected one overlay dirname'
-    string overlay_config_dir="${1}/if_config"
-    is -d "${overlay_config_dir}" si or return_true
+    (( # == 1 )) || die 'expected one overlay dirname'
+    local overlay_config_dir="${1}/if_config"
+    [[ -d "${overlay_config_dir}" ]] || return 0
 
     #FIXME: This'd be a nice place to add update handling for patching locally
     #modified config files against Zeshy-bundled config files on update.
@@ -338,13 +368,13 @@ function compile_zeshy_overlay_configs() {
     # * Copy such file to the current user's configuration directory, if
     #   containing no such file already.
     # * Source the file in the current user's configuration directory.
-    string basename target_filename
+    local basename target_filename
     for source_filename ("${overlay_config_dir}/"${~ZESHY_SCRIPT_GLOB}) {
         basename="$(basename -- "${source_filename}")"
         target_filename="${ZESHY_USER_CONFIG_DIR}/${basename}"
 
         # Copy.
-        is -f "${target_filename}" si or {
+        [[ -f "${target_filename}" ]] || {
             say "defaulting \"${target_filename}\"..."
             cp "${source_filename}" "${target_filename}"
         }
@@ -366,9 +396,9 @@ function compile_zeshy_overlay_configs() {
 #   commands to the overlay stack.
 function compile_zeshy_overlay_commands() {
     # Validate sanity.
-    die_unless_one_arg 'expected one overlay dirname'
-    string overlay_command_dir="${1}/if_installed"
-    is -d "${overlay_command_dir}" si or return_true
+    (( # == 1 )) || die 'expected one overlay dirname'
+    local overlay_command_dir="${1}/if_installed"
+    [[ -d "${overlay_command_dir}" ]] || return 0
 
     # List of all paths in this overlay's command directory corresponding to a
     # currently installed executable file in the $PATH. Dismantled, this is:
@@ -383,7 +413,7 @@ function compile_zeshy_overlay_commands() {
     # * "or true", ignoring failure (if ":c" fails finding such a command).
     list overlay_command_paths; overlay_command_paths=(
         "${overlay_command_dir}/"*(e{'[[ $REPLY:t:c == /* ]]'})
-    ) or true
+    ) || true
 
     # Append all files in this directory to the list of autoloadable files.
     ZESHY_AUTOLOAD_FILENAMES+=( "${^overlay_command_paths[@]}"(.) )
@@ -398,12 +428,23 @@ function compile_zeshy_overlay_commands() {
 # Dynamically synthesize functions to be compiled into the Zeshy digest file.
 function make_zeshy_functions() {
     # Validate sanity.
-    die_if_args
+    (( # == 0 )) || die 'no arguments expected'
 
-    # Make utility functions called by Zeshy startup functions. Do this *BEFORE*
-    # making the latter, which depends on the former.
-    make_zeshy_startup_functions_defining_aliases_and_globals
+    # Call functions that
+    # make_zeshy_startup_functions_defining_aliases_and_globals() makes at the
+    # beginning of Zeshy startup, arbitrarily defining globals prior to aliases.
+    # While order should not matter here, you never really know.
+    prepend_zeshy_startup_command startup_zeshy_aliases
+    prepend_zeshy_startup_command startup_zeshy_globals
+
+    # Make startup_zeshy() and friends.
     make_zeshy_startup_functions
+
+    # Make startup_zeshy_aliases() and startup_zeshy_globals() *AFTER DEFINING
+    # ALL OTHER ZESHY-SPECIFIC FUNCTIONS*. This is a hard requirement, as this
+    # function necessarily defines the list of such functions. (Fugly, fugly,
+    # fugly. But there seem little sane alternatives, in this case.)
+    make_zeshy_startup_functions_defining_aliases_and_globals
 }
 
 # void make_zeshy_startup_functions_defining_aliases_and_globals(void)
@@ -417,34 +458,154 @@ function make_zeshy_functions() {
 # calling all other startup functions.
 function make_zeshy_startup_functions_defining_aliases_and_globals() {
     # Validate sanity.
-    die_if_args
-    string aliases globals
+    (( # == 0 )) || die 'no arguments expected'
+    local aliases suffix_aliases globals
+#   print -l -- "===ZESHY_GLOBAL_NAMES===" "${ZESHY_GLOBAL_NAMES[@]}"
+#   print -l -- "===ZESHY_FUNCTION_NAMES===" "${ZESHY_FUNCTION_NAMES[@]}"
+#   print -l -- "===ZESHY_STARTUP_COMMANDS===" "${ZESHY_STARTUP_COMMANDS[@]}"
 
     # Avoid calling builtins on empty lists, as that typically causes such
     # builtins to exhaustively (and uselessly) print *EVERYTHING*.
-    (( #ZESHY_ALIAS_NAMES )) and
+    (( #ZESHY_ALIAS_NAMES )) &&
         aliases="$(alias -L "${ZESHY_ALIAS_NAMES[@]}")"
-    (( #ZESHY_GLOBAL_NAMES )) and
-        globals="$(typeset -p "${ZESHY_GLOBAL_NAMES[@]}")"
+    (( #ZESHY_SUFFIX_ALIAS_NAMES )) &&
+        suffix_aliases="$(alias -Ls "${ZESHY_SUFFIX_ALIAS_NAMES[@]}")"
 
-    # Make such functions.
+    # Save the lists of Zeshy-specific aliases, functions, and globals.
+    # Subsequently recompiling the Zeshy digest file in either the current shell
+    # or children of such shell requires such lists for deciding which aliases,
+    # functions, and globals to undefine prior to resourcing the Zeshy codebase.
+    # See the "MAIN" section of this component below.
+    ZESHY_GLOBAL_NAMES+=(
+        ZESHY_ALIAS_NAMES
+        ZESHY_SUFFIX_ALIAS_NAMES
+        ZESHY_FUNCTION_NAMES
+        ZESHY_GLOBAL_NAMES
+    )
+
+    # Make such functions, making a placeholder empty definition for
+    # startup_zeshy_globals() to be replaced below. The reasons, as ever, are
+    # insidious. The set of all Zeshy-specific globals includes list global
+    # ${ZESHY_FUNCTION_NAMES}, which cannot be defined until after defining all
+    # Zeshy-specific functions. Naturally, startup_zeshy_globals() is such a
+    # function. To break such circularity, define such function empty initially.
     eval "function startup_zeshy_aliases() {
     ${aliases}
+    ${suffix_aliases}
 }"
+    eval "function startup_zeshy_globals() {
+}"
+
+    # The list of Zeshy-specific functions is the asymmetric difference of the
+    # old from new list of functions.
+    ZESHY_FUNCTION_NAMES_NEW=( ${(f)"$(typeset +f)"} )
+    ZESHY_FUNCTION_NAMES=(
+        "${ZESHY_FUNCTION_NAMES_NEW[@]:|ZESHY_FUNCTION_NAMES_OLD}" )
+
+    # The "typeset -p" command fails to print the "-g" modifier for global
+    # variables. Since "typeset -x" commands do not imply such modifier under
+    # Zsh option "no_global_export", failing to print such modifier effectively
+    # localizes such globals to the startup_zeshy_globals() function. Of course,
+    # this constitutes a Zsh bug. (Submit a report please.) In the meanwhile,
+    # forcefully add the "-g" modifier to all output "typeset" commands.
+    globals="${$(\
+        typeset -p "${ZESHY_GLOBAL_NAMES[@]}")//typeset -/typeset -g}"
+
+    # Make the last such function. (Phew!)
     eval "function startup_zeshy_globals() {
     ${globals}
 }"
-
-    # Register such functions to be called at the beginning of Zeshy startup.
-    # Arbitrarily define globals prior to aliases. (Order should not matter!)
-    prepend_zeshy_startup_command startup_zeshy_aliases
-    prepend_zeshy_startup_command startup_zeshy_globals
 }
 
 # ....................{ MAIN                               }....................
+# This component recompiles the Zeshy digest file by sourcing all components
+# defining Zeshy-specific Zsh objects (i.e., aliases, functions, and globals)
+# specific to the current user and system and then compiling exactly such
+# objects into such digest. To decide exactly which objects to compile, this
+# component subtracts the set of all Zsh objects defined *AFTER* sourcing such
+# components from the set of all Zsh objects defined *BEFORE* sourcing such
+# components: the difference between the two sets is exactly the set of all
+# Zeshy-specific objects to be compiled.
+#
+# By design, this requires no such objects to be defined before sourcing such
+# components. If some (or all) such objects were defined before sourcing such
+# components, the difference between the above two sets and hence the recompiled
+# Zeshy digest file would be essentially empty. To avoid such issues, undefine
+# Zeshy-specific objects defined by parent shells before such recompilation.
+#
+# Globals *MUST* be undefined in a global context to have meaningful effect.
+# While aliases and functions may be meaningfully undefined in a local context,
+# there seems little point in doing so elsewhere. Centralize all logic here.
+# See undefine_variable() and unfreeze_variable() for details on undefining
+# globals (namely, why we call typeset() prior to unset()).
+[[ -n "${ZESHY_GLOBAL_NAMES-}" ]] && {
+#   print -l "===ZESHY_GLOBAL_NAMES===" "${ZESHY_GLOBAL_NAMES[@]}"
+    typeset +r -- "${ZESHY_GLOBAL_NAMES[@]}"
+    unset      -- "${ZESHY_GLOBAL_NAMES[@]}"
+#   typeset -p -m "${ZESHY_GLOBAL_NAMES[@]}"
+}
+[[ -n "${ZESHY_ALIAS_NAMES-}" ]] &&
+    unalias -- "${ZESHY_ALIAS_NAMES[@]}"
+[[ -n "${ZESHY_FUNCTION_NAMES-}" ]] &&
+    unfunction -- "${ZESHY_FUNCTION_NAMES[@]}"
+
+# Recompile the Zeshy digest file.
 compile_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+#   {
+#       print -rl -- "================[old function names]================" "${ZESHY_FUNCTION_NAMES_OLD[@]}"
+#       print -rl -- "================[new function names]================" "${ZESHY_FUNCTION_NAMES_NEW[@]}"
+#       print -rl -- "================[dif function names]================" "${ZESHY_FUNCTION_NAMES_NEW[@]:|ZESHY_FUNCTION_NAMES_OLD}"
+#   } | less
+    # The alias() builtin lists only regular and global names with option "+"
+    # and only suffix alias names with option "+s". Split the output of both on
+    # newlines to get all regular, global, and suffix aliases.
+
+    # Delete all Zeshy-specific globals defined by and imported from the parent
+    # shell, locally preserving global ${ZESHY_HOME} for subsequent use. Failure to
+    # delete such globals results in a subtle issue when compiling the Zeshy digest
+    # file, which persists such globals to startup_zeshy_globals() by differencing
+    # the lists of globals defined before and after such compilation. Failing to
+    # delete such globals ensures the two lists to be effectively identical, thus
+    # preventing persistence of Zeshy globals into the Zeshy digest file.
+    #
+    # See undefine_variable_matching() for details on variable deletion.
+    #local zeshy_home="${ZESHY_HOME-}"
+
+    #FIXME: Hmm; should use unexported globals by default, I think.
+    #Unfortunately, getting a list of unexported globals appears to be somewhat
+    #more difficult. The following should work, assuming globals without
+    #whitespace (which I believe may be prohibited by POSIX, yes?):
+
+    # Zeshy declares globals to be globally exported (e.g., "typeset -gx") rather
+    # than merely as globals or exports (i.e., "typeset -g" or "typeset -x"). For
+    # disambiguity, list only the former.
+#   ZESHY_GLOBAL_NAMES_OLD=( ${(f)"$(typeset +x)"} )
+# to the current user and then compiles only such 
+# selects which such aliases, functions, and globals 
+# recompiles all aliases, functions, and globals defined only *AFTER*
+# sourcing befor
+#
+# determines which currently defined Zsh aliases, functions, and globals to The
+# difference of 
+# Zeshy decides
+#
+# If recompiling the Zeshy digest file and hence sourcing Zeshy scripts
+# defining globals, undefine such globals prior to initializing Zeshy. Why?
+# The reason may be subtle, but the logic flows like butter. Zeshy may and
+# typically does declare globals to be read-only. Understandably, Zsh fails on
+# attempting to redefine such globals. The subsequent call to startup_zeshy()
+# and hence startup_zeshy_globals() does just that, requiring such globals be
+# undefined prior to such calls. Oh, 'tis all a tad silly and worm-bitten, but
+# so goes life in the tranche of code trenches.
+    #FIXME: Unsure this much matters, now.
+    # Recompilation optimizations require Zeshy to *NOT* have been autoloaded at
+    # this point... Throw an exception if Zeshy has been. While this should
+    # never be the case, one can't be too careful in a bitwise world.
+#   typeset -f get_zeshy_version &>/dev/null and
+#       die "get_zeshy_version() and hence Zeshy already autoloaded"
+
     # Undefine all globals defined by sourcing Zeshy. Why? The reason is subtle;
     # the logic flows like butter. Zeshy may (and usually does) declare some
     # such globals to be read-only. Understandably, Zsh prints errors on
