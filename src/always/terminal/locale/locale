@@ -6,14 +6,54 @@
 # See "COPYING" for additional details.
 #
 # --------------------( SYNOPSIS                           )--------------------
-# Handle the current user's preferred locale (i.e., set of environment variables
+# Handle the current user's preferred locale (i.e., set of global variables
 # defining language, location, country, and culture preferences).
+#
+# --------------------( GLOBALS                            )--------------------
+# The X/Open CAE Specification defines at least six primary globals
+# ${LC_COLLATE}, ${LC_CTYPE}, ${LC_MESSAGES}, ${LC_MONETARY}, ${LC_NUMERIC}, and
+# ${LC_TIME} and two secondary globals ${LC_ALL} and ${LANG}. Collectively, such
+# globals define the current user's wanted locale. ${LC_ALL} supersedes all
+# primary globals, themselves superseding ${LANG}. ${LC_ALL} and ${LANG} have
+# no use apart from deciding the value of primary globals. Avoid setting
+# ${LC_ALL} unless testing, since such setting cannot be overridden.
+#
+# To decide the value of a primary global (say, ${LC_CTYPE}), the official
+# algorithm and hence the "locale" command:
+#
+# * If ${LC_ALL} is set, expands such global, which overrides all other globals.
+# * Else if the wanted primary global is set, expands such global.
+# * Else if ${LANG} is set, expands such global, which provides a default value
+#   for all unset globals.
+# * Otherwise, adopts the default "C" locale.
 #
 # --------------------( SEE ALSO                           )--------------------
 # http://pubs.opengroup.org/onlinepubs/007908799/xbd/envvar.html
 #     Documents all canonical locale environment variables (e.g., ${LC_ALL}).
 #
 # --------------------( TODO                               )--------------------
+# * Be nice to check LC_* sanity. Namely, either ${LANG} should be set or all
+#   "LC_*" globals excluding "LC_ALL" should be set. "LC_ALL" should never be
+#   set, since such setting cannot subsequently be overridden. See:
+#   http://www.gentoo.org/doc/en/guide-localization.xml
+#   If neither condition holds, we should try to set a sane default LANG value.
+#   * If *ALL* "LC_*" globals *AND* ${LANG} are empty, set LANG to a sensible
+#     locale supported under the current system -- ideally, "en_US.utf8". (Print out
+#     a warning message suggesting the user set either ${LANG} or ${LC_ALL}.) Ah-ha!
+#     So. We can run "locale -a" to print out all public locales. Filter the
+#     ubiquitous "C" from such list and use the first remaining line. Done!
+#   * Else if ${LANG} and ${LC_ALL} are empty but some "LC_*" global is not, set
+#     LANG to such global. (Print out a warning message suggesting the user set
+#     either ${LANG} or ${LC_ALL}.)
+#   * Else, do nothing.
+# * POSIX function nl_langinfo() provides a large number of rather cool
+#   functions for dynamically incorporating the current user's locale in a
+#   language-independent fashion. I particularly liked "YESEXPR", which, to
+#   quote: "Returns a regular expression that can be used with the regex
+#   function to recognize a positive response to a yes/no question." Nice! But
+#   how the heck do we access this from the command line, if such library is
+#   available? *OOOH*. Ridiculous. Just call "locale yesexpr". God, that's neat-
+#   o. For a description of all available options, see "man nl_langinfo".
 # * It'd be great to begin providing hooks for a Zeshy message catalog of
 #   internationalized messages (e.g., errors, warnings, headers). I note that,
 #   while there's little to no Zsh-specific content on i18n, Bash-specific
@@ -83,9 +123,9 @@
 #    ("`...`" or "$(...)"), variable access with defaulting (like
 #    ${variable-default}), access to positional arguments (like $0, $1, ...) or
 #    highly volatile shell variables (like $?)." In other words, interpolated
-#    variables must have purely alphabetic names. I'm fairly certain we adhere
-#    to such suggests everywhere, except in a few exception error messages where
-#    we interpolate in "${1}" or "${2}". *shrug*
+#   variables must have purely alphabetic names. I'm fairly certain we adhere
+#   to such suggests everywhere, except in a few exception error messages where
+#   we interpolate in "${1}" or "${2}". *shrug*
 #
 #   For strings interpolating no variables, calling "gettext" suffices (as above).
 #   For strings interpolating at least one variable, we'll need to call the
@@ -132,113 +172,70 @@
 #   }
 #
 #   Sweet. I reckon that covers things, yes?
-
-# ....................{ EXCEPTIONS                         }....................
-# void die_unless_locale(
-#   string locale,
-#   string error_message = "\"${locale}\" not an installed locale")
-#
-# Throw an exception unless the passed locale is available under the current
-# system.
-function die_unless_locale() {
-    die_unless_one_or_two_args 'expected one locale and optional error message'
-    string locale="${1}"
-    is_locale "${locale}" or die "${2:-\"${locale}\" not an installed locale}"
-}
-
-# ....................{ TESTS                              }....................
-# boolean is_locale(string locale)
-#
-# Return true if the passed locale is available under the current system. Such
-# locales are typically installed on installing (or upgrading) "glibc" or
-# running corresponding utilities (e.g., "localegen" under Gentoo).
-function is_locale() {
-    #FIXME: Does "uclibc" install a comparable command?
-    # "glibc" installs "locale", which when run with option "-a" lists all
-    # available locales in newline-delimited format. Since alternative C
-    # libraries (e.g., "uclibc") are unlikely to install such command, throw an
-    # exception unless "locale" is currently installed.
-    die_unless_one_arg 'expected one locale'
-    die_unless_installed locale
-    locale -a | is_string_containing_line "${1}"
-}
-
-# boolean is_character_locale_encoding_utf8(void)
-#
-# Return true if the current user's character locale enables UTF-8 encoding.
-function is_character_locale_encoding_utf8() {
-    # Validate sanity.
-    die_if_args
-
-    # The current character locale enables UTF-8 encoding if suffixed by either
-    # ".utf8" (the canonical UTF-8 encoding name) or ".UTF-8" (a non-canonical
-    # common alias of ".utf8").
-    string character_locale; character_locale="$(get_character_locale)"
-    is "${character_locale}" == *'.'('utf8'|'UTF-8') si
-}
-
-# ....................{ GETTERS                            }....................
-# string get_character_locale(void)
-#
-# Get the current user's character locale (i.e., the ${LC_CTYPE} environment
-# variable). Applications use such locale to ascertain:
-#
-# * Input and output character encodings (e.g., UTF-8, US-ASCII).
-# * Regular expression character classes (e.g., [[:alpha:]], [[:space:]]).
-#
-# See set_locale() for further details on the format of such string.
-function get_character_locale() {
-    # ${LC_ALL} supersedes ${LC_CTYPE} superseding ${LANG} for purposes of
-    # ascertaining the character locale, according to:
-    #
-    #     http://rosettacode.org/wiki/Terminal_control/Unicode_output
-    #
-    # Specifically:
-    #
-    # * If ${LC_ALL} is set, it overrides all other locale globals.
-    # * Else if ${LC_CTYPE} is set, it provides the desired value.
-    # * Else if ${LANG} is set, it provides a default value for unset locale
-    #   globals and hence ${LC_CTYPE}.
-    # * Otherwise, the default locale is always the "C" locale.
-    die_if_args
-    get_first_nonempty_variable_value_if_found LC_ALL LC_CTYPE LANG or
-        output "C"
-}
+# * Ah; better function names might include:
+#   void die_locale_message(string error_msgid, string text_domain = 'zeshy', string text_domain_dirname = "${ZESHY_HOME}/locale")
+#   void cry_locale_message(string warning_msgid, string text_domain = 'zeshy', string text_domain_dirname = "${ZESHY_HOME}/locale")
+#   void say_locale_message(string info_msgid, string text_domain = 'zeshy', string text_domain_dirname = "${ZESHY_HOME}/locale")
 
 # ....................{ SETTERS                            }....................
-# void set_locale(string locale)
+# void set_current_locale_default(string locale)
 #
-# Set the current user's locale to the passed locale specifier of the format
-# "${language_code}_${country_code}.${encoding_code}", where:
+# Set the current user's default locale to the passed locale specifier of the
+# format "${language_code}_${region_code}.${encoding_code}", where:
 #
 # * "${language_code}" is two lowercase letters signifying such language (e.g.,
 #   "en" for English, "fr" for French).
-# * "${country_code}" is two uppercase letters signifying such country (e.g.,
+# * "${region_code}" is two uppercase letters signifying such region (e.g.,
 #   "AU" for Australia, "CA" for Canada).
 # * "${encoding_code}" is one or more letters signifying such encoding (e.g.,
 #   "UTF-8" for UTF-8).
-function set_locale() {
+function set_current_locale_default() {
     die_unless_one_arg 'expected one locale'
     string locale="${1}"
-    die_unless_locale "${locale}"
-    string_global_export LC_ALL="${locale}"
+    die_unless_public_locale "${locale}"
+    string_global_export LANG="${locale}"
 }
 
 # ....................{ PRINTERS                           }....................
-# string print_locale(void)
+# string print_current_locale(void)
 #
 # Print a human-readable synopsis of the current locale.
-function print_locale() {
+function print_current_locale() {
     #FIXME: "locale" output is not terribly helpful. Annotating such output
     #with human-readable labels would be helpful. Actually... depending on
     #"locale" is a tad silly, here. Since it refuses to print human-readable
-    #output, let's do so in its stead.
+    #output, let's do so in its stead. Ah, *NO*. "locale" output is actually
+    #awesome, since it implicitly incorporates ${LANG} defaulting and so on.
     die_if_args
     die_unless_installed locale
     locale
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# ....................{ I18N                               }....................
+#FIXME: Is this globally safe? Assuming no terminal device, this *SHOULD* be safe.
+#If this shell is attached to a terminal device, however, we should probably
+#only accept UTF-8 output under terminal devices accepting such input. Perhaps
+#the terminfo database publishes such details? Investigate.
+
+# Uncomment one or both of the following definitions to enable default English
+# Unicode support, if not already enabled.
+#   LANG\
+#   LC_ALL\
+
+# Default locale for all globals matching "LC_*" (e.g., "LC_CTYPE", "LC_TIME").
+#LANG="${LANG-en_US.utf8}"
+
+# Global locale overriding all globals matching "LC_*".
+#LC_ALL="${LC_ALL-en_US.utf8}"
+
+    #FIXME: Antiquated. Just call locale.
+#   get_first_nonempty_variable_value_if_found LC_ALL LC_CTYPE LANG or
+#       output "C"
+# ${LC_ALL} supersedes ${LC_CTYPE} superseding ${LANG} for purposes of
+# ascertaining the character locale, according to:
+#
+#     http://rosettacode.org/wiki/Terminal_control/Unicode_output
 #   if is_nonempty LC_ALL
 #   then output ${LC_ALL}
 #   elif is_nonempty LC_CTYPE
