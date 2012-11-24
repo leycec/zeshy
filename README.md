@@ -7,7 +7,7 @@ _Zeshy_ :: high-level shell scripting language implemented in pure `zsh`
 
 ### Gentoo
 
-Gentoo effectively supports Zeshy out of the box. (Probably due to Zeshy's implementation by a Gentoo user. _Probably_.)
+Gentoo effectively supports Zeshy out of the box. (Probably due to Zeshy's implementation by a Gentoo contributor. _Probably_.)
 
 #### Install `layman`, the Gentoo overlay manager.
 
@@ -26,6 +26,10 @@ Gentoo effectively supports Zeshy out of the box. (Probably due to Zeshy's imple
 #### Install `zeshy`.
 
     emerge -av zeshy
+
+### Non-Gentoo
+
+For all other distributions, please consult your distribution's package manager.
 
 ## Synopsis
 
