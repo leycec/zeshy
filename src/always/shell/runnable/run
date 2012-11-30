@@ -177,16 +177,14 @@ function run_if_runnable() {
     is_runnable "${command_name}" and run "${@}"
 }
 
-# ....................{ RUNNERS ~ output_string                   }....................
-# string run_with_unified_output(
+# ....................{ RUNNERS ~ output                   }....................
+# string run_unifying_output(
 #   string command_name, string command_arg1, string command_arg2, ...)
 #
 # Run the passed command with standard error redirected to standard output, thus
-# "unifying" all command output_string to standard output.
-function run_with_unified_output() {
-    run "${@}"\
-        ${ZESHY_FILE_DESCRIPTOR_STANDARD_ERROR}>&\
-        ${ZESHY_FILE_DESCRIPTOR_STANDARD_OUTPUT}
+# "unifying" all command output to standard output.
+function run_unifying_output() {
+    run "${@}" 2>&1
 }
 
 # ....................{ RUNNERS ~ quietly                  }....................
@@ -196,22 +194,6 @@ function run_with_unified_output() {
 # Run the passed command quietly (i.e., squelching output).
 function run_quietly() {
     run "${@}" &>/dev/null
-}
-
-#FIXME: Rename to run_quietly_as_user(), if we actually still use this
-#somewhere. Wait; no. Excise this completely. Don't bother chaining run_*()
-#commands together into one function. The number of possible permutations is
-#stupidly high. Instead, just call such functions in a simple chain: e.g.,
-#
-#    run_quietly run_as_user 'ls' 'leycec'
-
-# void run_quietly_as(
-#   string username,
-#   string command_name, string command_arg1, string command_arg2, ...)
-#
-# Run the passed command as the passed user quietly (i.e., squelching output).
-function run_quietly_as() {
-    run_as "${@}" &>/dev/null
 }
 
 # string run_quietly_getting_exit_status(
@@ -243,23 +225,38 @@ function run_quietly_getting_exit_status_as_boolean() {
     fi
 }
 
+# void run_quietly_writing_standard_output_to_file(
+#   string command_name, string command_arg1, string command_arg2, ...,
+#   string filename)
+#
+# Run the passed command, redirecting standard output (but not error) to the
+# passed file by overwriting such file with such output.
+function run_quietly_writing_standard_output_to_file() {
+    # Validate passed arguments.
+    die_unless_args_at_least_2 'expected one command and one filename'
+    string filename="${@[-1]}"
+    die_unless_file_plain_or_not_path "${filename}"
+    pop_one_arg
+
+    # Run such command.
+    run "${@}" >!"${filename}"
+}
+
 # void run_quietly_writing_standard_output_and_error_to_file(
 #   string command_name, string command_arg1, string command_arg2, ...,
 #   string filename)
 #
-# Run the passed command quietly (i.e., without output), overwriting the passed
-# file with such command's standard output_string and error.
+# Run the passed command, redirecting both standard output and error to the
+# passed file by overwriting such file with such output.
 function run_quietly_writing_standard_output_and_error_to_file() {
     # Validate passed arguments.
     die_unless_args_at_least_2 'expected one command and one filename'
     string filename="${@[-1]}"
+    die_unless_plain_file_or_not_path "${filename}"
     pop_one_arg
 
     # Run such command.
-    run "${@}"\
-        ${ZESHY_FILE_DESCRIPTOR_STANDARD_ERROR}>&\
-        ${ZESHY_FILE_DESCRIPTOR_STANDARD_OUTPUT}\
-        >!"${filename}"
+    run "${@}" >&!"${filename}"
 }
 
 # ....................{ RUNNERS ~ background               }....................
@@ -449,7 +446,9 @@ function run_with_priorities() {
     run "${command_line[@]}"
 }
 
-# ....................{ RUNNERS ~ progress                 }....................
+# ....................{ RUNNERS ~ time                     }....................
+#FIXME: Shouldn't this be run_with_progress_bar()? Much more intelligible, and
+#straight forward.
 # string run_with_progress_timer(
 #   string command_name, string command_arg1, string command_arg2, ...)
 #
@@ -463,6 +462,8 @@ function run_with_progress_timer() {
     die_unless_args 'expected one command'
 
     #FIXME: If "pv" is *NOT* installed, are there any respectable alternatives?
+    #Surely we could cobble together a weak pure-Zsh solution, no? I wonder if
+    #anything similar's been done in bash, actually...
     # Prefer "pv", the pipe viewer.
     if is_installed pv
     then run "${*} | pv -t"
@@ -472,19 +473,27 @@ function run_with_progress_timer() {
     fi
 }
 
-# ....................{ RUNNERS ~ schedule                 }....................
+#FIXME: Rename to run_on_scheduled_interval(), run_on_schedule(),
+#run_on_interval(), or run_every_interval(). I rather prefer the latter, but...
 # void run_every(
-#   int seconds,
-#   string command_name, string command_arg1, string command_arg2, ...)
+#   string command_name, string command_arg1, string command_arg2, ...,
+#   integer seconds)
 #
 # Run the passed command every passed number of seconds.
 function run_every() {
     # Validate passed arguments.
     die_unless_args_at_least_2\
         'expected one duration in seconds and one command'
-    string every_seconds="${1}"
+    string every_seconds="${@[-1]}"
     die_unless_string_integer_positive "${every_seconds}"
     shift_one_arg
+
+    #FIXME: Not quite right; this conditional succeeds on command lines
+    #resembling "ls 2>&1", but shouldn't. It's exceedingly difficult to
+    #reliably determine whether or not such command requires shell
+    #interpretation; so, just excise this conditional altogether. What follows
+    #is generally reliable and, in fact, more precise, as we can pass intervals
+    #in units other than seconds to the sleep() builtin.
 
     # If the passed command is an external command, run under "watch", a POSIX-
     # standard command with an efficiently aesthetic CLI supporting only
@@ -496,10 +505,25 @@ function run_every() {
         # Until the user explicitly hits <Ctrl-C>, ...
         while true; do
             #FIXME: Append with a right-aligned timestamp, as under "watch".
+            #Also, shouldn't we actually be calling "echoti" directly here?
             # Mimic the "watch" UI. For efficiency, call "echoti" directly.
             clear_terminal_screen
             output_string "Every ${every_seconds}s: ${@}\n"
 
+            #FIXME: We could actually make this reasonably precise; ideally, we
+            #want to run the passed command precisely on the passed interval.
+            #But the current implementation just sleeps for the passed interval.
+            #Not at all the same thing, particularly for commands that take
+            #somewhat long to complete. Instead, get the current time before and
+            #after executing such command. Subtract the positive difference
+            #between the two from the desired interval; the resulting float is
+            #the exact number of time units to sleep this iteration. Simple.
+            #Ah! Wait. There's an even simpler means. The prior iteration should
+            #calculate the time at which the next iteration should run such
+            #command; then, in the next iteration, just get the current time...
+            #Hmm. Perhaps that's not simpler at all, actually. O.K.; constrain
+            #everything to the current iteration. For simplicity, go with the
+            #first idea above.
             # Run and sleep. (Just like in real life.)
             run "${@}"
             sleep ${every_seconds}s
@@ -507,22 +531,13 @@ function run_every() {
     fi
 }
 
-# ....................{ RUNNERS ~ users                    }....................
-# void run_as_superuser(
-#   string command_name, string command_arg1, string command_arg2, ...)
-#
-# Run the passed command as the superuser.
-function run_as_superuser() {
-    run_as root "${@}"
-}
-
-#FIXME: Rename to run_as_user().
-# void run_as(
+# ....................{ RUNNERS ~ user                     }....................
+# void run_as_user(
 #   string username,
 #   string command_name, string command_arg1, string command_arg2, ...)
 #
 # Run the passed command as the passed user.
-function run_as() {
+function run_as_user() {
     # Validate passed arguments, stripping off the prefixing username.
     die_unless_args_at_least_2 'expected one username and one command'
     string username="${1}"
@@ -547,20 +562,53 @@ function run_as() {
     #
     #Of course, that's not *QUITE* right. If ${*} contains either '"' or "'"
     #characters, we need to quote protect such characters (and *ONLY* such
-    #characters, yes?) Contemplate.
+    #characters, yes?). Not terribly difficult, but contemplate.
     die_unless_installed "${command_name}"
+
+    #FIXME: The first conditional is too strict; if "sudo" is installed, we want
+    #to be checking whether the current user is listed by "/etc/sudoers". Ah;
+    #hmm; that file has a rather complex structure. We really don't want to
+    #parse it manually. Instead, let's just use the following logic:
+    #if is_installed sudo and { is_current_user_superuser "${username}"
 
     # If the target user is the superuser, use "sudo" to take advantage of
     # password caching. Avoid "@", as that splits the command line into discrete
     # arguments. "sudo" and "su" can split their own arguments, thank you.
-    if is_superuser "${username}" and is_installed sudo
+    if is_installed sudo and is_user_superuser "${username}"
     then sudo -E  "${*}"
     # Otherwise, use "su".
     else su -p -c "${*}" "${username}"
     fi
 }
 
+# void run_as_superuser(
+#   string command_name, string command_arg1, string command_arg2, ...)
+#
+# Run the passed command as the superuser.
+function run_as_superuser() {
+    run_as_user root "${@}"
+}
+
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: Rename to run_quietly_as_user(), if we actually still use this
+#somewhere. Wait; no. Excise this completely. Don't bother chaining run_*()
+#commands together into one function. The number of possible permutations is
+#stupidly high. Instead, just call such functions in a simple chain: e.g.,
+#
+#    run_quietly run_as_user 'ls' 'leycec'
+
+# void run_quietly_as(
+#   string username,
+#   string command_name, string command_arg1, string command_arg2, ...)
+#
+# Run the passed command as the passed user quietly (i.e., squelching output).
+#function run_quietly_as() {
+#    run_as_user "${@}" &>/dev/null
+#}
+
+    #FUXME: Perform an additional sanity check before running: if such file is
+    #an existing non-file, throw an exception. This suggests a new function
+    #die_unless_file_or_not_found(). (Nice name!)
     # Command line to run. Dismantled, this is:
     #
     # * "Q", stripping one level of quote protection from the passed parameters,
@@ -773,7 +821,7 @@ function run_as() {
     # "eval" the passed command as the second call to this function will do so
     # already. Since each "eval" strips one level of quotes from such command,
     # running such command as is avoids stripping of quote protection.
-#   string run_function_glob='(run(|_as|as_superuser|_every|_paged|_with_options|_with_priorities)|run_quickly|run_quietly(|_as)|run_slowly|run_with_unified_output)'
+#   string run_function_glob='(run(|_as|as_superuser|_every|_paged|_with_options|_with_priorities)|run_quickly|run_quietly(|_as)|run_slowly|run_unifying_output)'
 #   list command_line; command_line=( "${(z)@}" )
 #   is "${command_line[1]}" == ${~run_function_glob} si and {
 
