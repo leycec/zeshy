@@ -252,7 +252,7 @@ function run_quietly_writing_standard_output_and_error_to_file() {
     # Validate passed arguments.
     die_unless_args_at_least_2 'expected one command and one filename'
     string filename="${@[-1]}"
-    die_unless_plain_file_or_not_path "${filename}"
+    die_unless_file_plain_or_not_path "${filename}"
     pop_one_arg
 
     # Run such command.
@@ -324,9 +324,18 @@ function run_under_dir() {
 }
 
 # ....................{ RUNNERS ~ options                  }....................
+#FIXME: Documentation's somewhat out-of-date and rather vague. Should note that
+#the first passed list option name signifies the "root" to which
+#"_IS_SHELL_INTERACTIVE", etc. will be appended.
+
 # string run_with_options(
 #   string command_prefix,
 #   string list_options_name,
+#   string command_arg1, string command_arg2, ...) --OR--
+# string run_with_options(
+#   string command_prefix,
+#   string list_options_name1, string list_options_name2, ...,
+#   "--",
 #   string command_arg1, string command_arg2, ...)
 #
 # Run the passed command with the passed options and arguments. Unlike most
@@ -337,7 +346,7 @@ function run_under_dir() {
 # * Append the contents of the list with the passed name.
 # * If interactive, append the contents of the list with name
 #   "${list_options_name}_IF_SHELL_INTERACTIVE"; otherwise, of the list with name
-#   "${list_options_name}_IF_NON_INTERACTIVE".
+#   "${list_options_name}_IF_SHELL_NONINTERACTIVE".
 # * Append "--", treating subsequent command arguments as non-options. This
 #   precaution prevents treating option-like arguments as options (e.g., if a
 #   file "-l" exists, "ls -- -l" lists that file while "ls -l" does not).
@@ -347,48 +356,59 @@ function run_under_dir() {
 function run_with_options() {
     # Validate passed arguments.
     die_unless_args_at_least_2\
-        'expected one command prefix, one list name, and optional command arguments'
+        'expected at least one list name, optional "--" separator, one command prefix, and optional command arguments'
     string\
-        __command_line_prefix__="${1}" __options_list_name_uppercase__\
-        options_list_name="${2}" options_list_name_if
-    list __command_line__ __empty_list__
-    shift_two_args
+        __command_line_prefix__="${1}" __dash_index__\
+        __options_list_name_uppercase__
+    list __command_line__ __options_list_names__
+    shift_one_arg
 
-    # Validate passed arguments, uppercasing the desired interactive list name
-    # regardless of the original case of the passed list name.
-    __options_list_name_uppercase__="$(uppercase_string "${options_list_name}")"
-    if is_shell_interactive
-    then options_list_name_if="${__options_list_name_uppercase__}_IF_SHELL_INTERACTIVE"
-    else options_list_name_if="${__options_list_name_uppercase__}_IF_SHELL_NON_INTERACTIVE"
+    # 1-based index of the first "--" in the passed arguments.
+    __dash_index__="${@[(i)--]}"
+    (( __dash_index__ == 1 )) and
+        die "arguments $(join_list_conjunctively "${@}") contain no options list names"
+
+    # If the caller passed a "--" argument, move all arguments preceding such
+    # argument into the list of options list names.
+    if (( __dash_index__ <= # )); then
+        __options_list_names__=( "${@[1,$(( __dash_index__ - 1 ))]}" )
+        shift_args "${__dash_index__}"
+    # Otherwise, move only the first passed argument into such list.
+    else
+        __options_list_names__=( "${@[1]}" )
+        shift_one_arg
     fi
 
-    # For each such list that does not exist, print a warning and set such list
-    # to an empty placeholder list.
-    is_list "${options_list_name}" or {
-        cry "list \"${options_list_name}\" not found"
-        options_list_name='__empty_list__'
-    }
-    is_list "${options_list_name_if}" or {
-        cry "list \"${options_list_name_if}\" not found"
-        options_list_name_if='__empty_list__'
-    }
+    # Uppercase the first passed list name.
+    __options_list_name_uppercase__="$(\
+        uppercase_string "${__options_list_names__[1]}")"
 
-    # If passed piped input, propagate such input to the desired command.
+    # Append an options list name corresponding to whether the current shell is
+    # interactive to the passed list of such names.
+    if is_shell_interactive
+    then __options_list_names__+="${__options_list_name_uppercase__}_IF_SHELL_INTERACTIVE"
+    else __options_list_names__+="${__options_list_name_uppercase__}_IF_SHELL_NONINTERACTIVE"
+    fi
+
+    # If passed piped input, propagate such input to the command line to be run.
     is_standard_input_piped and __command_line__=( cat '/dev/stdin' \| )
 
-    # Dismantled, this is:
-    #
-    # * "(z)", splitting the passed command prefix into shell words.
-    # * "(@P)", expanding the passed list name into the shell words of the
-    #   corresponding external lists.
-    __command_line__+=(
-        "${(z)__command_line_prefix__}"
-        "${(@P)options_list_name}"
-        "${(@P)options_list_name_if}" --
-        "${@}"
-    )
+    # Append such prefix split into shell words to such line.
+    __command_line__+="${(z)__command_line_prefix__}"
 
-    # Run.
+    # For such options list name, append the contents of such list to such
+    # line or print a warning if no such list exists.
+    for __options_list_name__ ("${__options_list_names__[@]}") {
+        if is_list "${__options_list_name__}"
+        then __command_line__+=( "${(@P)__options_list_name__}" )
+        else cry "list \"${__options_list_name__}\" not found"
+        fi
+    }
+
+    # Append all remaining passed arguments to such line, prefixed by "--".
+    __command_line__+=( -- "${@}" )
+
+    # Run such line.
 #   output_string "run_with_options: ${__command_line__[@]}..."
     run "${__command_line__[@]}"
 }
@@ -590,6 +610,36 @@ function run_as_superuser() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: O.K.; revert to the original idea of accepting an initial list of list
+#names prior to the command prefix and subsequent arguments. It's quite simple
+#to do so; just switch to:
+#
+# string run_with_options(
+#   string list_options_name,
+#   string command_prefix,
+#   string command_arg1, string command_arg2, ...) --OR--
+# string run_with_options(
+#   string list_options_name1, string list_options_name2, ...,
+#   "--",
+#   string command_prefix,
+#   string command_arg1, string command_arg2, ...)
+#
+#This requires a fairly significant fixup elsewhere, but renders this function
+#dramatically simpler to use by callers. It also makes much more intuitive sense
+#to pass options list names as "options" prefixed by the traditional "--"
+#options prefix than the current oddball approach.
+
+        # Remove all passed arguments preceding and including the first passed "--",
+        # having copied such arguments into the prior list.
+#       die "arguments $(join_list_conjunctively "${@}") contain no \"--\""
+#   integer __i__
+#   for (( __i__ = 1; __i__ <= #; __i__++ )) {
+#       is "${@[${__i__}]}" == '--' si and break
+#   }
+# string run_with_options(
+#   string command_prefix,
+#   string list_options_name,
+#   string command_arg1, string command_arg2, ...)
 #FUXME: Rename to run_quietly_as_user(), if we actually still use this
 #somewhere. Wait; no. Excise this completely. Don't bother chaining run_*()
 #commands together into one function. The number of possible permutations is
