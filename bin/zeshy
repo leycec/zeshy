@@ -21,6 +21,17 @@
 # zsh, on the other hand, ignores non-zero exit status where not explicitly
 # handled (e.g., by appending "|| { print 'command failed' 1>&2; exit 1 }" to
 # commands expected to fail).
+#
+# --------------------( TODO                               )--------------------
+# * Document somewhere that setting Zeshy as a user's default "/etc/passwd"
+#   shell requires adding "zeshy-login" to "/etc/shells" under Linux and
+#   "zeshy-login" as the corresponding shell field.
+# * The fact that Zsh squelches "-" prefixes on ${argv[0]} is a clue that we
+#   probably want to reimplement this script in POSIX C. (Could be quite fun,
+#   actually, aside from the fact that it'll require a substantially smarter
+#   Zeshy makefile.) Shouldn't be a terribly large file; everything we're doing
+#   here *SHOULD* have a direct C analogue. The potential startup speedup makes
+#   this a particularly worthwhile improvement.
 
 # ....................{ PATHS                              }....................
 #FIXME: The "install" script *MUST* absolutely globally replace all instances of
@@ -56,26 +67,181 @@ export ZESHY_HOME_SCRIPT="${ZESHY_HOME}/main"
 }
 
 # ....................{ MAIN                               }....................
-# Load Zeshy.
-source "${ZESHY_HOME_SCRIPT}"
-
 #FIXME: Extend to support options -- particularly, "-c", which should definitely
 #be the first option we implement support for, and "-", implying a login shell.
 #Supporting the latter option is essential for masquerading Zeshy as a proper
 #shell (and in particular allowing use of Zeshy in "/etc/passwd").
+#FIXME: O.K.; this script pretty much has to be rewritten as a basic Bourne
+#shell script. I know, I know; but there's really no other way. Such script
+#should combine the contents of this and "zeshy.dev" into a single driver
+#script invoking zsh with desired options (e.g., "-"). After careful thought, I
+#can't help but conclude that the only sane means of loading Zeshy when manually
+#invoking zsh is by passing the path to ${ZESHY_HOME} as the first argument to
+#"zsh" and all other arguments passed to such script as subsequent arguments to
+#"zsh". According to "man zsh", "zsh -i ${ZESHY_HOME}" *SHOULD* have the desired
+#effect of running "zsh" interactively after sourcing the passed Zsh script.
+#FIXME: Note that this will play poorly with our current method of sourcing
+#Zeshy in "/etc/zsh/zshrc". We'll be loading Zeshy twice -- first by
+#"/etc/zsh/zshrc" and second by the passed parameter to "zsh". Clearly, the
+#latter should immediately return if having already been loaded by
+#"/etc/zsh/zshrc". How to test... Ah! What if we run zsh from such driver script
+#as: 'zsh "${ZESHY_HOME}" 1 "${@}"'. Passing "1" notifies the "src/main" Zeshy
+#script that it is being loaded from the driver; if such argument is passed and
+#Zeshy has already been loaded, silently avoid reloading Zeshy. Or some such...
+#Hmmm. It still doesn't feel quite right, though. Running "/usr/bin/zeshy"
+#should reload Zeshy in *ALL* cases *EXCEPT* where a dot-file has already loaded
+#Zeshy *IN THE SAME PROCESS*. I suppose we could have Zeshy set the ID of the
+#Zsh process from which it was originally loaded; then, on subsequently
+#detecting that Zeshy is being reloaded, do so *UNLESS* the current process ID...
+#Hmm. No. Subtle issues abound, clearly. Hmmmm.
+#FIXME: I reckon we'd need to explicitly check in Zeshy for being loaded from
+#both a dot-file (as evidenced by the current call stack -- just see if the
+#topmost entry of the call stack is a path prefixed by either "/etc/zsh" or
+#"$ZDOTDIR" -- wait; no, "/etc/zsh" is non-portable; O.K.; how about this: ...is
+#a path matching glob "*/(.|)(zprofile|zshrc)" -- coolio!) and the driver script
+#(as evidenced by canonical Zsh global ${PPID}, which can be used to examine the
+#process list or, I suppose, just "/proc/${PPID}/cmdline" for now). Should be
+#quite an efficient test, in any case. If the test matches, return immediately
+#from Zeshy -- since Zsh will be sourcing Zeshy immediately anyway from the
+#passed argument. This implies that sourcing Zeshy from "/etc/zsh/zshrc" is only
+#of use in forcing all login and interactive Zsh shells to also source Zeshy.
+#Not terribly helpful, really, since "/usr/bin/zeshy" already provides such a
+#shell. In any case, implement the above heuristic -- and, for debugging purposes,
+#print out a warning that we'll probably squelch in some later version.
+#FIXME: The above heuristic is a helpful first approximation. Unfortunately,
+#testing "/proc/${PPID}/cmdline" isn't terribly cross-platform portable. For
+#efficiency reasons, I'd also rather not call external commands (e.g., "ps").
+#Consequently, perhaps we'd rather try the following in "src/main":
+#
+#* Set ${ZESHY_PID} as a global export in "src/main" to the current process ID.
+#* Immediately before setting such global export, test whether or not:
+#  [[ "${ZESHY_PID-}" -eq "${PPID}" ]]
+#  If such test is true, Zeshy has already been loaded by the parent process and
+#  hence (hopefully) inherited by the current process. Return immediately.
+#
+#Seems a bit risky -- but I can't see any inherent flaws, at the moment. Hmm;
+#actually, that's pretty shoddy. Zeshy would then behave differently when running
+#scripts directly under a Zeshy shell versus running scripts under other scripts.
+#Silly. O.K.; how about something more specific to Zsh startup flow:
+#
+#* If [[ "${ZESHY_PID_IF_ZSH_STARTUP-}" -eq "${PPID}" ]], then:
+#  * Zeshy has already been loaded by the parent process and hence (hopefully)
+#    inherited by the current process. Return immediately.
+#* If [[ "${funcstack[1]}" == "*/(.|)(zprofile|zshrc)" ]], then:
+#  * Set ${ZESHY_PID_IF_ZSH_STARTUP} as a global export in "src/main" ala:
+#    typeset -igx ZESHY_PID_IF_ZSH_STARTUP="${PID}"
+#
+#Looks good. Only, note that Zeshy *MAY* (and should, really) execute passed
+#scripts in the current shell process. Actually, it'd better. Be stupid to spawn
+#a new subshell, right? In that case, the test is simply:
+#
+#  [[ "${ZESHY_PID_IF_ZSH_STARTUP-}" -eq "${PID}" ]]
+#
+#Well, test which, anyway.
+#
+#Oh, and if such test succeeds, "unset ZESHY_PID_IF_ZSH_STARTUP". No more reason
+#to keep such global around at that point -- just clutters things up.
+#FIXME: O.K.; Linux login precedents are, frankly, bizarre. Here's out it works:
+#
+#* All (or nearly all) shells check $argv[0] to see whether or not the name they
+#  were run as is prefixed with a hyphen (e.g., "-bash", "-zsh"). If so, this
+#  indicates such shell should run as a login shell.
+#* If not prefixed with a hyphen, some shells additionally check for a passed
+#  option "-l" indicating the same thing (e.g., "bash -l", "zsh -l"). What's
+#  particularly crazy here is that "man zsh" does not explicitly list "-l" in
+#  the options it claims to accept -- even though it actually does! *sigh*
+#
+#In any case, the latter method of passing "-l" should suffice in the above
+#driver script. We'll need to test ${0} for a "-" prefix in such script, as
+#that's presumably what the "login" process will run such script as. (Crazy.)
+#FIXME: Weaksauce. Linux's "/etc/passwd" shell field supports no passed
+#arguments. *sigh* We'll need to create a secondary "/usr/bin/zeshy-login"
+#script -- probably just a symbolic link to this script. We can then check
+#whether or not this script was invoked as "zeshy-login"; if so, obviously
+#prepend "-l" to the passed argument list as follows:
+[[ "${0}" == (|*/)zeshy-login ]] && set -- -l "${@}"
+
+#FIXME: Fix. Document. Oh, Christ.
+[[ -o interactive ]] && {
+    print "already an interactive shell; unsure how to respond, frankly" 1>&2
+    return 1
+}
+
+#FIXME: O.K.; we should probably be testing here whether or not we were run with
+#a "-"-prepended $argv[0] string and hence as a login shell. Unfortunately, I'm
+#not entirely sure how to accomplish that cross-platform portably. Zsh appears
+#to provide no access to such string, as verified by printing such variables
+#below. However, there is a way. You won't like it, but...
+#"/proc/${$}/cmdline" *DOES* provide efficient access under Linux to the null-
+#delimited argv string. That's probably the only way, unfortunately.
+#FIXME: Uh-oh. Problem. Zsh appears to squelch the prefixing "-" unless the
+#script is explicitly called as follows: "- zsh /usr/bin/zeshy".
+#"- /usr/bin/zeshy" has no effect. Lame! I suppose Zsh thought it "knew" best
+#and decided to simply hide such prefix. O.K.; that implies that we *NEED* "-l"
+#to be explicitly passed to this script on login. We can 
+
+#print "argv: ${argv[@]}"
+#print "0: ${0}"
+
+# If the caller passed no arguments and...
+[[ ${#} -eq 0 ]] &&
+    # If standard input to the current shell is attached to a terminal, drop the
+    # caller into an interactive Zeshy shell.
+    if [[ -t 0 ]]
+    then set -- -i
+    # Otherwise, drop the caller off the Tarabithian bridge.
+    else die 'expected at least one argument when called non-interactively'
+    fi
+
+# Find the index of the first passed argument either equal to "-c" or not
+# prefixed by "-", signifying the first Zeshy-specific argument.
+integer zsh_nonoption_first_index="${@[(i)(-c|([^-])*)]}"
+integer zsh_option_last_index=$(( zsh_nonoption_first_index - 1))
+
+# Split passed arguments into Zsh-specific options and Zeshy-specific arguments.
+# The former include all passed arguments prefixed by "-" excluding "-c", while
+# the latter include all remaining passed arguments.
+local -a zsh_options zeshy_args
+zsh_options=( "${@[1,${zsh_option_last_index}]}" )
+zeshy_args=( "${@[${zsh_nonoption_first_index},-1]}" )
+#print "options: ${zsh_options[@]}"
+#print "nonoptions: ${zeshy_args[@]}"
+
+# For efficiently sensible process trees, replace the process running the
+# current shell with a new process running Zeshy under a new Zsh shell.
+exec zsh "${zsh_options[@]}" --\
+    "${ZESHY_HOME_SCRIPT}" "${zeshy_args[@]}"
+
+# --------------------( WASTELANDS                         )--------------------
+#FUXME: No reason to leave this as a Zsh script, really. "sh" is considerably
+#lighter weight, and seems inherently much more appropriate for this sort-o'-
+#thing. Consider switching. Hard. Well... actually, we *DO* benefit from Zsh-
+#specific functionality below -- particularly, for list element matching. I'm
+#unconvinced that switching to "sh" nets us anything but headaches, really.
+#FUXME: Not quite right, of course. Option "-c" and following arguments must be
+#passed to Zeshy as is and hence treated as non-options. How about:
+#  integer nonoption_first_index="${@[(i)([^-]|-c)*]}"
+#Simple, no? Don't worry about valid Zsh options passed after the argument
+#following "-c": they'll be passed to Zeshy as arguments, and if the user
+#doesn't like that... well, they can just reorder them then!
+
+#(( nonoption_first_index > # )) && nonoption_first_index=0
+#options="${(M)@:#-*}"
+# arguments="${@:#-*}"
+#for arg ("${@}") {
+
+#for ((i = 1; i <= "${#}"; i++)) {
+#    [[ "${@[${i}]}" == '-'* ]] or break
+#    zeshy_options+="${@[${i}]}"
+#}
 
 # If the caller passed arguments, interpret the first argument as the absolute
 # path to the Zeshy script to be "executed" and remaining arguments as the
 # arguments to be passed such script. Certainly, this is always the case when
 # this wrapper script is indirectly invoked by a shebang script header (e.g.,
 # "#!/usr/bin/env zeshy").
-if is_args
-then source_shell_script "${@}"
-# If the caller passed no arguments and the current shell is a login shell, we
-# are already done. Zeshy startup has already detected being a login shell and
-# responded accordingly (e.g., by setting the current ${PATH}).
-elif is_shell_login
-then noop
+#if is_args
+#then source_shell_script "${@}"
 # If the caller passed no arguments and standard input for the current shell is
 # attached to a terminal, drop the caller into a new interactive Zsh shell
 # inheriting current Zeshy settings. For efficiency, replace the process running
@@ -84,13 +250,25 @@ then noop
 # Avoid calling is_shell_interactive() to test such condition. Since the current
 # script is a file rather than standard input, Zsh is not currently reading
 # commands from standard input and hence disables shell option "interactive".
-elif is_standard_input_terminal
-then exec zsh
+#elif [[ -t 0 ]]
+#then exec zsh -i "${ZESHY_HOME_SCRIPT}" "${@}"
 # Otherwise, drop the caller off the Tarabithian bridge.
-else die 'expected at least one argument when called non-interactively'
-fi
+#else die 'expected at least one argument when called non-interactively'
+#fi
 
-# --------------------( WASTELANDS                         )--------------------
+#exec zsh -i "${ZESHY_HOME_SCRIPT}" "${@}"
+
+# Load Zeshy.
+#source "${ZESHY_HOME_SCRIPT}"
+
+#FUXME: This only works because our "/etc/zsh/zshrc" explicitly sources Zeshy. In
+#most cases, this will not have the desired effect. See above for possible
+#solutions.
+#
+# If the caller passed no arguments and the current shell is a login shell, we
+# are already done. Zeshy startup has already detected being a login shell and
+# responded accordingly (e.g., by setting the current ${PATH}).
+#elif is_shell_login
 #   [[ -o interactive ]] or print 'uh-oh: non-interactive!'
 #FUXME: Call a safer Zeshy wrapper around source(). Doesn't
 #source_shell_script() suffice?
