@@ -51,23 +51,18 @@
 # * Incorporate grml-zshrc functionality where helpful, currently available at:
 #   http://git.grml.org/f/grml-etc-core/etc/zsh/zshrc
 
-# ....................{ SANITY                             }....................
+# ....................{ SANITY ~ version                   }....................
 # Oldest Zsh version under which Zeshy runs without error.
 export ZESHY_ZSH_VERSION_REQUIRED=5.0.0
 
-# Exit with fatal error if not running such version.
+# If *NOT* running under such version, fail with non-zero exit status.
 autoload -U is-at-least
 is-at-least ${ZESHY_ZSH_VERSION_REQUIRED} || {
     # Print an error message to standard error.
-    print\
-        "zeshy: installed zsh ${ZSH_VERSION} < required zsh ${ZESHY_ZSH_VERSION_REQUIRED}" 1>&2
+    print "zeshy: installed zsh ${ZSH_VERSION} < required zsh ${ZESHY_ZSH_VERSION_REQUIRED}" 1>&2
 
-    # If interactive, immediately return back to Zsh; otherwise, exit the
-    # current script.
-    if [[ -o interactive ]]
-    then return 1
-    else   exit 1
-    fi
+    # Return rather than exiting to avoid exiting interactive shells.
+    return 1
 }
 
 # Prohibit duplicate paths from being added to canonical global lists, removing
@@ -130,6 +125,8 @@ ZESHY_USER_VERSION_FILE="${ZESHY_USER_DIR}/version"
 # Enforce strictness, as under conventional high-level languages.
 setopt no_unset           # exception on attempting to expand unset parameters
 setopt warn_create_global # warning on attempting to set undeclared parameters
+setopt no_err_exit        # Zeshy implements more robust error handling
+setopt no_err_return      # Zeshy implements more robust error handling
 
 # Variable assignment.
 setopt no_global_export   # prevent "typeset -x" from implying "typeset -xg"
@@ -255,17 +252,18 @@ setopt no_list_ambiguous # only list matches if ambiguous
 # implicitly loading their parent module on the first call to such function, we
 # explicitly load no other modules.
 
-# Stat module wrapping the stat() system call with the zstat() Zsh function. Do
-# not load this module via "zmodload zsh/stat", as that wraps the stat() system
-# call with a stat() Zsh function conflicting with the "stat" command.
+# Wrap system call stat() with Zsh function zstat(). Do not load this module
+# with "zmodload zsh/stat", as that wraps such call with Zsh function stat()
+# conflicting with external POSIX command "stat".
 zmodload -F zsh/stat b:zstat
 
-# Black box module exposing Zsh's C-based internal dictionaries as Zsh-based
+# Expose several of Zsh's internal C-based dictionaries as external Zsh-based
 # associative arrays, including:
 #
-# * ${funcstack}, having the current function call stack for user inspection.
-# * ${functions}, having the current set of all functions for redefinition and
-#   subsequent restoration of alternate function definitions.
+# * ${funcstack}, the stack of functions, scripts, and "eval" statements on the
+#   current call path.
+# * ${functions}, the set of all currently defined functions, permitting
+#   redefinition and subsequent restoration of new function implementations.
 zmodload zsh/parameter
 
 #FIXME: Add ANSI coloring to sayed messages if on an ANSI-capable terminal.
@@ -711,7 +709,10 @@ function print_call_stack() {
 #    return $(( 128 + ${signal_number} ))
 #}
 
-# ....................{ SOURCERS                           }....................
+# ....................{ OPTIONS                            }....................
+#FIXME: Parse options here!
+
+# ....................{ BOOTSTRAP                          }....................
 # void source_zeshy_script(string filename1, string filename2, ...)
 #
 # Source the passed Zeshy scripts with no arguments in the passed order.
@@ -730,12 +731,76 @@ function source_zeshy_script() {
     }
 }
 
-# ....................{ BOOTSTRAP                          }....................
 # If the current shell is a login shell, perform essential login-specific logic.
 # Specifically, set global string ${PATH} and a sane umask and source the
 # expected startup scripts (e.g., under "/etc/profile.d/").
 [[ -o login ]] && source_zeshy_script login
 
+# ....................{ BOOTSTRAP ~ reload                 }....................
+# If sourcing the current script under Zsh startup logic (e.g., from a Zsh
+# script with basename matching either ".zlogin", ".zprofile", or ".zshrc"),
+# prevent Zsh from reloading Zeshy if already loaded earlier during such logic.
+#
+# Ideally, the current script should only ever be sourced by the "zeshy" script
+# installed with Zeshy. Ideally, Zsh startup logic should avoid sourcing the
+# current script. Since Zeshy is valid Zsh, however, this script is sourceable
+# as is by any Zsh script or shell -- including Zsh startup scripts. In such a
+# case, failing to prevent Zsh from reloading Zeshy induces the following:
+#
+# * Some process runs the "zeshy" script as a new child process.
+# * This process runs under "zsh" due to such script's shebang line.
+# * This process sources at least ".zshrc" and possibly also ".zlogin" and
+#   ".zprofile", depending on runtime context.
+# * Sourcing such script could source the current script, loading Zeshy.
+# * After sourcing the current script, control returns to the "zeshy" script,
+#   which either:
+#   * Sources the current script, reloading Zeshy.
+#   * Replaces this process with a new process running "zsh" passed the current
+#     script as its first argument and hence reloading Zeshy twice:
+#     * Once by Zsh startup logic, as above.
+#     * Once by the first argument passed to such script.
+#
+# In either case, Zsh loads Zeshy at least twice and possibly more. Avoid this!
+
+#FIXME: We really need such boolean? Hmmm. Probably. But let's make sure.
+# If non-empty, load Zeshy; otherwise, only handle passed arguments.
+export ZESHY_IS_LOADING=1
+
+#FIXME: This conditional needs testing, clearly.
+#FIXME: Damn. It's broken. Zsh doesn't set it as I expected; hence, we need to
+#manually parse an option "--no-reload". Do so above and test for
+#"(( ${+arg_options[--no-reload]} ))" here. I'm fairly sure we can just replace
+#the "false &&" with the above test... and everything (might) just work. Ah;
+#well, yes. *TECHNICALLY*, the logic below would work -- but it's overkill.
+#Wait...no, it's not. It's the option name that's wrong: it's too succinct.
+#Rename such option to "--no-reload-by-current-process". Bit if a mouthful, but
+#that accurately describes what we *REALLY* want. And given that crazy name,
+#I'm happy to leave this option undocumented, you know?
+
+# If sourcing the current script under Zsh startup logic...
+#print "zeshy: funcstack[1]=${funcstack[1]}"
+print "zeshy: process ID (current)=$$"
+print "zeshy: process ID (parent!)=${PPID}"
+print "zeshy: process ID (cached.)=${ZESHY_PID_IF_ZSH_STARTUP-}"
+
+# Process ID of the last zsh process to previously source this script.
+export -i ZESHY_PID_LAST_LOADED_UNDER
+
+#FIXME: Actually handle the disabling of this boolean, below!
+
+# If such process is the current zsh process, Zeshy has already been loaded.
+# In such case, avoid doing so again.
+if (( ${+arg_options[--no-reload-by-current-process]} &&
+     ZESHY_PID_LAST_LOADED_UNDER == $ ))
+then ZESHY_IS_LOADING=
+# Otherwise, Zeshy has not yet been loaded. Set such process ID to that of
+# the current process for detecting such situation on the next sourcing by
+# the current process of this script.
+else ZESHY_PID_LAST_LOADED_UNDER=$$
+fi
+print "zeshy: ZESHY_IS_LOADING=${ZESHY_IS_LOADING}"
+
+# ....................{ BOOTSTRAP ~ startup                }....................
 # Bootstrap Zeshy by loading core aliases, globals, and autoloads, the minimal
 # clique of Zeshy components. All subsequent Zeshy functions are implicitly
 # loaded on the first call to such functions by the autoload system.
@@ -768,6 +833,27 @@ startup_zeshy
 setup_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: Do we need test against *BOTH* $$ and ${PPID}? It can't hurt, of
+    #course... but it would be nice to ascertain which we require.
+#   if [[ "${ZESHY_PID_IF_ZSH_STARTUP}" == ($$|${PPID}) ]]
+
+#[[ "${funcstack[1]}" == */(.|)(zshrc|zprofile|zlogin) ]] && {
+#* If [[ "${ZESHY_PID_IF_ZSH_STARTUP-}" -eq "${PPID}" ]], then:
+#  * Zeshy has already been loaded by the parent process and hence (hopefully)
+#    inherited by the current process. Return immediately.
+#* If [[ "${funcstack[1]}" == "*/(.|)(zprofile|zshrc)" ]], then:
+#  * Set ${ZESHY_PID_IF_ZSH_STARTUP} as a global export in "src/main" ala:
+#    typeset -igx ZESHY_PID_IF_ZSH_STARTUP="${PID}"
+
+# Due to portability
+# concerns, avoid exporting globals via "export" prior to enabling
+    # If interactive, immediately return back to Zsh; otherwise, exit the
+    # current script.
+#   if [[ -o interactive ]]
+#   then return 1
+#   else   exit 1
+#   fi
+
 #   print "defaulting \"ZESHY_HOME\" to \"${ZESHY_HOME}\"" 1>&2
 #   print "consider running \"zeshy\" rather than sourcing \"${0}\"" 1>&2
 
