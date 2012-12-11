@@ -51,17 +51,41 @@
 # * Incorporate grml-zshrc functionality where helpful, currently available at:
 #   http://git.grml.org/f/grml-etc-core/etc/zsh/zshrc
 
-# ....................{ SANITY ~ version                   }....................
+# ....................{ GLOBALS                            }....................
 # Oldest Zsh version under which Zeshy runs without error.
 export ZESHY_ZSH_VERSION_REQUIRED=5.0.0
 
-# If *NOT* running under such version, fail with non-zero exit status.
+# Absolute paths for Zeshy-specific directories and files. See commentary below.
+export\
+    ZESHY_HOME\
+    ZESHY_USER_DIR\
+    ZESHY_USER_DIR_BASENAME\
+    ZESHY_USER_CONFIG_DIR\
+    ZESHY_USER_OVERLAY_DIR\
+    ZESHY_USER_DIGEST_FILE\
+    ZESHY_USER_VERSION_FILE
+
+# Process ID of the last zsh process to previously source this script.
+export -i ZESHY_PID_LAST_LOADED_BY
+
+# If non-empty, make and use the user-specific Zeshy directory ${ZESHY_USER_DIR}
+# and all subdirectories and files of such directory; else, load Zeshy with
+# default configuration and shell settings and no digest file. Unlike the
+# similar boolean ${ZESHY_IS_LOADING}, publish this boolean globally; numerous
+# Zeshy functions called after startup need to know about the "situation."
+export ZESHY_IS_LOADING_USER_DIR=1
+
+# ....................{ LOCALS                             }....................
+# If non-empty, load Zeshy; else, only handle arguments passed to this script.
+local ZESHY_IS_LOADING=1
+
+# ....................{ SANITY                             }....................
+# If *NOT* running under such version, print an error message to standard error
+# and return rather than exiting to avoid exiting interactive shells with non-
+# zero exit status.
 autoload -U is-at-least
 is-at-least ${ZESHY_ZSH_VERSION_REQUIRED} || {
-    # Print an error message to standard error.
     print "zeshy: installed zsh ${ZSH_VERSION} < required zsh ${ZESHY_ZSH_VERSION_REQUIRED}" 1>&2
-
-    # Return rather than exiting to avoid exiting interactive shells.
     return 1
 }
 
@@ -74,27 +98,7 @@ is-at-least ${ZESHY_ZSH_VERSION_REQUIRED} || {
 typeset -U path cdpath fpath manpath
 
 # ....................{ PATHS                              }....................
-#FIXME: Woops. This is pretty much completely wrong for actual Zeshy
-#installations (e.g., into "/usr/share/zeshy", containing the current contents
-#of "~/zsh/zeshy/src"). ZESHY_HOME and ZESHY_HOME should *ALWAYS* be the
-#same exact thing. Hence, remove the latter and set the former as follows:
-#
-#[[ -n "${ZESHY_HOME-}" ]] || export ZESHY_HOME="${0:h}"(:A)
-#
-#We should probably remove all setting of such variable from
-#"etc/{zlogin,zprofile,zshrc}", perhaps suggesting "etc/{zlogin,zshrc}" should
-#be removed entirely and "etc/zprofile" reduced to just running "zeshy". (Or
-#perhaps just "etc/zshrc" reduced to running "zeshy" and the others removed?)
-export\
-    ZESHY_HOME\
-    ZESHY_USER_DIR\
-    ZESHY_USER_DIR_BASENAME\
-    ZESHY_USER_CONFIG_DIR\
-    ZESHY_USER_OVERLAY_DIR\
-    ZESHY_USER_DIGEST_FILE\
-    ZESHY_USER_VERSION_FILE
-
-# Absolute directory of the Zeshy codebase. See "bin/zeshy.dev" for commentary.
+# Absolute directory of the Zeshy codebase. See "bin/zeshy" for commentary.
 [[ -n "${ZESHY_HOME}" ]] || ZESHY_HOME="$(print -- "${0:h}"(:A))"
 
 # User-specific Zeshy dot directory basename.
@@ -119,7 +123,7 @@ ZESHY_USER_OVERLAY_DIR="${ZESHY_USER_DIR}/src"
 ZESHY_USER_DIGEST_FILE="${ZESHY_USER_DIR}/digest.zwc"
 
 # File to which Zeshy caches its version specifier (e.g., to detect upgrades).
-ZESHY_USER_VERSION_FILE="${ZESHY_USER_DIR}/version"
+ZESHY_USER_VERSION_FILE="${ZESHY_USER_DIR}/current_version"
 
 # ....................{ OPTIONS                            }....................
 # Enforce strictness, as under conventional high-level languages.
@@ -710,33 +714,18 @@ function print_call_stack() {
 #}
 
 # ....................{ OPTIONS                            }....................
-#FIXME: Parse options here!
+# Parse passed options *BEFORE* operating on any Zeshy files, as the former
+# could modify the behavior of the latter (e.g., by preventing Zeshy from
+# recompiling and loading its digest file). If such parsing fails, set option
+# "-h" to non-zero exit status, instructing the end of this script to print help
+# to standard error and return with such status. See parse_arg_options().
+local -A arg_options
+zparseopts -M -D -E -A arg_options --\
+    c h o v -command=c -help=h -option=o -version=v\
+    -no-zeshy-dot-dir -no-zeshy-reload-by-same-process ||
+    arg_options[-h]=1
 
-# ....................{ BOOTSTRAP                          }....................
-# void source_zeshy_script(string filename1, string filename2, ...)
-#
-# Source the passed Zeshy scripts with no arguments in the passed order.
-function source_zeshy_script() {
-    # Validate passed arguments.
-    (( # >= 1 )) || die 'expected at least one filename'
-
-    for filename ("${@}") {
-        # If such filename is prefixed with no dirname and hence is only a
-        # basename,  prefix such basename with Zeshy's top-level directory.
-        [[ "${filename}" == *'/'* ]] ||
-            filename="${ZESHY_HOME}/${filename}"
-
-        # Source such Zeshy script.
-        source -- "${filename}"
-    }
-}
-
-# If the current shell is a login shell, perform essential login-specific logic.
-# Specifically, set global string ${PATH} and a sane umask and source the
-# expected startup scripts (e.g., under "/etc/profile.d/").
-[[ -o login ]] && source_zeshy_script login
-
-# ....................{ BOOTSTRAP ~ reload                 }....................
+# ....................{ OPTIONS ~ reload                   }....................
 # If sourcing the current script under Zsh startup logic (e.g., from a Zsh
 # script with basename matching either ".zlogin", ".zprofile", or ".zshrc"),
 # prevent Zsh from reloading Zeshy if already loaded earlier during such logic.
@@ -761,78 +750,188 @@ function source_zeshy_script() {
 #     * Once by the first argument passed to such script.
 #
 # In either case, Zsh loads Zeshy at least twice and possibly more. Avoid this!
+#print "zeshy: process ID (current)=$$"
+#print "zeshy: process ID (parent!)=${PPID}"
+#print "zeshy: process ID (cached.)=${ZESHY_PID_IF_ZSH_STARTUP-}"
 
-#FIXME: We really need such boolean? Hmmm. Probably. But let's make sure.
-# If non-empty, load Zeshy; otherwise, only handle passed arguments.
-export ZESHY_IS_LOADING=1
+# If the caller requests we not reload Zeshy if previously loaded by the current
+# shell and (indeed!) Zeshy was loaded by such shell, avoid doing so again.
+if (( ${+arg_options[--no-zeshy-reload-by-same-process]} &&
+     ZESHY_PID_LAST_LOADED_BY == $ ))
+then ZESHY_IS_LOADING=
+# Else Zeshy is not yet loaded. To test the prior conditional on the next run of
+# this script by the current shell, set the process ID to that of this shell.
+else ZESHY_PID_LAST_LOADED_BY=$$
+fi
+#print "zeshy: ZESHY_IS_LOADING=${ZESHY_IS_LOADING}"
 
-#FIXME: This conditional needs testing, clearly.
-#FIXME: Damn. It's broken. Zsh doesn't set it as I expected; hence, we need to
+#FIXME: Actually test this. Shouldn't be terribly difficult: just temporarily
+#move "~leycec/.zeshy" aside and pass "--no-zeshy-dot-dir" to an interactively
+#run "zeshy" process. If "~leycec/.zeshy" doesn't appear, we've done something
+#spectacularly right. Huzza!
+
+# If ignoring the Zeshy user directory, disable the corresponding boolean.
+(( ${+arg_options[--no-zeshy-dot-dir]} )) && ZESHY_IS_LOADING_USER_DIR=
+
+# ....................{ BOOTSTRAP                          }....................
+# void source_zeshy_script(string filename1, string filename2, ...)
+#
+# Source the passed Zeshy scripts with no arguments in the passed order.
+function source_zeshy_script() {
+    # Validate passed arguments.
+    (( # >= 1 )) || die 'expected at least one filename'
+
+    for filename ("${@}") {
+        # If such filename is prefixed with no dirname and hence is only a
+        # basename,  prefix such basename with Zeshy's top-level directory.
+        [[ "${filename}" == *'/'* ]] ||
+            filename="${ZESHY_HOME}/${filename}"
+
+        # Source such Zeshy script.
+        source -- "${filename}"
+    }
+}
+
+# void load_zeshy(void)
+#
+# Load Zeshy into the current zsh shell. Specifically:
+#
+# * If such shell is a login shell, establish sensible login shell settings.
+#   See set_shell_login_defaults() for further details.
+# * Source all Zeshy configuration files.
+# * If no Zeshy digest file has been compiled or such file requires
+#   recompilation (e.g., due to upgrading Zeshy, editing Zeshy configuration
+#   files, or installing new command or uninstalling old commands from the
+#   current ${PATH}), recompile such digest.
+# * Prepend such digest to the current ${FPATH}, thus effectively loading all
+#   Zeshy functions. For efficiency, the Zsh autoload system delays defining
+#   these functions until the first call to such functions.
+# * Perform all Zeshy startup tasks, including:
+#   * Defining all Zeshy aliases and globals.
+#   * Calling all user-defined startup hooks.
+function load_zeshy() {
+    # Validate passed arguments.
+    (( # == 0 )) || die 'expected no arguments'
+
+    # If the current shell is a login shell, set login-specific behavior.
+    [[ -o login ]] && source_zeshy_script login
+
+    # Source all Zeshy configuration files and compile and load Zeshy's digest.
+    source_zeshy_script config autoload
+    #print "glob: ${ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY}"
+
+    # Undefine all globals defined by such recompilation. The reasons are subtle but
+    # the logic flows like butter. Zeshy may (and often does) declare globals to be
+    # read-only. Sadly, Zsh fails on attempting to redefine read-only globals. Since
+    # the subsequent call to startup_zeshy() and hence startup_zeshy_globals() does
+    # just that, undefine Zeshy-specific globals prior to such calls. Do so in the
+    # root global context (i.e., in this component outside of functions) to
+    # guarantee expected behavior. "'tis all a tad silly and worm-bitten, but such
+    # is life in the tranche of code trenches."
+    #
+    # Since Zsh never fails on redefining aliases or functions, do not bother
+    # undefining either. We could, but there's little point (or profit) in it.
+    [[ -n "${ZESHY_GLOBAL_NAMES-}" ]] && {
+    #   print -l "===ZESHY_GLOBAL_NAMES===" "${ZESHY_GLOBAL_NAMES[@]}"
+        typeset +r -- "${ZESHY_GLOBAL_NAMES[@]}"
+        unset      -- "${ZESHY_GLOBAL_NAMES[@]}"
+    #   print "glob: ${ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY}"
+    }
+
+    # Initialize Zeshy, having recompiled the Zeshy digest file above and hence
+    # defined all autoloads applicable to the current user.
+    startup_zeshy
+
+    #FIXME: Kill this. Kill this soon. (You know you want to...)
+    setup_zeshy
+}
+
+# Load Zeshy and grace the saffron skies with fullsome zest! All shell commands
+# following this conditional may safely access all Zeshy aliases, globals, and
+# functions. Specifically:
+#
+# * If loading Zeshy, do so.
+# * Else if Zeshy has not been previously loaded under the current shell (as
+#   implied by the lack of get_zeshy_version()), throw an exception.
+if [[ -n "${ZESHY_IS_LOADING}" ]]
+then load_zeshy
+elif ! typeset -f -- get_zeshy_version &>/dev/null
+then die "get_zeshy_version() not defined and hence Zeshy not loaded"
+fi
+
+# ....................{ OPTIONS ~ help                     }....................
+# Handle passed help and version options *AFTER* loading Zeshy.
+
+# If passed a help option, ignore all other options and if:
+#
+# * The above option parsing failed as signified by (( arg_options[-h] == 1 )),
+#   print usage help to standard error and return with non-zero exit status.
+# * Else, print help to standard output and return with zero exit status.
+(( ${+arg_options[-h]} )) and {
+    if (( arg_options[-h] == 1 )); then
+        run_redirecting_to_standard_error print_zeshy_help_usage
+        die 'passed invalid or unknown options'
+    else
+        print_zeshy_help_usage
+        return_true
+    fi
+}
+
+# If passed a version option, behave similarly to above.
+(( ${+arg_options[-v]} )) and {
+    print_zeshy_version
+    return_true
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#print "zeshy: funcstack[1]=${funcstack[1]}"
+#sleep 2
+#exit
+#, but Zeshy has been at least partially previously loaded"
+    # Bootstrap Zeshy by loading core aliases, globals, and autoloads, the minimal
+    # clique of Zeshy components. All subsequent Zeshy functions are implicitly
+    # loaded on the first call to such functions by the autoload system.
+    # Specifically, set global string ${PATH} and a sane umask and source the
+    # expected startup scripts (e.g., under "/etc/profile.d/").
+#FUXME: We really need such boolean? Hmmm. Probably. But let's make sure.
+#FUXME: Woops. This is pretty much completely wrong for actual Zeshy
+#installations (e.g., into "/usr/share/zeshy", containing the current contents
+#of "~/zsh/zeshy/src"). ZESHY_HOME and ZESHY_HOME should *ALWAYS* be the
+#same exact thing. Hence, remove the latter and set the former as follows:
+#
+#[[ -n "${ZESHY_HOME-}" ]] || export ZESHY_HOME="${0:h}"(:A)
+#
+#We should probably remove all setting of such variable from
+#"etc/{zlogin,zprofile,zshrc}", perhaps suggesting "etc/{zlogin,zshrc}" should
+#be removed entirely and "etc/zprofile" reduced to just running "zeshy". (Or
+#perhaps just "etc/zshrc" reduced to running "zeshy" and the others removed?)
+
+# as the latter establishes the global ${PATH} required by the former. To avoid
+# reduplication,
+#
+# (e.g., for
+# finding commands in the global ${PATH} with word modifier ":c").
+#    # See "compile" for further details on clever expressions like this.
+#   [[ -x "${${:-lsb_release}:c}" ]] &&
+#FUXME: This conditional needs testing, clearly.
+#FUXME: Damn. It's broken. Zsh doesn't set it as I expected; hence, we need to
 #manually parse an option "--no-reload". Do so above and test for
 #"(( ${+arg_options[--no-reload]} ))" here. I'm fairly sure we can just replace
 #the "false &&" with the above test... and everything (might) just work. Ah;
 #well, yes. *TECHNICALLY*, the logic below would work -- but it's overkill.
 #Wait...no, it's not. It's the option name that's wrong: it's too succinct.
-#Rename such option to "--no-reload-by-current-process". Bit if a mouthful, but
+#Rename such option to "--no-reload-by-same-process". Bit if a mouthful, but
 #that accurately describes what we *REALLY* want. And given that crazy name,
 #I'm happy to leave this option undocumented, you know?
 
-# If sourcing the current script under Zsh startup logic...
-#print "zeshy: funcstack[1]=${funcstack[1]}"
-print "zeshy: process ID (current)=$$"
-print "zeshy: process ID (parent!)=${PPID}"
-print "zeshy: process ID (cached.)=${ZESHY_PID_IF_ZSH_STARTUP-}"
-
-# Process ID of the last zsh process to previously source this script.
-export -i ZESHY_PID_LAST_LOADED_UNDER
-
-#FIXME: Actually handle the disabling of this boolean, below!
-
-# If such process is the current zsh process, Zeshy has already been loaded.
-# In such case, avoid doing so again.
-if (( ${+arg_options[--no-reload-by-current-process]} &&
-     ZESHY_PID_LAST_LOADED_UNDER == $ ))
-then ZESHY_IS_LOADING=
-# Otherwise, Zeshy has not yet been loaded. Set such process ID to that of
-# the current process for detecting such situation on the next sourcing by
-# the current process of this script.
-else ZESHY_PID_LAST_LOADED_UNDER=$$
-fi
-print "zeshy: ZESHY_IS_LOADING=${ZESHY_IS_LOADING}"
-
-# ....................{ BOOTSTRAP ~ startup                }....................
-# Bootstrap Zeshy by loading core aliases, globals, and autoloads, the minimal
-# clique of Zeshy components. All subsequent Zeshy functions are implicitly
-# loaded on the first call to such functions by the autoload system.
-source_zeshy_script config autoload
-#print "glob: ${ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY}"
-
-# Undefine all globals defined by such recompilation. The reasons are subtle but
-# the logic flows like butter. Zeshy may (and often does) declare globals to be
-# read-only. Sadly, Zsh fails on attempting to redefine read-only globals. Since
-# the subsequent call to startup_zeshy() and hence startup_zeshy_globals() does
-# just that, undefine Zeshy-specific globals prior to such calls. Do so in the
-# root global context (i.e., in this component outside of functions) to
-# guarantee expected behavior. "'tis all a tad silly and worm-bitten, but such
-# is life in the tranche of code trenches."
+# Parse passed options *AFTER* performing login-specific logic, as the latter
+# establishes the global ${PATH} required by the former (e.g., for finding
+# commands in the global ${PATH} with word modifier ":c").
 #
-# Since Zsh never fails on redefining aliases or functions, do not bother
-# undefining either. We could, but there's little point (or profit) in it.
-[[ -n "${ZESHY_GLOBAL_NAMES-}" ]] && {
-#   print -l "===ZESHY_GLOBAL_NAMES===" "${ZESHY_GLOBAL_NAMES[@]}"
-    typeset +r -- "${ZESHY_GLOBAL_NAMES[@]}"
-    unset      -- "${ZESHY_GLOBAL_NAMES[@]}"
-#   print "glob: ${ZESHY_GLOB_SHELL_EMULATABLE_DIRECTLY}"
-}
-
-# Initialize Zeshy, having recompiled the Zeshy digest file above and hence
-# defined all autoloads applicable to the current user.
-startup_zeshy
-
-#FIXME: Kill this. Kill this soon. (You know you want to...)
-setup_zeshy
-
-# --------------------( WASTELANDS                         )--------------------
+# Parse passed options *BEFORE* operating on any additional Zeshy files or operating
+# on user-specific Zeshy files, as the
+# former could modify the behavior of the latter (e.g., by preventing Zeshy from
+# recompiling and loading its digest file).
     #FUXME: Do we need test against *BOTH* $$ and ${PPID}? It can't hurt, of
     #course... but it would be nice to ascertain which we require.
 #   if [[ "${ZESHY_PID_IF_ZSH_STARTUP}" == ($$|${PPID}) ]]
