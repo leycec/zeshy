@@ -20,14 +20,22 @@
     exit 1
 }
 
-# If the list of arguments passed to "zeshy" was not previously defined, this
+# If the list of previously passed arguments was not previously defined, this
 # script was probably not run by "zeshy". Throw an exception!
 (( ${+ZESHY_ARGS} )) || {
     print "zeshy: \${ZESHY_ARGS} not defined, so \"${0}\" not sourced by \"zeshy\"" 1>&2
     exit 1
 }
 
-# Source the main Zeshy script, thus loading Zeshy.
-source -- "${ZESHY_HOME_SCRIPT}" "${ZESHY_ARGS}"
+# Source the main Zeshy script, thus loading Zeshy. Convert the list of
+# arguments previously passed to the "zeshy" wrapper script from a string back
+# into its original list. Since strings but not lists cannot be inherited by
+# subshells, such circumlocution is sadly unavoidable. See restore_list() for
+# further details.
+#print "ZESHY_ARGS: ${(Qz)ZESHY_ARGS}"
+source -- "${ZESHY_HOME_SCRIPT}" "${(Qz)ZESHY_ARGS}"
 
 # --------------------( WASTELANDS                         )--------------------
+#source -- "${ZESHY_HOME_SCRIPT}" "${(z)ZESHY_ARGS}"
+    #FUXME: ZESHY_ARGS="${@}" is wrong; we need to export a proper list, here.
+    #Verify that ".zshrc" actually imports a proper Zsh list.

@@ -248,6 +248,14 @@ zmodload zsh/parameter
 # This placeholder implementation called only when bootstrapping Zeshy will be
 # replaced when loading Zeshy's digest file.
 function say() {
+    #FIXME: Quite certain we want to replace all "[[ -o interactive ]] && say"
+    #and "interactively say" with merely "say". (The former are patently silly
+    #and, let's be honest, dangerous, by duplicating logic *EVERYWHERE*.) That
+    #said, I'm not convinced that the solution here is to simply prepend this
+    #statement with "[[ -o interactive ]] && "; the problem, of course, are
+    #pipes. We want functions like the following to work:
+    #    function testem() { say 'Oh, hello!'; }
+    #    testem | cat
     print "zeshy: ${@}"
 }
 
@@ -341,7 +349,7 @@ function die() {
     handle_exception ${exit_status}
 
     #FIXME: Suffix the exception name by the name of the function directly
-    #responsible for throwing this exception. See outcry_exception_exit_status()
+    #responsible for throwing this exception. See curse_exception_exit_status()
     #for simple logic getting this function name.
 
     # Unwind the current call stack, thus returning the current user to an
@@ -453,38 +461,41 @@ function die_unhandled() {
 # by the current user. This placeholder implementation called only when
 # bootstrapping Zeshy will be replaced when loading Zeshy's digest file.
 function handle_exception() {
+    # Redirect all output printed below to standard error. Yes, a single
+    # suffixing "} 1>&2" actually suffices. You rock, Zsh! (Sometimes.)
     {
         # If called directly from the command-line, no such exception exists.
         (( # == 1 )) || die 'expected one positive integer'
-        (( #funcstack >= 2 )) || die 'exception not found'
+        (( #funcstack >= 2 )) || die 'exception not thrown'
+
+        # Print a blank line.
+        print
 
         # Print a description of the passed non-zero exit status.
-        print 1>&2  # print a blank line to standard error
-        outcry_exception_exit_status "${1}"
+        print_exception_exit_status "${1}"
 
         # If the current user's Zeshy configuration requests printing stack
         # traces on exceptions, do so.
         [[ -n "${ZESHY_IS_ERROR_HANDLER_PRINTING_CALL_STACK-}" ]] &&
-            outcry_call_stack
+            print_call_stack
+    # If such handling itself throws an exception, catch such exception here to
+    # prevent uncaught exceptions from recursively triggering TRAPZERR(). Since
+    # Zeshy functions may sadly be the source of such exception, avoid calling
+    # Zeshy functions in catch logic.
     } always {
-        # If such handling threw an exception, catch such exception here to
-        # prevent an uncaught exception from recursively triggering TRAPZERR().
-        # Since a Zeshy function may have been the culprit throwing such
-        # exception, avoid calling Zeshy functions in catch logic.
-        #
         # While Zsh *SHOULD* always set the ${CAUGHT} global to the name of the
         # uncaught exception, it (occassionally) appears not to. *sigh*
         catch * && if [[ -n "${CAUGHT-}" ]]
         then print "zeshy: exception handler threw uncaught exception \"${CAUGHT}\"" 1>&2
         else print "zeshy: exception handler failed with non-zero exit status" 1>&2
         fi
-    }
+    } 1>&2
 }
 
-# string outcry_exception_exit_status(integer exit_status)
+# string print_exception_exit_status(integer exit_status)
 #
 # Print a description of the passed non-zero exit status to standard error.
-function outcry_exception_exit_status() {
+function print_exception_exit_status() {
     # Validate passed arguments.
     local exit_status="${1}"
     [[ "${exit_status}" == <-> ]] ||   # see is_integer()
@@ -527,14 +538,14 @@ function outcry_exception_exit_status() {
 #   fi
 
     # Describe such exit status.
-    print "${caller_name}: failed with exit status ${exit_status}" 1>&2
+    print "${caller_name}: failed with exit status ${exit_status}"
 }
 
 #FIXME: There appears to be a very curious oddity in Zsh; sourcing a Zsh script
 #containing the line "return 1" produces the expected call stack, resembling:
 #
 #./tmpy.zsh: failed with exit status 1
-#    \_ outcry_call_stack() { /home/leycec/zsh/zeshy/src/main: 418 }
+#    \_ curse_call_stack() { /home/leycec/zsh/zeshy/src/main: 418 }
 #     \_ handle_exception() { /home/leycec/zsh/zeshy/src/main: 8458093679346917924 }
 #      \_ TRAPZERR() { ./tmpy.zsh: 2 }
 #       \_ ./tmpy.zsh { zsh: 32 }
@@ -543,7 +554,7 @@ function outcry_exception_exit_status() {
 #produces call stacks resembling:
 #
 #TRAPZERR: failed with exit status 20
-#    \_ outcry_call_stack() { /home/leycec/zsh/zeshy/src/main: 418 }
+#    \_ curse_call_stack() { /home/leycec/zsh/zeshy/src/main: 418 }
 #     \_ handle_exception() { /home/leycec/zsh/zeshy/src/main: 7955925549229362501 }
 #      \_ TRAPZERR() { /bin/zsh: 31 }
 #
@@ -561,7 +572,7 @@ function outcry_exception_exit_status() {
 #  "./tmpy.zsh: failed with exit status 1". Just not sure how to *GET* the
 #  expected command name or exit status.
 
-# string outcry_call_stack(void)
+# string print_call_stack(void)
 #
 # Print a trace of the current call stack consisting of all previously called
 # functions, sourced files, and "eval" statements in the current call path to
@@ -575,7 +586,7 @@ function outcry_exception_exit_status() {
 #     # substitution throws an exception printing a call stack trace to
 #     # standard error without effort on our behalf.
 #     >>> string first_file; first_file="$(get_first_file /spider /murphy)"
-function outcry_call_stack() {
+function print_call_stack() {
     # Validate passed arguments.
     (( # == 0 )) || die 'expected no arguments'
     integer funcstack_size=${#funcstack} i caller_line
@@ -605,18 +616,16 @@ function outcry_call_stack() {
 
         # Print the current stack frame to standard error.
         print --\
-            "${frame_prefix} ${caller_name} { ${filename}: ${caller_line} }"\
-            1>&2
+            "${frame_prefix} ${caller_name} { ${filename}: ${caller_line} }"
 
         # Indent the next stack frame one space to the right.
         frame_prefix=" ${frame_prefix}"
     }
-#   print "got through!"
 }
 
 # ....................{ INTERRUPTION                       }....................
 #FIXME: It appears this may encourage non-halting interrupts, which is bad. I
-#have no idea why, but strongly suspect calling outcry_call_stack() in this
+#have no idea why, but strongly suspect calling curse_call_stack() in this
 #context to be the culprit. Disable for now.
 # integer TRAPINT(integer signal_number = SIGINT)
 #
@@ -625,7 +634,7 @@ function outcry_call_stack() {
 #    integer signal_number=${1}
 
     # Print the current call stack to indicate the point of interruption.
-#    outcry_call_stack
+#    curse_call_stack
 
     # Store the interrupted line in the history. By default, Zsh omits such
     # lines -- somewhat unhelpfully. Dismantled, this is:
@@ -686,10 +695,14 @@ zparseopts -M -D -E -A arg_options --\
     h=-help v=-version c+:=-command o+:=-option\
     -zeshy-dot-dir:: -no-zeshy-dot-dir=-zeshy-dot-dir ||
     arg_options[--help]=1
+#print -- "passed option names (${#arg_options}): ${(k)arg_options}"
 
 # ....................{ OPTIONS ~ paths                    }....................
 # Absolute directory of the Zeshy codebase. See "bin/zeshy" for commentary.
-[[ -n "${ZESHY_HOME}" ]] || ZESHY_HOME="$(print -- "${0:h}"(:A))"
+[[ -n "${ZESHY_HOME}" ]] || ZESHY_HOME="$(print -- "${0:h}"(:A))" || {
+    print "zeshy: main script \"${0}\" not found" 1>&2
+    return 1
+}
 
 # User-specific Zeshy dot directory basename.
 ZESHY_DOT_DIR_BASENAME='.zeshy'
@@ -884,7 +897,41 @@ fi
     return_true
 }
 
+#FIXME: Parse ${arg_options} and ${arg_commands} here. Test a bit, of course.
+
+# ....................{ MAIN                               }....................
+# Avoid implicitly returning with non-zero exit status, as occurs when the prior
+# statement is a conditional evaluating to false.
+return_true
+
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: Rename "curse_" to "print_" here and below, and reform handle_exception()
+#to simply redirect output of such functions to standard error. Simple: centralize
+#such redirection in one place rather than in every print statement in such
+#functions.
+
+#       print 1>&2  # print a blank line to standard error
+#if (( #arg_options ))
+#then for key ("${(k)arg_options}") print "arg_options[${key}]=${arg_options[${key}]}"
+#else print "arg_options empty; args: ${*}"
+#fi
+#FUXME: Rename "print_" back to "print_" *EVERYWHERE*.
+#FUXME: Rename "curse_" to "admit_" (?) *EVERYWHERE*. To search for applicable alternatives,
+#search synonyms of "complain" and "confess". Ah! Right. Why not "curse". I
+#still quite like it after all these years. It's readily replaceable, anyway, if
+#we elect for something else. O.K.; go "curse" it!
+#zeshy_interactive_substitution_names_for_gui_commands
+#zeshy_interactive_aliases_substituting_gui_commands
+#zeshy_interactive_aliases_for_gui_commands
+#zeshy_interactive_aliases_for_cli_commands
+#zeshy_interactive_substitutions_graphical
+#zeshy_interactive_selfaliases_graphical
+#zeshy_interactive_substitution_names_run_disowned
+#zeshy_command_names
+
+#zeshy_interactive_substitution_names_run_disowned
+#zeshy_interactive_substitution_names
+
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -1263,7 +1310,7 @@ fi
 #FUXME: *BRILLIANT IDEA*. Stack traces are great. But, with longer function
 #implementations, output like:
 #
-#   outcry_call_stack: make_and_install_kernel() failed with exit status 1
+#   curse_call_stack: make_and_install_kernel() failed with exit status 1
 #        \_ TRAPZERR() { /root/.zeshy/digest.zwc/make_and_install_kernel: 34 }
 #         \_ make_and_install_kernel() { /bin/zsh: 130 }
 #
@@ -1272,7 +1319,7 @@ fi
 #implementation and discern just where the fault lies. Hence, a solution:
 #
 #* Add a new "ZESHY_DEBUG" config global. (Think we might have one already, yes?)
-#* If enabled, outcry_call_stack() should implicitly with no external effort
+#* If enabled, curse_call_stack() should implicitly with no external effort
 #  append something resembling "which ${funcname[2]}" to its output. That's
 #  closer to what we want, but still incomplete: "which" has no option for
 #  prefixing each line of output with its line number, which is what we need.
@@ -1386,7 +1433,7 @@ fi
 #however, I can only assume this is somehow the intended behavior. Nonetheless,
 #file a mailing list comment.
 #trap TRAPZERR ZERR
-#trap 'outcry_call_stack; throw ZeshyException' ZERR
+#trap 'curse_call_stack; throw ZeshyException' ZERR
 
 #   if is_interactive
 #   then return $(( ${exit_status} + 128 + ${signal_number} ))
@@ -1765,7 +1812,7 @@ fi
 
         # Print the passed error message followed by a complete backtrace.
 #   cry "${@}"
-#   outcry_call_stack
+#   curse_call_stack
  #
     # Shells differentiate
     # fatal from non-fatal errors by setting the high bit (i.e., 2^7 = 128).
