@@ -51,6 +51,17 @@
 # * Incorporate grml-zshrc functionality where helpful, currently available at:
 #   http://git.grml.org/f/grml-etc-core/etc/zsh/zshrc
 
+# ....................{ PROFILING                          }....................
+# Set the current time since the Unix epoch *BEFORE* all subsequent operations
+# to ensure reasonable profiling results.
+
+# Load module "datetime", providing timing-related globals expanded below.
+zmodload zsh/datetime
+
+# Time in partial seconds since the Unix epoch at which Zeshy was first loaded
+# (i.e., at which the current script was first sourced).
+float ZESHY_STARTUP_TIME_SECONDS="${EPOCHREALTIME}"
+
 # ....................{ GLOBALS                            }....................
 # Oldest Zsh version under which Zeshy runs without error.
 export ZESHY_ZSH_VERSION_REQUIRED=5.0.0
@@ -670,16 +681,34 @@ function print_call_stack() {
 local -A arg_options
 
 # List of shell commands to be run parsed from options "-c" and "--command".
-local -a arg_commands
+local -a arg_shell_commands
 
 # List of shell options to be enabled parsed from options "-o" and "--option".
-local -a arg_options
+local -a arg_shell_options
 
 #FIXME: I'm fairly assured that passing multiple commands and options with
 #long-form options works as advertised. I strongly doubt, however, that passing
 #multiple commands and options with short-form options works as advertised. If
 #not, we'll probably want to drop the "-M" and manually map short- to long-form
 #arguments following option parsing. (Simple, if a tad tedious.)
+#FIXME: Add an option for profiling Zsh startup. Yes, Zsh supports this.
+#Exceptionally cool; I had no idea! See Dennis' great answer here:
+#
+#http://stackoverflow.com/questions/4351244/can-i-profile-my-zshrc-zshenv
+#http://stackoverflow.com/questions/6693515/zsh-how-to-time-a-block-of-code
+#
+#We should most certainly add a run_profiled() function for printing a timing
+#profile after running the passed command. There appear to be several ways of
+#doing this: the "setopt xtrace" approach of the first URL above; the
+#"time ( ... )" approach of the second URL above; and the "zprof" module. I'm
+#unclear which is better but am currently leaning towards the latter. Regardless
+#of which approach we choose, output to standard error by default, so as to
+#ensure expected behavior under process substitution. (Naturally, a secondary
+#function could be implemented to log to a passed file, instead.)
+#FIXME: Hmm; yes, the "zprof" approach appears superior. Its output rocks, as
+#expected. Mimics "gprof", so there you go. It's a bit wieldy to use, requiring
+#unload of the module to disable profiling, but... no problems, given a
+#run_profiled() helper.
 
 # Parse passed options *BEFORE* operating on any Zeshy files, as the former
 # could modify the behavior of the latter (e.g., by preventing Zeshy from
@@ -691,8 +720,10 @@ local -a arg_options
 # "--no-zeshy-dot-dir" to "--zeshy-dot-dir", thus implicitly setting the latter
 # option with the option string on parsing the former option.
 zparseopts -M -D -E -A arg_options --\
-    -help -version -command+:=arg_commands -option+:=arg_options\
-    h=-help v=-version c+:=-command o+:=-option\
+    h=-help -help \
+    v=-version -version\
+    c+:=arg_shell_commands -command+:=arg_shell_commands\
+    o+:=arg_shell_options -option+:=arg_shell_options\
     -zeshy-dot-dir:: -no-zeshy-dot-dir=-zeshy-dot-dir ||
     arg_options[--help]=1
 #print -- "passed option names (${#arg_options}): ${(k)arg_options}"
@@ -874,7 +905,7 @@ else
 fi
 
 # ....................{ OPTIONS ~ help                     }....................
-# Handle passed help and version options *AFTER* loading Zeshy.
+# Handle passed help options *AFTER* loading Zeshy.
 
 # If passed a help option, ignore all other options and if:
 #
@@ -897,7 +928,51 @@ fi
     return_true
 }
 
-#FIXME: Parse ${arg_options} and ${arg_commands} here. Test a bit, of course.
+# ....................{ OPTIONS ~ shell                    }....................
+# Handle passed shell options *AFTER* handling help options, which immediately
+# return if passed and hence assume priority.
+
+#FIXME: Parse ${arg_options} and ${arg_shell_commands} here. Test a bit, of course.
+
+# Run all passed shell commands. Since every other element parsed into
+# ${arg_shell_commands} is either "-c" or "--command" and hence ignorable, iterate
+# elements in pairs ignoring the first such element.
+for placeholder arg_shell_command ("${arg_shell_commands[@]}") {
+#   print "zeshy: passed command \"${arg_shell_command}\""
+    run "${arg_shell_command}"
+}
+
+# Enable all passed shell options *AFTER* running passed shell commands, to
+# ensure such commands run under the default Zeshy environment. Iterate list
+# elements in pairs ignoring the first such element, as above.
+for placeholder arg_shell_option ("${arg_shell_options[@]}") {
+#   print "zeshy: passed option \"${arg_shell_option}\""
+    enable_shell_option "${arg_shell_option}"
+}
+
+# ....................{ PROFILING ~ end                    }....................
+# If debugging Zeshy, print a human-readable synopsis of Zeshy startup time. For
+# accuracy, minimize shell overhead by:
+#
+# * Printing such synopsis as a single statement.
+# * Avoiding calling Zeshy-specific functions to do so.
+is -n "${ZESHY_IS_DEBUG-}" si and printf\
+    "zeshy: startup in %.4f seconds (wall clock)\n"\
+    $(( EPOCHREALTIME - ZESHY_STARTUP_TIME_SECONDS ))
+
+#FIXME: It'd be nice to profile Zeshy a bit to see what's consuming the most
+#time. (I suspect the single "autoload -w" statement loading the digest, but
+#one never knows, really.) Perhaps add a new "--profile-zeshy-startup" option.
+
+# ....................{ ARGUMENTS                          }....................
+# If the caller passed at least one argument *NOT* prefixed by "-", source
+# Prior option parsing removed all recognized options from the current argument
+# list. Interpret the first remaining argument as the path of a Zeshy script to
+# be sourced and subsequent remaining arguments as arguments to be passed to
+# such script. Since this is the same argument order accepted by builtin
+# source(), source all remaining arguments as is *AFTER* printing Zeshy's
+# startup time to avoid increasing such time by the time spent sourcing.
+(( # )) && source -- "${@}"
 
 # ....................{ MAIN                               }....................
 # Avoid implicitly returning with non-zero exit status, as occurs when the prior
@@ -905,6 +980,71 @@ fi
 return_true
 
 # --------------------( WASTELANDS                         )--------------------
+#is_boolean_true ZESHY_IS_DEBUG and printf\
+#FUXME: Source all remaining arguments via source_shell_script().
+# Source such arguments *AFTER* printing Zeshy's startup time to avoid
+# incrementing such time by the time required to source such arguments.
+#FUXME: If ${ZESHY_IS_DEBUG}, print out a brief line printing timing statistics:
+#namely, how quickly Zeshy started up. *ALWAYS* start timing as the first line
+#of this file, since we won't have access to ${ZESHY_IS_DEBUG} for a bit of
+#time. (What's the best way to perform shell profiling? Google us up.) Hmm;
+#don't adopt the "zprof" solution, which imposes a bit too much overhead. We
+#want a no-overhead -- the "times" command looks particularly helpful. Is there
+#any way to reset the "times" timer? Alternatively, if we could somehow run this
+#entire script prefixed by "time"... Heavy-weight, though. "times" would be
+#preferable, really. Perhaps an initial implementation should just do:
+#
+#local ZESHY_TIME_STARTUP
+#[[ -x "${${:-lsb_release}:c}" ]] &&
+#  ZESHY_TIME_STARTUP="$(date "+%s%N)"
+#
+#Only trouble there is that the default profile may not have been established.
+#Ah-ha! Knew it. Zsh helpfully provides a builtin module circumventing such
+#difficulties: "zsh/datetime". So, at the very top of this script:
+#
+## Load module "datetime", providing global list ${epochtime} expanded below.
+#zmodload zsh/datetime
+#
+## Time in seconds and nanoseconds since the Unix epoch at which Zeshy was first
+## loaded (i.e., at which the current script was first sourced).
+#export -i ZESHY_STARTUP_TIME_SECONDS ZESHY_STARTUP_TIME_NANOSECONDS
+#
+## Get such times from global list ${epochtime}, whose:
+##
+## * First shell word has the current time in seconds since the Unix epoch.
+## * Second shell word has the current time in nanoseconds since the epoch.
+##
+## For reliability, expand such shell words at the same time.
+#for ZESHY_STARTUP_TIME_SECONDS ZESHY_STARTUP_TIME_NANOSECONDS in ${epochtime}
+#do; done
+#
+#Brilliant! Make it so.
+# accuracy, avoid calling Zeshy-specific functions to do so.
+    # Time in seconds and nanoseconds since the Unix epoch at which Zeshy
+    # startup completed.
+#   float ZESHY_STARTUP_TIME_SECONDS="${EPOCHREALTIME}"
+
+    # Print such synopsis as a single statement to minimize shell overhead.
+# Time in seconds and nanoseconds since the Unix epoch at which Zeshy was first
+# loaded (i.e., at which the current script was first sourced).
+#integer ZESHY_STARTUP_TIME_SECONDS ZESHY_STARTUP_TIME_NANOSECONDS
+
+# Set such times from global list ${epochtime}, whose:
+#
+# * First shell word has the current time in seconds since the Unix epoch.
+# * Second shell word has the current time in nanoseconds since the epoch.
+#
+# For reliability, expand such shell words at the same time.
+#for ZESHY_STARTUP_TIME_SECONDS ZESHY_STARTUP_TIME_NANOSECONDS in ${epochtime}
+#do; done
+    # Time in seconds and nanoseconds since the Unix epoch at which Zeshy
+    # startup completed.
+#   integer ZESHY_STARTUP_END_TIME_SECONDS ZESHY_STARTUP_END_TIME_NANOSECONDS
+
+    # Set such times. See the top of this script for further details.
+#   for ZESHY_STARTUP_END_TIME_SECONDS ZESHY_STARTUP_END_TIME_NANOSECONDS in\
+#       ${epochtime}; do; done
+
 #FUXME: Rename "curse_" to "print_" here and below, and reform handle_exception()
 #to simply redirect output of such functions to standard error. Simple: centralize
 #such redirection in one place rather than in every print statement in such
