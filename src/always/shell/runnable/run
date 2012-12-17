@@ -161,6 +161,7 @@ function run() {
     # caller quote protect user-passed arguments with "(q)".
     #
     # You have now entered the Clusterfuck Zone.
+#   print_string "run: ${@}..."
     if is_standard_input_piped
     then run_with_piped_input eval "${@}"
     else eval "${@}"
@@ -331,70 +332,130 @@ function run_under_dir() {
 }
 
 # ....................{ RUNNERS ~ options                  }....................
-#FIXME: Documentation's somewhat out-of-date and rather vague. Should note that
-#the first passed list option name signifies the "root" to which
-#"_IS_SHELL_INTERACTIVE", etc. will be appended.
+#FIXME: O.K.; this should be substantially improved as follows:
+#
+#* If non-interactive, always prefix passed args with "--" as currently done.
+#* If interactive, however, *NEVER* do so. It just completely breaks user
+#  expectations, I'm afraid. That isn't too say that we can't still take
+#  precautions, however: e.g.,
+#  * Copy only "-"-prefixed passed args into a new temporary list.
+#  * Filter such list with a file match glob excluding all list elements
+#    *NOT* matching existing paths.
+#  * If any list elements remain, print a warning and recommendation on how
+#    to correct such issue (e.g., by prepending such args with "--").
+#FIXME: Not every POSIX-style function calls this function. Consequently,
+#I'm afraid we'll have to manually hunt down all current improper uses of
+#"--" in such functions and excise them.
+#FIXME: Technically, if interactive, we really only want to avoid prefixing
+#passed args with "--" when this function is transitively called by a
+#function of the same or similar name as the command to be run (e.g., when
+#the passed command is "command rm" and this function is transitively called
+#by interactive alias rr()). In such case, the current user has a reasonable
+#expectation that any options entered will be passed as is to the corresponding
+#underlying command. In all other cases, no such expectation exists. I should
+#note that under the proposed help documentation revisions, the
+#interactive_abbreviation() function will be improved so as to accept an
+#optional option specifying the underlying external command to be run.
+#Presumably, we'll then record all such passed options in a global map from
+#alias to command name. Given that, determining whether or not to prefix
+#passed args with "--" when interactive reduces to the following heuristic:
+#
+#* If and only if:
+#  * The name of function called earliest on the call stack is an existing
+#    key of such map *AND*
+#  * The current command line to be run matches "command ${map_value}",
+#    where ${map_value} is the value for such key in such map,
+#* Then and only then exclude a prefixing "--".
+#* Otherwise, always include a prefixing "--".
+#
+#Sweet. It's (fairly) simple, very efficient, and easily debuggable. Go, no?
+#No iterative searching or complex heuristics required, so... It's hard to
+#see any hard objections, really.
+#FIXME: Ah; it's not an objection, more a... curiosity. But how are pipes
+#handled in relation to the call stack, exactly? We'd really like one-liners
+#such as "ls -o --type=full * | grep -v yumyum | less -o" to work as
+#expected. I suspect the shell already handles this correctly by running
+#each pipe command as the root of its own call stack in a separate subshell...
+#Hmm; but, in that case, such subshells would be marked as non-interactive.
+#In any case, we'll just have to test such pipes ourselves and see what Zsh
+#comes up with. (We should be able to hack it up in our favor, but...)
+#FIXME: *NO, NO, NO.* The above heavy-weight solution is horrible. It's
+#horribly inefficient. It's horribly complex. It's a big fail. Here's what
+#we're going to do instead. It's not pretty, but we have to do it anyway to
+#support arbitrary option passing when interactive: for *MOST* functions with
+#existing interactive aliases, we need to divert such aliases to a new
+#function with name prefixed by "_interactive" accepting arbitrary options
+#and *NOT* passing "--". The original non-interactive function must, on the
+#other hand, explicitly pass "--". We've already excised the hard-coded "--"
+#from this function, so we're good to go. Look: I know it'll be unpleasant,
+#but we basically have little choice. It'll probably take two days from
+#starting to finishing such revisions.
+#
+#Example:
+#Define a new remove_file_interactively() function. Redefine interactive
+#alias "rm" to call such function rather than remove_file(). Do *NOT* change
+#the original remove_file(). And...we're good!
 
 # string run_with_options(
 #   string command_prefix,
-#   string list_options_name,
-#   string command_arg1, string command_arg2, ...) --OR--
-# string run_with_options(
-#   string command_prefix,
-#   string list_options_name1, string list_options_name2, ...,
-#   "--",
+#   string options_list_names,
 #   string command_arg1, string command_arg2, ...)
 #
-# Run the passed command with the passed options and arguments. Unlike most
-# functions in the run*() family, this function requires the passed command be a
-# single string. This function creates the command line to be run as follows:
+# Create a command line to be run with the passed options and arguments and
+# run such command line. While most run functions run the passed command line as
+# is, this run function creates such command line dynamically: e.g.,
 #
-# * Begin with the passed command.
-# * Append the contents of the list with the passed name.
-# * If interactive, append the contents of the list with name
-#   "${list_options_name}_IF_SHELL_INTERACTIVE"; otherwise, of the list with name
-#   "${list_options_name}_IF_SHELL_NONINTERACTIVE".
-# * Append "--", treating subsequent command arguments as non-options. This
-#   precaution prevents treating option-like arguments as options (e.g., if a
-#   file "-l" exists, "ls -- -l" lists that file while "ls -l" does not).
-# * Append the passed command arguments. This completes the command line.
-# * If this function was called with piped input, pipe such input to the command
-#   line; otherwise, run the command line as is.
+#   # Run grep recursively with the passed list of options and user arguments,
+#   # paging standard output if required.
+#   >>> run_with_options 'run_paged grep'\
+#   ...   'ZESHY_GREP_OPTIONS ZESHY_GREP_OPTIONS_IF_RECURSIVE' "${(q)@}"
+#
+# Specifically, this function:
+#
+# * If this function was called with piped input, initializes the command line
+#   to be run to pipe such input; else initializes such command line to the
+#   empty string (e.g., assuming piped input, "cat /dev/stdin |"; else "").
+# * Initializes the command line to be run to the passed command prefix (e.g.,
+#   "run_paged grep -R").
+# * Splits the passed string of options list names on whitespace into a proper
+#   list of the names of all lists with options to be passed on such command
+#   line (e.g., splits 'ZESHY_GREP_OPTIONS ZESHY_GREP_OPTIONS_IF_RECURSIVE' into
+#   a 2-element list containing both 'ZESHY_GREP_OPTIONS' and
+#   'ZESHY_GREP_OPTIONS_IF_RECURSIVE').
+# * Sets the main options list name ${main_list_options_name} to the first
+#   element of such list (e.g., 'ZESHY_GREP_OPTIONS').
+# * If the current shell is interactive, appends
+#   "${main_list_options_name}_IF_SHELL_INTERACTIVE" to such list; else appends
+#   "${main_list_options_name}_IF_SHELL_NONINTERACTIVE" (e.g., assuming the
+#   latter case, 'ZESHY_GREP_OPTIONS_IF_SHELL_NONINTERACTIVE').
+# * For each list name in such list:
+#   * If the list with that name exists, append all elements of that list to
+#     such command line.
+#   * Else print a warning.
+# * Append the passed arguments to such command line, thus completing the
+#   command line to be run (e.g., assuming the caller passed a single argument
+#   'Weeds', no piped input, and the above lists with default elements,
+#   "run_paged grep --extended-regexp --no-messages --recursive 'Weeds'").
+# * Run such command line.
 function run_with_options() {
     # Validate passed arguments.
     die_unless_args_2_or_more\
         'expected at least one list name, optional "--" separator, one command prefix, and optional command arguments'
     string\
-        __command_line_prefix__="${1}" __dash_index__\
-        __options_list_name_uppercase__
+        __command_line_prefix__="${1}"\
+        __dash_index__ __options_list_name_uppercase__
     list __command_line__ __options_list_names__
-    shift_one_arg
 
-    # 1-based index of the first "--" in the passed arguments.
-    __dash_index__="${@[(i)--]}"
-    (( __dash_index__ == 1 )) and
-        die "arguments $(join_list_conjunctively "${@}") contain no options list names"
-
-    # If the caller passed a "--" argument, move all arguments preceding such
-    # argument into the list of options list names.
-    if (( __dash_index__ <= # )); then
-        __options_list_names__=( "${@[1,$(( __dash_index__ - 1 ))]}" )
-        shift_args "${__dash_index__}"
-    # Otherwise, move only the first passed argument into such list.
-    else
-        __options_list_names__=( "${@[1]}" )
-        shift_one_arg
-    fi
-
-    # Uppercase the first passed list name.
-    __options_list_name_uppercase__="$(\
-        uppercase_string "${__options_list_names__[1]}")"
+    # Split the whitespace-delimited string of option list names into a proper
+    # list, to be appended to below.
+    set_list_to_string_split_on_words __options_list_names__ "${2}"
+    shift_two_args
 
     # Append an options list name corresponding to whether the current shell is
     # interactive to the passed list of such names.
     if is_shell_interactive
-    then __options_list_names__+="${__options_list_name_uppercase__}_IF_SHELL_INTERACTIVE"
-    else __options_list_names__+="${__options_list_name_uppercase__}_IF_SHELL_NONINTERACTIVE"
+    then __options_list_names__+="${__options_list_names__[1]}_IF_SHELL_INTERACTIVE"
+    else __options_list_names__+="${__options_list_names__[1]}_IF_SHELL_NONINTERACTIVE"
     fi
 
     # If passed piped input, propagate such input to the command line to be run.
@@ -412,56 +473,8 @@ function run_with_options() {
         fi
     }
 
-    #FIXME: O.K.; this should be substantially improved as follows:
-    #
-    #* If non-interactive, always prefix passed args with "--" as currently done.
-    #* If interactive, however, *NEVER* do so. It just completely breaks user
-    #  expectations, I'm afraid. That isn't too say that we can't still take
-    #  precautions, however: e.g.,
-    #  * Copy only "-"-prefixed passed args into a new temporary list.
-    #  * Filter such list with a file match glob excluding all list elements
-    #    *NOT* matching existing paths.
-    #  * If any list elements remain, print a warning and recommendation on how
-    #    to correct such issue (e.g., by prepending such args with "--").
-    #FIXME: Not every POSIX-style function calls this function. Consequently,
-    #I'm afraid we'll have to manually hunt down all current improper uses of
-    #"--" in such functions and excise them.
-    #FIXME: Technically, if interactive, we really only want to avoid prefixing
-    #passed args with "--" when this function is transitively called by a
-    #function of the same or similar name as the command to be run (e.g., when
-    #the passed command is "command rm" and this function is transitively called
-    #by interactive alias rr()). In such case, the current user has a reasonable
-    #expectation that any options entered will be passed as is to the corresponding
-    #underlying command. In all other cases, no such expectation exists. I should
-    #note that under the proposed help documentation revisions, the
-    #interactive_abbreviation() function will be improved so as to accept an
-    #optional option specifying the underlying external command to be run.
-    #Presumably, we'll then record all such passed options in a global map from
-    #alias to command name. Given that, determining whether or not to prefix
-    #passed args with "--" when interactive reduces to the following heuristic:
-    #
-    #* If and only if:
-    #  * The name of function called earliest on the call stack is an existing
-    #    key of such map *AND*
-    #  * The current command line to be run matches "command ${map_value}",
-    #    where ${map_value} is the value for such key in such map,
-    #* Then and only then exclude a prefixing "--".
-    #* Otherwise, always include a prefixing "--".
-    #
-    #Sweet. It's (fairly) simple, very efficient, and easily debuggable. Go, no?
-    #No iterative searching or complex heuristics required, so... It's hard to
-    #see any hard objections, really.
-    #FIXME: Ah; it's not an objection, more a... curiosity. But how are pipes
-    #handled in relation to the call stack, exactly? We'd really like one-liners
-    #such as "ls -o --type=full * | grep -v yumyum | less -o" to work as
-    #expected. I suspect the shell already handles this correctly by running
-    #each pipe command as the root of its own call stack in a separate subshell...
-    #Hmm; but, in that case, such subshells would be marked as non-interactive.
-    #In any case, we'll just have to test such pipes ourselves and see what Zsh
-    #comes up with. (We should be able to hack it up in our favor, but...)
-
-    # Append all remaining passed arguments to such line, prefixed by "--".
-    __command_line__+=( -- "${@}" )
+    # Append all remaining passed arguments to such line.
+    __command_line__+=( "${@}" )
 
     # Run such line.
 #   print_string "run_with_options: ${__command_line__[@]}..."
@@ -583,6 +596,60 @@ function run_as_superuser() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # 1-based index of the first "--" in the passed arguments.
+#   __dash_index__="${@[(i)--]}"
+#   (( __dash_index__ == 1 )) and
+#       die "arguments $(join_list_conjunctively "${@}") contain no options list names"
+
+    # If the caller passed a "--" argument, move all arguments preceding such
+    # argument into the list of options list names.
+#   if (( __dash_index__ <= # )); then
+#       __options_list_names__=( "${@[1,$(( __dash_index__ - 1 ))]}" )
+#       shift_args "${__dash_index__}"
+    # Otherwise, move only the first passed argument into such list.
+#   else
+#       __options_list_names__=( "${@[1]}" )
+#       shift_one_arg
+#   fi
+
+    #FUXME: No point in uppercasing. Just reuse the caller-provided case.
+    # Uppercase the first passed list name.
+#   __options_list_name_uppercase__="$(\
+#       uppercase_string "${__options_list_names__[1]}")"
+
+#FUXME: Documentation's somewhat out-of-date and rather vague. Should note that
+#the first passed list option name signifies the "root" to which
+#"_IS_SHELL_INTERACTIVE", etc. will be appended.
+#FUXME: Woops. Subtle, but fatal, flaw here: a "--" passed as an actual command
+#argument is indistinguishable from a "--" passed to delimit the end of list
+#option names. Oh, bloody hell. This function has become one gigantic ball of
+#fail. Ah; right. I have the solution. It's a tad hacky, but much cleaner than
+#the current nonsense, while still admitting the same expressivity: since
+#variable names cannot contain whitespace by Zsh definition, simply interpret
+#the passed list_options_name as, in fact, a whitespace-delimited string
+#splittable into all such names, callable like so:
+#
+#    run_with_options 'run_paged hiya' 'ZESHY_HIYA ZESHY_HIYA_RECURSIVE' "${(q)@}"
+#
+#While slightly awkward, I'm satisfied with the current argument order, as it
+#corresponds exactly to the resulting order of interpolation. Phew! Make it so.
+
+# * Appends the elements of all lists the contents of all lists with the passed name.
+# * Append "--", treating subsequent command arguments as non-options. This
+#   precaution prevents treating option-like arguments as options (e.g., if a
+#   file "-l" exists, "ls -- -l" lists that file while "ls -l" does not).
+# * Append the passed command arguments. This completes the command line.
+# * If this function was called with piped input, pipe such input to the command
+#   line; otherwise, run the command line as is.
+#
+# For example:
+#
+# string run_with_options(
+#   string command_prefix,
+#   string list_options_name1, string list_options_name2, ...,
+#   "--",
+#   string command_arg1, string command_arg2, ...)
+
 #FUXME: Awkward nomenclature, really. How about simply
 #run_quietly_and_get_exit_status()? Same number of characters but reads simpler.
 #The run_redirecting_*()-style nomenclature makes inherent sense as the
