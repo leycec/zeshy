@@ -1,0 +1,168 @@
+#!/usr/bin/env zsh
+# ====================[ option                             ]====================
+#
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2012 by Cecil Curry.
+# See "COPYING" for additional details.
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Handle dynamically constructed command lines passed options lists.
+
+# ....................{ RUNNERS ~ options                  }....................
+#FIXME: Ah; it's not an objection, more a... curiosity. But how are pipes
+#handled in relation to the call stack, exactly? We'd really like one-liners
+#such as "ls -o --type=full * | grep -v yumyum | less -o" to work as
+#expected. I suspect the shell already handles this correctly by running
+#each pipe command as the root of its own call stack in a separate subshell...
+#Hmm; but, in that case, such subshells would be marked as non-interactive.
+#In any case, we'll just have to test such pipes ourselves and see what Zsh
+#comes up with. (We should be able to hack it up in our favor, but...)
+#FIXME: *NO, NO, NO.* The above heavy-weight solution is horrible. It's
+#horribly inefficient. It's horribly complex. It's a big fail. Here's what
+#we're going to do instead. It's not pretty, but we have to do it anyway to
+#support arbitrary option passing when interactive: for *MOST* functions with
+#existing interactive aliases, we need to divert such aliases to a new
+#function with name prefixed by "_interactive" accepting arbitrary options
+#and *NOT* passing "--". The original non-interactive function must, on the
+#other hand, explicitly pass "--". We've already excised the hard-coded "--"
+#from this function, so we're good to go. Look: I know it'll be unpleasant,
+#but we basically have little choice. It'll probably take two days from
+#starting to finishing such revisions.
+#
+#Example:
+#Define a new remove_file_interactively() function. Redefine interactive
+#alias "rm" to call such function rather than remove_file(). Do *NOT* change
+#the original remove_file(). And...we're good!
+
+document_function '
+string run_with_options(
+  string command_prefix,
+  string options_list_names,
+  string command_arg1, string command_arg2, ...)
+
+Construct a command from the passed arguments; then run such command: e.g.,
+
+  # Run grep recursively with the passed list of options and user arguments,
+  # paging standard output if required.
+  >>> run_with_options "run_paged grep"\
+  ...   "ZESHY_GREP_OPTIONS ZESHY_GREP_OPTIONS_IF_RECURSIVE" "${(q)@}"
+
+Specifically, this function:
+
+* Splits the passed string of options list names on whitespace into a list of
+  the names of all lists with options to be passed to such command (e.g., splits
+  "ZESHY_GREP_OPTIONS ZESHY_GREP_OPTIONS_IF_RECURSIVE" into a list containing
+  "ZESHY_GREP_OPTIONS" and "ZESHY_GREP_OPTIONS_IF_RECURSIVE").
+* Sets the command to be run to pipe standard input if this function was piped
+  such input or to the empty string otherwise (e.g., "cat /dev/stdin |" or "").
+* Appends the passed prefix to such command (e.g., "run_paged grep -R").
+* For every list name in such list:
+  * If that list exists, append all elements of that list to such command.
+  * Else print a warning.
+* Append the passed arguments to such command (e.g., "${(q)@}").
+* Run such command (e.g., assuming the caller passed a single argument ''Weeds''
+  and piped no input and the above options lists contain default elements,
+  "run_paged grep --extended-regexp --no-messages --recursive ''Weeds''").
+'
+function run_with_options() {
+    # Validate passed arguments.
+    die_unless_args_2_or_more\
+        'expected one command prefix, one list name, and optional command arguments'
+    string __command_prefix__="${1}" __dash_index__
+    list __command__ __options_list_names__
+
+    # Split the whitespace-delimited string of option list names into a list of
+    # such names, to be interpolated below.
+    set_list_to_string_split_on_words __options_list_names__ "${2}"
+    shift_two_args
+
+    # If passed piped input, propagate such input to the command to be run.
+    is_standard_input_piped and __command__=( cat '/dev/stdin' \| )
+
+    # Append such prefix split into shell words to such line.
+    __command__+="${(z)__command_prefix__}"
+
+    # For such options list name, append the contents of such list to such
+    # command or print a warning if no such list exists.
+    for __options_list_name__ ("${__options_list_names__[@]}") {
+        if is_list "${__options_list_name__}"
+        then __command__+=( "${(@P)__options_list_name__}" )
+        else cry "list \"${__options_list_name__}\" not found"
+        fi
+    }
+
+    # Append all remaining passed arguments to such command.
+    __command__+=( "${@}" )
+
+    # Run such command.
+#   print_string "run_with_options: ${__command__[@]}..."
+    run "${__command__[@]}"
+}
+
+document_function '
+string run_with_options_quietly(
+  string command_prefix,
+  string options_list_names,
+  string command_arg1, string command_arg2, ...)
+
+Construct a command from the passed arguments; then run such command quietly
+(i.e., with neither terminal output or interactive input). To do so, append
+" ${list_name_first}_IF_SHELL_NON_INTERACTIVE" to the passed string of list
+names, where ${list_name_first} is the first list name in such string; then
+call run_with_options() on such arguments.
+'
+function run_with_options_quietly() {
+    # Validate passed arguments.
+    die_unless_args_2_or_more\
+        'expected one command prefix, one list name, and optional command arguments'
+
+    # The first shell word from the list of options list names, having the name
+    # of the options list to be suffixed below.
+    string __options_list_name_first__
+    __options_list_name_first__="$(get_string_word "${2}" 1)"
+
+    # Append a non-interactive-specific options list name, regardless of whether
+    # the current shell is interactive.
+    2+=" ${__options_list_name_first__}_IF_SHELL_NONINTERACTIVE"
+
+    # Run such command.
+    run_quietly run_with_options "${@}"
+}
+
+document_function '
+string run_with_options_configured(
+  string command_prefix,
+  string options_list_names,
+  string command_arg1, string command_arg2, ...)
+
+Construct a command from the passed arguments contextually depending on whether
+or not the current shell is interactive; then run such command. To do so, append
+" ${list_name_first}_IF_SHELL_INTERACTIVE" if this shell is interactive or
+" ${list_name_first}_IF_SHELL_NON_INTERACTIVE" otherwise to the passed string of
+list names, where ${list_name_first} is the first list name in such string; then
+call run_with_options() on such arguments.
+'
+function run_with_options_configured() {
+    # Validate passed arguments.
+    die_unless_args_2_or_more\
+        'expected one command prefix, one list name, and optional command arguments'
+
+    # The first shell word from the list of options list names, having the name
+    # of the options list to be suffixed below.
+    string __options_list_name_first__
+    __options_list_name_first__="$(get_string_word "${2}" 1)"
+
+    # Append another options list name corresponding to whether the current
+    # shell is interactive or not.
+    if is_shell_interactive
+    then 2+=" ${__options_list_name_first__}_IF_SHELL_INTERACTIVE"
+    else 2+=" ${__options_list_name_first__}_IF_SHELL_NONINTERACTIVE"
+    fi
+
+    # Run such command.
+    run_with_options "${@}"
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#ensure the resulting command
+#does *NOT* request input from the current user
