@@ -9,31 +9,6 @@
 # Handle dynamically constructed command lines passed options lists.
 
 # ....................{ RUNNERS ~ options                  }....................
-#FIXME: Ah; it's not an objection, more a... curiosity. But how are pipes
-#handled in relation to the call stack, exactly? We'd really like one-liners
-#such as "ls -o --type=full * | grep -v yumyum | less -o" to work as
-#expected. I suspect the shell already handles this correctly by running
-#each pipe command as the root of its own call stack in a separate subshell...
-#Hmm; but, in that case, such subshells would be marked as non-interactive.
-#In any case, we'll just have to test such pipes ourselves and see what Zsh
-#comes up with. (We should be able to hack it up in our favor, but...)
-#FIXME: *NO, NO, NO.* The above heavy-weight solution is horrible. It's
-#horribly inefficient. It's horribly complex. It's a big fail. Here's what
-#we're going to do instead. It's not pretty, but we have to do it anyway to
-#support arbitrary option passing when interactive: for *MOST* functions with
-#existing interactive aliases, we need to divert such aliases to a new
-#function with name prefixed by "_interactive" accepting arbitrary options
-#and *NOT* passing "--". The original non-interactive function must, on the
-#other hand, explicitly pass "--". We've already excised the hard-coded "--"
-#from this function, so we're good to go. Look: I know it'll be unpleasant,
-#but we basically have little choice. It'll probably take two days from
-#starting to finishing such revisions.
-#
-#Example:
-#Define a new remove_file_interactively() function. Redefine interactive
-#alias "rm" to call such function rather than remove_file(). Do *NOT* change
-#the original remove_file(). And...we're good!
-
 document_function '
 string run_with_options(
   string command_prefix,
@@ -68,35 +43,35 @@ function run_with_options() {
     # Validate passed arguments.
     die_unless_args_2_or_more\
         'expected one command prefix, one list name, and optional command arguments'
-    string __command_prefix__="${1}" __dash_index__
-    list __command__ __options_list_names__
+    string command_prefix__rwo="${1}"
+    list command__rwo options_list_names__rwo
 
     # Split the whitespace-delimited string of option list names into a list of
     # such names, to be interpolated below.
-    set_list_to_string_split_on_words __options_list_names__ "${2}"
+    set_list_to_string_split_on_words options_list_names__rwo "${2}"
     behead_args_2
 
     # If passed piped input, propagate such input to the command to be run.
-    is_standard_input_piped and __command__=( cat '/dev/stdin' \| )
+    is_standard_input_piped and command__rwo=( cat '/dev/stdin' \| )
 
     # Append such prefix split into shell words to such line.
-    __command__+="${(z)__command_prefix__}"
+    command__rwo+="${(z)command_prefix__rwo}"
 
     # For such options list name, append the contents of such list to such
     # command or print a warning if no such list exists.
-    for __options_list_name__ ("${__options_list_names__[@]}") {
-        if is_list "${__options_list_name__}"
-        then __command__+=( "${(@P)__options_list_name__}" )
-        else cry "list \"${__options_list_name__}\" not found"
+    for options_list_name__rwo ("${options_list_names__rwo[@]}") {
+        if is_list "${options_list_name__rwo}"
+        then command__rwo+=( "${(@P)options_list_name__rwo}" )
+        else cry "list \"${options_list_name__rwo}\" not found"
         fi
     }
 
     # Append all remaining passed arguments to such command.
-    __command__+=( "${@}" )
+    command__rwo+=( "${@}" )
 
     # Run such command.
-#   print_string "run_with_options: \"${__command__[*]}\"..."
-    run "${__command__[@]}"
+#   print_string "run_with_options: \"${command__rwo[*]}\"..."
+    run "${command__rwo[@]}"
 }
 
 document_function '
@@ -118,15 +93,29 @@ function run_with_options_silently() {
 
     # The first shell word from the list of options list names, having the name
     # of the options list to be suffixed below.
-    string __options_list_name_first__
-    __options_list_name_first__="$(get_string_word "${2}" 1)"
+    string options_list_name_first__rwos
+    options_list_name_first__rwos="$(get_string_word "${2}" 1)"
 
-    # Append a non-interactive-specific options list name, regardless of whether
-    # the current shell is interactive.
-    2+=" ${__options_list_name_first__}_IF_SHELL_NONINTERACTIVE"
+    # For each options list name given below, append such name to the passed
+    # list of such names if such list exists.
+    is_list "${options_list_name_first__rwos}_IF_SILENT" and
+        2+=" ${options_list_name_first__rwos}_IF_SILENT"
+    is_list "${options_list_name_first__rwos}_IF_SHELL_NONINTERACTIVE" and
+        2+=" ${options_list_name_first__rwos}_IF_SHELL_NONINTERACTIVE"
+#   for options_list_name__rwos (
+#       "${options_list_name_first__rwos}_IF_SILENT"
+#       "${options_list_name_first__rwos}_IF_SHELL_NONINTERACTIVE") {
+#       is_list "${options_list_name__rwos}" and
+#           2+=" ${options_list_name__rwos}"
+#   }
 
-    # Run such command.
-    run_silently run_with_options "${@}"
+    # Run such command. Avoid prepending such command with a call to
+    # run_silently(), which also inadvertently silences error output from
+    # run_with_options(). In particular, don't do this:
+    #
+    #     >>> run_silently run_with_options "${@}"
+#   print "running silently: ${*}"
+    run_with_options "${@}" '1>&2'
 }
 
 document_function '
@@ -147,22 +136,55 @@ function run_with_options_configured() {
     die_unless_args_2_or_more\
         'expected one command prefix, one list name, and optional command arguments'
 
-    # The first shell word from the list of options list names, having the name
-    # of the options list to be suffixed below.
-    string __options_list_name_first__
-    __options_list_name_first__="$(get_string_word "${2}" 1)"
+    # The first shell word from the list of options list names, comprising the
+    # name of the options list to be suffixed below.
+    string options_list_name_first__rwoc
+    options_list_name_first__rwoc="$(get_string_word "${2}" 1)"
 
-    # Append another options list name corresponding to whether the current
-    # shell is interactive or not.
+    # If an options list with name corresponding to whether the current shell is
+    # interactive or not exists, append such name to the passed list of such
+    # names if such list exists.
+    string options_list_name__rwoc
     if is_shell_interactive
-    then 2+=" ${__options_list_name_first__}_IF_SHELL_INTERACTIVE"
-    else 2+=" ${__options_list_name_first__}_IF_SHELL_NONINTERACTIVE"
+    then options_list_name__rwoc="${options_list_name_first__rwoc}_IF_SHELL_INTERACTIVE"
+    else options_list_name__rwoc="${options_list_name_first__rwoc}_IF_SHELL_NONINTERACTIVE"
     fi
+    is_list "${options_list_name__rwoc}" and
+        2+=" ${options_list_name__rwoc}"
 
     # Run such command.
     run_with_options "${@}"
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Append a non-interactive-specific options list name, regardless of whether
+    # the current shell is interactive.
+#   2+=" ${options_list_name_first__rwos}_IF_SHELL_NONINTERACTIVE"
+
+#FUXME: Ah; it's not an objection, more a... curiosity. But how are pipes
+#handled in relation to the call stack, exactly? We'd really like one-liners
+#such as "ls -o --type=full * | grep -v yumyum | less -o" to work as
+#expected. I suspect the shell already handles this correctly by running
+#each pipe command as the root of its own call stack in a separate subshell...
+#Hmm; but, in that case, such subshells would be marked as non-interactive.
+#In any case, we'll just have to test such pipes ourselves and see what Zsh
+#comes up with. (We should be able to hack it up in our favor, but...)
+#FUXME: *NO, NO, NO.* The above heavy-weight solution is horrible. It's
+#horribly inefficient. It's horribly complex. It's a big fail. Here's what
+#we're going to do instead. It's not pretty, but we have to do it anyway to
+#support arbitrary option passing when interactive: for *MOST* functions with
+#existing interactive aliases, we need to divert such aliases to a new
+#function with name prefixed by "_interactive" accepting arbitrary options
+#and *NOT* passing "--". The original non-interactive function must, on the
+#other hand, explicitly pass "--". We've already excised the hard-coded "--"
+#from this function, so we're good to go. Look: I know it'll be unpleasant,
+#but we basically have little choice. It'll probably take two days from
+#starting to finishing such revisions.
+#
+#Example:
+#Define a new remove_file_interactively() function. Redefine interactive
+#alias "rm" to call such function rather than remove_file(). Do *NOT* change
+#the original remove_file(). And...we're good!
+
 #ensure the resulting command
 #does *NOT* request input from the current user
