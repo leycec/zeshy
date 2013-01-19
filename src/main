@@ -110,6 +110,7 @@ export ZESHY_ZSH_VERSION_REQUIRED=5.0.0
 # Absolute paths for Zeshy-specific directories and files. See commentary below.
 export\
     ZESHY_HOME\
+    ZESHY_HOME_IS_DOT_DIGEST_FILE_DEPENDENCY\
     ZESHY_DOT_DIR\
     ZESHY_DOT_DIR_BASENAME\
     ZESHY_DOT_CACHE_DIR\
@@ -775,10 +776,12 @@ local -a arg_shell_options
 #
 # For readability, map short- to long-form options. Map option
 # "--no-zeshy-dot-dir" to "--zeshy-dot-dir", thus implicitly setting the latter
-# option with the option string on parsing the former option.
+# to the empty string on parsing the former.
 zparseopts -M -D -E -A arg_options --\
     h=-help -help \
-    v=-version -version\
+    v=-verbose -verbose\
+    -test-zeshy-mtime\
+    -version\
     c+:=arg_shell_commands -command+:=arg_shell_commands\
     o+:=arg_shell_options -option+:=arg_shell_options\
     -zeshy-dot-dir:: -no-zeshy-dot-dir=-zeshy-dot-dir ||
@@ -855,7 +858,6 @@ Directory from which Zeshy reads user themes, plugins, etc.
 '
 ZESHY_DOT_OVERLAY_DIR="${ZESHY_DOT_DIR}/overlay"
 
-#FIXME: Rename to ZESHY_DOT_CACHE_DIGEST_FILE.
 set_global_documentation ZESHY_DOT_DIGEST_FILE '
 string ZESHY_DOT_DIGEST_FILE
 
@@ -865,7 +867,6 @@ file is user-specific.
 '
 ZESHY_DOT_DIGEST_FILE="${ZESHY_DOT_CACHE_DIR}/digest.zwc"
 
-#FIXME: Rename to ZESHY_DOT_CACHE_VERSION_FILE.
 set_global_documentation ZESHY_DOT_VERSION_FILE '
 string ZESHY_DOT_VERSION_FILE
 
@@ -873,26 +874,46 @@ File to which Zeshy caches its version specifier (e.g., to detect upgrades).
 '
 ZESHY_DOT_VERSION_FILE="${ZESHY_DOT_CACHE_DIR}/version"
 
-# ....................{ LOAD                               }....................
-set_function_documentation source_zeshy_script '
-void source_zeshy_script(string filename1, string filename2, ...)
-
-Source the passed Zeshy scripts with no arguments in the passed order.
-'
-function source_zeshy_script() {
-    # Validate passed arguments.
-    (( # >= 1 )) || die 'expected at least one filename'
-
-    for filename ("${@}") {
-        # If such filename is prefixed with no dirname and hence is only a
-        # basename,  prefix such basename with Zeshy's top-level directory.
-        [[ "${filename}" == *'/'* ]] || filename="${ZESHY_HOME}/${filename}"
-
-        # Source such Zeshy script.
-        source -- "${filename}"
-    }
+# ....................{ OPTIONS ~ startup                  }....................
+# If Zeshy's codebase resides in a directory with basename "src", implicitly
+# enable all options below. Such options are generally desirable when debugging
+# Zeshy's developer-specific codebase, naturally residing under directory "src".
+# In other words, this is a special case facilitating developer torpitude.
+# (Hopefully, the cost of such test for non-developers is negligible......)
+[[ "${ZESHY_HOME}" == *'/src' ]] && {
+    arg_options[--test-zeshy-mtime]=
+    arg_options[--verbose]=
 }
 
+set_alias_documentation is_zeshy_verbose_and '
+string is_zeshy_verbose_and<
+  string command_name, string command_arg1, string command_arg2, ...>
+
+If Zeshy''s user configuration enables debugging, run the passed command; else,
+perform a no-op (i.e., return true without running anything).
+'
+# If the caller requests verbosity, define is_zeshy_verbose_and<> to run the
+# passed command; else, define such alias to ignore such command. The latter
+# reduces debug statements to constant time noops, simulating the "compiling
+# away" of such statements under conventional high-level language optimization.
+if (( ${+arg_options[--verbose]} ))
+then alias is_zeshy_verbose_and=''
+else alias is_zeshy_verbose_and='true ||'
+fi
+
+set_global_documentation ZESHY_HOME_IS_DIGEST_FILE_DEPENDENCY '
+boolean ZESHY_HOME_IS_DIGEST_FILE_DEPENDENCY
+
+If true, Zeshy''s user digest file depends on all files and directories within
+Zeshy''s codebase, in which case changing any such file or directory will trigger
+recompilation of such digest on the next Zeshy startup.
+'
+# While is_zeshy_verbose_and<> is expanded frequently enough to warrant such
+# alias, this boolean is expanded only once elsewhere. Avoid alias overkill.
+(( ${+arg_options[--test-zeshy-mtime]} )) &&
+    ZESHY_HOME_IS_DIGEST_FILE_DEPENDENCY=true
+
+# ....................{ LOAD                               }....................
 # If sourcing the current script under zsh startup logic (e.g., from a zsh
 # script with basename matching either ".zlogin", ".zprofile", or ".zshrc"),
 # prevent zsh from reloading Zeshy if already loaded earlier during such logic.
@@ -948,10 +969,10 @@ if (( ZESHY_PID_LAST_LOADED_BY == $$ )); then
 #   * Calling all user-defined startup hooks.
 else
     # If the current shell is a login shell, set login-specific behavior.
-    [[ -o login ]] && source_zeshy_script login
+    [[ -o login ]] && source -- "${ZESHY_HOME}/login"
 
-    # Source all Zeshy configuration files and compile and load Zeshy's digest.
-    source_zeshy_script setup autoload
+    # Autoload Zeshy's user digest file, recompiling such file if needed.
+    source -- "${ZESHY_HOME}/digest"
 
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     #Note: this *MUST* be performed from a global rather than function context.
@@ -1052,7 +1073,7 @@ for placeholder arg_shell_option ("${arg_shell_options[@]}") {
 #
 # * Printing such synopsis as a single statement.
 # * Avoiding calling Zeshy-specific functions to do so.
-is_zeshy_debugging_and printf\
+is_zeshy_verbose_and printf\
     "zeshy: startup in %.4f seconds (wall clock)\n"\
     $(( EPOCHREALTIME - ZESHY_STARTUP_TIME_SECONDS ))
 
@@ -1072,6 +1093,29 @@ is_zeshy_debugging_and printf\
 return_true
 
 # --------------------( WASTELANDS                         )--------------------
+# In either case, such alias
+# eliminates the non-negligible cost of testing option
+# "--verbose" each debug statement, thus simulating conventional
+# debug statements.
+#
+# While zsh implements no conventional debug-specific builtins (e.g., assert()),
+# it does offer a sufficiently general-purpose, language-level device for
+# simulating such builtins: aliases.
+#
+# Conventional high-level language compilers and interpreters reduce debug
+# statements to noops when targeting release builds, eliminating the otherwise
+# non-negligible cost of such statements. While zsh provides no conventional
+# debug-specific builtins (e.g., assert), it does offer a general-purpose,
+# language-level mechanism for simulating such builtins: aliases.
+#
+# Default such alias to ignore the passed command. If Zeshy's user configuration
+# files enable debugging, redefine such alias after sourcing such files to run
+# the passed command instead.
+
+# If such scripts enable Zeshy debugging, redefine is_zeshy_verbose_and<>
+# defined at the top of this component to run the passed command instead.
+#FUXME: Rename to ZESHY_DOT_CACHE_DIGEST_FILE.
+#FUXME: Rename to ZESHY_DOT_CACHE_VERSION_FILE.
 #is -n "${ZESHY_IS_DEBUGGING-}" si and printf\
 #FUXME: Parse ${arg_options} and ${arg_shell_commands} here. Test a bit, of course.
 
