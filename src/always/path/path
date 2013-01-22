@@ -7,79 +7,16 @@
 #
 # --------------------( SYNOPSIS                           )--------------------
 # Handle paths and pathnames.
-#
-# --------------------( TODO                               )--------------------
-# * It'd be nice to render remove_filename() an uber-powerful meta-remove command used in
-#   place of "rmdir", "rm -rf *", etc. The essential ideas are:
-#   * Add a config file option ${ZESHY_IS_RECYCLING}, disabled by default but, when
-#     enabled, auto-moving all removed files to a new path
-#     "${ZESHY_RECYCLE_BIN)/$(date +'%N')/', the former defaulting to
-#     "${HOME}/tmp/zeshy.recycled". This effectively guarantees no
-#     collision (still test such collision, and simply repeat until non-colliding).
-#     I'll probably enable this locally, I imagine. Obviously, such auto-moving
-#     such test for sufficient free disk space on the mounted disk to be moved to
-#     prior to doing so and fail with error if insufficient disk space remains.
-#     *ALSO*, note that no recycling must be done on paths in the recycler: an "rm"
-#     within the recycler is always perma-death.
-#   * Add implicit support for "rmdir". Basically, if the passed path is an empty
-#     directory, use "rmdir"; otherwise, either "rm -ri ${DIRNAME}" or
-#     "rm -rI ${DIRNAME}", depending on how many files or subdirectories exist
-#     in such directory.
-# * It'd be nice to incorporate "zmv", for those who want and/or expect it.
-#   "zmv" is a built-in shell function applying extended glob patterns to
-#   the usual "mv" command, thus allowing batch renaming of file- and path-names.
-#   (Use option "-n" before permanently applying any such pattern, so as to
-#   prete[n]d- apply the pattern as initial "trial run;" or, use option "-i" to
-#   force "zmv" to [i]nteractively ask your permission to perform each rename.)
-#   For example: zmv -n '(*).txt' '$1.xtx'  # renames files ending in 'txt' to
-#   end in 'xtx'. Naturally, "zmv" is an autoloadable function: e.g.,
-#   autoload -U zmv
-# * O.K.; so, we should add a new trash_path(), implementing a trash bin-
-#   style move to "~/tmp" (if such path exists) or "/tmp/$(get_current_user)" if such
-#   path is creatable or already exists and is writable by the current user. This
-#   suggests a new "file/trash" component with getter get_trash_home(). If
-#   trash_path() is called from within get_trash_home(), it should:
-#
-#   * Die unless interactive.
-#   * Manually confirm such removals as under remove_file().
-#
-#   Since such functionality will doubtless enrage a substantial subset of the Zsh
-#   populace (and fair enough), this should be subject to a global boolean
-#   ${ZESHY_IS_RECYCLING}. Consider adding a new "ZESHY_RM_OPTIONS_IF_RECYCLING",
-#   as well. (Though, perhaps we don't need that?) Hmm; but perhaps the existing
-#   ${ZESHY_IS_REPLACING_CORE_COMMANDS} suffices.
-#
-#   Note the implementation needs to be partition-aware; specifically, if the
-#   target partition the target path resides on has insufficient space, ask the
-#   user whether they'd like to remove-in-place. This requires additional
-#   functionality elsewhere; namely:
-#
-#   * A new get_disk_size() in "device/disk", passed a disk device.
-#   * A new get_mount_point_from_path() in "device/disk", passed a pathname. The most
-#     efficient implementation for this function is probably to get a list of all
-#     mount points, dynamically OR such mount points together into a glob pattern
-#     or PCRE, and match such pathname against such pattern. The resulting $match
-#     is the desired mount point.
-#   * A new get_disk_from_mount_point() in "device/disk", passed a mount point
-#     pathname. The most efficient implementation for this function is probably just
-#     to glob the desired column of "blkid -o list" or "mount" for such mount point.
-#     No PCRE required. (Canonicalize the passed mount point first, yes? That
-#     helpfully removes trailing "/", as well.) Then, just call the following pipeline:
-#
-#     integer disk_size
-#     disk_size="$(get_disk_size "$(get_disk_from_mount_point "$(get_mount_point_from_path "${pathname}")")")"
-#     interactive_alias rm='trash_path'
-# * Replace "trash" in the prior discussion with "compost", a verb and noun with
-#   delectable connotations. Also, it would be quite nice if, much like compost,
-#   the compost heap were confined to a user-configurable percentage of total
-#   partition size -- defaulting to, say, 10%. Then configuring such percentage
-#   to 100% gives default Recycle Bin-like behavior (i.e., unintelligently
-#   filling up the entire partition with deleted refuse). The default, of
-#   course, behaves much more intelligently. On reaching full capacity, sort the
-#   immediate subpaths of the compost heap by ascending date and iteratively
-#   delete such subpaths starting from the first in this order until the compost
-#   heap subsides beneath the desired threshold. Behavior precisely resembles a
-#   genuine compost heap, which rather titillates my obscure fancy.
+
+#FIXME: It'd be nice to incorporate "zmv", for those who want and/or expect it.
+#"zmv" is a built-in shell function applying extended glob patterns to
+#the usual "mv" command, thus allowing batch renaming of file- and path-names.
+#(Use option "-n" before permanently applying any such pattern, so as to
+#prete[n]d- apply the pattern as initial "trial run;" or, use option "-i" to
+#force "zmv" to [i]nteractively ask your permission to perform each rename.)
+#For example: zmv -n '(*).txt' '$1.xtx'  # renames files ending in 'txt' to
+#end in 'xtx'. Naturally, "zmv" is an autoloadable function: e.g.,
+#autoload -U zmv
 
 # ....................{ EXCEPTIONS                         }....................
 document_function '
@@ -211,6 +148,45 @@ function get_path_dirname() {
     print_string "${1:h}"
 }
 
+# ....................{ GETTERS ~ size                     }....................
+document_function '
+integer get_path_size(string pathname)
+
+Get the size in bytes of the passed path. If such path is:
+
+* A directory, this is the recursive disk usage reported by the "du" command.
+* A symbolic link, this is the non-dereferenced file size of such link. To get
+  the dereferenced file or directory size of the non-symbolic target of such
+  link, explicitly call canonicalize_path() prior to this function.
+* Anything else (e.g., device node, plain file), this is the typical file size
+  reported by the "stat" command.
+
+Regardless of type, such size is always the physical space allocated to such
+path by the filesystem containing such path and *NOT* the logical space such
+path pretends to consume (e.g., due to contiguous runs of logical zeroes in the
+case of sparse files or redirection in the case of symbolic links).
+'
+function get_path_size() {
+    # Validate passed arguments.
+    die_unless_arg 'expected one pathname'
+    string pathname="${1}"
+    die_unless_path "${pathname}"
+
+    # If the passed path is a directory, get its recursive disk usage.
+    if is_dir "${pathname}"; then
+        get_string_word "$(run_with_options 'command du'\
+            'ZESHY_DU_OPTIONS ZESHY_DU_OPTIONS_IF_GETTING_DIR_SIZE' --\
+            "${(q)pathname}")" 1
+    # Otherwise, the passed path is a non-directory file (e.g., symbolic link,
+    # device node, plain file). Dismantled, this is:
+    #
+    # * "-L", preserving rather than dereferencing symbolic links. (In contrast
+    #   to some commands, zstat() dereferences by default.)
+    # * "+size", expanding to such file's size in bytes.
+    else zstat -L +size "${pathname}"
+    fi
+}
+
 #FIXME: Shift to "path" and complete implementation.
 #function remove_list_nonpaths() {
     # Filter non-extant paths from the passed paths. Dismantled, this is:
@@ -222,6 +198,11 @@ function get_path_dirname() {
 #}
 
 # --------------------( WASTELANDS                         )--------------------
+    # Dismantled, this is:
+    #
+    # * "-s", a summary of the form "4815162342 /the/numbers".
+    # * "-B1", in bytes rather than the default kilobytes.
+#   then get_string_word "$(command du -s -B1 "${pathname}")" 1
 # ....................{ ALIASES                            }....................
 #interactive_abbreviation {c}p{r}ecursive='copy_path_recursively'
 #interactive_abbreviation {r}m{r}ecursive='remove_path_recursively'

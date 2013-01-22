@@ -73,9 +73,6 @@
 #   * Zeshy configuration files, to be unconditionally copied into the user-
 #     specific "~/.zeshy/config" directory if not already found.
 
-#FIXME: Add support for sourcing all files directly under an overlay *IF* such
-#overlay is not the main overlay. An important user convenience, particularly for
-#smaller overlays not requiring a tree structure.
 #FIXME: It'd be awesomely inspiring to print an in-place rotating ANSI-fueled
 #progress sequence (i.e., "\-/|\-/|") during script sourcing. Namely, after
 #sourcing each script, rotate such sequence a single character. Naturally,
@@ -86,22 +83,43 @@
 
 # ....................{ GLOBALS                            }....................
 document_global '
-list_set ZESHY_RUNNABLES_TO_MAKE_ZESHY
+list_set ZESHY_MAKE_ZESHY_COMMANDS
 
 List of commands to be run before compiling Zeshy''s user digest file.
 '
 
-# ....................{ APPENDERS                          }....................
+# ....................{ SOURCERS                           }....................
 document_function '
-void append_make_zeshy_command(string command)
+void source_zeshy_configuration(void)
 
-Append the passed command to the end of the definition of make_zeshy().
-Zeshy calls such function and hence command immediately after compiling the
-Zeshy digest file.
+Source all configuration files in Zeshy''s user configuration directory specific
+to the current shell, creating such directory if needed. Such files include:
+
+* All plain files in such directory.
+* If the current shell is interactive, all plain files in subdirectory
+  "if_shell_interactive" of such directory.
 '
-function append_make_zeshy_command() {
-    (( # == 1 )) || die 'expected one command'
-    ZESHY_RUNNABLES_TO_MAKE_ZESHY+="${1}"
+function source_zeshy_configuration() {
+    # Validate sanity. Unless loading Zeshy's user directory and Zeshy's user
+    # configuration directory exists, return silently.
+    (( # == 0 )) || die 'expected no arguments'
+    [[ -n "${ZESHY_DOT_DIR}" && -d "${ZESHY_DOT_CONFIG_DIR}" ]] || return 0
+
+    # List of all scripts in such directory applicable to the current shell,
+    # Dismantled, this is:
+    #
+    # * "*(-.)", matching all plain files after resolving symbolic links.
+    local -a config_filenames; config_filenames=(
+        "${ZESHY_DOT_CONFIG_DIR}/"*(-.) )
+    [[ -o interactive ]] && config_filenames+=(
+        "${ZESHY_DOT_CONFIG_DIR}/if_shell_interactive/"*(-.) )
+
+    # If at least one such script exists, source such scripts; else, avoid
+    # calling source_zeshy_script() with no arguments throwing an exception.
+    (( ${#config_filenames} )) &&
+        for config_filename ("${config_filenames[@]}") {
+            source -- "${config_filename}"
+        }
 }
 
 # ....................{ COMPILERS                          }....................
@@ -290,6 +308,21 @@ function compile_zeshy_source() {
         source -- "${script_filename}"
 #       say "sourced \"${autoload_function_filename}\"."
     }
+
+    # Source Zeshy's user configuration files:
+    #
+    # * *AFTER* sourcing the main Zeshy codebase, ensuring such files may expand
+    #   standard aliases (e.g., string_export_global<>).
+    # * *BEFORE* calling compile_zeshy_teardown() obtaining the list of newly
+    #   declared globals, ensuring serialization of globals such files defined
+    #   into Zeshy's user digest file.
+    #
+    # The latter point is particularly important. Serializing configuration-
+    # specific globals into the user digest suggests that the configuration need
+    # *NOT* be sourced on every Zeshy startup but only during recompilation, an
+    # efficiency improvement.
+#   which string_global_export
+    source_zeshy_configuration
 }
 
 document_function '
@@ -305,7 +338,6 @@ function compile_zeshy_teardown() {
     ZESHY_ALIAS_NAMES_NEW=( ${(f)"$(alias +)"} )
     ZESHY_SUFFIX_ALIAS_NAMES_NEW=( ${(f)"$(alias +s)"} )
     ZESHY_GLOBAL_NAMES_NEW=( ${(f)"$(typeset +gx)"} )
-#   ZESHY_GLOBAL_NAMES_NEW=( ${${(f)"$(typeset +g +)"}##* } )
 
     # The lists of Zeshy-specific aliases and globals are the asymmetric
     # differences of the old from new lists of aliases and globals, which
@@ -334,28 +366,36 @@ function compile_zeshy_digest() {
     # Validate sanity.
     (( # == 0 )) || die 'no arguments expected'
 
-    # Call functions that
-    # make_zeshy_startup_functions_defining_aliases_and_globals() makes at the
-    # beginning of Zeshy startup, arbitrarily defining globals prior to aliases.
-    # While order should not matter here, you never really know.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    #ORDER IS SUBTLY IMPORTANT HERE (i.e., cranky graemlins slumber within).
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Finalize all aliases, functions, and globals to be compiled into Zeshy's
+    # user digest file *BEFORE* compiling such file and prepending commands to
+    # startup_zeshy(). The latter ensures startup_zeshy_aliases() and
+    # startup_zeshy_globals() to *ALWAYS* be the first functions called by
+    # startup_zeshy(), ensuring aliases and globals to always be defined at the
+    # "start" of Zeshy startup, ensuring subsequent functions may always safely
+    # expand any Zeshy alias or global.
+    make_zeshy
+
+    # Call functions make_zeshy_functions_startup_aliases_and_globals() makes at
+    # the start of Zeshy startup, arbitrarily defining globals before aliases.
     prepend_startup_zeshy_command startup_zeshy_aliases
     prepend_startup_zeshy_command startup_zeshy_globals
 
-    # Make startup_zeshy() and friends.
-    append_make_zeshy_command make_zeshy_startup_functions
+    # Define top-level Zeshy startup functions (e.g., startup_zeshy()).
+    make_zeshy_functions_startup
 
-    # Make startup_zeshy_aliases() and startup_zeshy_globals() *AFTER DEFINING
-    # ALL OTHER ZESHY-SPECIFIC FUNCTIONS*. This is a hard requirement, as this
-    # function necessarily defines the list of such functions. (Fugly, fugly,
-    # fugly. But there seem little sane alternatives, in this case.)
-    append_make_zeshy_command\
-        make_zeshy_startup_functions_defining_aliases_and_globals
+    # Define mid-level Zeshy startup functions startup_zeshy_aliases() and
+    # startup_zeshy_globals() *AFTER* defining all other Zeshy functions. The
+    # latter function defines a global listing all Zeshy functions and hence
+    # must be the last function to define such functions. Subtle dragons lie.
+    make_zeshy_functions_startup_aliases_and_globals
 
-    # Run all commands previously added to ${ZESHY_COMMANDS_TO_MAKE_ZESHY}.
-    make_zeshy
-
-    # If loading Zeshy's user directory, compile Zeshy-specific functions into
-    # the digest file in such directory.
+    # If loading Zeshy's user directory, compile all Zeshy functions excluding
+    # those defined by top-level components (e.g., "main", "digest") into
+    # Zeshy's user digest file.
     [[ -n "${ZESHY_DOT_DIR}" ]] &&
         zcompile -c -- "${ZESHY_DOT_DIGEST_FILE}" "${ZESHY_FUNCTION_NAMES[@]}"
 }
@@ -397,7 +437,7 @@ function compile_zeshy_overlay() {
     # Source all configuration files in such overlay's configuration directory.
     # Do so prior to all other overlay logic depending on globals defined by
     # such files.
-    compile_zeshy_overlay_configs "${overlay_dir}"
+    compile_zeshy_overlay_configuration "${overlay_dir}"
 
     # If such overlay is *NOT* the topmost system-wide overlay, append all
     # scripts in such overlay's directory. The topmost system-wide overlay
@@ -425,18 +465,17 @@ function compile_zeshy_overlay() {
 }
 
 document_function '
-void compile_zeshy_overlay_configs(string overlay_dirname)
+void compile_zeshy_overlay_configuration(string overlay_dirname)
 
 Recursively copy all files from the "if_config" subdirectory of the passed
 overlay directory to Zeshy''s user configuration directory, if not already found
-in the latter; then source such files.
+in the latter.
 '
-function compile_zeshy_overlay_configs() {
-    # Validate passed arguments.
+function compile_zeshy_overlay_configuration() {
+    # Validate passed arguments. If such overlay contains no configuration
+    # subdirectory, return silently.
     (( # == 1 )) || die 'expected one overlay dirname'
     local overlay_config_dir="${1}/if_config"
-
-    # If such overlay contains no configuration subdirectory, return silently.
     [[ -d "${overlay_config_dir}" ]] || return 0
 
     #FIXME: This'd be a nice place to add update handling for patching locally
@@ -483,12 +522,9 @@ function compile_zeshy_overlay_configs() {
         # Make such file's parent directory, if needed.
         command mkdir -p -- "${target_filename:h}"
 
-        # Copy such file.
+        # Copy such file. Do *NOT* source such file: most configuration files
+        # require aliases subsequently declared under the main Zeshy codebase.
         command cp -- "${source_filename}" "${target_filename}"
-
-        # Source such file.
-#       say "sourcing \"${target_filename}\"..."
-        source -- "${target_filename}"
     }
 }
 
@@ -533,30 +569,41 @@ function compile_zeshy_overlay_commands() {
 
 # ....................{ MAKERS                             }....................
 document_function '
-void make_zeshy(void)
+void append_make_zeshy_command(string command)
 
-Before compiling Zeshy''s digest file, finalize all aliases, functions, and
-globals to be compiled into such file. Specifically, run all commands added to
-global list ${ZESHY_RUNNABLES_TO_MAKE_ZESHY} (e.g., by previous calls to
-append_make_zeshy_command()).
+Append the passed command to the end of the definition of make_zeshy(), called
+immediately before compiling Zeshy''s user digest file.
 '
-function make_zeshy() {
-    (( # == 0 )) || die 'no arguments expected'
-    for command ("${ZESHY_RUNNABLES_TO_MAKE_ZESHY[@]}") run "${command}"
+function append_make_zeshy_command() {
+    (( # == 1 )) || die 'expected one command'
+    ZESHY_MAKE_ZESHY_COMMANDS+="${1}"
 }
 
 document_function '
-void make_zeshy_startup_functions_defining_aliases_and_globals(void)
+void make_zeshy(void)
+
+Finalize all Zeshy-specific aliases, functions, and globals to be compiled into
+Zeshy''s user digest file immediately before compiling such file. Specifically,
+run all commands added to global list ${ZESHY_MAKE_ZESHY_COMMANDS} (e.g., by
+prior calls to append_make_zeshy_command()).
+'
+function make_zeshy() {
+    (( # == 0 )) || die 'no arguments expected'
+    for command ("${ZESHY_MAKE_ZESHY_COMMANDS[@]}") run "${command}"
+}
+
+document_function '
+void make_zeshy_functions_startup_aliases_and_globals(void)
 
 Dynamically synthesize the following functions:
 
 * startup_zeshy_aliases(), defining regular, global, and suffix aliases.
 * startup_zeshy_globals(), defining globally exported variables.
 
-The subsequently synthesized startup_zeshy() calls both such functions before
-calling all other startup functions.
+Subsequently synthesized function startup_zeshy() calls both such functions
+before calling all other startup functions.
 '
-function make_zeshy_startup_functions_defining_aliases_and_globals() {
+function make_zeshy_functions_startup_aliases_and_globals() {
     # Validate sanity.
     (( # == 0 )) || die 'no arguments expected'
     local aliases suffix_aliases globals
@@ -684,10 +731,488 @@ ZESHY_ALIAS_NAMES=( ${alias_names_quoted[@]} )"
 # Recompile the Zeshy digest file.
 compile_zeshy
 
+#FIXME: This snippet used to reside in "if_config/posix" until I found it
+#sufficiently embarrassing. Frankly, we won't be implementing any functionality
+#using this anytime soon. Nonetheless, store it here for the moment:
+# ....................{ PREFERRED                          }....................
+# Preferred terminal multiplexer. If commented, Zeshy selects the first such
+# multiplexer installed on the current machine, if any.
+#ZESHY_TERMINAL_MULTIPLEXER='tmux'
+#ZESHY_TERMINAL_MULTIPLEXER='screen'
+#ZESHY_TERMINAL_MULTIPLEXER='dtach'
+#FIXME: This doesn't... seem quite right. Shouldn't this be uncommented. But,
+#again, it's clearly incorrect. Another half-implemented feature, eh?
+#ZESHY_TERMINAL_MULTIPLEXER="ZESHY_TERMINAL_MULTIPLEXER$(get_pathable_path_first tmux screen dtach)"
+
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: *GENIUS*. I've been gradually shifting to the following realization, and
+#unsure why it took me quite so long to glom: *SOURCE CONFIGURATION FILES !ONLY!
+#DURING DIGEST RECOMPILATION*. This should dramatically improve runtime
+#efficiency, effectively caching all config file globals to
+#zeshy_startup_globals() for subsequent restoration. Man, *MAKE THIS HAPPEN*.
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#Apallingly, failing to call the function defining alias
+#is_zeshy_verbose_and<> at the topmost level before calling functions
+#expanding such alias below results in such alias temporarily reverting to its
+#default definition only in such functions. (This is insanity, zsh.)
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# ....................{ ALIASES ~ variable                 }....................
+# Zeshy's user configuration files only export globals. While such files can
+# declare locals and non-exported globals via traditional zsh primitives (e.g.,
+# "typedef -Fr"), avoid promoting such bad behavior by aliasing human-readable
+# names to such primitives. Defer defining further aliases and documentation for
+# these specific aliases to the main Zeshy codebase.
+#alias\
+#    string_global_export='export'\
+#    boolean_global_export=string_global_export\
+#    character_global_export=string_global_export\
+#    integer_global_export='export -i'\
+#    float_global_export='export -F'\
+#    list_global_export='export -a'\
+#    list_set_global_export='export -Ua'\
+
+# "export -A" fails with error; "export -a", however, succeeds. *massive shrug*
+#alias map_global_export='typeset -Agx'
+#FUXME: After doing so, I'm not necessarily convinced there 
+#FUXME: Shift elsewhere, per lengthy discussion in "digest". Honestly, why don't
+#we just rename this component to "config" and shift the autoload_zsh_modules()
+#*INTO THE MAIN ZESHY CODEBASE*, *PREPENDED* (emphasis on prepended) to
+#startup_zeshy(). We *NEVER* call any such module functions here at the topmost
+#level -- and even if we did, we'd just replace such implicit autoload with an
+#explicit load of such module. Faster, simpler. Bam! :)
+# after defining aliases
+# required by such files. For efficiency, defer defining all other aliases to
+# Zeshy startup in the proper Zeshy codebase and hence compilation into the
+# Zeshy digest file. Redefine aliases defined below with such other aliases,
+# guaranteeing that:
+#
+# * Zeshy records all aliases defined below in global list ${ZESHY_ALIAS_NAMES},
+#   to be subsequently undefined if recompiling Zeshy in the current shell or a
+#   child of the current shell. (See "compile" for gruesome details.)
+# * Zeshy retrieves documentation for all aliases defined below in the same
+#   manner as such other aliases. (See "help" for miserable details.)#
+    # This matches all basenames of immediate files of directories in the function
+    # path. (Since this is also the set of all autoloadable function names,
+    # autoloading such basenames autoloads all autoloadable functions.) Oh!
+#       print 'enabling debugging'
+#       alias is_zeshy_verbose_and='true &&'
+    # * "/*", each immediate file and subdirectory of such directory.
+    # * "N", ignoring non-extant files and subdirectories.
+# ....................{ CONFIGURERS ~ main                 }....................
+#   for autoloadable_function_name in ${^fpath}/*(N.:t); do
+#FUXME: O.K.; because of this, it would seem prudent to split this component
+#into two new components "config" and "digest": the former defining the above
+#config-specific aliases, functions, and globals; the latter defining all
+#remaining objects declared in this component. While I'm somewhat loathe to
+#introduce yet another component into startup logic, the sheer inanity of this
+#behavior suggests we could benefit from doing so. After all, we must admit
+#that digest behavior is wholly separate from config file behavior.
+#FUXME: If splitting as described, digest behavior could actually be readily
+#merged into existing component "autoload". In such case, it could make sense
+#to do the following, in which case no actual split need take case *WHICH IS
+#ABSOLUTELY GREAT*:
+#
+#* Shift all digest behavior below to "autoload."
+#* Shift all zsh module-specific behavior in "autoload" here.
+#* Rename "autoload" to "digest" to better reflect its role.
+#
+#And that's it. *NO NEW TOPMOST COMPONENTS REQUIRED*, just a slight shuffling
+#of existing functionality for improved understandability.
+#FUXME: Yes. Make it so, I should think.
+
+    #FUXME: Many of the functions this function calls redundantly test
+    #"[[ -n "${ZESHY_DOT_DIR}" ]]" as well. Eliminate that.
+#   [[ -n "${ZESHY_DOT_DIR}" ]] || return 0
+    # Source Zeshy's user configuration files here, as such files define global
+    # ${ZESHY_IS_DEBUGGING} tested by functions called immediately below.
+#   setup_zeshy_configuration
+#   which is_zeshy_verbose_and
+#   is_zeshy_verbose_and print 'ok'
+
+#FUXME: If splitting as described, rename the above function to source_zeshy_configuration(),
+#which is really a much more sensible name in any case.
+#FUXME: Eliminate.
+#set_function_documentation setup_zeshy_digest_uptodate '
+#void setup_zeshy_digest_uptodate(void)
+#
+#Assuming Zeshy''s user digest file to be up-to-date, implement placeholders for
+#aliases and functions required only for compiling an outdated digest file.
+#'
+#function setup_zeshy_digest_uptodate() {
+#    # Validate sanity.
+#    (( # == 0 )) || die 'expected no arguments'
+#
+#    # Implement placeholders with zsh builtin ":" (i.e., noop).
+#    alias document_alias=':'
+#    alias document_function=':'
+#    alias document_global=':'
+#}
+
+#FUXME: O.K.; start using is_zeshy_verbose_and<> everywhere. Yum!
+
+#Parse the passed documentation, associating the global name prefixing such
+#documentation with such documentation and globally exporting such global as the
+#Zeshy-specific type prefixing such documentation. Expand this alias only before
+#compiling Zeshy''s user digest file.
+#FUXME: Use is_zeshy_verbose_and<> instead. This requires we shift such
+    #code to the very bottom of this component, but it makes everything nice and
+    #orthogonal. So, go-go-go!
+    #FUXME: This isn't right. Such configuration defines ${ZESHY_IS_DEBUGGING},
+    #used *ABOVE*. Clearly, config files should be sourced *BEFORE* testing the
+    #digest file, yes?
+
+#FUXME: For both efficiency and readability, define a new alias resembling:
+#
+#  alias inquisitively='[[ -n "${ZESHY_IS_DEBUGGING}" ]] &&'    # or perhaps...
+#  alias investigatively='[[ -n "${ZESHY_IS_DEBUGGING}" ]] &&'
+#
+#I'll admit neither adjective to be the best, but "debuggedly" simply doesn't
+#make sense. That said, we could also contemplate "if_zeshy_debugging" or
+#"is_zeshy_verbose_and"... Yes, the latter seems quite sensible, in fact. So,
+#where does the "efficiency" part come in? Pretty simple: we'd like to
+#effectively "compile away" all such statements under release builds: namely, if
+#${ZESHY_IS_DEBUGGING} is false *AFTER* sourcing user config files. In such
+#case, we can simply re-alias as follows:
+#
+#  alias is_zeshy_verbose_and='true ||'
+#
+#Brilliant! This reduces such test to a (hopefully) maximally fast no-op while
+#ensuring it evaluates to true and hence does not throw exceptions.
+#FUXME: After defining such alias, fixup all current references to
+#${ZESHY_IS_DEBUGGING} - particularly at the top level.
+    # Replacing all prior instances of '[[ -n "${ZESHY_IS_DEBUGGING}" ]] &&' in
+    # the Zeshy codebase with 'is_zeshy_verbose_and'
+    #
+    # If such configuration enables Zeshy debugging, expand such alias to the
+    # empty string, thus unconditionally running the passed command.
+#  alias investigatively='[[ -n "${ZESHY_IS_DEBUGGING}" ]] &&'
+#
+#I'll admit neither adjective to be the best, but "debuggedly" simply doesn't
+#make sense. That said, we could also contemplate "if_zeshy_debugging" or
+#"is_zeshy_verbose_and"... Yes, the latter seems quite sensible, in fact. So,
+#where does the "efficiency" part come in? Pretty simple: we'd like to
+#effectively "compile away" all such statements under release builds: namely, if
+#${ZESHY_IS_DEBUGGING} is false *AFTER* sourcing user config files. In such
+#case, we can simply re-alias as follows:
+#
+#  alias is_zeshy_verbose_and='true ||'
+
+#       say 'digest outdated!'
+#   print "ZESHY_DOT_DIGEST_FILE_IS_OUTDATED: ${ZESHY_DOT_DIGEST_FILE_IS_OUTDATED}"
+# non-zero only if such file was outdated at shell startup.
+    #FUXME: Not quite right. We need to set
+    #ZESHY_DOT_DIGEST_FILE_DEPENDENCY_NEWEST_MODIFICATION_TIME to the current
+    #time. Now how do we do that, again...?
+#* The main user-specific Zeshy configuration file. This file contains theme
+#  settings, which when edited require recompiling theme autoloads.
+#* The main system-wide command directories (e.g., "/bin", "/usr/bin").
+#  Installing or uninstalling commands requires recompiling command autoloads.
+
+#           if [[ "${function_name}" == *'[OR]'* ]]; then
+#FUXME: Shift is_zeshy_digest_outdated() here and cache the result into a global
+#variable, as subsequent components will also need reference such result. Shift
+#document_function() here as well. If Zeshy's digest file is outdated, define
+#document_function() and document_global() as below (i.e., nest such function
+#and alias definitions in a code or function block run only if outdated);
+#otherwise, define both document_function() and document_global() to be aliases
+#expanding to ":". Genius, no? This should ensure we incur no measurable
+#overhead when sourcing configuration files and *NOT* recompiling such digest.
+
+#Processes assigned to class 3 are idle-only processes scheduled when no other
+#process performs I/O. Class 3 processes are likely to suffer scheduling
+#starvation and hence appropriate only for background daemons.
+#FUXME: Document all such globals.
+#document_global '
+#list ZESHY_IONICE_CLASS_HIGH
+#
+#"ionice"-specific highest and lowest priority pairs consisting of class and
+#ioniceness for I/O scheduling of processes. Processes assigned to class 3
+#signify "idle-only" processes to be scheduled only when no other process
+#performs I/O. Since such processes are likely to suffer scheduling starvation,
+#omit class 3 from consideration.
+#; assigning class 2 to the default lowest priority class improves
+#process responsiveness.
+#'
+
+#       '/bin' '/sbin' '/usr/bin' '/usr/sbin' "${ZESHY_DOT_CONFIG_DIR}"/{,*}) {
+    #FUXME: We may need to explicitly unset ${documentation__dg} *ONCE* after
+    #sourcing all configuration files. We'll know whether we need to do so based on
+    #whether or not the current environment has become polluted with such variable
+    #after entering a new Zeshy shell.
+
+#FUXME: Should probably be pushed into "main". Ideally, this could allow us to
+#obsolete the lower-level set_*_documentation() family of functions in favor of
+#the higher-level document_*() family of functions. It will increase the size of
+#"main", but probably not by quite as much as thought -- after all, we'd also be
+#removing a sizable block of existing functionality: set_*_documentation().
+#Naturally, this requires moving document_*() and all conditional logic defining
+#such functions from here to "main".
+#FUXME: Since we'd like to declare such functionality as "early" as possible, we
+#should probably declare "set -e" at the top of "main" and then inject such code
+#immediately after "setopt" calls (i.e., before defining die(), say(), and
+#friends). This implies we should undo "set -e" immediately prior to defining
+#die(). (I recall we do something similar; just double-check us up.)
+#FUXME: Actually, the current method isn't terribly inappropriate. Steady as she
+#goes, folks!
+
+        # Nonetheless, reuse the same glob expression for simplicity.
+        # Hence, this glob expression matches more strictly than the function
+        # glob expression above. Dismantled, this is:
+
+#FUXME: Hopefully superfluous, after implementing document_global() properly.
+#Excise after excising from all config files.
+    # If Zeshy's user digest file is up-to-date, define placeholders for
+    # runnables required only for compiling an outdated digest file.
+
+    # * Loading Zeshy's user directory and
+#   [[ -n "${ZESHY_DOT_DIR}" &&\
+#FUXME: This looks *EXTREMELY* heavyweight. I'm concerned about expanding such
+#alias as much as we inevitably will be. Given that, I'm currently inclined to
+#reconsider aliasing document_global=':' when the digest file is not outdated.
+#This requires we retain variable declarations, which is probably a good idea.
+#   [[ -n "${(k)ZESHY_GLOBAL_TYPE_TO_DECLARATOR[(r)${match[1]}]-}" ]] ||
+    #FUXME: Insufficient. document_global() needs to *AT LEAST* declare such
+    #global based on the passed help string.
+    #FUXME: In reflection, declaring such global is basically the entirety of
+    #document_global(). We'd might as well just define the whole thing as is.
+#   alias document_global=':'
+
+    # Parse variable helpstring here. Since the first line is something like:
+    #
+    #     string ZESHY_ZSTRANGE
+    #
+    #     I''m a strange global. (But here I am.)
+    #
+    # ...this implementation can parse that line and produce the corresponding
+    # "export ZESHY_ZSTRANGE" line. No problem, yes? Most efficient
+    # implementation uses a dictionary lookup on the first shell word of such
+    # helpstring. Name the dictionary, say, ZESHY_GLOBAL_TYPE_TO_DECLARATOR.
+    # See initial definition above.
+
+#: e.g.,
+  # Declare ${THIS_IS_A_MAP} to be a global map.
+# >>> ${(z)ZESHY_GLOBAL_TYPE_TO_DECLARATOR[map]} THIS_IS_A_MAP
+#FUXME: Excise after converting all current configuration file global
+#declarations to the aliases below.
+#FUXME: Hmm; actually, we'll have to replicate the current document_function()
+#function into a new document_global() function defined here. And since we're
+#defining that function here, we'd might as well move document_function() from
+#"compile" here as well for sanity. Shouldn't be terribly difficult. The tedious
+#aspect will be in converting existing configuration files to call such
+#function. Well... no time like the present, yes?
+#FUXME: Ah; hmm. I note that we *COULD* define:
+#alias document_global='
+#{
+#    # Parse variable helpstring here. Since the first line is something like:
+#    #
+#    #     string ZESHY_ZSTRANGE
+#    #
+#    #     I'm a strange global. (But here I am.)
+#    #
+#    # ...this implementation can parse that line and produce the corresponding
+#    # "export ZESHY_ZSTRANGE" line. No problem, yes? Most efficient
+#    # implementation uses a dictionary lookup on the first shell word of such
+#    # helpstring. Name the dictionary, say, ZESHY_GLOBAL_TYPE_TO_DECLARATOR.
+#    # See initial definition above.
+#} <<<'
+#I am mildly concerned about the efficiency of sourcing configuration files with
+#numerous such alias expansions. If efficiency becomes a problem, just
+#implement a separate document_global() function. That then leaves us with code
+#resembling:
+#
+#document_global '
+#string ZESHY_ZSTRANGE
+#
+#I'm a strange global. (But here I am.)
+#'
+#string_global_export ZESHY_ZSTRANGE='lululululuuuuuu"
+#
+#The above alternative leaves us with:
+#
+#document_global '
+#string ZESHY_ZSTRANGE
+#
+#I'm a strange global. (But here I am.)
+#'
+#ZESHY_ZSTRANGE='lululululuuuuuu"
+#
+#FUXME: O.K.; so, in either case, we have a document_global() runnable. The
+#latter case is more concise and hence preferable, but somewhat less efficient
+#due to parsing overhead. Let's see how much it costs us. Simple experiment:
+#
+#* Temporarily force is_zeshy_digest_outdated() to return_false.
+#* Copy all of the existing config files to a new dir under "old/".
+#* Migrate existing config files to call document_global().
+#* Time startup under both! Hopefully, the overhead isn't hideously noticeable.
+#FUXME: The following aliases *SHOULD* already exist under "always/00-setup".
+#Ensure this to be the case; then, excise such aliases here.
+
+#       set_global_documentation "${match[2]}" "${documentation}"
+# print_function_documentation() to subsequently print such documentation.
+#       then set_function_documentation "${match[1]}" "${documentation}"
+# ....................{ EXPORTS                            }....................
+# Zeshy configuration files declare only global exports. While such files can
+# declare locals and non-exported globals with traditional Zsh primitives (e.g.,
+# "typedef -Fr"), avoid promoting such bad behavior by aliasing human-readable
+# names to such primitives. Delay defining all remaining Zeshy aliases to the
+# main Zeshy codebase.
+
+#is_zeshy_digest_outdated() returning true. Yes:
+#this is somewhat hackier than we prefer, but the alternatives are uglier.
+#   local -a path_plus_zeshy
+#   path_plus_zeshy=( "${path[@]}" "${ZESHY_DOT_CONFIG_DIR}/zeshy" )
+#   local path_plus_zeshy_glob="${(j~|~)${(q@)path_plus_zeshy}}"
+#   zeshy_dependency_mtimes+="$(zstat +mtime "${path_plus_zeshy_glob}")"
+
+    #FUXME: Definitely not right. We absolutely want to do this *AFTER*
+    #"always/shell/profile" establishes the global list "path"; then, replace
+    #the awkwardly hard-coded paths below with the following:
+    #
+    #    for dependency_pathname ("${path[@]}" "${ZESHY_DOT_CONFIG_DIR}"/{,*}) {
+    #
+    #Concise; awesome; and exactly what's needed. We'll probably just want to
+    #extricate the setting of the ${PATH} currently performed by
+    #"always/shell/profile" to somewhere directly under "src/" -- perhaps this
+    #component? There's really no reason to perform such logic *ONLY* under a
+    #login shell; ideally, the ${PATH} should always be "fixed up" on Zeshy
+    #startup. After all, either the user or a script could destroy the ${PATH}
+    #after login, in which case we really wouldn't want to trust its current
+    #setting. So, fix it up to guarantee sane behavior.
+    #FUXME: We can substantially optimize this, I believe. Cease appending
+    #modification times to list ${dependency_mtimes}; instead, perform a single
+    #call to $(zstat +mtime ...) with a single argument selecting the oldest
+    #such path that exists:
+    #
+    # zstat +mtime (if_shell_interactive|posix)(e:'[[ -e $REPLY ]]':om[1])
+    #
+    #That works at the shell. Given that, how about a generalization:
+    #
+    # zstat +mtime (~dependency_pathname_glob)(e:'[[ -e $REPLY ]]':om[1])
+
+#
+    # Dismantled, this is:
+    #
+    # * "${ZESHY_DOT_CONFIG_DIR}"/{,*}, expanding to the current user's Zeshy
+    #   configuration dirname and all filenames under such dirname, thus
+    #   reporting Zeshy to be outdated on adding, deleting, or editing a Zeshy
+    #   configuration file.
+#   local dependency_pathname_glob
+#   : ${dependency_pathname_glob::=\'${^path}\'}
+#   dependency_pathname_glob="${path}|${ZESHY_DOT_CONFIG_DIR}/zeshy"
+#   ="${path}|${ZESHY_DOT_CONFIG_DIR}/zeshy"
+
+    #FUXME: Mostly right. Note that for safe generality, however, reserved glob
+    #characters in pathnames should be prefixed by "\" to prevent usage as glob
+    #characters. Fine for now, but of some importance later.
+#   local -a path_quoted
+#   path_quoted=( \'${^path}\' "${ZESHY_DOT_CONFIG_DIR}/zeshy" )
+#   local path_quoted_glob="${(j:|:)path_quoted}"
+
+    #FUXME: Rename "ZESHY_IS_DEBUGGING" to "ZESHY_IS_IN_DEVELOPMENT". :)
+    # * "${ZESHY_DOT_CONFIG_DIR}"/{,*}, expanding to the current user's Zeshy
+    #   configuration dirname and all filenames under such dirname, thus
+    #   reporting Zeshy to be outdated on adding, deleting, or editing a Zeshy
+    #   configuration file.
+    # If either or configuration directory do not exist or
+    # the latter exists but is empty, mark such file "outdated."
+    # Ensure the current user's Zeshy configuration directory and all non-extant
+    # parents of such directory exist.
+#   command mkdir -p -- "${ZESHY_DOT_CONFIG_DIR}"
+
+    # specifically including:
+    #
+    # * All plain files in such directory.
+    # * If the current shell is interactive, all plain files in subdirectory
+    #   "if_shell_interactive" of such directory.
+    #
+    # If the current shell is interactive and such directory contains a
+    # subdirectory "if_shell_interactive" containing at least one Zeshy script,
+    # source such scripts as above.
+#   config_filenames=( "${ZESHY_DOT_CONFIG_DIR}/if_shell_interactive/"*(-.) )
+
+# Booleans are false if set to the empty string and otherwise true.
+#
+# For simplicity, disable or enable booleans by commenting or uncommenting the
+# lines on which they appear (e.g., prefixing such lines with "#" or deleting
+# such prefix).
+
+    # subsequent logic
+    # sources the default versions of such files.
+
+#FUXME: All of the magic constants defined in "global" should be declared
+#frozen, perhaps suggesting new "string_global_constant",
+#"boolean_global_constant", and so on types in "alias".
+
+#FUXME: I'm not terribly fond of enabling booleans by setting them to 1. Avoid
+#such magic by defining the following magic in "global":
+#
+#string_global_constant ZESHY_BOOLEAN_TRUE=1 ZESHY_BOOLEAN_FALSE=''
+#
+#Then use below: e.g.,
+#ZESHY_IS_DEBUGGING=${ZESHY_BOOLEAN_TRUE}
+
+# void string_global_export(string variable_name)
+#
+# Globally declare a string exported to the calling shell.
+#alias string_global_export='export'
+
+# void boolean_global_export(string variable_name)
+#
+# Globally declare a boolean exported to the calling shell.
+#alias boolean_global_export='export'
+
+# void integer_global_export(string variable_name)
+#
+# Globally declare an integer exported to the calling shell.
+#alias integer_global_export='export -i'
+
+# void float_global_export(string variable_name)
+#
+# Globally declare a float exported to the calling shell.
+#alias float_global_export='export -F'
+
+# void list_global_export(list variable_name)
+#
+# Globally declare a list exported to the calling shell.
+#alias list_global_export='export -a'
+
+# void map_global_export(map variable_name)
+#
+# Globally declare a map exported to the calling shell.
+#alias map_global_export='typeset -Agx'   # "export -A" oddly fails with error;
+                                          # "export -a" succeeds, however (!?!)
+        # Source such file.
+#       say "sourcing \"${target_filename}\"..."
+#       source -- "${target_filename}"
+    #FUXME: Right. We can drastically reduce the size of the "config" component,
+    #now that we've made the load order much more sensible. Doing so permits us
+    #to shift that function here, which seems sensible. The fewer components the
+    #better, I should think.
+#   source -- "${ZESHY_HOME}/config"
+
+#, a hard
+    # requirement due to *THIS* function defining the global list of all Zeshy
+    # functions. (Fugly, fugly, fugly. But there seem little sane alternatives.)
+    # While order should *NOT* matter here, can we ever really know?
+#, and source such files.
+#   ZESHY_GLOBAL_NAMES_NEW=( ${${(f)"$(typeset +g +)"}##* } )
+#FUXME: Add support for sourcing all files directly under an overlay *IF* such
+#overlay is not the main overlay. An important user convenience, particularly for
+#smaller overlays not requiring a tree structure.
+    # Make startup_zeshy() and friends.
+#   append_make_zeshy_command make_zeshy_functions_startup
+
+    # Make startup_zeshy_aliases() and startup_zeshy_globals() *AFTER DEFINING
+    # ALL OTHER ZESHY-SPECIFIC FUNCTIONS*. This is a hard requirement, as this
+    # function necessarily defines the list of such functions. (Fugly, fugly,
+    # fugly. But there seem little sane alternatives, in this case.)
+#   append_make_zeshy_command\
+#       make_zeshy_functions_startup_aliases_and_globals
 # [[ && -o interactive ]] &&
 # List of commands to be run immediately before compiling Zeshy's digest file.
-#export -Ua ZESHY_RUNNABLES_TO_MAKE_ZESHY
+#export -Ua ZESHY_MAKE_ZESHY_COMMANDS
 #FUXME: Rename to append_make_zeshy_command(). Much more natural (...the
 #most important "make_zeshy" part comes first) and in keeping with nomenclature
 #elsewhere.
@@ -874,7 +1399,7 @@ compile_zeshy
     # directory with that function name to that file.
 #FIXME: Add support for storing defined globals and aliases in a single
 #startup_zeshy_globals() function. Naturally, do so prior to calling
-#make_zeshy_startup_functions().
+#make_zeshy_functions_startup().
 
 #   {
 #       print -rl -- "================[old function names]================" "${ZESHY_FUNCTION_NAMES_OLD[@]}"
