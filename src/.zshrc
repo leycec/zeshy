@@ -38,4 +38,4 @@ source -- "${ZESHY_HOME_SCRIPT}" "${(Qz)ZESHY_ARGS}"
 # --------------------( WASTELANDS                         )--------------------
 #source -- "${ZESHY_HOME_SCRIPT}" "${(z)ZESHY_ARGS}"
     #FUXME: ZESHY_ARGS="${@}" is wrong; we need to export a proper list, here.
-    #Verify that ".zshrc" actually imports a proper Zsh list.
+    #Verify that ".zshrc" actually imports a proper zsh list.

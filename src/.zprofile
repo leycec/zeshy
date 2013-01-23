@@ -11,9 +11,9 @@
 # ....................{ MAIN                               }....................
 # Clear global list ${path} and hence global string ${PATH}, if inherited from a
 # parent shell. Doing so allows Zeshy to reliably test whether or not the
-# canonical "/etc/zsh/zprofile" script sourced by Zsh immediately after sourcing
+# canonical "/etc/zsh/zprofile" script sourced by zsh immediately after sourcing
 # this script establishes a default login profile (e.g., by sourcing
-# "/etc/profile.env"). If it does, ${path} will be non-empty by the time Zsh
+# "/etc/profile.env"). If it does, ${path} will be non-empty by the time zsh
 # sources Zeshy's ".zshrc" script, which sources the main Zeshy script; else,
 # ${path} will remain empty. In the former case, the main Zeshy script must not
 # establish a default login profile (since "/etc/zsh/zprofile" has already done
