@@ -52,6 +52,17 @@
 # * Incorporate grml-zshrc functionality where helpful, currently available at:
 #   http://git.grml.org/f/grml-etc-core/etc/zsh/zshrc
 
+#FIXME: O.K.; I conceived a simple, but critical, technique for improving
+#Zeshy's robustness on upgrades: namely, *ALWAYS* explicitly source *ALL*
+#configuration files supplied by the current overlay on digest file recompilation
+#(i.e., from the overlay itself before copying such files to "~/.zeshy/config/"),
+#*BEFORE* resourcing configuration files from "~/.zeshy/config/". What does this
+#achieve? Simple. It ensures that any globals that might be missing from the
+#current user's configuration will simply be set to default Zeshy settings. This
+#is substantially better than the current approach, which basically ensures
+#"zsh: ZESHY_EUEUEUBLAHBLAH not defined" errors on upgrades. Given how easy this
+#is, there's really no (or only little) downside to ramming it through.
+
 #FIXME: It'd be nice to profile Zeshy a bit to see what's consuming the most
 #time. (I suspect the single "autoload -w" statement loading the digest, but
 #one never knows, really.) Perhaps add a new "--profile-zeshy-startup" option.
@@ -108,8 +119,8 @@ local -A ZESHY_FUNCTION_NAME_TO_DOCUMENTATION
 # Map from Zeshy-specific global name to documentation for such global.
 local -A ZESHY_GLOBAL_NAME_TO_DOCUMENTATION
 
-# Avoid documenting the following three functions, subsequently undefined soon
-# after (i.e., early in the Zeshy startup process).
+# Avoid documenting the following three functions, subsequently undefined during
+# Zeshy startup and hence inaccessible to callers.
 
 # void set_alias_documentation(string alias_name, string documentation)
 #
@@ -136,25 +147,14 @@ function set_global_documentation() {
 }
 
 # ....................{ GLOBALS                            }....................
-# Oldest zsh version under which Zeshy runs without error.
+set_global_documentation ZESHY_ZSH_VERSION_REQUIRED '
+string ZESHY_ZSH_VERSION_REQUIRED
+
+Oldest zsh version under which Zeshy is known to run without error.
+'
 export ZESHY_ZSH_VERSION_REQUIRED=5.0.0
 
-# Absolute paths for Zeshy-specific directories and files. See commentary below.
-export\
-    ZESHY_HOME\
-    ZESHY_HOME_IS_DOT_DIGEST_FILE_DEPENDENCY\
-    ZESHY_DOT_DIR\
-    ZESHY_DOT_DIR_BASENAME\
-    ZESHY_DOT_CACHE_DIR\
-    ZESHY_DOT_CONFIG_DIR\
-    ZESHY_DOT_OVERLAY_DIR\
-    ZESHY_DOT_DIGEST_FILE\
-    ZESHY_DOT_VERSION_FILE
-
-# Process ID of the last zsh process to previously source this script.
-export -i ZESHY_PID_LAST_LOADED_BY
-
-# ....................{ SANITY                             }....................
+# ....................{ VERSION                            }....................
 # If *NOT* running under such version, print an error message to standard error
 # and return rather than exiting to avoid exiting interactive shells with non-
 # zero exit status.
@@ -836,12 +836,13 @@ local -a arg_shell_options
 zparseopts -M -D -E -A arg_options --\
     h=-help -help \
     v=-verbose -verbose\
-    -test-zeshy-mtime\
+    -recompile-digest\
+    -recompile-digest-if-zeshy-home-changed\
     -version\
     c+:=arg_shell_commands -command+:=arg_shell_commands\
     o+:=arg_shell_options -option+:=arg_shell_options\
     -zeshy-dot-dir:: -no-zeshy-dot-dir=-zeshy-dot-dir ||
-    arg_options[--help]=1
+    arg_options[--help]='failed'
 #print -- "passed option names (${#arg_options}): ${(k)arg_options}"
 
 # ....................{ OPTIONS ~ paths                    }....................
@@ -851,6 +852,7 @@ string ZESHY_HOME
 
 Absolute directory of the Zeshy codebase. See "bin/zeshy" for commentary.
 '
+export ZESHY_HOME
 [[ -n "${ZESHY_HOME}" ]] || ZESHY_HOME="$(print -- "${0:h}"(:A))" || {
     print "zeshy: main script \"${0}\" not found" 1>&2
     return 1
@@ -861,8 +863,10 @@ string ZESHY_DOT_DIR_BASENAME
 
 User-specific Zeshy dot directory basename.
 '
-ZESHY_DOT_DIR_BASENAME='.zeshy'
+export ZESHY_DOT_DIR_BASENAME='.zeshy'
 
+#FIXME: Replace "[[ -n "${ZESHY_DOT_DIR}" ]] ||" with a similar alias to
+#is_zeshy_verbose_and<>, probably named is_zeshy_dot_dir_or<>.
 #FIXME: Actually test this. Shouldn't be terribly difficult: just temporarily
 #move "~leycec/.zeshy" aside and pass "--no-zeshy-dot-dir" to an interactively
 #run "zeshy" process. If "~leycec/.zeshy" doesn't appear, we've done something
@@ -882,6 +886,10 @@ All Zeshy functionality must test this global for non-emptiness before reading
 from or writing to this directory or files or subdirectories of this directory.
 If empty, Zeshy necessarily loads with default user settings and no digest file.
 '
+# Default such directory to "~/.zeshy".
+export ZESHY_DOT_DIR="${HOME}/${ZESHY_DOT_DIR_BASENAME}"
+
+# If passed the dot directory option, overwrite such default.
 if (( ${+arg_options[--zeshy-dot-dir]} ))
 then ZESHY_DOT_DIR="${arg_options[--zeshy-dot-dir]}"
 # If the current user's ${HOME} is the root directory, the current user is
@@ -889,8 +897,6 @@ then ZESHY_DOT_DIR="${arg_options[--zeshy-dot-dir]}"
 # under "/var/".
 elif [[ "${HOME}" == '/' ]]
 then ZESHY_DOT_DIR='/var/cache/zeshy'
-# Otherwise, default this directory to "~/.zeshy".
-else ZESHY_DOT_DIR="${HOME}/${ZESHY_DOT_DIR_BASENAME}"
 fi
 
 set_global_documentation ZESHY_DOT_CACHE_DIR '
@@ -898,21 +904,21 @@ string ZESHY_DOT_CACHE_DIR
 
 Directory to which Zeshy caches transient files and directories.
 '
-ZESHY_DOT_CACHE_DIR="${ZESHY_DOT_DIR}/cache"
+export ZESHY_DOT_CACHE_DIR="${ZESHY_DOT_DIR}/cache"
 
 set_global_documentation ZESHY_DOT_CONFIG_DIR '
 string ZESHY_DOT_CONFIG_DIR
 
 Directory from which Zeshy reads user configuration files.
 '
-ZESHY_DOT_CONFIG_DIR="${ZESHY_DOT_DIR}/config"
+export ZESHY_DOT_CONFIG_DIR="${ZESHY_DOT_DIR}/config"
 
 set_global_documentation ZESHY_DOT_OVERLAY_DIR '
 string ZESHY_DOT_OVERLAY_DIR
 
 Directory from which Zeshy reads user themes, plugins, etc.
 '
-ZESHY_DOT_OVERLAY_DIR="${ZESHY_DOT_DIR}/overlay"
+export ZESHY_DOT_OVERLAY_DIR="${ZESHY_DOT_DIR}/overlay"
 
 set_global_documentation ZESHY_DOT_DIGEST_FILE '
 string ZESHY_DOT_DIGEST_FILE
@@ -921,36 +927,70 @@ Digest file to which Zeshy compiles its codebase. Since such compilation
 assumes user-specific state (e.g., Zeshy theme, installed commands), such
 file is user-specific.
 '
-ZESHY_DOT_DIGEST_FILE="${ZESHY_DOT_CACHE_DIR}/digest.zwc"
+export ZESHY_DOT_DIGEST_FILE="${ZESHY_DOT_CACHE_DIR}/digest.zwc"
 
 set_global_documentation ZESHY_DOT_VERSION_FILE '
 string ZESHY_DOT_VERSION_FILE
 
 File to which Zeshy caches its version specifier (e.g., to detect upgrades).
 '
-ZESHY_DOT_VERSION_FILE="${ZESHY_DOT_CACHE_DIR}/version"
+export ZESHY_DOT_VERSION_FILE="${ZESHY_DOT_CACHE_DIR}/version"
 
 # ....................{ OPTIONS ~ startup                  }....................
-#FIXME: This is terrible. I've since stumbled on the obvious solution: restore
-#global boolean ${ZESHY_IS_DEBUGGING}, but do so *AT THE TOP OF THIS FILE*
-#rather than in the configuration file. Default such global as follows:
-#
-#    ZESHY_IS_DEBUGGING=${ZESHY_IS_DEBUGGING-'@ZESHY_IS_DEBUGGING@'}
-#
-#So, the caller can override such global which defaults to non-empty. On
-#installation, Zeshy's install script should (obviously) delete the hard-coded
-#'@ZESHY_IS_DEBUGGING@' (i.e., replace such string with the empty string).
-#Perfectimo.
+#FIXME: Zeshy's install script should replace such string with a value
+#corresponding to whether or not a release or debug build is being installed.
 
-# If Zeshy's codebase resides in a directory with basename "src", implicitly
-# enable all options below. Such options are generally desirable when debugging
-# Zeshy's developer-specific codebase, naturally residing under directory "src".
-# In other words, this is a special case facilitating developer torpitude.
-# (Hopefully, the cost of such test for non-developers is negligible......)
-[[ "${ZESHY_HOME}" == *'/src' ]] && {
-    arg_options[--test-zeshy-mtime]=
+set_global_documentation ZESHY_IS_DEBUGGING '
+boolean ZESHY_IS_DEBUGGING
+
+If true, enable expensive developer-specific logic. This includes:
+
+* Printing verbose debug messages on Zeshy startup.
+* Printing verbose trace messages on Zeshy startup, for measuring startup costs.
+* Recompiling Zeshy''s user digest file on changes to the Zeshy codebase. For
+  Zeshy developers, such recompilation is essential to fast development. For
+  Zeshy non-developers, detecting such changes is unnecessarily wasteful.
+'
+# Zeshy's installation script defaults such boolean to "true" if installing a
+# debug build and to the empty string (i.e., false) otherwise. When uninstalled
+# (e.g., when run from a git repository), the non-empty placeholder value
+# effectively defaults such boolean to "true".
+export ZESHY_IS_DEBUGGING="${ZESHY_IS_DEBUGGING-@ZESHY_IS_DEBUGGING@}"
+
+# If debugging Zeshy, forcefully enable debug-specific options *BEFORE* testing
+# whether or not at least one such option was passed.
+[[ -n "${ZESHY_IS_DEBUGGING}" ]] && {
+    arg_options[--compile-digest-if-zeshy-home-changed]=
     arg_options[--verbose]=
 }
+
+#FIXME: Document option "--compile-digest".
+
+# If true, recompile Zeshy's user digest file -- regardless of whether a
+# dependency of such file has changed since such file's last compilation. Do
+# *NOT* bother exporting this boolean. Unlike
+# ${ZESHY_DOT_DIGEST_FILE_IS_DEPENDENT_ON_ZESHY_HOME}, of which post-startup
+# testing by is_zeshy_dot_digest_outdated() appears reasonable, post-startup
+# testing by the same function of this global is nonsensical. When the caller
+# passes "--compile-digest", they expect such recompilation to occur only once
+# at initial startup and then subsequently revert to normalcy -- *NOT* to force
+# is_zeshy_dot_digest_outdated() to return true on all subsequent calls.
+#
+# While other methods for achieving the same effect exist (e.g., touching
+# Zeshy's user configuration directory when passed option "--compile-digest"),
+# such methods have non-idempotent and hence unexpected side effects.
+local ZESHY_DOT_DIGEST_FILE_IS_COMPILING=
+
+set_global_documentation ZESHY_DOT_DIGEST_FILE_IS_DEPENDENT_ON_ZESHY_HOME '
+boolean ZESHY_DOT_DIGEST_FILE_IS_DEPENDENT_ON_ZESHY_HOME
+
+If true, Zeshy''s user digest file depends on all files and directories within
+Zeshy''s codebase, in which case changing any such file or directory triggers
+recompilation of such digest on the next Zeshy startup. Note that regardless of
+the value of this boolean, Zeshy always recompiles such digest on upgrading
+Zeshy''s codebase to a new version.
+'
+export ZESHY_HOME_IS_DOT_DIGEST_FILE_DEPENDENCY=
 
 set_alias_documentation is_zeshy_verbose_and '
 string is_zeshy_verbose_and<
@@ -963,25 +1003,17 @@ perform a no-op (i.e., return true without running anything).
 # passed command; else, define such alias to ignore such command. The latter
 # reduces debug statements to constant time noops, simulating the "compiling
 # away" of such statements under conventional high-level language optimization.
-if (( ${+arg_options[--verbose]} ))
-then alias is_zeshy_verbose_and=''
-else alias is_zeshy_verbose_and='true ||'
-fi
+alias is_zeshy_verbose_and='true ||'
 
-#FIXME: Add a new option "--recompile-digest".
-#FIXME: Rename option to "--recompile-digest-if-zeshy-home-changed".
-
-set_global_documentation ZESHY_HOME_IS_DIGEST_FILE_DEPENDENCY '
-boolean ZESHY_HOME_IS_DIGEST_FILE_DEPENDENCY
-
-If true, Zeshy''s user digest file depends on all files and directories within
-Zeshy''s codebase, in which case changing any such file or directory will trigger
-recompilation of such digest on the next Zeshy startup.
-'
-# While is_zeshy_verbose_and<> is expanded frequently enough to warrant such
-# alias, this boolean is expanded only once elsewhere. Avoid alias overkill.
-(( ${+arg_options[--test-zeshy-mtime]} )) &&
-    ZESHY_HOME_IS_DIGEST_FILE_DEPENDENCY=true
+# If at least one command-line option was passed, handle all options upon which
+# Zeshy startup subsequently depends (e.g., digest-specific options).
+(( ${#arg_options} )) && {
+    (( ${+arg_options[--verbose]} )) && alias is_zeshy_verbose_and=''
+    (( ${+arg_options[--compile-digest]} )) &&
+        ZESHY_DOT_DIGEST_FILE_IS_COMPILING='true'
+    (( ${+arg_options[--compile-digest-if-zeshy-home-changed]} )) &&
+        ZESHY_DOT_DIGEST_FILE_IS_DEPENDENT_ON_ZESHY_HOME='true'
+}
 
 # ....................{ LOAD                               }....................
 # If sourcing the current script under zsh startup logic (e.g., from a zsh
@@ -1015,6 +1047,13 @@ recompilation of such digest on the next Zeshy startup.
 #print "zeshy: process ID (cached.)=${ZESHY_PID_LAST_LOADED_BY-}"
 #print "zeshy: passed option names=${(k)arg_options}"
 
+set_global_documentation ZESHY_PID_LAST_LOADED_BY '
+integer ZESHY_PID_LAST_LOADED_BY
+
+Process ID of the most recent zsh process in the call stack to load Zeshy.
+'
+export -i ZESHY_PID_LAST_LOADED_BY
+
 # If the caller requests not reloading Zeshy when previously loaded under the
 # current shell and Zeshy has indeed already been loaded, do not do so again.
 if (( ZESHY_PID_LAST_LOADED_BY == $$ )); then
@@ -1041,47 +1080,55 @@ else
     # If the current shell is a login shell, set login-specific behavior.
     [[ -o login ]] && source -- "${ZESHY_HOME}/login"
 
-    # Autoload Zeshy's user digest file, recompiling such file if needed.
-    source -- "${ZESHY_HOME}/digest"
+    #FIXME: Consider catching exceptions thrown by Zeshy startup and responding
+    #appropriately...somehow.
+#   {
+        # Autoload Zeshy's user digest file, recompiling such file if needed.
+        source -- "${ZESHY_HOME}/digest"
 
-    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    #Note: this *MUST* be performed from a global rather than function context.
-    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    #
-    # Undefine all globals defined by such recompilation. The reasons are subtle but
-    # the logic flows like butter. Zeshy may (and often does) declare globals to be
-    # read-only. Sadly, zsh fails on attempting to redefine read-only globals. Since
-    # the subsequent call to startup_zeshy() and hence startup_zeshy_globals() does
-    # just that, undefine Zeshy-specific globals prior to such calls. Do so in the
-    # root global context (i.e., in this component outside of functions) to
-    # guarantee expected behavior. "'tis all a tad silly and worm-bitten, but such
-    # is life in the tranche of code trenches."
-    #
-    # Since zsh never fails on redefining aliases or functions, do not bother
-    # undefining either. We could, but there's little point (or profit) in it.
-    #
-    # Unfortunately, the above sourcing exposes function but *NOT* alias
-    # declarations. Since undefine_variable_from<> is an alias, manually
-    # implement the following:
-    #
-    #     >>> is_list_nonempty ZESHY_GLOBAL_NAMES and  # must be "*" rather than "@"
-    #     ...     undefine_variable_from "${ZESHY_GLOBAL_NAMES[*]}"
-    [[ -n "${ZESHY_GLOBAL_NAMES-}" ]] && {
-        typeset +r -- "${ZESHY_GLOBAL_NAMES[@]}"
-        unset      -- "${ZESHY_GLOBAL_NAMES[@]}"
-    }
+        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        #Note: this *MUST* be performed from a global rather than function context.
+        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        #
+        # Undefine all globals defined by such recompilation. The reasons are subtle but
+        # the logic flows like butter. Zeshy may (and often does) declare globals to be
+        # read-only. Sadly, zsh fails on attempting to redefine read-only globals. Since
+        # the subsequent call to startup_zeshy() and hence startup_zeshy_globals() does
+        # just that, undefine Zeshy-specific globals prior to such calls. Do so in the
+        # root global context (i.e., in this component outside of functions) to
+        # guarantee expected behavior. "'tis all a tad silly and worm-bitten, but such
+        # is life in the tranche of code trenches."
+        #
+        # Since zsh never fails on redefining aliases or functions, do not bother
+        # undefining either. We could, but there's little point (or profit) in it.
+        #
+        # Unfortunately, the above sourcing exposes function but *NOT* alias
+        # declarations. Since undefine_variable_from<> is an alias, manually
+        # implement the following:
+        #
+        #     >>> is_list_nonempty ZESHY_GLOBAL_NAMES and  # must be "*" rather than "@"
+        #     ...     undefine_variable_from "${ZESHY_GLOBAL_NAMES[*]}"
+        [[ -n "${ZESHY_GLOBAL_NAMES-}" ]] && {
+            typeset +r -- "${ZESHY_GLOBAL_NAMES[@]}"
+            unset      -- "${ZESHY_GLOBAL_NAMES[@]}"
+        }
 
-    # Initialize Zeshy, having recompiled the Zeshy digest file above and hence
-    # defined all autoloads applicable to the current user.
-#   print 'starting up zeshy...'
-    startup_zeshy
-#   print 'finished zeshy...'
+        # Initialize Zeshy, having recompiled the Zeshy digest file above and hence
+        # defined all autoloads applicable to the current user.
+#       print 'starting up zeshy...'
+        startup_zeshy
+#       print 'finished zeshy...'
+#   }
 
     # Ensure this conditional evaluates to true on the next attempt to load
     # Zeshy under the current shell by setting such process ID to that of this
     # shell after successfully loading Zeshy. (The "after" is key here!)
     ZESHY_PID_LAST_LOADED_BY=$$
 fi
+
+#FIXME: Unset such globals at the same place that we undefine the corresponding
+#setter functions. Since the former *MUST* happen here, that suggests we should
+#shift the latter here.
 
 # Undefine documentation-specific maps defined at the top of this script. As the
 # prior conditional calling load_zeshy() calling compile_zeshy() has already
@@ -1093,48 +1140,48 @@ unset --\
     ZESHY_FUNCTION_NAME_TO_HELP_STRING\
     ZESHY_GLOBAL_NAME_TO_HELP_STRING
 
-# ....................{ OPTIONS ~ help                     }....................
-# Handle passed help options *AFTER* loading Zeshy.
+# ....................{ OPTIONS ~ last                     }....................
+# If at least one command-line option was passed, handle all remaining options.
+# *AFTER* loading Zeshy.
+(( ${#arg_options} )) and {
+    # Handle help options *BEFORE* all other remaining options, which
+    # immediately return if passed and hence assume priority. If passed, ignore
+    # all other options and if:
+    #
+    # * The above option parsing failed as signified by option value "failed",
+    #   print usage help to standard error and return with non-zero exit status.
+    # * Else, print help to standard output and return with zero exit status.
+    (( ${+arg_options[--help]} )) and {
+        if [[ "${arg_options[--help]}" == 'failed' ]]; then
+            run_redirecting_to_standard_error print_zeshy_help_usage
+            die 'passed invalid or unknown options'
+        else
+            print_zeshy_help_usage
+            return_true
+        fi
+    }
 
-# If passed a help option, ignore all other options and if:
-#
-# * The above option parsing failed as signified by (( arg_options[-h] == 1 )),
-#   print usage help to standard error and return with non-zero exit status.
-# * Else, print help to standard output and return with zero exit status.
-(( ${+arg_options[--help]} )) and {
-    if (( arg_options[--help] == 1 )); then
-        run_redirecting_to_standard_error print_zeshy_help_usage
-        die 'passed invalid or unknown options'
-    else
-        print_zeshy_help_usage
+    # If passed a version option, behave similarly to above.
+    (( ${+arg_options[--version]} )) and {
+        print_zeshy_version
         return_true
-    fi
-}
+    }
 
-# If passed a version option, behave similarly to above.
-(( ${+arg_options[--version]} )) and {
-    print_zeshy_version
-    return_true
-}
+    # Run all passed shell commands. Since every other element parsed into
+    # ${arg_shell_commands} is either "-c" or "--command" and hence ignorable,
+    # iterate elements in pairs ignoring the first such element.
+    for placeholder arg_shell_command ("${arg_shell_commands[@]}") {
+    #   print "zeshy: passed command \"${arg_shell_command}\""
+        run "${arg_shell_command}"
+    }
 
-# ....................{ OPTIONS ~ shell                    }....................
-# Handle passed shell options *AFTER* handling help options, which immediately
-# return if passed and hence assume priority.
-
-# Run all passed shell commands. Since every other element parsed into
-# ${arg_shell_commands} is either "-c" or "--command" and hence ignorable, iterate
-# elements in pairs ignoring the first such element.
-for placeholder arg_shell_command ("${arg_shell_commands[@]}") {
-#   print "zeshy: passed command \"${arg_shell_command}\""
-    run "${arg_shell_command}"
-}
-
-# Enable all passed shell options *AFTER* running passed shell commands, to
-# ensure such commands run under the default Zeshy environment. Iterate list
-# elements in pairs ignoring the first such element, as above.
-for placeholder arg_shell_option ("${arg_shell_options[@]}") {
-#   print "zeshy: passed option \"${arg_shell_option}\""
-    enable_shell_option "${arg_shell_option}"
+    # Enable all passed shell options *AFTER* running passed shell commands, to
+    # ensure such commands run under the default Zeshy environment. Iterate list
+    # elements in pairs ignoring the first such element, as above.
+    for placeholder arg_shell_option ("${arg_shell_options[@]}") {
+    #   print "zeshy: passed option \"${arg_shell_option}\""
+        enable_shell_option "${arg_shell_option}"
+    }
 }
 
 # ....................{ PROFILING ~ end                    }....................
@@ -1148,21 +1195,59 @@ is_zeshy_verbose_and printf\
     $(( EPOCHREALTIME - ZESHY_STARTUP_TIME_SECONDS ))
 
 # ....................{ ARGUMENTS                          }....................
-# If the caller passed at least one argument *NOT* prefixed by "-", source
-# Prior option parsing removed all recognized options from the current argument
-# list. Interpret the first remaining argument as the path of a Zeshy script to
-# be sourced and subsequent remaining arguments as arguments to be passed to
-# such script. Since this is the same argument order accepted by builtin
-# source(), source all remaining arguments as is *AFTER* printing Zeshy's
-# startup time to avoid increasing such time by the time spent sourcing.
-(( # )) && source -- "${@}"
+# If the caller passed at least one non-option, non-empty argument (i.e.,
+# neither prefixed by "-" or expanding to the empty string), source the first
+# such argument as the path of a Zeshy script and pass such script all remaining
+# such arguments. To avoid unfairly budgeting the time spent sourcing such
+# script to Zeshy startup, do so *AFTER* printing Zeshy's startup time.
+(( ${#} )) and is_string_nonempty "${@}" and {
+#   is_zeshy_verbose_and print "zeshy: sourcing \"${@}\"..."
+    source -- "${@}"
+}
 
 # ....................{ MAIN                               }....................
 # Avoid implicitly returning with non-zero exit status, as occurs when the prior
 # statement is a conditional evaluating to false.
+#print 'returning zsh!'
 return_true
 
 # --------------------( WASTELANDS                         )--------------------
+#           print 'printing usage!'
+#           print 'exiting zsh!'
+            #FUXME: Revert to return_true() after correcting startup regression.
+#           exit_zsh
+# While is_zeshy_verbose_and<> is expanded frequently enough to warrant such
+# alias, this boolean is expanded only once elsewhere. Avoid alias overkill.
+# If Zeshy's codebase resides in a directory with basename "src", implicitly
+# enable all options below. Such options are generally desirable when debugging
+# Zeshy's developer-specific codebase, naturally residing under directory "src".
+# In other words, this is a special case facilitating developer torpitude.
+# (Hopefully, the cost of such test for non-developers is negligible......)
+#[[ "${ZESHY_HOME}" == *'/src' ]] && {
+#if (( ${+arg_options[--verbose]} ))
+#then alias is_zeshy_verbose_and=''
+#else alias is_zeshy_verbose_and='true ||'
+#fi
+#FUXME: This is terrible. I've since stumbled on the obvious solution: restore
+#global boolean ${ZESHY_IS_DEBUGGING}, but do so *AT THE TOP OF THIS FILE*
+#rather than in the configuration file. Default such global as follows:
+#
+#    ZESHY_IS_DEBUGGING=${ZESHY_IS_DEBUGGING-'@ZESHY_IS_DEBUGGING@'}
+#
+#So, the caller can override such global which defaults to non-empty. On
+#installation, Zeshy's install script should (obviously) delete the hard-coded
+#'@ZESHY_IS_DEBUGGING@' (i.e., replace such string with the empty string).
+#Perfectimo.
+#detecting an upgrade to new versions of Zeshy.
+# Absolute paths for Zeshy-specific directories and files. See commentary below.
+#   ZESHY_DOT_DIR\
+#   ZESHY_DOT_DIR_BASENAME\
+#   ZESHY_DOT_CACHE_DIR\
+#   ZESHY_DOT_CONFIG_DIR\
+#   ZESHY_DOT_OVERLAY_DIR\
+#   ZESHY_DOT_DIGEST_FILE\
+#   ZESHY_DOT_VERSION_FILE
+
 # In either case, such alias
 # eliminates the non-negligible cost of testing option
 # "--verbose" each debug statement, thus simulating conventional
