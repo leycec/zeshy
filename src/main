@@ -317,43 +317,6 @@ zmodload -F zsh/stat b:zstat
 #   redefinition and subsequent restoration of new function implementations.
 zmodload zsh/parameter
 
-# ....................{ PRINTERS                           }....................
-# Declare placeholder functions to be overridden after loading the Zeshy digest.
-
-set_function_documentation say '
-void say(string message = "")
-
-Print the passed message suffixed by a trailing newline to standard output.
-This placeholder implementation called only when bootstrapping Zeshy will be
-replaced when loading Zeshy''s digest file.
-'
-function say() {
-    #FIXME: Quite certain we want to replace all "[[ -o interactive ]] && say"
-    #and "interactively say" with merely "say". (The former are patently silly
-    #and, let's be honest, dangerous, by duplicating logic *EVERYWHERE*.) That
-    #said, I'm not convinced that the solution here is to simply prepend this
-    #statement with "[[ -o interactive ]] && "; the problem, of course, are
-    #pipes. We want functions like the following to work:
-    #    function testem() { say 'Oh, hello!'; }
-    #    testem | cat
-    print "zeshy: ${@}"
-}
-
-set_function_documentation cry '
-void cry(string message = "")
-
-Print the passed message suffixed by a trailing newline to standard error.
-This placeholder implementation called only when bootstrapping Zeshy will be
-replaced when loading Zeshy''s digest file.
-'
-function cry() {
-    # Print this message. Do *NOT* call print() as "print -u2 -- "${message}".
-    # While that appears superficially identical to the following call, passing
-    # the desired file descriptor as an argument fails to preserve interleaving
-    # with prior commands printing to file descriptor 1 (i.e., standard out).
-    print "zeshy: ${@}" 1>&2
-}
-
 # ....................{ EXCEPTIONS                         }....................
 #FIXME: Either the documentation or implementation is wrong. In any case, I'm
 #not convinced *EITHER* is right. We really want to implicitly throw exceptions
@@ -430,8 +393,15 @@ function die() {
     # If the prior command succeeded, coerce such exit status into an error.
     (( ${exit_status} == 0 )) && exit_status=1
 
-    # Print the passed error message and handle such exception.
-    cry "${@}"
+    # If print_exception_message() has been defined, print such error message by
+    # calling such function.
+    if typeset -f print_exception_message &>/dev/null
+    then print_exception_message "${@}"
+    # Else, print such error message with a simple one-liner.
+    else print "zeshy: ${@}" 1>&2
+    fi
+
+    # Handle such exception.
     handle_exception ${exit_status}
 
     #FIXME: Suffix the exception name by the name of the function directly
@@ -449,102 +419,6 @@ function die() {
     fi
 }
 
-#FIXME: Interestingly, we don't actually want all exceptions to be handled. We
-#always want *UNEXPECTED* exceptions to be handled. Expected exceptions,
-#however, should only be handled if the current user's Zeshy configuration
-#requests such handling, which should be disabled by default. The canonical
-#example of an expected exception is an external command wrapped by a Zeshy
-#function returning non-zero exit status on failing to find a match (e.g.,
-#"command grep" wrapped by grep_path()). Note that even in this case, of course,
-#not all errors emitted by "command grep" are expected: only on failing to find
-#a match, which must be explicitly tested for. This suggests a new helper
-#function die_unhandled(), which (as expected) does everything die() does but
-#excludes only the call to handle_exception(). Since this reduplicates a great
-#deal of intricate code, perhaps die() and die_unhandled() can simply delegate
-#to an internal utility function with prototype:
-#
-# string die_handled_if(
-#   string error_message = '', boolean is_handling_exception)
-#
-#Obviously, such functions should be shifted to a new component in the proper
-#Zeshy codebase: say, "shell/exception".
-#FIXME: While such functionality is essential for oddball corner-cases (e.g.,
-#"grep"), what we generally want is a simple way of squelching exceptions when
-#the current shell is interactive *AND* the current call stack ends with a
-#particular function that was called by some other particular function earlier
-#in such stack. This could possibly be implemented as a global map from the
-#former to latter, which function die() and associates would need to respect.
-#Consider the following definition:
-#
-#map_global_export\
-#    ZESHY_EXCEPTION_HIDE_IF_INTERACTIVELY_THROWN_BY_FUNCTION_NAMES
-#
-#Ah; wait. The "_INTERACTIVELY" is redundant, since such code paths can only
-#come about as interactive alias expansions. Also, it's not specifically
-#function names -- it's runnable names. Reduce to:
-#
-#map_global_export\
-#    ZESHY_EXCEPTION_HIDE_IF_THROWN_BY_RUNNABLE_NAMES
-#
-#Define such global as follows:
-#
-#ZESHY_EXCEPTION_HIDE_IF_THROWN_BY_RUNNABLE_NAMES=(
-#    'ls' 'l'
-#    'ls' 'ls'
-#    'grep' 'g'
-#    'grep' 'grep'
-#    'grep' 'gr'
-#    ...
-#)
-#
-#Now, that's in a great format for consumption by die_*() functions. But it's
-#not really the greatest for definition; given the tenuous nature of interactive
-#aliases, we really want to automate definition of such global. This should,
-#naturally, be done by the interactive_abbreviation() and
-#interactive_substitution() functions. (O.K.; I suppose interactive_alias()
-#applies as well.) Under interactive_substitution(), it's easy to set two such
-#entries: for both, the key is the command name being substituted; for the
-#first, the value is the same name; for the second, the value is such
-#substitution's abbreviation (if any!). Under interactive_abbreviation(),
-#thing's are a bit less automated: we'll need to improve
-#interactive_abbreviation() to accept an optional second argument specifying the
-#name of the core underlying external command that such abbreviation eventually
-#runs. Hence, this:
-#
-#    interactive_abbreviation {cal}endar{q}uarter='print_calendar_quarter'
-#
-#...would need to be expanded to this:
-#
-#    interactive_abbreviation {cal}endar{q}uarter='print_calendar_quarter' cal
-#
-#This then adds a single entry to the above global resembling this:
-#
-#    ZESHY_EXCEPTION_HIDE_IF_THROWN_BY_RUNNABLE_NAMES+='cal' 'calq'
-#
-#There's really no other sensible way to handle abbreviations. This works, it's
-#only a minor nuisance; let's go-goggogogogo-go!
-#
-#The first steps, clearly, will be automating interactive_substitution() to
-#perform such definition and die() to respect such definition (possibly subject
-#to a user-configurable boolean enabling or disabling such functionality). After
-#getting that to work, then contemplate the extension of such logic to
-#interactive_abbreviation(). Such global could (possibly) be called:
-#
-#    boolean_global_export ZESHY_IS_HANDLING_ERROR_IF_THROWN_BY_NONHANDLING_RUNNABLES
-#
-#Hmm; what about:
-#
-#    boolean_global_export ZESHY_IS_ERROR_HANDLED_IF_HIDDEN
-#    ZESHY_IS_ERROR_HANDLED_IF_HIDDEN=${ZESHY_BOOLEAN_FALSE}
-#
-#Much better. >)
-
-# string die_unhandled(string error_message = '')
-function die_unhandled() {
-    #FIXME: Implement such function. Unsure this is the best name, to be honest.
-    die_handled_if "${@}" ${ZESHY_BOOLEAN_FALSE}
-}
-
 set_function_documentation handle_exception '
 string handle_exception(integer exit_status)
 
@@ -557,15 +431,23 @@ function handle_exception() {
     # Redirect all output printed below to standard error. Yes, a single
     # suffixing "} 1>&2" actually suffices. You rock, zsh! (Sometimes.)
     {
-        # If called directly from the command-line, no such exception exists.
-        (( # == 1 )) || die 'expected one positive integer'
-        (( #funcstack >= 2 )) || die 'exception not thrown'
+        # Validate passed arguments. See is_integer_nonnegative() for details.
+        (( # == 1 )) || die 'expected one exit status'
+        local exit_status="${1}"
+        [[ "${exit_status}" == <-> ]] ||
+            die "exit status \"${exit_status}\" not a positive integer"
+
+        # If called directly from the command line, no such exception exists.
+        (( ${#funcstack} >= 2 )) || die 'exception not thrown'
 
         # Print a blank line.
         print
 
         # Print a description of the passed non-zero exit status.
-        print_exception_exit_status "${1}"
+        if typeset -f print_exception_exit_status &>/dev/null
+        then print_exception_exit_status "${exit_status}"
+        else print "zeshy: failed with exit status ${exit_status}"
+        fi
 
         # If the current user's Zeshy configuration requests printing stack
         # traces on exceptions, do so.
@@ -592,57 +474,14 @@ function handle_exception() {
     } 1>&2
 }
 
-set_function_documentation print_exception_exit_status '
-string print_exception_exit_status(integer exit_status)
-
-Print a description of the passed non-zero exit status to standard error.
-'
-function print_exception_exit_status() {
-    # Validate passed arguments.
-    local exit_status="${1}"
-    [[ "${exit_status}" == <-> ]] ||  # see is_integer()
-        die "\"${exit_status}\" not a positive integer"
-
-    # Decide the name of the caller script or function. Since the prior test
-    # succeeded, the call stack consists of at least two (and typically
-    # three) stack frames:
-    #
-    # * ${funcstack[1]}, this function.
-    # * ${funcstack[2]}, the handle_exception() function.
-    # * ${funcstack[3]}, the caller. This is typically either the
-    #   intermediate Zeshy-specific TRAPZERR() or die() functions.
-    # * ${funcstack[4]}, the caller's caller. Assuming ${funcstack[2]} to be
-    #   either TRAPZERR() or die(), this is the actual "caller."
-    local caller_name
-    if [[ "${#funcstack}" -ge 4 && "${funcstack[3]}" == (TRAPZERR|die) ]]
-    then caller_name="${funcstack[4]}"
-    else caller_name="${funcstack[3]}"
-    fi
-
-    #FIXME: Quite nice, though we don't currently use it. Perhaps extract into a
-    #new function convert_runnable_name_to_printable_string() in "runnable/runnable". This
-    #suggests a new series of functions inspired by Java's toString() approach,
-    #all intended for use as human-readable strings. There are a number of existing
-    #functions which, arguably, should be renamed in such fashion -- including:
-    #
-    #* convert_string_integer_to_comma_delimited_string(). This function appears to
-    #  use awk's printf() and hence implicitly locale globals to perform such
-    #  delimitation, suggesting in fact the result to not necessarily be comma-
-    #  delimited. Hence, convert_string_integer_to_printable_string() seems much
-    #  more sensible.
-    # If this frame signifies a function, append "()" to such function name.
-#   if typeset -f -- "${caller_name}" &>/dev/null
-#   then caller_name="${caller_name}()"
-    # If this frame signifies no "eval" statement and hence signifies a script,
-    # double quote such filename.
-#   elif [[ "${caller_name}" != '(eval)' ]]
-#   then caller_name="\"${caller_name}\""
-#   fi
-
-    # Describe such exit status.
-    print "${caller_name}: failed with exit status ${exit_status}"
-}
-
+#FIXME: This function is complex enough to warrant extraction into the main
+#Zeshy codebase. That said, we'll still want a stub implementation available at
+#Zeshy startup: stack traces are essential. To do so, cut this implementation
+#back to the bone and inline such bare-bones implementation up into the guts of
+#handle_exception() itself. (Yes, *DO IT*. If we allow ourselves to implement a
+#separate stub function, we invite even more confusion by having to define a
+#temporary function undefined at the end of this component. It's just not worth
+#it, you dig?)
 #FIXME: There appears to be a very curious oddity in zsh; sourcing a zsh script
 #containing the line "return 1" produces the expected call stack, resembling:
 #
@@ -779,18 +618,6 @@ local -a arg_shell_commands
 # List of shell options to be enabled parsed from options "-o" and "--option".
 local -a arg_shell_options
 
-#FIXME: Option parsing has become sufficiently long to warrant extrication into
-#a new top-level component "options". Since sourcing files is moderately
-#expensive and since we don't need to source such file unless passed at least
-#one option, consider the following efficient conditional:
-#
-#(( ${#arg_options} + ${#arg_shell_commands} + ${#arg_shell_options} )) &&
-#    source options
-#
-#Assuming no options to be passed (as will be the typical case under release
-#builds), this should actually be faster than the current method (as we manually
-#test whether each option is enabled or not).
-
 #FIXME: I'm fairly assured that passing multiple commands and options with
 #long-form options works as advertised. I strongly doubt, however, that passing
 #multiple commands and options with short-form options works as advertised. If
@@ -857,13 +684,6 @@ User-specific Zeshy dot directory basename.
 '
 export ZESHY_DOT_DIR_BASENAME='.zeshy'
 
-#FIXME: Replace "[[ -n "${ZESHY_DOT_DIR}" ]] ||" with a similar alias to
-#is_zeshy_verbose_and<>, probably named is_zeshy_dot_dir_or<>.
-#FIXME: Actually test this. Shouldn't be terribly difficult: just temporarily
-#move "~leycec/.zeshy" aside and pass "--no-zeshy-dot-dir" to an interactively
-#run "zeshy" process. If "~leycec/.zeshy" doesn't appear, we've done something
-#spectacularly right. Huzza!
-
 set_global_documentation ZESHY_DOT_DIR '
 string ZESHY_DOT_DIR
 
@@ -881,7 +701,49 @@ If empty, Zeshy necessarily loads with default user settings and no digest file.
 # Default such directory to "~/.zeshy".
 export ZESHY_DOT_DIR="${HOME}/${ZESHY_DOT_DIR_BASENAME}"
 
-# If passed the dot directory option, overwrite such default.
+#FIXME: Replace "[[ -n "${ZESHY_DOT_DIR}" ]] ||" with a similar alias to
+#is_zeshy_verbose_and<>, probably named is_zeshy_dot_dir_or<>. See below!
+#FIXME: Actually, setting such global to the empty string is somewhat dangerous
+#as Zeshy functions failing to properly test such global for emptiness prior to
+#expansion will end up attempting to read and write from directories resembling
+#"/.zeshy/config/posix", *WHICH IS TOTALLY BAD.* To avert this, there's really
+#no choice but to *UNSET* this global here at the top-level and then define a
+#convenience alias resembling:
+#
+#    alias is_zeshy_dot_dir_or='(( ${+ZESHY_DOT_DIR} )) ||'
+#
+#Dead simple, really. We just need to do it. *AND DO IT SOON.* This is bloody
+#dangerous, and quite unfriendly.
+#FIXME: Oh. Wait. But then we can't define any other user paths, *INCLUDING
+#THOSE IN CONFIG FILES*. Right. That doesn't work.
+#FIXME: Wait. This exposes a fatal flaw with the current approach: passing
+#"--no-zeshy-dot-dir" will permanently compile Zeshy (until the next
+#compilation without such option, anyway) without *SOME* dot directory files,
+#as such files are compiled from "if_config/zeshy". That, in turn, suggests
+#that we need to shift such globals from such configuration file *BACK* here.
+#No choice, really; they depend on passed command line options and hence cannot
+#be baked into Zeshy's user digest.
+#FIXME: O.K.; having corrected such issue, I see two amenable solutions (in no
+#particular order):
+#
+#1. If passed "--no-zeshy-dot-dir", unset *ALL* such globals. This is a pretty
+#   sweet solution, frankly. We could simply perform such unsetting *AFTER*
+#   exporting all such globals here. (Should work, no?)
+#2. If passed "--no-zeshy-dot-dir", be clever and set ZESHY_DOT_DIR="/dev/null".
+#   This is the one system-wide path pretty much guaranteed to exist on all
+#   *nix's and *NOT* be a directory. Hence, any attempt to read from or write
+#   no any path "${ZESHY_DOT_DIR}/pathname" will always and reliably fail. That
+#   said, it's a tad lazy: the failure doesn't show up until attempting an
+#   actual file operation. The former solution spits up an error much earlier,
+#   which is great.
+#FIXME: Actually test this. Shouldn't be terribly difficult: just temporarily
+#move "~leycec/.zeshy" aside and pass "--no-zeshy-dot-dir" to an interactively
+#run "zeshy" process. If "~leycec/.zeshy" doesn't appear, we've done something
+#spectacularly right. Huzza!
+
+# If passed the dot directory option, replace such default. If passed the non-
+# dot directory option, this silently replaces such default with the empty
+# string, thus disabling use of such directory.
 if (( ${+arg_options[--zeshy-dot-dir]} ))
 then ZESHY_DOT_DIR="${arg_options[--zeshy-dot-dir]}"
 # If the current user's ${HOME} is the root directory, the current user is
@@ -1072,45 +934,41 @@ else
     # If the current shell is a login shell, set login-specific behavior.
     [[ -o login ]] && source -- "${ZESHY_HOME}/login"
 
-    #FIXME: Consider catching exceptions thrown by Zeshy startup and responding
-    #appropriately...somehow.
-#   {
-        # Autoload Zeshy's user digest file, recompiling such file if needed.
-        source -- "${ZESHY_HOME}/digest"
+    # Autoload Zeshy's user digest file, recompiling such file if needed.
+    source -- "${ZESHY_HOME}/digest"
 
-        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        #Note: this *MUST* be performed from a global rather than function context.
-        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        #
-        # Undefine all globals defined by such recompilation. The reasons are subtle but
-        # the logic flows like butter. Zeshy may (and often does) declare globals to be
-        # read-only. Sadly, zsh fails on attempting to redefine read-only globals. Since
-        # the subsequent call to startup_zeshy() and hence startup_zeshy_globals() does
-        # just that, undefine Zeshy-specific globals prior to such calls. Do so in the
-        # root global context (i.e., in this component outside of functions) to
-        # guarantee expected behavior. "'tis all a tad silly and worm-bitten, but such
-        # is life in the tranche of code trenches."
-        #
-        # Since zsh never fails on redefining aliases or functions, do not bother
-        # undefining either. We could, but there's little point (or profit) in it.
-        #
-        # Unfortunately, the above sourcing exposes function but *NOT* alias
-        # declarations. Since undefine_variable_from<> is an alias, manually
-        # implement the following:
-        #
-        #     >>> is_list_nonempty ZESHY_GLOBAL_NAMES and  # must be "*" rather than "@"
-        #     ...     undefine_variable_from "${ZESHY_GLOBAL_NAMES[*]}"
-        [[ -n "${ZESHY_GLOBAL_NAMES-}" ]] && {
-            typeset +r -- "${ZESHY_GLOBAL_NAMES[@]}"
-            unset      -- "${ZESHY_GLOBAL_NAMES[@]}"
-        }
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    #Note: this *MUST* be performed from a global rather than function context.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    #
+    # Undefine all globals defined by such recompilation. The reasons are subtle but
+    # the logic flows like butter. Zeshy may (and often does) declare globals to be
+    # read-only. Sadly, zsh fails on attempting to redefine read-only globals. Since
+    # the subsequent call to startup_zeshy() and hence startup_zeshy_globals() does
+    # just that, undefine Zeshy-specific globals prior to such calls. Do so in the
+    # root global context (i.e., in this component outside of functions) to
+    # guarantee expected behavior. "'tis all a tad silly and worm-bitten, but such
+    # is life in the tranche of code trenches."
+    #
+    # Since zsh never fails on redefining aliases or functions, do not bother
+    # undefining either. We could, but there's little point (or profit) in it.
+    #
+    # Unfortunately, the above sourcing exposes function but *NOT* alias
+    # declarations. Since undefine_variable_from<> is an alias, manually
+    # implement the following:
+    #
+    #     >>> is_list_nonempty ZESHY_GLOBAL_NAMES and  # must be "*" rather than "@"
+    #     ...     undefine_variable_from "${ZESHY_GLOBAL_NAMES[*]}"
+    [[ -n "${ZESHY_GLOBAL_NAMES-}" ]] && {
+        typeset +r -- "${ZESHY_GLOBAL_NAMES[@]}"
+        unset      -- "${ZESHY_GLOBAL_NAMES[@]}"
+    }
 
-        # Initialize Zeshy, having recompiled the Zeshy digest file above and hence
-        # defined all autoloads applicable to the current user.
+    # Initialize Zeshy, having recompiled the Zeshy digest file above and hence
+    # defined all autoloads applicable to the current user.
 #       print 'starting up zeshy...'
-        startup_zeshy
+    startup_zeshy
 #       print 'finished zeshy...'
-#   }
 
     # Ensure this conditional evaluates to true on the next attempt to load
     # Zeshy under the current shell by setting such process ID to that of this
@@ -1192,7 +1050,7 @@ is_zeshy_verbose_and printf\
 # such argument as the path of a Zeshy script and pass such script all remaining
 # such arguments. To avoid unfairly budgeting the time spent sourcing such
 # script to Zeshy startup, do so *AFTER* printing Zeshy's startup time.
-(( ${#} )) and is_string_nonempty "${@}" and {
+is_string_nonempty "${*}" and {
 #   is_zeshy_verbose_and print "zeshy: sourcing \"${@}\"..."
     source -- "${@}"
 }
@@ -1204,6 +1062,80 @@ is_zeshy_verbose_and printf\
 return_true
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: Is this overkill? What happens if we return 1 instead? Forcefully
+    #trigger this... and see!
+    #FUXME: Uhm; we already validate this below. Hmm.
+    # Validate passed arguments. Avoid returning non-zero exit status on fatal
+    # errors, as such status triggers an exception and hence infinite recursion.
+#   (( # == 1 )) || {
+#       print 'zeshy: handle_exception() expected one exit status' 1>&2
+#       return 0
+#   }
+
+    # See is_integer_nonnegative() for implementation details.
+#   local exit_status="${1}"
+#   [[ "${exit_status}" == <-> ]] || {
+#       print "zeshy: handle_exception() exit status \"${exit_status}\" not a positive integer" 1>&2
+#       return 0
+#   }
+
+    #FUXME: Consider catching exceptions thrown by Zeshy startup and responding
+    #appropriately...somehow.
+#   }
+#${#} -ge 1 and
+#(( ${#} )) and is_string_nonempty "${@}"
+
+#FUXME: Option parsing has become sufficiently long to warrant extrication into
+#a new top-level component "options". Since sourcing files is moderately
+#expensive and since we don't need to source such file unless passed at least
+#one option, consider the following efficient conditional:
+#
+#(( ${#arg_options} + ${#arg_shell_commands} + ${#arg_shell_options} )) &&
+#    source options
+#
+#Assuming no options to be passed (as will be the typical case under release
+#builds), this should actually be faster than the current method (as we manually
+#test whether each option is enabled or not).
+
+    #FUXME: Extract into a new throw_exception() function for use in the
+    #new die() function.
+# ....................{ PRINTERS                           }....................
+# Declare placeholder functions to be overridden after loading the Zeshy digest.
+
+#set_function_documentation say '
+#void say(string message = "")
+#
+#Print the passed message suffixed by a trailing newline to standard output.
+#This placeholder implementation called only when bootstrapping Zeshy will be
+#replaced when loading Zeshy''s digest file.
+#'
+#function say() {
+    #FUXME: Quite certain we want to replace all "[[ -o interactive ]] && say"
+    #and "interactively say" with merely "say". (The former are patently silly
+    #and, let's be honest, dangerous, by duplicating logic *EVERYWHERE*.) That
+    #said, I'm not convinced that the solution here is to simply prepend this
+    #statement with "[[ -o interactive ]] && "; the problem, of course, are
+    #pipes. We want functions like the following to work:
+    #    function testem() { say 'Oh, hello!'; }
+    #    testem | cat
+#    print "zeshy: ${@}"
+#}
+#
+#set_function_documentation cry '
+#void cry(string message = "")
+#
+#Print the passed message suffixed by a trailing newline to standard error.
+#This placeholder implementation called only when bootstrapping Zeshy will be
+#replaced when loading Zeshy''s digest file.
+#'
+#function cry() {
+    # Print this message. Do *NOT* call print() as "print -u2 -- "${message}".
+    # While that appears superficially identical to the following call, passing
+    # the desired file descriptor as an argument fails to preserve interleaving
+    # with prior commands printing to file descriptor 1 (i.e., standard out).
+#    print "zeshy: ${@}" 1>&2
+#}
+
 #FUXME: Add ANSI coloring to sayed messages if on an ANSI-capable terminal.
 #Also, consider prefixing messages under cron with: "["$(date +'%F %T')"].
 

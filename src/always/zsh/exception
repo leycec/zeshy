@@ -1,0 +1,199 @@
+#!/usr/bin/env zsh
+# ====================[ exception                          ]====================
+#
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2012 by Cecil Curry.
+# See "COPYING" for additional details.
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Handle zsh exceptions.
+
+# ....................{ EXCEPTIONS                         }....................
+#FIXME: Interestingly, we don't actually want all exceptions to be handled. We
+#always want *UNEXPECTED* exceptions to be handled. Expected exceptions,
+#however, should only be handled if the current user's Zeshy configuration
+#requests such handling, which should be disabled by default. The canonical
+#example of an expected exception is an external command wrapped by a Zeshy
+#function returning non-zero exit status on failing to find a match (e.g.,
+#"command grep" wrapped by grep_path()). Note that even in this case, of course,
+#not all errors emitted by "command grep" are expected: only on failing to find
+#a match, which must be explicitly tested for. This suggests a new helper
+#function die_unhandled(), which (as expected) does everything die() does but
+#excludes only the call to handle_exception(). Since this reduplicates a great
+#deal of intricate code, perhaps die() and die_unhandled() can simply delegate
+#to an internal utility function with prototype:
+#
+# string die_handled_if(
+#   string error_message = '', boolean is_handling_exception)
+#
+#Obviously, such functions should be shifted to a new component in the proper
+#Zeshy codebase: say, "shell/exception".
+#FIXME: While such functionality is essential for oddball corner-cases (e.g.,
+#"grep"), what we generally want is a simple way of squelching exceptions when
+#the current shell is interactive *AND* the current call stack ends with a
+#particular function that was called by some other particular function earlier
+#in such stack. This could possibly be implemented as a global map from the
+#former to latter, which function die() and associates would need to respect.
+#Consider the following definition:
+#
+#map_global_export\
+#    ZESHY_EXCEPTION_HIDE_IF_INTERACTIVELY_THROWN_BY_FUNCTION_NAMES
+#
+#Ah; wait. The "_INTERACTIVELY" is redundant, since such code paths can only
+#come about as interactive alias expansions. Also, it's not specifically
+#function names -- it's runnable names. Reduce to:
+#
+#map_global_export\
+#    ZESHY_EXCEPTION_HIDE_IF_THROWN_BY_RUNNABLE_NAMES
+#
+#Define such global as follows:
+#
+#ZESHY_EXCEPTION_HIDE_IF_THROWN_BY_RUNNABLE_NAMES=(
+#    'ls' 'l'
+#    'ls' 'ls'
+#    'grep' 'g'
+#    'grep' 'grep'
+#    'grep' 'gr'
+#    ...
+#)
+#
+#Now, that's in a great format for consumption by die_*() functions. But it's
+#not really the greatest for definition; given the tenuous nature of interactive
+#aliases, we really want to automate definition of such global. This should,
+#naturally, be done by the interactive_abbreviation() and
+#interactive_substitution() functions. (O.K.; I suppose interactive_alias()
+#applies as well.) Under interactive_substitution(), it's easy to set two such
+#entries: for both, the key is the command name being substituted; for the
+#first, the value is the same name; for the second, the value is such
+#substitution's abbreviation (if any!). Under interactive_abbreviation(),
+#thing's are a bit less automated: we'll need to improve
+#interactive_abbreviation() to accept an optional second argument specifying the
+#name of the core underlying external command that such abbreviation eventually
+#runs. Hence, this:
+#
+#    interactive_abbreviation {cal}endar{q}uarter='print_calendar_quarter'
+#
+#...would need to be expanded to this:
+#
+#    interactive_abbreviation {cal}endar{q}uarter='print_calendar_quarter' cal
+#
+#This then adds a single entry to the above global resembling this:
+#
+#    ZESHY_EXCEPTION_HIDE_IF_THROWN_BY_RUNNABLE_NAMES+='cal' 'calq'
+#
+#There's really no other sensible way to handle abbreviations. This works, it's
+#only a minor nuisance; let's go-goggogogogo-go!
+#
+#The first steps, clearly, will be automating interactive_substitution() to
+#perform such definition and die() to respect such definition (possibly subject
+#to a user-configurable boolean enabling or disabling such functionality). After
+#getting that to work, then contemplate the extension of such logic to
+#interactive_abbreviation(). Such global could (possibly) be called:
+#
+#    boolean_global_export ZESHY_IS_HANDLING_ERROR_IF_THROWN_BY_NONHANDLING_RUNNABLES
+#
+#Hmm; what about:
+#
+#    boolean_global_export ZESHY_IS_ERROR_HANDLED_IF_HIDDEN
+#    ZESHY_IS_ERROR_HANDLED_IF_HIDDEN=${ZESHY_BOOLEAN_FALSE}
+#
+#Much better. >)
+
+# string die_unhandled(string error_message = '')
+#function die_unhandled() {
+#    #FIXME: Implement such function. Unsure this is the best name, to be honest.
+#    die_handled_if "${@}" ${ZESHY_BOOLEAN_FALSE}
+#}
+
+# ....................{ PRINTERS                           }....................
+document_function '
+string print_exception_exit_status(integer exit_status)
+
+Print a description of the passed non-zero exit status to standard error. This
+function is intended to be called by handle_exception(). If not called by such
+function, throw an exception!
+'
+function print_exception_exit_status() {
+    # Validate passed arguments.
+    die_unless_arg 'expected one exit status'
+    string exit_status="${1}"
+    die_unless_integer_nonnegative "${exit_status}"
+    die_unless_caller_equals handle_exception
+
+    # Caller's caller's name (i.e., the name of the function or script calling
+    # the function or script calling this function). Since this function was
+    # called by handle_exception(), the current call stack contains at least two
+    # and typically three stack frames:
+    #
+    # * ${funcstack[1]}, this function.
+    # * ${funcstack[2]}, the handle_exception() function.
+    # * ${funcstack[3]}, the caller. This is typically either the
+    #   intermediate Zeshy-specific TRAPZERR() or die() functions.
+    # * ${funcstack[4]}, the caller's caller. Assuming ${funcstack[2]} to be
+    #   either TRAPZERR() or die(), this is the actual "caller."
+    string caller_name
+    if (( ${#funcstack} >= 4 )) and is "${funcstack[3]}" == (TRAPZERR|die) si
+    then caller_name="${funcstack[4]}"
+    else caller_name="${funcstack[3]}"
+    fi
+
+    # Describe such exit status. Do not bother redirecting to standard error, as
+    # handle_exception() already does so. If colormaps have been initialized,
+    # print such status with color; else, do not.
+    if (( ${+ZESHY_COLOR} + ${+ZESHY_COLOR[red]} + ${+ZESHY_COLOR[grey]} +\
+          ${+ZESHY_COLOR_BOLD} + ${+ZESHY_COLOR_BOLD[red]} == 5 ))
+    then print_string_colored\
+        "${ZESHY_COLOR[red]}${caller_name}${ZESHY_COLOR[grey]}: ${ZESHY_COLOR_BOLD[red]}failed with exit status ${exit_status}"
+    else "${caller_name}: failed with exit status ${exit_status}"
+    fi
+}
+
+# --------------------( WASTELANDS                         )--------------------
+    #FUXME: Actually print colors. To do so reasonably, we'll want to abstract
+    #the current color scheme of "io/output/say/say" into globals and reuse such
+    #globals here. Hmm; alternately, perhaps such color scheme should change on
+
+    #FUXME: Quite nice, though we don't currently use it. Perhaps extract into a
+    #new function convert_runnable_name_to_printable_string() in "runnable/runnable". This
+    #suggests a new series of functions inspired by Java's toString() approach,
+    #all intended for use as human-readable strings. There are a number of existing
+    #functions which, arguably, should be renamed in such fashion -- including:
+    #
+    #* convert_string_integer_to_comma_delimited_string(). This function appears to
+    #  use awk's printf() and hence implicitly locale globals to perform such
+    #  delimitation, suggesting in fact the result to not necessarily be comma-
+    #  delimited. Hence, convert_string_integer_to_printable_string() seems much
+    #  more sensible.
+    # If this frame signifies a function, append "()" to such function name.
+#   if typeset -f -- "${caller_name}" &>/dev/null
+#   then caller_name="${caller_name}()"
+    # If this frame signifies no "eval" statement and hence signifies a script,
+    # double quote such filename.
+#   elif [[ "${caller_name}" != '(eval)' ]]
+#   then caller_name="\"${caller_name}\""
+#   fi
+
+
+    #FUXME: Overkill. I'm nearly certain throwing exceptions here is quite
+    #alright. Test in any event.
+
+    # Validate passed arguments. Avoid returning non-zero exit status on fatal
+    # errors, as such status triggers an exception and hence infinite recursion.
+#   (( # == 1 )) || {
+#       print 'zeshy: print_exception_exit_status() expected one exit status'\
+#           1>&2
+#       return 0
+#   }
+#   local exit_status="${1}"
+
+    # See is_integer_nonnegative() for implementation details.
+#   [[ "${exit_status}" == <-> ]] || {
+#       print "zeshy: print_exception_exit_status() exit status \"${exit_status}\" not a positive integer" 1>&2
+#       return 0
+#   }
+
+#FUXME: Shift this to the main Zeshy codebase, requiring we call such function
+#from handle_exception() only if defined. If not defined, handle_exception()
+#should default to printing out the following string:
+#    print "zeshy: failed with exit status ${exit_status}"
+
