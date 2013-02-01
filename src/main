@@ -323,26 +323,27 @@ zmodload zsh/parameter
 #on triggering TRAPZERR(), don't we? As stated below, throwing exceptions
 #interacts sanely with "always" blocks -- this doesn't. It's still a sane
 #implementation, but one wonders if we can't do better.
+#FIXME: The documentation could certainly use streamlining.
 
 set_function_documentation TRAPZERR '
 integer TRAPZERR(integer signal_number = SIGZERR)
 
 Trap SIGZERR, a zsh-specific signal on non-zero exit status from zsh builtins
 and functions and external commands. Doing so effectively globally enables
-"setopt ERR_RETURN". On any command returning non-zero exit status:
+"setopt ERR_RETURN", such that on any command returning non-zero exit status:
 
-* If the current shell is interactive:
-* Implicitly throw an exception unwinding the call stack of such shell.
-* If such exception is uncaught, return the current user to the prompt.
-* If the current shell is non-interactive:
-* Immediately exit such shell with non-zero exit status.
+* If the current shell is interactive, implicitly throw an exception unwinding
+  the call stack of such shell. If such exception is uncaught, return the
+  current user to the prompt.
+* Else, the current shell is non-interactive. Immediately exit such shell with
+  non-zero exit status.
 * If the calling shell fails to handle such exit status (e.g., by using
   "or true") and is also running Zeshy, repeat the above logic until either
   exiting all non-interactive shells or returning to an interactive shell.
 
 In either case, handle such error according to the current user''s Zeshy
 configuration (e.g., by printing a stack trace, documentation, and/or source
-code related to such error). See handle_exception() for further details.
+code related to such error). See die() for further details.
 
 Unlike "setopt ERR_EXIT", this handler explicitly unwinds the call stack of
 only the current shell rather than all parent shells.
@@ -352,17 +353,26 @@ function TRAPZERR() {
     # by handling such error.
     integer exit_status=${?}
 
-    # Handle such exception and return such command's exit status, mimicing the
+    # Handle such exception and return such command's exit status, mimicking the
     # action of "setopt ERR_RETURN". (See "man zshoptions" for further details.)
-    handle_exception ${exit_status}
+    die_with_exit_status "${exit_status}"
     return ${exit_status}
 }
 
 set_function_documentation die '
 string die(string error_message1, string error_message2, ...)
 
-Print the passed error messages to standard error and return non-zero exit
-status, effectively throwing an exception as discussed under TRAPZERR().
+Print the passed exception message and related metadata requested by the current
+user to standard error and throw an exception. Metadata includes the following:
+
+* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK} is enabled, a stack
+  trace of the current call path. See print_call_stack() for further details.
+* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_DOCUMENTATION} is enabled,
+  documentation for the function or script throwing such exception. See
+  print_exception_thrower_documentation() for further details.
+* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_SOURCE_CODE} is enabled, the
+  source code of the function or script throwing such exception. See
+  print_exception_thrower_implementation() for further details.
 '
 function die() {
     # Exit status of the prior command. zsh defines "pipestatus" to be a global
@@ -393,177 +403,145 @@ function die() {
     # If the prior command succeeded, coerce such exit status into an error.
     (( ${exit_status} == 0 )) && exit_status=1
 
-    # If print_exception_message() has been defined, print such error message by
-    # calling such function.
-    if typeset -f print_exception_message &>/dev/null
-    then print_exception_message "${@}"
-    # Else, print such error message with a simple one-liner.
-    else print "zeshy: ${@}" 1>&2
-    fi
-
     # Handle such exception.
-    handle_exception ${exit_status}
+    die_with_exit_status "${@}" "${exit_status}"
 
     #FIXME: Suffix the exception name by the name of the function directly
     #responsible for throwing this exception. See curse_exception_exit_status()
     #for simple logic getting this function name.
 
-    # If function throw() is defined (as is usually the case), unwind the
-    # current call stack, returning the current user to an interactive prompt if
-    # the current shell is interactive or exiting such shell otherwise.
+    # If canonical function throw() is defined, unwind the current call stack,
+    # returning the current user to an interactive prompt if the current shell
+    # is interactive or exiting such shell otherwise.
     if typeset -f throw &>/dev/null
     then throw ZeshyException
-    # If function throw() is undefined, something terrible has happened. We
-    # can't do terribly much, so do our best: print a warning.
-    else print 'zeshy: throw() undefined (probably due to an exception handler throwing an exception)' 1>&2
+    # Else, something awful. Print a bleak warning.
+    else print 'zeshy: throw() undefined, probably as exception handler threw exception' 1>&2
     fi
+
+    # Return success to avoid triggering TRAPZERR and hence another exception.
+    return 0
 }
 
-set_function_documentation handle_exception '
-string handle_exception(integer exit_status)
+set_function_documentation die_with_exit_status '
+string die_with_exit_status(
+    string error_message1 = "", string error_message2, ..., integer exit_status)
 
-Handle the exception resulting from the passed (presumably) non-zero exit
-status, typically by printing such exception to standard error if requested
-by the current user. This placeholder implementation called only when
-bootstrapping Zeshy will be replaced when loading Zeshy''s digest file.
+Print the passed exception message (defaulting to the empty string) and related
+metadata requested by the current user to standard error. See die() for further
+details, which calls this function to perform such printing.
 '
-function handle_exception() {
+function die_with_exit_status() {
     # Redirect all output printed below to standard error. Yes, a single
     # suffixing "} 1>&2" actually suffices. You rock, zsh! (Sometimes.)
     {
+        # If the current call stack contains this function at any position other
+        # than the first (corresponding to the current call), this function
+        # transitively threw an exception. Blithely continuing on is likely to
+        # transitively throw another such exception, resulting in infinite
+        # recursion. To halt such recursion before it obliterates existence,
+        # print an error and return immediately on detecting such recursion. To
+        # do so efficiently, search from the end (i.e., root) of such stack; if
+        # the first matching caller is not the first, a witch! As below, return
+        # success to avoid triggering TRAPZERR and hence another exception.
+        (( ${funcstack[(I)die_with_exit_status]} == 1 )) || {
+            # For safety, print a mini rather than full stack trace.
+            print "zeshy: exception handler failed with exit status ${exit_status}"
+            print "zeshy: exception handler threw exception: ${*}"
+            print "zeshy: current call stack: ${funcstack[*]}"
+            return 0
+        }
+
         # Validate passed arguments. See is_integer_nonnegative() for details.
         (( # == 1 )) || die 'expected one exit status'
-        local exit_status="${1}"
+        local exit_status="${@[-1]}"
         [[ "${exit_status}" == <-> ]] ||
             die "exit status \"${exit_status}\" not a positive integer"
 
+        # Pop such status from the list of passed arguments.
+        set -- ${@[1,-2]}
+
         # If called directly from the command line, no such exception exists.
         (( ${#funcstack} >= 2 )) || die 'exception not thrown'
+
+        # If such message exists, print such message.
+        (( # )) &&
+            # If print_exception_message() is defined, call such function.
+            if typeset -f print_exception_message &>/dev/null
+            then print_exception_message "${@}"
+            # Else, print such message with a one-liner.
+            else print "zeshy: ${*}"
+            fi
 
         # Print a blank line.
         print
 
         # Print a description of the passed non-zero exit status.
+        # If print_exception_message() is defined, call such function.
         if typeset -f print_exception_exit_status &>/dev/null
         then print_exception_exit_status "${exit_status}"
+        # Else, print such message with a one-liner.
         else print "zeshy: failed with exit status ${exit_status}"
         fi
+#       print "printed exit status"
 
         # If the current user's Zeshy configuration requests printing stack
-        # traces on exceptions, do so.
-        [[ -n "${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK-}" ]] &&
-            print_call_stack
+        # traces on exceptions, do so. If the Zeshy function to do so has not
+        # yet been defined, attempt a stub implementation... Printing such
+        # traces is essential *ESPECIALLY* at Zeshy bootstrap, before such
+        # function is autoloaded from Zeshy's user digest file.
+        [[ -n "${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK-}" ]] && {
+#           print "printing call stack"
+            # If print_call_stack() is defined, call such function.
+            if typeset -f print_call_stack &>/dev/null
+            then
+#               print "calling print_call_stack()"
+                print_call_stack
+            # Else, print such stack with an implementation distilled from
+            # print_call_stack(). See such function for further details.
+            else
+                integer funcstack_size=${#funcstack} i caller_line
+                local frame_prefix='    \\_' filename caller_name
+#               print "printing stack frame"
+
+                for (( i = 1; i <= funcstack_size; i++ )) {
+                    caller_name="${funcstack[${i}]}"
+                    caller_line="${funcfiletrace[${i}]##*:}"
+                       filename="${funcfiletrace[${i}]%:*}"
+
+                    typeset -f -- "${caller_name}" &>/dev/null &&
+                        caller_name="${caller_name}()"
+                    print --\
+                        "${frame_prefix} ${caller_name} { ${filename}: ${caller_line} }"
+
+                    frame_prefix=" ${frame_prefix}"
+                }
+            fi
+        }
     # If such handling itself throws an exception, catch such exception here to
     # prevent uncaught exceptions from recursively triggering TRAPZERR(). Since
     # Zeshy functions may sadly be the source of such exception, avoid calling
     # Zeshy functions in catch logic.
     } always {
-        # If function catch() is defined (as is usually the case), catch such
-        # exception and print a warning.
-        if typeset -f catch &>/dev/null; then
-            # While zsh *SHOULD* always set the ${CAUGHT} global to the name of
-            # the uncaught exception, it (occassionally) appears not to. *sigh*
-            catch * && if [[ -n "${CAUGHT-}" ]]
-            then print "zeshy: exception handler threw exception \"${CAUGHT}\""
-            else print "zeshy: exception handler failed with non-zero exit status"
+        # If an exception was thrown...
+        (( ${+EXCEPTION} )) &&
+            # ...and if canonical function catch() is defined, catch such
+            # exception and print a warning.
+            if typeset -f catch &>/dev/null; then
+                # If catch() sets global ${CAUGHT} to the name of the uncaught
+                # exception, print such name.
+                catch * && if [[ -n "${CAUGHT-}" ]]
+                then print "zeshy: exception handler threw exception \"${CAUGHT}\""
+                # Unfortunately, catch() may not set such global! *shrug*
+                else print "zeshy: exception handler failed with non-zero exit status"
+                fi
+            # ...else, something awful. Print a despicable warning.
+            else print 'zeshy: catch() undefined, probably as exception handler threw exception'
             fi
-        # If function catch() is undefined, something terrible has happened. We
-        # can't do terribly much, so do our best: print a warning.
-        else print 'zeshy: exception handler threw exception, but catch() undefined'
-        fi
     } 1>&2
-}
 
-#FIXME: This function is complex enough to warrant extraction into the main
-#Zeshy codebase. That said, we'll still want a stub implementation available at
-#Zeshy startup: stack traces are essential. To do so, cut this implementation
-#back to the bone and inline such bare-bones implementation up into the guts of
-#handle_exception() itself. (Yes, *DO IT*. If we allow ourselves to implement a
-#separate stub function, we invite even more confusion by having to define a
-#temporary function undefined at the end of this component. It's just not worth
-#it, you dig?)
-#FIXME: There appears to be a very curious oddity in zsh; sourcing a zsh script
-#containing the line "return 1" produces the expected call stack, resembling:
-#
-#./tmpy.zsh: failed with exit status 1
-#    \_ curse_call_stack() { /home/leycec/zsh/zeshy/src/main: 418 }
-#     \_ handle_exception() { /home/leycec/zsh/zeshy/src/main: 8458093679346917924 }
-#      \_ TRAPZERR() { ./tmpy.zsh: 2 }
-#       \_ ./tmpy.zsh { zsh: 32 }
-#
-#Running a zsh script containing the line "exit 1" as a command, however,
-#produces call stacks resembling:
-#
-#TRAPZERR: failed with exit status 20
-#    \_ curse_call_stack() { /home/leycec/zsh/zeshy/src/main: 418 }
-#     \_ handle_exception() { /home/leycec/zsh/zeshy/src/main: 7955925549229362501 }
-#      \_ TRAPZERR() { /bin/zsh: 31 }
-#
-#In the latter case, zsh reports the call stack to contain no such command. But
-#it gets worse! zsh fails to include commands in *ALL* call stacks; try
-#"command ls zzmmmm", for example. This tends to produce inherently senseless
-#error output. I suggest one of two solutions:
-#
-#* If "TRAPZERR" is the top of the call stack, print no call stack. (It's
-#  meaningless, so don't even bother.) This is most certainly the simplest
-#  solution. (Actually, I tried this. It blatantly sucks.)
-#* Forcefully add the expected command to the top of the call stack. This is
-#  much better, since the prior solution still crudely reports
-#  "TRAPZERR: failed with exit status 20" when in fact we expect
-#  "./tmpy.zsh: failed with exit status 1". Just not sure how to *GET* the
-#  expected command name or exit status.
-
-set_function_documentation print_call_stack '
-string print_call_stack(void)
-
-Print a trace of the current call stack consisting of all previously called
-functions, sourced files, and "eval" statements in the current call path to
-standard error, excluding only the stack frame of the caller''s call to this
-function. Printing to standard error rather than output ensures that calling
-this function from command substitutions (e.g., "$(get_zsh_version)") prints
-to the terminal device attached to the current shell, without requiring the
-caller to explicitly perform such printing: e.g.,
-
-  # Assuming neither "/spider" or "/murphy" exist, the following command
-  # substitution throws an exception printing a call stack trace to
-  # standard error without effort on our behalf.
-  >>> string first_file; first_file="$(get_first_file /spider /murphy)"
-'
-function print_call_stack() {
-    # Validate passed arguments.
-    (( # == 0 )) || die 'expected no arguments'
-    integer funcstack_size=${#funcstack} i caller_line
-    local frame_prefix='    \\_' filename caller_name
-
-    # Print the current call stack.
-    for (( i = 1; i <= funcstack_size; i++ )) {
-        # Split the current stack frame's funcfiletrace entry on the last colon
-        # in that entry into this frame's filename and line number, thus
-        # accounting for possible colons in filenames (e.g., from "colon:blow:7"
-        # to filename "colon:blow" and line number 7).
-        caller_name="${funcstack[${i}]}"
-        caller_line="${funcfiletrace[${i}]##*:}"
-           filename="${funcfiletrace[${i}]%:*}"
-
-        # If this frame signifies a function, append "()" to such name. Sadly,
-        # if a script with the same name exists (which is technically feasible,
-        # given zsh support for double-quoted function names), there appears to
-        # be no simple way of discerning between the two. *shrug*
-        #
-        # Note that, when called due to an exception thrown from an interactive
-        # alias, such alias will be disabled here and hence not be recognized as
-        # a function. Since such alias signifies an alias and not a function,
-        # this is (arguably) not a bug. (Nothin' to see here, folks.)
-        typeset -f -- "${caller_name}" &>/dev/null &&
-            caller_name="${caller_name}()"
-
-        # Print the current stack frame to standard error.
-        print --\
-            "${frame_prefix} ${caller_name} { ${filename}: ${caller_line} }"
-
-        # Indent the next stack frame one space to the right.
-        frame_prefix=" ${frame_prefix}"
-    }
+    # Return success to avoid triggering TRAPZERR and hence another exception.
+    return 0
 }
 
 # ....................{ INTERRUPTION                       }....................
@@ -1062,6 +1040,33 @@ is_string_nonempty "${*}" and {
 return_true
 
 # --------------------( WASTELANDS                         )--------------------
+            # If an exception was thrown, print such exception.
+#           if (( ${+EXCEPTION} ))
+#           then print "zeshy: exception handler threw exception \"${EXCEPTION}\""
+            # Else, a command returned non-zero exit status.
+#           else print "zeshy: exception handler failed with non-zero exit status"
+#           fi
+            # While zsh should set global ${CAUGHT} to the name of the uncaught
+            # exception, it infrequently appears not to. Handle this.
+#Handle the exception resulting from the passed presumably non-zero exit status,
+#typically by printing such exception to standard error if desired by the current
+#user.
+
+#return non-zero exit
+#status, effectively throwing an exception as discussed under TRAPZERR().
+#set_function_documentation handle_exception '
+#string handle_exception(integer exit_status)
+#
+#Handle the exception resulting from the passed presumably non-zero exit status,
+#typically by printing such exception to standard error if desired by the current
+#user.
+#'
+#function handle_exception() {
+
+# This placeholder implementation called only when
+# bootstrapping Zeshy will be replaced when loading Zeshy''s digest file.
+    # Before calling *ANY* functions throwing exceptions on failure, 
+
     #FUXME: Is this overkill? What happens if we return 1 instead? Forcefully
     #trigger this... and see!
     #FUXME: Uhm; we already validate this below. Hmm.
