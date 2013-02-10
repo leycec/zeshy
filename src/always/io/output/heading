@@ -10,56 +10,129 @@
 # prefixed by a heading describing such section).
 
 # ....................{ GLOBALS                            }....................
+#FIXME: I'm unconvinced this works, actually. Consider calling
+#make_grub2_boot_image() twice from the command line. The second go around,
+#this name will be "make_grub2_boot_image", thus inducing print_heading() to
+#prefix the first heading output by the second call to make_grub2_boot_image()
+#with a newline. *sigh*
+#...well, that's a tremendously obvious flaw in the rough. This clearly won't
+#work reliably as advertised -- any of it. Ah; wait. I know how to amend this.
+#*phew* Bit annoying, but if we just... Hmmmm. Yikes. Technically, we can do
+#this, but won't we have to hash the contents of *BOTH* ${funcstack} and the
+#${funcfiletrace}? Hmmmm. Technically, we could efficiently compact both lists
+#into a single string with:
+#
+#   # We'll need to do this manually, both for efficiency and to avoid
+#   # permuting the call stack. Exclude the current call, for subsequent
+#   # comparability.
+#   "${(j:$'\0':)funcstack[1,-2]}\0\0${(j:$'\0':)funcfiletrace[1,-2]}"
+#
+#Should be *REASONABLY* efficient, assuming the call stack isn't recursively
+#stupidly deep. (If it is, this probably dies a flaming death... but then, no
+#one reasonable should be doing recursion in zsh, yes?)
+#
+#O.K.; so what that "hashed" string does is allow us to reliably answer the
+#question: is the current call to a print function the first in its "group"?
+#Specifically, if:
+#
+#* ${ZESHY_PRINT_FUNCTION_CALLER_NAME} is on the current call stack (which is
+#  fairly efficiently determined given typical call stack depths) and...
+#  * "${(j:$'\0':)funcstack[1,${caller_index}]}\0\0${(j:$'\0':)funcfiletrace[1,${caller_index}]}"
+#    is the same as the previously cached value above, where "${caller_index}"
+#    is the integer found on such stack, then this is *NOT* the first call to a
+#    print function by the current caller.
+#* Else, this is.
+#
+#I wish I could say that it's simple, but it's not. It should, however, reliably
+#work, thanks in part to zsh's incrementing the "line" number on each function
+#called from the command line (guaranteeing different calls hash to different
+#strings above). For sanity, we'll probably want to embed the above string hashing
+#in an alias -- which can then be conveniently called from both
+#set_print_function_caller() and print_heading() and friends. What's particularly
+#brilliant about the whole thing is that it implicitly tracks *ANY* Zeshy print
+#function. Hence, if one function calls print_heading() that then calls another
+#function that calls print_message(), the latter call will be smart enough to note
+#it to *NOT* be the first call to such a print function. Wow, great! Utterly no
+#idea how I'll ever document this monstrosity, but it should certainly work. Now
+#for a tea break.
+#FIXME: Use a herestring-style alias. Shouldn't be terribly much overhead, given
+#the short string lengths involved... and way more reliable.
+#FIXME: Ah-ha! This is *ALL* extreme overkill, though the method above does point
+#to the correct way. Note that we only want to track output for each call hierarchy
+#rooted at the same root caller: that is, each discrete call stack rooted at some
+#caller tracks whether output has been printed for that call stack or not. But this
+#is painfully simple to track: rather than all of this "caller_name" and "heading_group"
+#nonsense, just record the following string in a global variable:
+#
+#    "${funcstack[1]}\0${funcfiletrace[1]}"
+#
+#That's it. Then, on each call to a print function, simply test such variable for
+#equality with the same string re-evaluated at the current context. If they're the
+#same, then this is another call to the same call hierarchy, so *PRINT A NEWLINE*;
+#else, this is the first call to a new call hierarchy, so set such global variable
+#to such string's evaluation. Painfully simple, no?
+#FIXME: I believe we can dispense with at least
+#${ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED} and possibly also
+#set_print_function_caller().
+#FIXME: Right. Since we'll be leveraging such functionality in multiple places,
+#abstract out into a function entitled, say... print_message_prefix().
+#FIXME: Merge the contents of this file with "message", for obvious reasons.
+
 document_global '
-string ZESHY_HEADING_GROUP_NAME
+string ZESHY_PRINT_FUNCTION_CALLER_NAME
 
-Name of the most recent heading group tracking internal state for print_heading()
-or the empty string if neither print_heading() or set_heading_group() have been
-called. The heading group of two or more headings is simply the topmost function
-or script either directly printing such headings by calling print_heading() or
-indirectly printing such headings by calling other functions and scripts calling
-print_heading().
+Name of the most recent function or script to have called a Zeshy print function
+internally tracking such state (e.g., print_heading(), print_message()) or the
+empty string if no such function has been called. Such functions set this name
+to that of the caller when the current call stack does *NOT* contain this name''s
+current value, resetting such state. Alternatively, callers may explicitly set
+this name to a caller of their choosing by calling set_print_function_caller().
 
-In the former case, no heading group need be explicitly set, as print_heading()
-implicitly sets the current heading group to that of the caller. (See below.)
-In the latter case, a heading group must be explicitly set by calling
-set_heading_group(). (See such function for further details.)
+In either case, this name notifies each call to a concerned Zeshy print function
+of whether or not this constitutes the first call to such a function by such
+caller. If this is the first call, such function does *NOT* prefix output with
+delimiting whitespace; otherwise, such function does prefix output with
+delimiting whitespace.
 
-In either case, the heading group notifies each call to print_heading() of whether
-or not such call is printing a heading in the current heading group or not. When
-printing a heading in the current heading group, print_heading() precedes such
-heading by delimiting whitespace *UNLESS* this is the first heading to be
-printed for such group (i.e., no such heading has been printed yet). When
-printing a heading *NOT* in the current heading group, print_heading() closes the
-previous group and opens a new group with same name as the caller.
+For example, suppose the current user calls make_grub2_boot_image() from the
+command line and that such function calls print_heading(). Since the call stack
+cannot contain this name''s current value (whatever that was),  thus setting this
+name to "make_grub2_boot_image".  thus setting this name to
+"make_grub2_boot_image", before calling make_initramfs() that then calls
+print_heading(). As the current call stack contains this name''s current value,
+print_heading() 
 
-A heading is in the current heading group if the current caller is either such
+this name is currently "make_grub2_boot_image" and function
+make_initramfs() calls print_heading(), then since make_grub2_boot_image() transitively calls make_initramfs(), such heading
+is in the current output group and will be printed accordingly.
+
+A heading is in the current output group if the current caller is either such
 group or transitively called by such group. For example, if the current caller
-is make_initramfs() and the current heading group is make_grub2_boot_image() (as
-signified by "is ${ZESHY_HEADING_GROUP} == ''make_grub2_boot_image''"), then
+is make_initramfs() and the current output group is make_grub2_boot_image() (as
+signified by "is ${ZESHY_PRINT_FUNCTION_CALLER} == ''make_grub2_boot_image''"), then
 since make_grub2_boot_image() transitively calls make_initramfs(), such heading
-is in the current heading group and will be printed accordingly.
+is in the current output group and will be printed accordingly.
 '
 
 document_global '
-boolean ZESHY_HEADING_GROUP_IS_PRINTED
+boolean ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED
 
-If true, at least one heading has been printed for the current heading group.
-See ${ZESHY_HEADING_GROUP_NAME} for further discussion.
+If true, at least one heading has been printed for the current output group.
+See ${ZESHY_PRINT_FUNCTION_CALLER_NAME} for further discussion.
 '
 
 # ....................{ STARTERS                           }....................
 #FIXME: Improve documentation, please.
 document_function '
-void set_heading_group(string heading_group_name="$(get_caller_name)")
+void set_print_function_caller(string caller_name="$(get_caller_name)")
 
-Set the current heading group (defaulting to the calling function or script).
-See ${ZESHY_HEADING_GROUP_NAME} for further discussion.
+Set the current output caller (defaulting to the calling function or script).
+See ${ZESHY_PRINT_FUNCTION_CALLER_NAME} for further discussion.
 '
-function set_heading_group() {
+function set_print_function_caller() {
     die_unless_args_0_to_1 'expected optional group name'
-    ZESHY_HEADING_GROUP_NAME="${1:-$(get_caller_name)}"
-    ZESHY_HEADING_GROUP_IS_PRINTED=${ZESHY_BOOLEAN_FALSE}
+    ZESHY_PRINT_FUNCTION_CALLER_NAME="${1:-$(get_caller_name)}"
+    ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED=${ZESHY_BOOLEAN_FALSE}
 }
 
 # ....................{ PRINTERS                           }....................
@@ -68,7 +141,7 @@ document_function '
 string print_heading(string text1 = "", string text2, ...)
 
 Print the passed heading (defaulting to the empty string) in the current heading
-group. See ${ZESHY_HEADING_GROUP_NAME} for further discussion.
+group. See ${ZESHY_PRINT_FUNCTION_CALLER_NAME} for further discussion.
 '
 function print_heading() {
     # Heading to be printed, concatenated from passed arguments.
@@ -76,34 +149,34 @@ function print_heading() {
 
     # If *NOT* called directly from the command line, this function was called
     # by another function or script. Determine whether the heading just passed
-    # by such caller is in the current heading group.
+    # by such caller is in the current output group.
     is_caller and {
-#       print "ZESHY_HEADING_GROUP_NAME=${ZESHY_HEADING_GROUP_NAME}"
-#       print "ZESHY_HEADING_GROUP_IS_PRINTED=${ZESHY_HEADING_GROUP_IS_PRINTED}"
-        # If such heading is in the current heading group (i.e., if the current
+#       print "ZESHY_PRINT_FUNCTION_CALLER_NAME=${ZESHY_PRINT_FUNCTION_CALLER_NAME}"
+#       print "ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED=${ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED}"
+        # If such heading is in the current output group (i.e., if the current
         # caller or some transitive parent of such caller on the call stack
         # is such group), determine whether or not a heading has been printed
-        # in such group. See ${ZESHY_HEADING_GROUP_NAME} for further discussion.
-        if is_string_nonempty "${ZESHY_HEADING_GROUP_NAME}" and
-            is_call_stack_contains "${ZESHY_HEADING_GROUP_NAME}"; then
+        # in such group. See ${ZESHY_PRINT_FUNCTION_CALLER_NAME} for further discussion.
+        if is_string_nonempty "${ZESHY_PRINT_FUNCTION_CALLER_NAME}" and
+            is_call_stack_contains "${ZESHY_PRINT_FUNCTION_CALLER_NAME}"; then
             # If some heading has already been printed for such group, delimit
             # the heading to be printed below from prior output with whitespace.
-            is_boolean_false "${ZESHY_HEADING_GROUP_IS_PRINTED}" or {
+            is_boolean_false "${ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED}" or {
 #               print 'non-first heading!'
                 print_newline
             }
-        # Else, such heading is *NOT* in the current heading group. Start a new
+        # Else, such heading is *NOT* in the current output group. Start a new
         # group with same name as the caller.
         else
-#           print "setting new heading group to \"$(get_caller_name)\""
-            set_heading_group "$(get_caller_name)"
+#           print "setting new output group to \"$(get_caller_name)\""
+            set_print_function_caller "$(get_caller_name)"
         fi
 
         # Notify subsequent calls to this function that a heading has been
         # printed for such group. While we could set such boolean for the
         # specific cases necessitating its setting rather than for all cases
         # indiscriminantly, this approach invites fewer subtleties. Trust us.
-        ZESHY_HEADING_GROUP_IS_PRINTED=${ZESHY_BOOLEAN_TRUE}
+        ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED=${ZESHY_BOOLEAN_TRUE}
     }
 
     # Relevant integer lengths.
@@ -204,7 +277,7 @@ function print_heading() {
 
 #FIXME: In lieu of unit tests, this will do.
 #function sayh() {
-#    set_heading_group
+#    set_print_function_caller
 #    print_heading 'dancing to'
 #    print 'life'
 #    brayman
@@ -218,8 +291,29 @@ function print_heading() {
 #    print 'lichtschein'
 #}
 
+# --------------------( WASTELANDS                        )--------------------
+#FUXME: Rename set_print_function_caller() to something a bit more fitting, and
+#note that such function should really *NEVER* be called by any functions except
+#print_*() functions.
+#See such function for further details.
+#printing a heading in the current output group, print_heading() precedes such
+#heading by delimiting whitespace *UNLESS* this is the first heading to be
+#printed for such group (i.e., no such heading has been printed yet). When
+#printing a heading *NOT* in the current output group, print_heading() closes the
+#previous group and opens a new group with same name as the caller.
+
+#The output group of two or more headings is simply the topmost function
+#or script either directly printing such headings by calling print_heading() or
+#indirectly printing such headings by calling other functions and scripts calling
+#print_heading().
+#
+#In the former case, no output group need be explicitly set, as print_heading()
+#implicitly sets the current output group to that of the caller. (See below.)
+#In the latter case, a output group must be explicitly set by calling
+#set_print_function_caller(). (See such function for further details.)
+
 # ....................{ PRINTERS ~ sections                }....................
-#FIXME: Eliminate the distinction between say_first_section() and
+#FUXME: Eliminate the distinction between say_first_section() and
 #say_next_section() by replacing such functions with a single
 #print_heading() function. This function internally retains the name of the last
 #function that called this function (e.g., with a global string
@@ -243,75 +337,74 @@ function print_heading() {
 #caller stack. This should work without error if the caller is in fact a global
 #script; just return the script name, for example.
 #
-#The heading group is an arbitrary name distinguishing this "group" of headings
+#The output group is an arbitrary name distinguishing this "group" of headings
 #from other such groups, defaulting to the caller name. Callers performing
-#complex logic should pass a different heading group... Hmm. This is all well
+#complex logic should pass a different output group... Hmm. This is all well
 #and good, but perhaps we should provide additional functions, as well:
 #
-# string set_heading_group(string heading_group = "$(get_caller_function_name)")
-# string unset_heading_group()
+# string set_print_function_caller(string heading_group = "$(get_caller_function_name)")
+# string unset_print_function_caller()
 #
-#These set a global string ${ZESHY_HEADING_GROUP}. Then, slightly change
+#These set a global string ${ZESHY_PRINT_FUNCTION_CALLER}. Then, slightly change
 #print_heading() to:
 #
 # string print_heading(
 #   string heading,
-#   string heading_group = "${ZESHY_HEADING_GROUP:-$(get_caller_function_name)}")
+#   string heading_group = "${ZESHY_PRINT_FUNCTION_CALLER:-$(get_caller_function_name)}")
 #
 #print_heading() then internally compares the passed heading_group (with the above
 #default) to its cached ${ZESHY_SAY_HEADING_CALLER_FUNCTION_NAME} (which should
-#probably be ${ZESHY_HEADING_GROUP_PRIOR}). If different... well, you know the game.
+#probably be ${ZESHY_PRINT_FUNCTION_CALLER_PRIOR}). If different... well, you know the game.
 #
 #Sweet. That seems just right. Simple functions can just call print_heading() with
-#one argument without needing to call set_heading_group() or
-#unset_heading_group(). More complex functions can just call print_heading() with
-#two arguments. And truly complex groups of functions can call set_heading_group()
+#one argument without needing to call set_print_function_caller() or
+#unset_print_function_caller(). More complex functions can just call print_heading() with
+#two arguments. And truly complex groups of functions can call set_print_function_caller()
 #prior to calling print_heading() with one argument prior to calling
-#unset_heading_group().
+#unset_print_function_caller().
 #
-#Hmmm; set_heading_group() and unset_heading_group() might cause too many head-
+#Hmmm; set_print_function_caller() and unset_print_function_caller() might cause too many head-
 #aches, hmm? Just calling print_heading() with two arguments should suffice for
 #an initial implementation, no? Ah; wait. We really just need the following:
 #
 # string print_heading(string heading)
-# string set_heading_group(string heading_group = "$(get_caller_function_name)")
-# string unset_heading_group()
+# string set_print_function_caller(string heading_group = "$(get_caller_function_name)")
+# string unset_print_function_caller()
 #
 #Tada! Flash. Crash. Bamb.
-#FIXME: Hmmm. Heading groups seem a tad overkill, actually. *AS WELL AS NON-
+#FUXME: Hmmm. Heading groups seem a tad overkill, actually. *AS WELL AS NON-
 #TRIVIAL* to interact with properly, as it's the caller's responsibility to then
-#ensure calling unset_heading_group() in an "} always {...}" block surrounding
+#ensure calling unset_print_function_caller() in an "} always {...}" block surrounding
 #such code. Right. You know, the prior search-up-the-call-stack method is
 #actually pretty rockin'. We'll just need to define an additional separate
 #function setting ${ZESHY_HEADING_CALLER_NAME} to the caller name and then search
 #for such caller in the call stack on subsequent calls to print_heading(). No need
-#for set_heading_group() and set_heading_group() or for passing an optional
-#heading group parameter to print_heading(). *SWEEEET*.
+#for set_print_function_caller() and set_print_function_caller() or for passing an optional
+#output group parameter to print_heading(). *SWEEEET*.
 
-document_function '
-string say_first_section(string header1, string header2, ...)
+#document_function '
+#string say_first_section(string header1, string header2, ...)
+#
+#Print the passed strings as the header of a section (i.e., a contiguous block
+#of related output). Sections demarcate print_string into logical blocks, each
+#preceded by a terse header synopsizing such block. To ensure aesthetic output,
+#call this function *ONLY* on the first such section and say_next_section()
+#on all remaining sections.
+#'
+#function say_first_section() {
+#    print_message "[${@}]"
+#}
 
-Print the passed strings as the header of a section (i.e., a contiguous block
-of related output). Sections demarcate print_string into logical blocks, each
-preceded by a terse header synopsizing such block. To ensure aesthetic output,
-call this function *ONLY* on the first such section and say_next_section()
-on all remaining sections.
-'
-function say_first_section() {
-    print_message "[${@}]"
-}
+#document_function '
+#string say_first_section(string header1, string header2, ...)
+#
+#Print the passed strings as the header of any section other than the first.
+#'
+#function say_next_section() {
+#    print_newline
+#    say_first_section "${@}"
+#}
 
-document_function '
-string say_first_section(string header1, string header2, ...)
-
-Print the passed strings as the header of any section other than the first.
-'
-function say_next_section() {
-    print_newline
-    say_first_section "${@}"
-}
-
-# --------------------( WASTELANDS                        )--------------------
         # Border colors.
 #       string\
 #           color_border="${ZESHY_COLOR[blue]}"\
@@ -321,10 +414,10 @@ function say_next_section() {
             # If no heading has been printed for such group, this is the first.
             # Inform future calls to this function that a heading has now been
             # printed for such group.
-#           if is_boolean_false "${ZESHY_HEADING_GROUP_IS_PRINTED}"
+#           if is_boolean_false "${ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED}"
 #           then
 #               print 'first heading!'
-#               ZESHY_HEADING_GROUP_IS_PRINTED=${ZESHY_BOOLEAN_TRUE}
+#               ZESHY_PRINT_FUNCTION_CALLER_IS_PRINTED=${ZESHY_BOOLEAN_TRUE}
             # Else, some heading has been printed for such group. Since this is
             # not the first, delimit such heading from prior with whitespace.
 #           else
@@ -351,12 +444,12 @@ function say_next_section() {
 #   die_unless_args 'expected at least one string'
 # false, thus preceding headings by such whitespace.
     # If this function has been called at least once, string global
-    # ${ZESHY_HEADING_GROUP} should have been set by such call. In
+    # ${ZESHY_PRINT_FUNCTION_CALLER} should have been set by such call. In
     # such case, search the current call stack for a function or script with
-    # such name. See ${ZESHY_HEADING_GROUP} for further details.
+    # such name. See ${ZESHY_PRINT_FUNCTION_CALLER} for further details.
 #in the call stack under which all  transitively calling responsible for 
 #
-#Name of the most recent heading group to track state for calls to print_heading()
+#Name of the most recent output group to track state for calls to print_heading()
 #or the empty string if no such group .
 #Name of the function or script to most recently called print_heading().
 #On subsequent calls, print_heading() searches the current call stack for a
@@ -364,7 +457,7 @@ function say_next_section() {
 #first heading to be printed for such caller; else the passed heading *IS* the
 #first heading to be printed for such caller. print_heading() prints such heading
 #accordingly (e.g., prefixing non-first headings with blank newlines).
-#string ZESHY_HEADING_GROUP
+#string ZESHY_PRINT_FUNCTION_CALLER
 #           character_border='━'
 #           character_joiner_left='❴'
 #           character_joiner_right='❵'
@@ -408,7 +501,7 @@ function say_next_section() {
 #    widths (i.e., left banner, right banner, section header) back to the
 #    section header. That should do us right, no?
 #* Naturally, it'd be nice to colorify this, too. All things come.
-#FUXME: Print the actual headings with print_banner_titled(), as discussed in
+#FUXME: Print the actual headings with print_hard_rule_titled(), as discussed in
 #the "output" component.
 
 #           color_outline="${ZESHY_COLOR[blue]}"\
