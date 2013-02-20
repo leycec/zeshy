@@ -30,11 +30,19 @@
 # http://www.bash2zsh.com/essays/essay1_file_manager.html
 #   Brilliant introduction to suffix aliases, mime types, and file magic.
 
+#FIXME: MIME types are now officially referred to as "media types," which
+#certainly seems more human-readable. Contemplate renaming this component and
+#corresponding functions below.
+
 # ....................{ GETTERS                            }....................
 document_function '
 string get_file_mimetype(string filename)
 
-Get the passed file''s mimetype by dynamically inspecting such file''s content.
+Get the passed file''s mimetype by dynamically inspecting such file''s content:
+e.g.,
+
+    >>> get_file_mimetype "/etc/issue"
+    text/plain
 '
 function get_file_mimetype() {
     # Validate passed arguments. Since "file" successfully outputs mimetypes for
@@ -49,6 +57,12 @@ function get_file_mimetype() {
     #the desired substring from "-i" (i.e., "--mime"), which should certainly
     #exist on BSDs. We'll have to do some heavier lifting to generalize this,
     #but it certainly seems doable: parse "-i" output ourselves!
+    #FIXME: O.K.; the output for file "/etc/issue" resembles:
+    #    /etc/issue: text/plain; charset=us-ascii
+    #To account for filenames containing ":", we'll clearly need to dynamically
+    #create a glob first matching the desired filename (with glob characters
+    #escaped, of course), followed by a colon, and so on. Certainly doable, but
+    #somewhat annoying.
 
     # Defer to "file". (Oh, how we obsequiously bow before thy magnanimity.)
     file --brief --mime-type -- "${filename}"
@@ -58,7 +72,10 @@ document_function '
 string get_file_encoding(string filename)
 
 Get the passed file''s character set encoding by dynamically inspecting such
-file''s content.
+file''s content: e.g.,
+
+    >>> get_file_encoding "/etc/issue"
+    us-ascii
 '
 function get_file_encoding() {
     # Validate passed arguments. Since "file" successfully outputs mimetypes for
@@ -111,7 +128,7 @@ function open_file_with() {
     if is_pathable "${mimetype_command_name}"
     then "${mimetype_command_name}" "${filename}"
     #FIXME: Should probably print a warning in such case, no?
-    # Otherwise, default to the zsh "zsh-mime-handler" command.
+    # Otherwise, defer to zsh-mime-handler().
     else zsh-mime-handler "${filename}"
     fi
 }
@@ -123,20 +140,18 @@ string print_mimetype_aliases(void)
 List all suffix aliases defined by a prior call to setup_mimetype_aliases().
 '
 function print_mimetype_aliases() {
+    # See define_mimetype_aliases() for further details.
     die_if_args
-
-    #FIXME: How does run_command_paged() find "zsh-mime-setup", and couldn't we
-    #implement a similar solution below?
-    run_command_paged zsh-mime-setup -l
+    run_command_paged run_command_under_zsh_defaults zsh-mime-setup -l
 }
 
 # ....................{ MAKERS                             }....................
 document_function '
 string define_mimetype_aliases(void)
 
-Define one suffix aliase for each mimetype mapping listed in the system-wide
-and user-specific "mailcap" files. Such aliases associate filename suffixes with
-the command handling such files, enabling BSD-style file handling: e.g.,
+Define one suffix alias for each mimetype mapping listed in the system-wide and
+user-specific "mailcap" files. Such aliases associate filename suffixes with the
+command handling such files, enabling BSD-style file handling: e.g.,
 
     # Run files to open files. What could be simpler? Assuming installation of
     # PDF readers and mimetype mapping associating the PDF mimetype with some
@@ -145,36 +160,136 @@ the command handling such files, enabling BSD-style file handling: e.g.,
     >>> ./Devour_All_the_Living_Things.pdf
 '
 function define_mimetype_aliases() {
-    die_if_args
-    source_shell_script_defining_function zsh-mime-setup -f
-}
-
-# ....................{ STARTUP                            }....................
-run_hook_on_zeshy_startup_if_shell_interactive startup_zeshy_mimetype_aliases
-
-document_function '
-void startup_zeshy_mimetype_aliases(void)
-
-See define_mimetype_aliases() for further details.
-'
-function startup_zeshy_mimetype_aliases() {
     # Validate sanity.
     die_if_args
 
-    # If either the system-wide or user-specific "mailcap" file exists and is
-    # non-empty, define mimetype aliases from such file(s).
-    if is_file_nonempty "${HOME}/.mailcap" or is_file_nonempty '/etc/mailcap'
-    then define_mimetype_aliases
-    # Else, print a non-fatal warning.
-    else print_warning 'no mimetype aliases defined: "~/.mailcap" and "/etc/mailcap" empty or not found'
-    fi
+    # Autoload such function and functions such function transitively calls.
+    # While Zeshy autoloads such functions on startup, Zeshy calls this function
+    # during precompilation before startup.
+    autoload_function zsh-mime-setup zsh-mime-handler
+
+    # Define such aliases. (While such function does initially call emulate(),
+    # such call fails to revert traps and hence remains unsafe.)
+    run_command_under_zsh_defaults zsh-mime-setup -f
+}
+
+# ....................{ STARTUP                            }....................
+run_hook_on_zeshy_precompile precompile_zeshy_mimetype_aliases
+
+document_function '
+void precompile_zeshy_mimetype_aliases(void)
+
+Define one suffix alias for each mimetype mapping listed in the system-wide and
+user-specific "mailcap" files. See define_mimetype_aliases() for further details.
+'
+function precompile_zeshy_mimetype_aliases() {
+    # Validate sanity.
+    die_if_args
+
+    # If either the system-wide or user-specific "mailcap" file exists, define
+    # mimetype aliases via such file(s). Prevent functions such function
+    # temporarily defines from polluting the function namespace and hence being
+    # permanently compiled into Zeshy's user digest file.
+    { is_file '/etc/mailcap' or is_file "${HOME}/.mailcap" } and
+         run_command_and_undefine_functions_defined define_mimetype_aliases
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# Such function assumes default shell options and
+    # hence *CANNOT* be run under Zeshy shell options.
+#FUXME: Defining such aliases at precompilation rather than startup time
+#surprisingly *SIGNIFICANTLY* decreases performance -- by as much as several
+#seconds on both digest compilation and subsequent startup! That's a bit crazy.
+#Investigate when time affords. For the meanwhile, we revert to startup-based
+#alias definition.
+#FUXME: Ah; I think I've nailed it. Note, however, that the prior implementation
+#under "WASTELANDS" failed to properly undefine functions *INTERNALLY* defined
+#by such scripts. So, how do we do that? I reckon we want a new run_command_*()
+#function -- say, run_command_and_undefine_functions_defined(). Naturally, such
+#function should run the passed command and then undefine all new functions
+#defined by such command. Not terribly difficult, using an approach similar to
+#that of "src/compile".
+
+    #FUXME: Not the most granular of exception messages, obviously. To improve
+    #output, I suspect we'll probably have to reimplement "zsh-mime-setup" in
+    #pure Zeshy, at some lamentable future point.
+    # If such definition failed, throw an exception.
+#   run_command_silent_stdout print_mimetype_aliases or
+#       die 'mimetype aliases not defined'
+
+    #FUXME: Honestly, this is a bit odd. It works, but both the nomenclature and
+    #underlying implementation just don't fit here. "zsh-mime-setup" is a zsh
+    #script, yes; but at this point of Zeshy startup, zsh-mime-setup() has
+    #already been autoloaded. Hence, it's much more straightforward simply to
+    #call zsh-mime-setup(). The issue with that, of course, is that such
+    #function assumes stock zsh options. Hence, what we *REALLY* want is a new
+    #Zeshy function for calling non-Zeshy zsh functions under emulation: say,
+    #run_command_with_default_zsh_options(). Ah, but that's not quite right.
+    #Emulation doesn't *JUST* revert to default options; it also temporarily
+    #unsets TRAPZERR(). How about run_command_under_zsh_emulation()? That
+    #nicely coincides with the existing run_command_under_shell(). Ah; right.
+    #Then let's go with run_command_under_shell_zsh().
+#   source_shell_script_defining_function zsh-mime-setup -f
+
+    #FUXME: How does run_command_paged() find "zsh-mime-setup", and couldn't we
+    #implement a similar solution below?
+#run_hook_on_zeshy_precompile precompile_zeshy_mimetype_aliases
+
+#document_function '
+#void precompile_zeshy_mimetype_aliases(void)
+#
+#Define one suffix alias for each mimetype mapping listed in the system-wide and
+#user-specific "mailcap" files. See define_mimetype_aliases() for further details.
+#'
+#function precompile_zeshy_mimetype_aliases() {
+#    # Validate sanity.
+#    die_if_args
+#
+#    # If either the system-wide or user-specific "mailcap" file exists and is
+#    # non-empty, try to define mimetype aliases using such file(s).
+#    { is_file_nonempty '/etc/mailcap' or
+#      is_file_nonempty "${HOME}/.mailcap" } and {
+#        # Autoload the underlying functions such function calls. While Zeshy
+#        # autoloads such functions on startup, Zeshy performs precompilation
+#        # before startup.
+#        autoload_function zsh-mime-setup zsh-mime-handler
+#
+#        # Define such aliases.
+#        define_mimetype_aliases
+#
+#        # Avoid compiling autoloaded functions into Zeshy's user digest.
+#        undefine_function zsh-mime-setup zsh-mime-handler
+#    }
+#}
+
+    # Else, print a non-fatal warning.
+#   else print_warning 'no mimetype aliases defined: "~/.mailcap" and "/etc/mailcap" 0-byte or not found'
+#   fi
+
+#   source_shell_script_defining_function zsh-mime-setup -f
+    #FUXME: Revert back to the prior method of:
+    #
+    #   run_command_silent_stdout print_mimetype_aliases or {
+    #
+    #But replace run_command_silent() with an equivalent function
+    #squelching *ONLY* stdout. We need to print stderr, for obvious reasons.
+
+    # If either the system-wide or user-specific "mailcap" file exists and is
+    # non-empty, define mimetype aliases from such file(s).
+#   if is_file_nonempty "${HOME}/.mailcap" or is_file_nonempty '/etc/mailcap'
+#   then define_mimetype_aliases
+    # Else, print a non-fatal warning.
+#   else print_warning 'no mimetype aliases defined: "~/.mailcap" and "/etc/mailcap" empty or not found'
+#   fi
+
+#FUXME: *YE GODS*! This should absolutely be done at precompile time instead.
+#Note this implies we should add tests for both "~/.mailcap" and "/etc/mailcap"
+#to is_zeshy_digest_outdated(), which shouldn't be too cumbersome.
+# run_hook_on_zeshy_startup_if_shell_interactive startup_zeshy_mimetype_aliases
 #   if is_file "${HOME}/.mailcap" and is_file_nonempty "${HOME}/.mailcap" or
 #      is_file '/etc/mailcap'     and is_file_nonempty '/etc/mailcap'
     # If no such aliases were defined, print an error.
-#   run_command_silently print_mimetype_aliases or {
+#   run_command_silent print_mimetype_aliases or {
 #       string message_prefix='no mimetype aliases defined: "~/.mailcap" and "/etc/mailcap"'
 
 #       if is_file "${HOME}/.mailcap" or is_file '/etc/mailcap'
