@@ -1,7 +1,7 @@
 zeshy
 ===========
 
-_Zeshy_ :: high-level shell scripting language implemented in pure `zsh`
+_Zeshy_ :: high-level shell scripting lingua franca implemented in pure `zsh`
 
 ## Installation
 
