@@ -8,7 +8,6 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Handle paging ala "more" and "less".
 
-# ....................{ PRINTERS                           }....................
 #FIXME: When *NOT* paging, visually demarcate wrapped lines (ideally with color
 #or perhaps simply with a simple prefix). So, rather than printing:
 #
@@ -34,16 +33,16 @@
 #Happily, "yppy" already has appropriate Unicode for the former arrows. In
 #either case, I prefer a prefixing space on the wrapped line.
 
+# ....................{ PAGERS                             }....................
 document_function '
 string page_string(string text1, string text2, ...)
 
-If the passed string exceeds the current terminal''s dimensions, print such
-string with the current user''s preferred pager; otherwise, only print such
-string as is (i.e., without paging). Therefore, this function implements an
-intelligent pager.
+Page the passed string with the current user''s preferred pager (e.g., "less")
+if such string exceeds the current terminal height or print such string without
+paging otherwise. This function thus pages on an as-needed basis, providing a
+pseudo-intelligent context-sensitive pager.
 '
 function page_string() {
-    prepend_args_with_standard_input_if_piped
     page_string_if_overlong "${@}" or print_string "${*}"
 }
 
@@ -58,17 +57,18 @@ function page_string() {
 #Then, page if the text height is greater than or equal to
 #(( $(get_terminal_height) * ZESHY_PAGE_IF_TEXT_TO_TERMINAL_HEIGHT_PERCENT / 100 )).
 #Should work great, yes?
+#FIXME: Rename to page_string_if_needed(). The exact conditions under which a
+#string should be paged are implementation details that should be kept out of
+#the function name.
 
 document_function '
-string page_string_if_overlong(
-  string text1, string text2, ...)
+string page_string_if_overlong(string text1, string text2, ...)
 
 If the passed string exceeds the current terminal''s dimensions, print such
 string with the current user''s preferred pager; otherwise, return false.
 '
 function page_string_if_overlong() {
     # Validate passed arguments.
-    prepend_args_with_standard_input_if_piped
     die_unless_args 'expected at least one string'
     string text="${*}"
 
@@ -141,20 +141,67 @@ function page_string_if_overlong() {
     print_string "${text}" | "${command[@]}"
 }
 
+# ....................{ PAGERS ~ stdin                     }....................
+document_function_with_stdin <<'________________<heredoc?>________________'
+string page_stdin(void)
+
+Page standard input with the current user''s preferred pager (e.g., `less`) if
+such input exceeds the current terminal height or print such input without
+paging otherwise. This function is typically piped standard output from a block
+of related commands to be paged together: e.g.,
+
+.page_stdin()
+==========================================
+[source]
+------------------------------------------
+>>> { lsblk; lscpu; lsmod; lsof; lspci; lsusb } | page_stdin
+------------------------------------------
+==========================================
+
+See page_string() for further details.
+________________<heredoc?>________________
+function page_stdin() {
+    # Validate passed arguments.
+    die_if_args
+    die_if_stdin_empty
+
+    # All previously read lines of standard input.
+    string stdin
+
+    # Currently read line of standard input.
+    string stdin_line
+
+    # Incrementally read each line of standard input and for each such line,
+    # print such line to standard output and append such line to the string
+    # accumulating such input. While slightly more complex than the conventional
+    # blocking implementation capturing all standard input at once (e.g.,
+    # "$(< /dev/stdin)"), this non-blocking implementation is preferable for
+    # paging output from non-trivial commands not expected to end immediately.
+    # Dismantled, this is:
+    #
+    # * "IFS=", preventing read() from splitting read input on field separators.
+    # * "-r", preserving input characters (e.g., backslashes are not escapes).
+    # * "-E", copying read input to standard output.
+    while { IFS= read -r -E stdin_line } stdin+="${stdin_line}"
+
+    # If required, page such input.
+    page_string_if_overlong "${stdin}"
+}
+
 # ....................{ RUNNERS                            }....................
 document_function '
 string run_command_paged(
   string command_name, string command_arg1, string command_arg2, ...)
 
-Run the passed command with standard print_string and error piped to the current
-pager if such print_string exceeds either the current terminal height or width or as
+Run the passed command with standard output and error piped to the current
+pager if such output exceeds either the current terminal height or width or as
 is (i.e., without paging) otherwise. Hence, this is an intelligent pager.
 
-Customary pager commands block on standard input, thus delaying print_string until
+Customary pager commands block on standard input, thus delaying output until
 after the input command completes operation. Resource-intensive commands not
 completing immediately (e.g., "ls -R *") thus block paging with no
-intermediate print_string until such commands eventually complete. To rectify such
-interface woes, this function immediately prints all print_string as received from
+intermediate output until such commands eventually complete. To rectify such
+interface woes, this function immediately prints all output as received from
 the passed command to standard error prior to paging such output, as needed.
 '
 function run_command_paged() {
@@ -162,7 +209,7 @@ function run_command_paged() {
     if not is_stdout_terminal
     then run_command "${@}"
     # If passed piped input and no arguments, page such input.
-    elif is_args_0 and is_standard_input_piped
+    elif is_args_0 and is_stdin_piped
     then page_string
     # Otherwise, run the passed command with redirection.
     else
@@ -193,7 +240,7 @@ function run_command_paged() {
         # Avoid the following efficient and certainly simpler alternative, which
         # unfortunately discards non-zero exit status from run():
         #
-        #   run_command "${@}" 1>&1 1>&2 | page_string_if_overlong or true
+        #   run_command "${@}" 1>&1 1>&2 | page_stdin_if_overlong or true
 #       string output; output="$(run_command "${@}" 1>&1 1>&2 2>&1)"
 #       string output; output="$(run_command_and_set_string_to_stdout "${@}")"
 
@@ -212,7 +259,7 @@ function run_command_paged() {
 
     # * "or true", ignoring such function call when returning false, since the
     #   prior "1>&2" redirection already successfully printed such output.
-#       page_string "$(get_standard_input_piped)"
+#       page_string "$(get_stdin_piped)"
 #   get_and_set_string_global_if_unset_or_empty_to_evaluation
 #   set_string_if_unset_or_empty_to_evaluation\
 #       PAGER '$(get_pathable_path_first less more)'
@@ -232,38 +279,38 @@ function run_command_paged() {
         #run(). We only want to discard non-zero exit status from
         #print_...(). Hmmmm. Frak this. Revert to the prior logic, which
         #actually worked perfectly.
-#       run "${@}" 1>&1 1>&2 | page_string_if_overlong or
+#       run "${@}" 1>&1 1>&2 | page_stdin_if_overlong or
 #           true
-#       string output; set_string_to_standard_input_piped output
+#       string output; set_string_to_stdin_piped output
 #       page_string "${output}"
 #       line_sans_ansi_width="$(get_string_length "$(remove_ansi_color_codes "${line}")")"
 #       text_width=${#$(remove_ansi_color_codes "${line}")}
     # * "2>&1", redirecting standard error to output. Since command substitution
     #   only captures the latter, only such redirection captures standard error.
-#       run "${@}" 1>&1 1>&2 2>&1 | page_string_if_overlong
+#       run "${@}" 1>&1 1>&2 2>&1 | page_stdin_if_overlong
 
 #   print_message 'here!' 
-#   is_standard_input_piped and {
+#   is_stdin_piped and {
 #       print_message 'received piped input:'
 #       print_message "$(< /dev/stdin)"
 #       print_message 'yikes'
-#       close_standard_input
+#       close_stdin
 #       print_message 'yikes'
 #       is -p /dev/stdin si and print_message 'pipe"s alive!!!!'
 #       print_message 'yikes'
-#       is_standard_input_piped and print_message 'pipe"s alive!!!!'
+#       is_stdin_piped and print_message 'pipe"s alive!!!!'
 #       print_message 'yikes'
 #   }
 #   print_message 'no, here!' 
     # If passed piped input and...
 #   string output
-#   if is_standard_input_piped; then
-#       print_message "received piped input: $(get_standard_input_piped)"
+#   if is_stdin_piped; then
+#       print_message "received piped input: $(get_stdin_piped)"
         # ...no arguments, capture such print_string without running a command.
         # Duplicate the behavior of the print_string capturing below by printing such
         # print_string to standard error.
 #       if is_args_0; then
-#           set_string_to_standard_input_piped output
+#           set_string_to_stdin_piped output
 #           page_string "${output}"
         # ...at least one argument, run such arguments as a command and pipe the
         # input piped to this function to such command. See below for details.
@@ -271,13 +318,13 @@ function run_command_paged() {
             #FUXME: Not quite right. Revise run() to implicitly check for piped
             #input and, if available, to close such input after use. That would
             #condense the following two conditional blocks into one.
-#           run_command_with_standard_input_piped run "${@}" 1>&1 1>&2 2>&1 |
+#           run_command_with_stdin_piped run "${@}" 1>&1 1>&2 2>&1 |
 #               page_string_if_overlong
-#           output="$(run_command_with_standard_input_piped run "${@}" 1>&1 1>&2 2>&1)"
+#           output="$(run_command_with_stdin_piped run "${@}" 1>&1 1>&2 2>&1)"
 
             # Per the "CAVEAT" described under Zeshy Pipe, manually ensure
-            # is_standard_input_piped() now returns false.
-#           close_standard_input
+            # is_stdin_piped() now returns false.
+#           close_stdin
 #       fi
     #FUXME: Hmm; the documentation no longer reflects the reality. Fixmeup.
     # Otherwise, run the passed command with redirection. Dismantled, this is:
@@ -292,10 +339,10 @@ function run_command_paged() {
 #   else
 #       die_unless_args 'expected one command'
 #       print_string "run_command_paged: ${@}..."
-#       run "${@}" 1>&1 1>&2 2>&1 | page_string_if_overlong
+#       run "${@}" 1>&1 1>&2 2>&1 | page_stdin_if_overlong
 #   fi
 #           die_if_args 'expected no command when passed piped input'
-#           output="$(get_standard_input_piped)"
+#           output="$(get_stdin_piped)"
 #           curse_string "${output}"
 #           page_string_if_overlong "${output}"
 
