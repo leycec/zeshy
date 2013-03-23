@@ -47,61 +47,53 @@ function get_dir() {
 }
 
 # ....................{ SETTERS                            }....................
-#FIXME: Split into interactive and non-interactive versions, requiring a passed
-#dirname in the latter case. Name the interactive version
-#set_dir_with_options().
-
 declare_function_with_stdin <<'________________<heredoc?>________________'
-void set_dir(string dirname = "")
+void set_dir(string dirname)
 
-Set the current working directory to the passed directory, implicitly invoking
-the chpwd() hook and hence pushing that dirname if valid onto the persistent
-directory stack. Specifically, if:
-
-* Called non-interactively and...
-** No dirname was passed, throw an exception.
-** Else, set the current working dirname to the passed dirname.
-* Called interactively and...
-** No dirname was passed and...
-*** The directory stack is non-empty, pop the top dirname off that stack
-    and set the current working dirname to that directory.
-*** Else, set the current working dirname to the current user''s home.
-* Else, set the current working dirname to the passed dirname.
+Set the current working directory to the passed directory, implicitly calling
+builtin chpwd() and all functions registered with run_hook_after_dir_set().
 ________________<heredoc?>________________
 function set_dir() {
-    if { is_args } {
-        set_dir_and_prepend_to_dir_stack "${@}"
-    } elif { is_shell_interactive } {
-        # If passed at least one argument, switch to such directory.
-        # If the directory stack is non-empty, switch to the prior directory.
-        if { is_list_nonempty dirstack } {
-            pop_dir_stack_and_set_dir_to_top
-        # Otherwise, switch to the home directory.
-        } else {
-            set_dir_and_prepend_to_dir_stack "$(get_home)"
-        }
-    } else {
-        die 'expected one dirname'
-    }
+    die_unless_arg 'expected one dirname'
+    run_command_silent_with_options 'command cd' ZESHY_CD_OPTIONS -- "${(q)1}"
 }
+
+declare_function_with_stdin <<'________________<heredoc?>________________'
+void set_dir_idempotently(string dirname)
+
+Set the current working directory to the passed directory idempotently (i.e.,
+without implicit side effects and hence without implicitly calling builtin
+chpwd() or functions registered with run_hook_after_dir_set()).
+________________<heredoc?>________________
+function set_dir_idempotently() {
+    die_unless_arg 'expected one dirname'
+    run_command_silent_with_options 'command cd'\
+        'ZESHY_CD_OPTIONS ZESHY_CD_OPTIONS_IF_IDEMPOTENT' -- "${(q)1}"
+}
+
+declare_global_with_stdin <<'________________<heredoc?>________________'
+list ZESHY_CD_OPTIONS_IF_IDEMPOTENT
+
+`cd` options if run idempotently (i.e., without implicitly calling chpwd() and
+hence inducing side effects). See set_dir_idempotently() for further details.
+________________<heredoc?>________________
+ZESHY_CD_OPTIONS_IF_IDEMPOTENT=()
 
 declare_function_with_stdin <<'________________<heredoc?>________________'
 void set_dir_with_options(
     string cd_option1, string cd_option2, ...,
-    string dirname = "$(get_home)")
+    string dirname = "-")
 
-Set the current working directory to the passed directory (defaulting to the
-current user's home directory), with the passed `cd`-specific options. See
-set_dir() for further details.
+Set the current working directory to the passed directory (defaulting to "-",
+which `cd` interprets to be the prior directory on the directory stack), with
+the passed `cd`-specific options. See set_dir() for further details.
 ________________<heredoc?>________________
 function set_dir_with_options() {
     # Validate passed arguments. If passed only one source path, default the
     # target path to the current directory.
     die_unless_args_1_or_more\
-        'expected at least one source pathname and optional target pathname'
-    set_integers_to_arg_nonoption_count_and_first_index_from\
-        'arg_nonoption_count arg_nonoption_first_index'
-    (( arg_nonoption_count == 1 )) and append_arg "$(get_dir)"
+        'expected zero or more options and one dirname'
+    is_arg_nonoptions or append_arg '-'
 
     # Copy such paths. For efficiency, avoid printing warnings for symbolic
     # links broken by such copy. (The number of copied files to be tested for
@@ -112,6 +104,7 @@ function set_dir_with_options() {
 
 # ....................{ STORERS                            }....................
 #FIXME: How is this *NOT* thoroughly superfluous? set_dir() already does this.
+#Right. I just can't see the justification for keeping this.
 declare_function_with_stdin <<'________________<heredoc?>________________'
 void set_dir_and_prepend_to_dir_stack(string dirname)
 
@@ -125,6 +118,13 @@ function set_dir_and_prepend_to_dir_stack() {
     pushd -- "${1}"
 }
 
+#FIXME: Woops. This should be shift_dir_stack_and_set_dir_to_top(), actually.
+#Hmmmm; how about either:
+#
+#* set_dir_to_dir_stack_first_after_shifting().
+#* set_dir_to_dir_stack_second_and_shift(). Shorter, but requires thought. The
+#  former is much more intelligible. Actually... no! The reverse. This makes
+#  much more sense. No time dependencies. It does exactly what it says.
 declare_function_with_stdin <<'________________<heredoc?>________________'
 void pop_dir_stack_and_set_dir_to_top()
 
@@ -225,7 +225,7 @@ function print_dir_stack() {
     # * If the directory stack is empty, print nothing.
     # * Otherwise, print all lines following the first.
     is_list_nonempty dirstack or return_true
-    string dirs_output; dirs_output="$(dirs -p)"
+    string dirs_output; dirs_output="$(builtin dirs -p)"
     number_string_lines_highlighting\
         "$(get_string_lines "${dirs_output}" 2 -1)" 1
 }
@@ -241,7 +241,93 @@ function clear_dir_stack() {
     dirs -c
 }
 
+# ....................{ SERIALIZERS                        }....................
+declare_function_with_stdin <<'________________<heredoc?>________________'
+void read_dir_stack_file(void)
+
+Set the directory stack to the list written to the directory stack file if such
+file exists or return silently otherwise.
+________________<heredoc?>________________
+function read_dir_stack_file() {
+    # Validate sanity.
+    die_if_args
+
+    # If such script exists, source such script hopefully defining ${dirstack}.
+    if {    is_shell_script "${ZESHY_DIR_STACK_FILE}" } {
+        source_shell_script "${ZESHY_DIR_STACK_FILE}"
+    # Else, return success.
+    } else {
+        return_true
+    }
+}
+
+declare_function_with_stdin <<'________________<heredoc?>________________'
+void write_dir_stack_file(void)
+
+Overwrite the contents of the directory stack file with the directory stack.
+Such file will be a shell script sourcable by calling source_shell_script().
+________________<heredoc?>________________
+function write_dir_stack_file() {
+    die_if_args
+    write_file_with_variable "${ZESHY_DIR_STACK_FILE}" dirstack
+}
+
+# ....................{ HOOKS                              }....................
+# On Zeshy startup, initialize the directory stack from the corresponding file.
+# After changing the current working directory and hence invoking shell option
+# "auto_pushd", write the now-edited directory stack back to such file.
+run_hook_after_dir_set   write_dir_stack_file
+run_hook_on_zeshy_startup read_dir_stack_file
+
+#Respond to the current directory being set by pushing that directory onto the
+#directory stack if not already.
+
 # --------------------( WASTELANDS                         )--------------------
+#Append the current working directory to the the directory stack file,
+#${ZESHY_DIR_STACK_FILE}.
+# Unlike set_dir() or set_dir_with_options(), this function carries no hidden
+#side effects: it simply sets the current working directory.
+#FUXME: Split into interactive and non-interactive versions, requiring a passed
+#dirname in the latter case. Name the interactive version
+#set_dir_with_options().
+
+#declare_global_with_stdin <<'________________<heredoc?>________________'
+#list ZESHY_CD_OPTIONS_IF_IDEMPOTENT
+#
+#`cd` options if run idempotently (i.e., without implicitly calling chpwd() and
+#hence inducing side effects). See set_dir_idempotently() for further details.
+#________________<heredoc?>________________
+#ZESHY_CD_OPTIONS_IF_IDEMPOTENT=()
+
+#pushing that dirname if valid onto the persistent
+#directory stack. Specifically, if:
+#
+#* Called non-interactively and...
+#** No dirname was passed, throw an exception.
+#** Else, set the current working dirname to the passed dirname.
+#* Called interactively and...
+#** No dirname was passed and...
+#*** The directory stack is non-empty, pop the top dirname off that stack
+#    and set the current working dirname to that directory.
+#*** Else, set the current working dirname to the current user''s home.
+#* Else, set the current working dirname to the passed dirname.
+
+#   if { is_args } {
+#       set_dir_and_prepend_to_dir_stack "${@}"
+#   } elif { is_shell_interactive } {
+        # If passed at least one argument, switch to such directory.
+        # If the directory stack is non-empty, switch to the prior directory.
+#       if { is_list_nonempty dirstack } {
+#           pop_dir_stack_and_set_dir_to_top
+        # Otherwise, switch to the home directory.
+#       } else {
+#           set_dir_and_prepend_to_dir_stack "$(get_home)"
+#       }
+#   } else {
+#       die 'expected one dirname'
+#   }
+#}
+
 # ....................{ HOOKS                              }....................
 #run_hook_after_dir_set compact_dir_stack
 
