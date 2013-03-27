@@ -1,12 +1,18 @@
 #!/usr/bin/env zsh
 zmodload zsh/pcre
-setopt extended_glob rc_quotes rematch_pcre
+zmodload -F zsh/stat b:zstat
+setopt extended_glob no_unset rc_quotes rematch_pcre
 autoload throw catch
 
 function die() {
     print "${*}" 1>&2
     throw zeshy_exception
 }
+
+#local -x y='999ou'; print "y: $(y='hmmm'; print $y)"; print "y: $y"
+#readlink
+#ls --full-time /dev/fd/1
+#ls --full-time /dev/fd/1
 
 #local hmm="ok, hm, ya"
 #print ${hmm//[[:space:]]#,[[:space:]]#/,}
@@ -71,7 +77,23 @@ function die() {
 #local documentation='{globbable,} void <grea_ter, men,>[args: (integer siphon = ''y,m'', float funnel=3.1, integer system=-42, character awry, boolean testm="ugh,)"), stdin: (list list_name, string input="ok]")]'
 #local documentation='{globbable,} character <grea_ter, men,>[args: (integer siphon = ''y,m'', float funnel=3.1, integer system=-42, character awry, boolean testm="ugh,)"), stdin: (list list_name, string input="ok]")]'
 #local documentation='{globbable,} [stderr: character, status: integer] <grea_ter, men,>[args: (integer siphon = ''y,m'', float funnel=3.1, integer system=-42, character awry, boolean testm="ugh,)"), stdin: (list list_name, string input="ok]")] Yumyum.'
-local documentation='{globbable,indefatiguable,execrable,variform,indecipherable,unmentionable,witty,erudite} [stderr: character, status: integer] <grea_ter, men,>[args: (integer siphon = ''y,m'', float funnel=3.1, integer system=-42, character awry, boolean testm="ugh,)"), stdin: (list list_name, string input="ok]")] Yumyum. quite_interesting() oh how it ${bleeds_uhm}; le ende.'
+local documentation='<globbable,indefatiguable,execrable,variform,indecipherable,unmentionable,witty,erudite,  > [stderr: character, status: integer] {grea_ter, "men, womb",  }[args: (integer siphon = ''y,m'', float funnel=3.1, integer system=-42, character awry, boolean testm="ugh,)"), stdin: (list list_name, string input="ok]")] Yumyum. quite_interesting() oh how it ${bleeds_uhm}; le ende.
+
+.test_em()
+----------
+my hel_lo() darling
+----------
+Yumyum ok_ok() hmmm.'
+
+#FIXME: Shift everything below into a new
+#parse_runnable_documentation_and_run_command() or
+#run_command_after_matching_runnable_documentation() function. Yes, I rather
+#prefer the latter, which integrates sensibly with other run_command_*()
+#functions. Note that the AsciiDoc-specific logic needs to be shared with a similar
+#run_command_after_matching_global_documentation(); hence, shift such logic into a
+#separate match_documentation_description() function.
+#FIXME: Suffix all regex variables capturing at least one match group with
+#"_grouped", for consistency.
 
 # zsh identifier (i.e., variable name).
 local regex_ident='[-_[:alnum:]]++'
@@ -81,28 +103,35 @@ local regex_comma='\s*+,\s*+'
 
 # Function attributes. Zeshy currently prohibits single- and double-quoted
 # attribute names, thus simplifying matching.
-local regex_attrs='(?:\{\s*+([^}]*+)\}\s++)?'
+local regex_attrs='(?:<\s*+([^>]*+)>\s++)?'
 
 # Function return types. Zeshy currently prohibits single- and double-quoted
 # return types, thus simplifying matching.
 #local regex_return_type=${regex_ident}
-local regex_return_channels='\[\s*+([^]]*+)\]'
-local regex_return_type_grouped='(?:void|('${regex_ident}'))'
 local regex_return_channel_grouped='('${regex_ident}')\s*+:\s*+('${regex_ident}')'
+local                    regex_return_type=${regex_ident}
+local regex_return_type_grouped='(?:void|('${regex_ident}'))'
+local         regex_return_channels='\[\s*+[^]]*+\]'
+local regex_return_channels_grouped='\[\s*+([^]]*+)\]'
+local regex_return_type_or_channels='(?:'${regex_return_type}'|'${regex_return_channels}')\s++'
+local regex_return_type_or_channels_grouped='(?:'${regex_return_type_grouped}'|'${regex_return_channels_grouped}')\s++'
 
-# Function names. zsh permits single- and double-quoted function names, slightly
-# complicating matching.
-local regex_name_double_quoted='"(?:\\"[^"])*"'
-local regex_name_single_quoted="'(?:''|[^'])*'"
+# Function names. Since zsh permits single- and double-quoted function names,
+# matching requires more than class negation.
 local regex_name_unquoted=${regex_ident}
-local regex_name='(?:'${regex_name_unquoted}'|'${regex_name_double_quoted}'|'${regex_name_single_quoted}')'
-local regex_name_list='<((?:'${regex_name}${regex_comma}')*'${regex_name}')(?:'${regex_comma}')?>'
-local regex_names='(?:('${regex_name}')|'${regex_name_list}')\s*+'
+local regex_name_double_quoted='"(?:\\"|[^"])*"'
+local regex_name_single_quoted="'(?:''|[^'])*'"
+local regex_name_content=${regex_name_unquoted}'|'${regex_name_double_quoted}'|'${regex_name_single_quoted}
+local       regex_name='(?:'${regex_name_content}')'
+local regex_name_grouped='('${regex_name_content}')'
+#local regex_name_list='\{\s*+([^}]*?)(?:'${regex_comma}')?\}'
+local regex_names='\{\s*+((?:'${regex_name}${regex_comma}')*'${regex_name}')(?:'${regex_comma}')?\s*+\}'
+local regex_name_or_names='(?:('${regex_name}')|'${regex_names}')\s*+'
 
 # Function arguments.
 local regex_arg_value_double_quoted='"(?:\\"|$\([^)]*+\)|[^"])*"'
-local regex_arg_value_single_quoted="'(?:''|[^'])*'"
-local regex_arg_value_number='-?[[:digit:]]++\.[[:digit:]]++|-?[[:digit:]]++'
+local regex_arg_value_single_quoted=${regex_name_single_quoted}
+local regex_arg_value_number='-?\d++\.\d++|-?\d++'
 local regex_arg_value_content=${regex_arg_value_double_quoted}'|'${regex_arg_value_single_quoted}'|'${regex_arg_value_number}
 local regex_arg_value_equals='\s*+=\s*+'
 local regex_arg_value_grouped=${regex_arg_value_equals}'('${regex_arg_value_content}')'
@@ -115,23 +144,69 @@ local regex_args_grouped='\(\s*+(?:void|'${regex_args_list_grouped}')?\s*+\)'
 local         regex_args='\(\s*+(?:void|'${regex_args_list}')?\s*+\)'
 local regex_arg_channel_grouped='('${regex_ident}')\s*+:\s*+(?:(void|'${regex_arg}')|('${regex_args}'))'
 local            regex_arg_channel=${regex_ident}'\s*+:\s*+(?:void|'${regex_arg}'|'${regex_args}')'
-#local            regex_arg_channel=${regex_ident}'\s*+:\s*+void'
 local regex_arg_channels='\[\s*+((?:'${regex_arg_channel}${regex_comma}')*'${regex_arg_channel}')(?:'${regex_comma}')?\s*+\]'
+local regex_args_or_channels_grouped='(?:'${regex_args_grouped}'|'${regex_arg_channels}')'
 
-# Function description.
-local regex_asciidoc_cross_reference='(.*?)(\$\{'${regex_ident}'\}|(?:(alias|function):)?'${regex_ident}'\(\))'
+# Function description. Ignore cross-references embedded in the following
+# AsciiDoc-specific passthrough syntactic constructs, which AsciiDoc and hence
+# Zeshy ignores for parsing purposes:
+#
+# * "`"-delimited passthrough quotes.
+# * "pass:["- and "]"-delimited passthrough macros.
+# * "+++"-delimited passthrough macros.
+# * "$$"-delimited passthrough macros.
+# * "\n----"-delimited listing blocks.
+# * "\n...."-delimited literal blocks.
+# * "\n////"-delimited comment blocks.
+# * "\n++++"-delimited passthrough blocks.
+# * "\n[literal]"-prefixed literal paragraphs.
+# * "\n "- and "\n\t"-prefixed literal lines.
+#
+# Ignore cross-references embedded in the following AsciiDoc-specific anchored
+# syntactic constructs, which AsciiDoc anchors for subsequent cross-referencing
+# and hence should not themselves contain cross-references:
+#
+# * "\n."-prefixed block titles.
+local regex_asciidoc_quote_backtick='\b`\N*?`\b'
+local regex_asciidoc_macro_pass='pass:\[(?:\\\]|\N)*?\]'
+local regex_asciidoc_macro_plus='\+\+\+\N*?\+\+\+'
+local regex_asciidoc_macro_dollar='\$\$\N*?\$\$'
+local regex_asciidoc_block_listing='-{4,}+\n.*?\n-{4,}+'
+local regex_asciidoc_block_literal='\.{4,}+\n.*?\n\.{4,}+'
+local regex_asciidoc_block_comment='/{4,}+\n.*?\n/{4,}+'
+local regex_asciidoc_block_pass='\+{4,}+\n.*?\n\+{4,}+'
+local regex_asciidoc_block_title_or_line_literal='(?:\.|[ \t]++)\N+'
+local regex_asciidoc_paragraph_literal='^\[literal\]\n.*?(?:\n\n|\Z)'
+local regex_asciidoc_cross_reference='((?:'${regex_asciidoc_quote_backtick}'|\b(?:'${regex_asciidoc_macro_pass}'|'${regex_asciidoc_macro_plus}'|'${regex_asciidoc_macro_dollar}')\b|^(?:'${regex_asciidoc_block_listing}'|'${regex_asciidoc_block_literal}'|'${regex_asciidoc_block_comment}'|'${regex_asciidoc_block_pass}'|'${regex_asciidoc_block_title_or_line_literal}')$|'${regex_asciidoc_paragraph_literal}'|.)*?)(\$\{'${regex_ident}'\}|(?:(alias|function):)?'${regex_ident}'\(\))'
 local regex_asciidoc_suffix='(.*)'
-local regex_asciidoc='(.*)'
+local regex_asciidoc='\s*+(.*)'
 
-# Regex matching a complete function documentation consisting of Zeshy-specific
-# prototype and AsciiDoc description.
-local regex_documentation='^\s*+'${regex_attrs}'(?:'${regex_return_type_grouped}'|'${regex_return_channels}')\s++'${regex_names}'(?:'${regex_args_grouped}'|'${regex_arg_channels}')\s*+'${regex_asciidoc}'()$'
+# PCRE matching the beginning of `zeshy` function documentation. Dismantled,
+# this is:
+#
+# * "(?s)", inducing '.' to match all characters including newline.
+local ZESHY_DOCUMENTATION_PCRE_START='(?s)^\s*+'
+
+# PCRE matching all semantic substrings (e.g., arguments, attributes, names)
+# from `zeshy` documentation consisting of a `zeshy` function prototype and
+# AsciiDoc description. Dismantled, this is:
+#
+# * "(?s)", inducing '.' to match all characters including newline.
+local regex_documentation=${ZESHY_DOCUMENTATION_PCRE_START}${regex_attrs}${regex_return_type_or_channels_grouped}${regex_name_or_names}${regex_args_or_channels_grouped}${regex_asciidoc}'()$'
+
+# PCRE matching all function attributes and names declared by a `zeshy` function
+# prototype. Dismantled, this is:
+#
+# * "(?s)", inducing '.' to match all characters including newline.
+local ZESHY_DOCUMENTATION_PCRE_ATTRIBUTES_AND_NAMES=${ZESHY_DOCUMENTATION_PCRE_START}${regex_attrs}${regex_return_type_or_channels}${regex_name_or_names}
+
+print -r "documentation: ${documentation}"
 print -r "regex_documentation: ${regex_documentation}"
+print -r "ZESHY_DOCUMENTATION_PCRE_ATTRIBUTES_AND_NAMES: ${ZESHY_DOCUMENTATION_PCRE_ATTRIBUTES_AND_NAMES}"
 
 # Map from machine-readable match index to human-readable match name. This is
 # merely a convenience for improving code readability and maintainability.
-local -a match_index_to_name #arg_match_index_to_name
-match_index_to_name=(
+local -a match_index_to_name; match_index_to_name=(
     'attrs'
     'return_type'
     'return_channels'
@@ -142,31 +217,6 @@ match_index_to_name=(
     'asciidoc'
     'placeholder'
 )
-#arg_match_index_to_name=(
-#    'type'
-#    'name'
-#    'value'
-#    'placeholder'
-#)
-
-function set_map_to_list_inverted() {
-    # Validate passed arguments.
-    (( # == 2 )) || die 'expected one map name and one list name'
-    local map_name__smtli="${1}"
-    local list_name__smtli="${2}"
-
-    # Set such map to such list inverted.
-    for ((list_index__smtli = 1;
-          list_index__smtli <= ${#${(@P)list_name__smtli}};
-          list_index__smtli++)) {
-        eval "${map_name__smtli}[\${${list_name__smtli}[${list_index__smtli}]}]=${list_index__smtli}"
-    }
-}
-
-# Map from human-readable match name to machine-readable match index,
-# programmatically constructed by inverting the prior map.
-local -A match_name_to_index
-set_map_to_list_inverted match_name_to_index match_index_to_name
 
 # Map from human-readable match name to matched substring.
 local -A match_name_to_match
@@ -250,17 +300,16 @@ local ZPCRE_OP='0 0'
         print "match ${match_name}: ${match_name_to_match[${match_name}]}"
     }
 
-    # If function attributes were declared, record such attributes.
+    # If such function has attributes, match such attributes.
     string_attrs="${match_name_to_match[attrs]}"
     if [[ -n "${string_attrs}" ]] {
-        # Eliminate:
+        # Split such attributes on commas after eliminating:
         #
         # * Optional whitespace surrounding commas (e.g., from " , " to ",").
         # * Optional trailing commas and/or whitespace.
-        string_attrs="${${string_attrs//[[:space:]]#,[[:space:]]#/,}%%[[:space:]]#,#[[:space:]]#}"
-
-        # Split such string on commas.
-        attrs=( "${(s:,:)string_attrs}" )
+        attrs=(
+            "${(s:,:)${string_attrs//[[:space:]]#,[[:space:]]#/,}%%[[:space:]]#,#[[:space:]]#}"
+        )
     }
 
     # If such function returns only a single type, record such type under
@@ -291,19 +340,27 @@ local ZPCRE_OP='0 0'
         }
     }
 
-    # If such function has only a single name, record such name.
+    # If such function has only a single name, match such name.
     if [[ -n    "${match_name_to_match[name]}" ]] {
         names=( "${match_name_to_match[name]}" )
-    # Else, such function has multiple names. Record such names.
+    # Else, such function has multiple names. Since single- and double-quoted
+    # function names may contain commas, such names cannot be split on commas as
+    # with function attributes above. Rather, match such names with iteration.
     } else {
-        # Eliminate optional whitespace surrounding commas (e.g., reducing all
-        # substrings " , " to ",").
-        string_names="${match_name_to_match[names]//[[:space:]]#,[[:space:]]#/,}"
-#       print -r "string_names: ${string_names}"
+        # Get such names as a string.
+        string_names="${match_name_to_match[names]}"
 
-        # Split such string on commas.
-        names=( "${(s:,:)string_names}" )
+        # Prepare to iteratively match each such name.
+        pcre_compile -- ${regex_name_grouped}'(?:'${regex_comma}')?'
+        pcre_study
+
+        # Iteratively match. For efficiency, use hard-coded indices.
+        ZPCRE_OP='0 0'
+        while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${string_names}" } {
+            names+="${match[1]}"
+        }
     }
+
     print "names: ${names[@]}"
 
     # If such function accepts only a single argument list, record such list
@@ -381,7 +438,12 @@ local ZPCRE_OP='0 0'
     string_asciidoc="${match_name_to_match[asciidoc]%%[[:space:]]##}"
 
     # Prepare to iteratively match each cross-reference in such description.
-    pcre_compile -- ${regex_asciidoc_cross_reference}
+    # Dismantled, this is:
+    #
+    # * "-m", inducing ^ and $ to match newlines as well as the string start and
+    #   end respectively.
+    # * "-s", inducing . to match all characters including newline.
+    pcre_compile -ms -- ${regex_asciidoc_cross_reference}
     pcre_study
 
     # Iteratively match each AsciiDoc-specific substring and Zeshy-specific
@@ -405,7 +467,7 @@ local ZPCRE_OP='0 0'
     # At this point, ${args} and ${args_last} contain the desired strings.
     # Great!
 #   print "args: ${args[@]}"
-    print "names: ${names[@]}"
+#   print "names: ${names[@]}"
     print "------------"
     for ((match_index=1; match_index <= ${#attrs}; ++match_index)) {
         print "attr ${match_index}: ${attrs[${match_index}]}"
@@ -449,7 +511,7 @@ local line_suffix
 #changes between attributes and names? Probably easier for now just to repeat
 #ourselves. *sigh*
 
-output+='*{*'
+output+='{'
 line+='{'
 integer attrs_size=${#attrs}
 
@@ -475,13 +537,13 @@ for ((attrs_index=1; attrs_index <= attrs_size; ++attrs_index)) {
     } else {
 #       local digits="0123456789"
 #       print "line:\n\n${digits}${digits}${digits}${digits}${digits}${digits}${digits}${digits}\n${line}"
-        output+="\n${output_suffix}"
+        output+="\n ${output_suffix}"
         line="${line_suffix}"
     }
 }
 
 # Closing list delimiter in both AsciiDoc and plaintext format.
-output_suffix='*}*'
+output_suffix='}'
 line_suffix='}'
 
 # If such delimiter fits on the current line, suffix such line with such
@@ -506,8 +568,127 @@ ${asciidoc[*]}"
 
 print "prettified:${output}"
 
+print "=================================="
+
+if [[ "${documentation}" =~ ${~ZESHY_DOCUMENTATION_PCRE_ATTRIBUTES_AND_NAMES} ]] {
+    for ((match_index=1; match_index <= ${#match}; ++match_index)) {
+        print "match ${match_index}: ${match[${match_index}]}"
+    }
+
+    # If such function has attributes, match such attributes.
+    if [[ -n "${match[1]}" ]] {
+        # Split such attributes on commas after eliminating:
+        #
+        # * Optional whitespace surrounding commas (e.g., from " , " to ",").
+        # * Optional trailing commas and/or whitespace.
+        attrs=(
+            "${(s:,:)${match[1]//[[:space:]]#,[[:space:]]#/,}%%[[:space:]]#,#[[:space:]]#}"
+        )
+    }
+
+    # If such function has only a single name, match such name.
+    if [[ -n    "${match[2]}" ]] {
+        names=( "${match[2]}" )
+    # Else, such function has multiple names. Since single- and double-quoted
+    # function names may contain commas, such names cannot be split on commas as
+    # with function attributes above. Rather, match such names with iteration.
+    } else {
+        # Clear such list.
+        names=()
+
+        # Get such names as a string. Since iteration overwrites list global
+        # ${match}, copy such string before overwriting it below.
+        string_names="${match[3]}"
+
+        # Prepare to iteratively match each such name.
+        pcre_compile -- ${regex_name_grouped}'(?:'${regex_comma}')?'
+        pcre_study
+
+        # Iteratively match. For efficiency, use hard-coded indices.
+        ZPCRE_OP='0 0'
+        while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${string_names}" } {
+            names+="${match[1]}"
+        }
+    }
+
+    for ((match_index=1; match_index <= ${#attrs}; ++match_index)) {
+        print "attr ${match_index}: ${attrs[${match_index}]}"
+    }
+    for ((match_index=1; match_index <= ${#names}; ++match_index)) {
+        print "name ${match_index}: ${names[${match_index}]}"
+    }
+#   print "attrs: ${attrs[@]}"
+#   print "names: ${names[@]}"
+} else {
+    #FIXME: Actually, only print the first line of such documentation. Also, use
+    #a different color for such line; say, regular red or cyan?
+    #FIXME: Actually, print as follows:
+    #
+    #* If such prototype contains a blank line (i.e., "\n\n\n"), print from the
+    #  first line of such prototype up to the next line that comes first of
+    #  either such blank line or 5. (This avoids inevitable problems with
+    #  pathological documentation.)
+    #* Else, print only the first line of such documentation. This is only an
+    #  unlikely edge case, so it needn't be too fancy; pretty much everyone will
+    #  follow zeshy precedent of a blank line, I reckon.
+    print "function prototype invalid (see \"print_help declare_function\" for details):\n\t${documentation}" 1>&2
+}
+
+# List of all documentation matches, copied from list global ${match} to prevent
+# overwriting when matching 
+#local -a doc_match
+
+        # Split such attributes on commas after eliminating optional whitespace
+        # surrounding commas (e.g., from " , " to ","). Note that such PCRE
+        # necessarily avoids matching optional trailing commas and/or
+        # whitespace, unlike function attributes above.
+#       names=(
+#           "${(s:,:)match[3]//[[:space:]]#,[[:space:]]#/,}"
+#           "${(s:,:)${match[3]//[[:space:]]#,[[:space:]]#/,}%%[[:space:]]#,#[[:space:]]#}"
+#       )
+
+# For efficiency, inline such implementation rather than call a function.
+        #FUXME: Slightly out-of-date. See implementation below.
+        # Eliminate optional whitespace surrounding commas (e.g., reducing all
+        # substrings " , " to ",").
+#       string_names="${match_name_to_match[names]//[[:space:]]#,[[:space:]]#/,}"
+#       print -r "string_names: ${string_names}"
+
+        # Split such string on commas.
+#       names=( "${(s:,:)string_names}" )
+
+        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        #Copy all changes to such code to the similar block below.
+        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        # See the above block.
+
+        #FUXME: This is useful enough to generalize into a function. I know, I
+        #know: function overhead. But aliases really aren't powerful enough,
+        #here. Note also that such function should be called below, and that the
+        #implementation below appears to be insufficient. (Again, all the more
+        #reason for a function.) Such function is unlikely to be generally
+        #applicable. Or, perhaps it is? How about:
+        #    void set_list_to_string_split_on_commas_sans_comma_spaces_or_suffix(
+        #        string list_name, string text)
+        #Verbose name, but it's the only thing that accurately describes what it
+        #does. Again, it's generally useful enough to warrant such treatment.
+        #Note that such function's implementation should inline all operations
+        #for efficiency, as here.
+
+#FUXME: Regex variables are really named the inverse of what we want; by
+#default, regexes *SHOULD* capture groups. That's what regexes do, really. If
+#you want the version of such regex *NOT* capturing groups, you should exert
+#the effort of explicitly specifying that. In other words, suffix regex
+#variables with "_ungrouped" rather than "_grouped".
 # Output string in plaintext format.
 #local plaintext
+
+#arg_match_index_to_name=(
+#    'type'
+#    'name'
+#    'value'
+#    'placeholder'
+#)
 
 # Non-empty if the current element is not the first element of its list and
 # thus will be prefixed with a comma.
@@ -559,6 +740,25 @@ print "prettified:${output}"
 #   for ((match_index=1; match_index <= ${#match}; ++match_index)) {
 #       print "match ${match_index}: ${match[${match_index}]}"
 #   }
+
+#function set_map_to_list_inverted() {
+#    # Validate passed arguments.
+#    (( # == 2 )) || die 'expected one map name and one list name'
+#    local map_name__smtli="${1}"
+#    local list_name__smtli="${2}"
+#
+#    # Set such map to such list inverted.
+#    for ((list_index__smtli = 1;
+#          list_index__smtli <= ${#${(@P)list_name__smtli}};
+#          list_index__smtli++)) {
+#        eval "${map_name__smtli}[\${${list_name__smtli}[${list_index__smtli}]}]=${list_index__smtli}"
+#    }
+#}
+
+# Map from human-readable match name to machine-readable match index,
+# programmatically constructed by inverting the prior map.
+#local -A match_name_to_index
+#set_map_to_list_inverted match_name_to_index match_index_to_name
 
 #set_map_to_list_inverted arg_match_name_to_index arg_match_index_to_name
 #for match_name (${(k)match_name_to_index}) {
@@ -777,7 +977,7 @@ print "hello: ${hello}"
 local -A mapi; mapi=( ooommm mm33 33w uzu )
 (( ${+mapi[33w]} )) && print 'mapi!\n'
 
-local -a tyme; tyme=( oeuo mmm hhh 33 333 )
+local -a tyme; tyme=( 888o mmm hhh 33 333 )
 tyme[-1]=()
 print "tyme: ${tyme[@]}"
 print "tyme size: ${#tyme}"
