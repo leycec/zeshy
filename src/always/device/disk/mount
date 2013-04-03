@@ -17,33 +17,43 @@
 #   and "udevil", which it regularly polls for new events. Simple parsing. I
 #   reckon it'd be quite fun!
 
+#FIXME: When mounting by label, avoid accessing "/dev/disk/by-label/" symbolic
+#links, which are notoriously unreliable. Rather, use option "-L" of external
+#command "blkid", designed explicitly for such situations. In fact, mapping from
+#disk labels to paths is a sufficiently important function to be a new function,
+#don't you think? How about get_disk_labeled()? Simple; to the point!
+#FIXME: The use of "awk" *EVERYWHERE* below is fairly hideous. Strip it out;
+#replace it with pure-zeshy. A shame we didn't do so initially, eh? *sigh*
+
 # ....................{ EXCEPTIONS                         }....................
-#FIXME: Rename to die_unless_unmounted_disk() perhaps? This implies slightly
+#FIXME: Rename to die_unless_disk_unmounted() perhaps? This implies slightly
 #different semantics, so examine usage.
+#FIXME: O.K.; examined. Just do it; it's fine. :}
 
-declare_function '
+declare_function_with_stdin <<'________________<heredoc?>________________'
 void die_if_mounted_disk(
-  string pathname,
-  string error_message = "\"${pathname}\" not found or not an unmounted disk")
+    string device_filename,
+    string error_message = "\"${device_filename}\" not an unmounted disk")
 
-Throw an exception unless the passed device file corresponds to an unmounted
-disk (i.e., neither the disk itself or any partition of such disk is mounted).
-'
+Throw an exception with the passed message unless the passed disk is unmounted.
+See is_disk_unmounted() for further details.
+________________<heredoc?>________________
 function die_if_mounted_disk() {
     die_unless_args_1_to_2\
-        'expected one pathname and optional error message'
-    string pathname="${1}"
-    is_disk "${pathname}" and not is_disk_mounted "${pathname}" or
-        die "${2:-\"${pathname}\" not found or not an unmounted disk}"
+        'expected one device filename and optional error message'
+    string filename="${1}"
+    is_disk_unmounted "${filename}" or
+        die "${2:-\"${filename}\" not an unmounted disk}"
 }
 
-declare_function '
+declare_function_with_stdin <<'________________<heredoc?>________________'
 void die_if_mount_point(
-  string pathname,
-  string error_message = "\"${pathname}\" mounted")
+    string dirname,
+    string error_message = "\"${pathname}\" currently mounted")
 
-Throw an exception if the passed path is a mount point.
-'
+Throw an exception if the passed directory is a mount point. See
+is_mount_point() for further details.
+________________<heredoc?>________________
 function die_if_mount_point() {
     # Validate passed arguments.
     die_unless_args_1_to_2\
@@ -52,23 +62,30 @@ function die_if_mount_point() {
 
     #FIXME: Print what it's actually mounted to, for clarity.
     # Test and possibly throw such exception.
-    is_mount_point "${pathname}" and die "${2:-\"${pathname}\" mounted}"
+    is_mount_point "${pathname}" and die "${2:-\"${pathname}\" currently mounted}"
 }
 
-declare_function '
+#FIXME: Rename to die_unless_mount_point_static().
+#FIXME: Actually, the nomenclature's not quite right -- either here or for
+#is_static_mount_point(). This should be die_unless_dir_statically_mountable(),
+#since such directory is *NOT* a mount point until it's actually mounted to.
+#We're only testing here whether "/etc/fstab" lists such directory -- not
+#whether it's also currently mounted to.
+declare_function_with_stdin <<'________________<heredoc?>________________'
 void die_unless_static_mount_point(
-  string pathname,
-  string error_message = "\"${pathname}\" not listed by \"$(get_static_mount_point_file)\"")
+    string dirname,
+    string error_message = "\"${dirname}\" not listed by \"$(get_static_mount_point_file)\"")
 
-Throw an exception unless the passed path is listed by "/etc/fstab" and hence
-statically mountable without explicitly specifying a source device file.
-'
+Throw an exception with the passed message unless the passed path is a static
+mount point. See is_static_mount_point() for further details.
+________________<heredoc?>________________
 function die_unless_static_mount_point() {
     # Validate passed arguments.
     die_unless_args_1_to_2\
         'expected one pathname and optional error message'
     string pathname="${1}"
 
+    # Test such mount point.
     is_static_mount_point "${pathname}" or {
         string static_filename; static_filename="$(get_static_mount_point_file)"
         die "${2:-\"${pathname}\" not listed by \"${static_filename}\"}"
@@ -76,25 +93,39 @@ function die_unless_static_mount_point() {
 }
 
 # ....................{ TESTERS                            }....................
-declare_function '
-boolean is_disk_mounted(string pathname)
+declare_function_with_stdin <<'________________<heredoc?>________________'
+[status: boolean] is_disk_mounted(string device_filename)
 
-Return true if the passed device file corresponds to a mounted disk (i.e.,
-either the disk itself or some partition of such disk is currently mounted).
-'
+Return success if either the passed disk or some partition of such disk is
+currently mounted.
+________________<heredoc?>________________
 function is_disk_mounted() {
+    not is_disk_unmounted "${@}"
+}
+
+declare_function_with_stdin <<'________________<heredoc?>________________'
+[status: boolean] is_disk_unmounted(string device_filename)
+
+Return success if neither the passed disk or some partition of such disk is
+currently mounted.
+________________<heredoc?>________________
+function is_disk_unmounted() {
     # Validate passed arguments.
     die_unless_arg 'expected one device filename'
     string device_filename="${1}"
 
-    # Genius. Unless "blkid -o list" reports the passed disk under column "mount
-    # point" as "(not mounted)", either the disk itself or some partition of
-    # such disk is currently mounted. There appears to be other reasonable means
-    # of testing such transitive dependencies, so this is quite essential.
-    is '(not mounted)' !=\
-      "$(blkid -o list | awk -v DEV="${device_filename}" '$1 == DEV { print $4, $5 }')" si
+    #FIXME: Clearly, it'd be great to implement this *WITHOUT* "awk". Examine.
+
+    # If "blkid -o list" reports such disk under column "mount point" to be
+    # "(not mounted)", neither the disk itself or some partition of such disk is
+    # currently mounted. Since there appears to be no reasonable means of
+    # testing partition dependencies from the command line, this is great.
+    is_string_equals\
+        "$(blkid -o list | awk -v DEV="${device_filename}" '$1 == DEV { print $4, $5 }')"\
+        '(not mounted)'
 }
 
+#FIXME: Rename to is_disk_mounted_to_path().
 declare_function '
 boolean is_disk_mounted_to(string device_filename, string mount_dirname)
 
@@ -175,23 +206,24 @@ function is_path_writable_mount_point() {
         awk -v DIR="${mount_dirname}" '
 BEGIN { CODE = 1 }
 $2 == DIR && $4 ~ /(^|,)rw($|,)/ { CODE = 0 }
-END { exit CODE }' '/proc/mounts' | print_stdin_and_return_exit_status
+END { exit CODE }' '/proc/mounts' | return_exit_status
 #       print_message 'failed...'
     # Otherwise, manually match "mount" output.
     else
         command mount | awk -v DIR="${mount_dirname}" '
 BEGIN { CODE = 1 }
 $3 == DIR && $NF ~ /(,|\()rw(,|\))/ { CODE = 0 }
-END { exit CODE }' | print_stdin_and_return_exit_status
+END { exit CODE }' | return_exit_status
     fi
 }
 
-declare_function '
-boolean is_static_mount_point(string dirname)
+#FIXME: Rename to is_mount_point_static().
+declare_function_with_stdin <<'________________<heredoc?>________________'
+[status: boolean] is_static_mount_point(string dirname)
 
-Return true if the passed directory is listed by "/etc/fstab" and hence
-mountable without explicitly specifying a source device file.
-'
+Return success if the passed directory is a *static mount point* (i.e., listed
+by `/etc/fstab` and hence mountable without specifying a device file).
+________________<heredoc?>________________
 function is_static_mount_point() {
     die_unless_arg 'expected one dirname'
     string static_filename; static_filename="$(get_static_mount_point_file)"
@@ -255,21 +287,6 @@ function get_mount_points() {
     string mount_output; mount_output="$(command mount)"
     get_string_column "${mount_output}" 3 | remove_string_line_duplicates
 }
-
-#FIXME: What's this? *sigh* I frankly can't recall. Excise, I should think.
-# string get_mount_point(string mount_point_name)
-#
-# Get the absolute path of the passed mount point. If such point is already an
-# absolute path, return such path as is; otherwise, return the first d
-#get_static_mount_point_for_disk() {
-#    # Validate passed arguments.
-#    die_unless_arg 'expected one device filename'
-#    string device_filename="${1}"
-#    die_unless_disk "${device_filename}"
-#        is_path_absolute "${device_filename}" and
-#            die "\"${device_filename}\" not found"
-#        device_filename="$(get_device_first "/dev/disk/by-label/${device_filename}" "/dev/mapper/${device_filename}" "/dev/${device_filename}")"
-#}
 
 declare_function '
 string get_static_mount_point_for_disk(string device_filename)
@@ -592,6 +609,21 @@ function mount_disk() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: What's this? *sigh* I frankly can't recall. Excise, I should think.
+# string get_mount_point(string mount_point_name)
+#
+# Get the absolute path of the passed mount point. If such point is already an
+# absolute path, return such path as is; otherwise, return the first d
+#get_static_mount_point_for_disk() {
+#    # Validate passed arguments.
+#    die_unless_arg 'expected one device filename'
+#    string device_filename="${1}"
+#    die_unless_disk "${device_filename}"
+#        is_path_absolute "${device_filename}" and
+#            die "\"${device_filename}\" not found"
+#        device_filename="$(get_device_first "/dev/disk/by-label/${device_filename}" "/dev/mapper/${device_filename}" "/dev/${device_filename}")"
+#}
+
 #FUXME: Alias "mount" to "mount_nicely", or perhaps simply rename the latter the
 #former and improve such function so as to defer to "command mount" when non-
 #interactive (much like grep()).

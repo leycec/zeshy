@@ -35,31 +35,15 @@
 #*IMMEDIATELY BEFORE THE FUNCTION IT EXPANDS*, below. This will help us to
 #maintain all of this abominable machinery, which I must say... ROCKS!
 
-#FIXME: Hmm. Niiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiice. It turns out it *IS*
-#possible to match globs iteratively in a manner similar to that of regular
-#expressions. Should be fairly efficient, as well. First, note that parameter
-#expansion "${string//(#m)${~glob}/${MATCH}}" is a noop iteratively replacing
-#all substrings matching glob ${glob} with themselves. That isn't terribly
-#useful, but note that this is generalizable into a similar parameter
-#expansion "${string//(#m)${~glob}/$(run_command_on_match "${command}" "${MATCH}"; print_string "${MATCH}")}". Now *THIS* is clever. Unsure why I didn't think of it earlier,
-#honestly. For each match, pass such match to helper function
-#run_command_on_match() evaluating the passed "${command}", presumably passed
-#the current match with standard output and error redirected to the bit bucket
-#(to avoid mucking up the current match). Then, assuming such evaluation does
-#not throw an exception, print such match, thus avoiding changing such string.
-#Ah! Note that if we run the simpler parameter expansion
-#"noop ${string//(#m)${~glob}/$(run_command_on_match "${command}" "${MATCH}")}",
-#we achieve the same effect! No need to worry about whether or not we replace
-#matched substrings, since we don't bother assigning the resulting string. Nice.
-#In fact, it might even (slightly) improve efficiency to just replace all
-#matches with the empty string (e.g., ";print;"), resulting in a smaller
-#temporary string to be retained in-memory.
-
 # ....................{ TESTERS                            }....................
 declare_function_with_stdin <<'________________<heredoc?>________________'
 <globbable> [status: boolean] is_string_matches(string text, string glob)
 
-Return success if the passed string matches the passed glob: e.g.,
+Return success if the passed string matches the passed glob and, in such case,
+set match globals ${MATCH}, ${MBEGIN}, and ${MEND} but _not_ necessarily
+${match}, ${mbegin}, or ${mend}; the latter (slightly) reduce match efficiency.
+Consider calling is_string_matches_capturing_groups() or prefix such glob with
+"(#b)" to set all such globals: e.g.,
 
 .is_string_matches()
 ==========================================
@@ -69,35 +53,34 @@ Return success if the passed string matches the passed glob: e.g.,
 dai-ichi
 ------------------------------------------
 ==========================================
-
-This function does _not_ implicitly capture match groups into canonical `zsh`
-globals (e.g., `${match}`). To perform such capturing, consider calling
-is_string_matches_with_capturing() instead.
 ________________<heredoc?>________________
 function is_string_matches() {
+    # Validate passed arguments.
     die_unless_args_2 'expected one string and one glob'
-    is "${1}" == ${~2} si
+    string text="${1}" glob
+    glob="$(convert_string_to_glob_capturing_substrings "${2}")"
+
+    # Test such match. Avoid quoting such glob.
+    is "${text}" == ${~glob} si
 }
 
 declare_function_with_stdin <<'________________<heredoc?>________________'
-<globbable> [status: boolean] is_string_matches_with_capturing(
+<globbable> [status: boolean] is_string_matches_capturing_groups(
     string text, string glob)
 
 Return success if the passed string matches the passed glob and, in such case,
-capture groups into canonical list globals (i.e., ${match}, ${mbegin}, ${mend})
-and substrings into canonical string globals (i.e., ${MATCH}, ${MBEGIN},
-${MEND}). See convert_string_to_glob_capturing_groups_and_substrings() for
-further details.
-
-If capturing only one match group, consider calling
+set match globals ${MATCH}, ${MBEGIN}, ${MEND}, ${match}, ${mbegin}, and
+${mend}. If capturing only one match group, consider calling
 get_string_match_group_first() or
-get_string_match_group_first_if_matched() instead: e.g.,
+get_string_match_group_first_if_matched() instead. See
+convert_string_to_glob_capturing_groups_and_substrings() for further details:
+e.g.,
 
-.is_string_matches_with_capturing() vs. Match Group Getters
+.is_string_matches_capturing_groups() vs. get_string_match_group_*if_matched()
 ==========================================
 [source]
 ------------------------------------------
->>> is_string_matches_with_capturing        "hiroshima" (???)oshima
+>>> is_string_matches_capturing_groups        "hiroshima" (???)oshima
 >>> print_string "${match[1]}"
 hir
 >>> get_string_match_group_first_if_matched "hiroshima" (???)oshima
@@ -107,7 +90,7 @@ hir
 ------------------------------------------
 ==========================================
 ________________<heredoc?>________________
-function is_string_matches_with_capturing() {
+function is_string_matches_capturing_groups() {
     # Validate passed arguments.
     die_unless_args_2 'expected one string and one glob'
     string text="${1}" glob
@@ -117,22 +100,11 @@ function is_string_matches_with_capturing() {
     is "${text}" == ${~glob} si
 }
 
-declare_function_with_stdin <<'________________<heredoc?>________________'
-[status: boolean] is_string_contains_glob_characters(string text)
-
-Return true if the passed string contains a glob-reserved character, effectively
-including most ASCII punctuation (e.g., `[`, `<`, `(`, `|`, `+`, `*`, `?`, `#`).
-________________<heredoc?>________________
-function is_string_contains_glob_characters() {
-    die_unless_arg 'expected one string'
-    is_string_matches "${1}" *[\[\]\<\>\(\)\|+*?#~^]*
-}
-
 # ....................{ GETTERS                            }....................
 declare_function_with_stdin <<'________________<heredoc?>________________'
 <globbable> integer get_string_matches_count(string text, string glob)
 
-Get the number of matches in the passed string of the passed glob: e.g.,
+Get the number of substrings in the passed string matching the passed glob: e.g.,
 
 .get_string_matches_count()
 ==========================================
@@ -144,34 +116,9 @@ Get the number of matches in the passed string of the passed glob: e.g.,
 ==========================================
 ________________<heredoc?>________________
 function get_string_matches_count() {
-    # Validate passed arguments
-    die_unless_args_2\
-        'expected one string and one glob expression'
-    string text="${1}" glob="${2}"
-
-    # If either such string or glob is empty, there can be no possible matches.
-    if is -z "${text}" or -z "${glob}" si {
-        return_string 0
-    # If such glob contains no glob-reserved characters, such glob is a string
-    # literal. Get the number of instances of such literal in such string.
-    } elif { not is_string_contains_glob_characters "${glob}" } {
-        return_string "$(get_string_substrings_count "${text}" "${glob}")"
-    # Else, count with brute-force iteration. While zsh offers no flags or
-    # functions for optimizing counting, iterating a counter while removing each
-    # match until no matches remain suffices to yield the number of matches.
-    } else {
-        integer match_count=-1
-        string text_old
-
-        # For efficiency, avoid calling is_string_equals().
-        until { is "${text_old}" == "${text}" si } {
-            (( ++match_count ))
-            text_old="${text}"
-            text="${text/${~glob}/}"
-        }
-
-        return_string ${match_count}
-    }
+    integer match_count=0
+    for_string_matches_pcre "${@}" '(( ++match_count ))'
+    return_string ${match_count}
 }
 
 # ....................{ GETTERS ~ group                    }....................
@@ -193,8 +140,10 @@ zombie
 ==========================================
 ________________<heredoc?>________________
 function get_string_match_group() {
-    get_string_match_group_if_matched "${@}" or
+    get_string_match_group_if_matched "${@}" or {
+        string text="${1}" glob="${2}"
         die "\"${text}\" not matched by glob \"${glob}\""
+    }
 }
 
 declare_function_with_stdin <<'________________<heredoc?>________________'
@@ -221,7 +170,7 @@ function get_string_match_group_if_matched() {
         'expected one string, one glob, and optional group index'
     string text="${1}" glob group_index="${3:-1}"
     die_unless_integer_positive "${group_index}"
-    glob="$(convert_string_to_glob_capturing_groups "${2}")"
+    glob="$(convert_string_to_glob_capturing_groups_and_substrings "${2}")"
 
     # If such string matches, return such group. Avoid double-quoting such glob.
     if is "${text}" == ${~glob} si {
@@ -324,6 +273,128 @@ function convert_string_to_glob_capturing_groups_and_substrings() {
     convert_string_to_glob_capturing_groups "(#m)${1}"
 }
 
+# ....................{ ITERATORS                          }....................
+declare_function_with_stdin <<'________________<heredoc?>________________'
+<globbable> string for_string_matches(string text, string glob, string command)
+
+Run the passed command for each substring of the passed string matching the
+passed glob. This function provides such command access to match globals
+${MATCH}, ${MBEGIN}, and ${MEND} by prefixing such glob with `(#m)` if not
+already. This function does _not_ necessarily provide such command access to
+${match}, ${mbegin}, or ${mend}, as doing so slightly reduces match efficiency.
+To do so, consider calling for_string_matches_capturing_groups() instead or
+prefix such glob with `(#b)`: e.g.,
+
+.for_string_matches()
+==========================================
+[source]
+------------------------------------------
+>>> string on_proprietary_software="
+...     I could have made money this way and perhaps amused myself writing code.
+...     But I knew that at the end of my career, I would look back on years of
+...     building walls to divide people, and feel I had spent my life making the
+...     world a worse place."
+>>> for_string_matches "${on_proprietary_software}"\
+...     I\ (#b)([[:WORD:]]##) 'output_string "${MATCH}" ("${match[1]}")'
+I could (could)
+I knew (knew)
+I would (would)
+I had (had)
+------------------------------------------
+==========================================
+________________<heredoc?>________________
+function for_string_matches() {
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize changes to this function to those below.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Validate passed arguments.
+    die_unless_args_3 'expected one string, one glob, and one command'
+    string text="${1}" glob="${2}" command="${3}"
+    die_unless_string_nonempty glob 'expected non-empty glob'
+    glob="$(convert_string_to_glob_capturing_substrings "${glob}")"
+
+    # Iterate such matches. While zsh provides no explicit mechanism for doing
+    # so, cleverly misusing parameter expansion replacement suffices to do so.
+    # Dismantled, this is:
+    #
+    # * "noop", discarding the result of such replacement.
+    # * "//.../...", replacing each substring matching such glob with the output
+    #   of running such command. By discarding such output, this has the effect
+    #   of running such command for each such match. Great, and very efficient!
+    eval "noop \"\${text//\${~glob}/\$(${command})}\""
+}
+
+declare_function_with_stdin <<'________________<heredoc?>________________'
+<globbable> string for_string_matches_nongreedy(
+    string text, string glob, string command)
+
+Run the passed command for each substring of the passed string matching the
+passed glob *non-greedily* (i.e., matching shortest rather than longest possible
+substrings). By default, glob quantifiers `*`, `#`, and `##` match greedily. See
+for_string_matches() for further details.
+________________<heredoc?>________________
+function for_string_matches_capturing_nongreedy() {
+    # Specifying parameter expansion flag "(S)" enables non-greedy matching.
+    # Sadly, this requires reimplementing for_string_matches().
+    die_unless_args_3 'expected one string, one glob, and one command'
+    string text="${1}" glob="${2}" command="${3}"
+    die_unless_string_nonempty glob 'expected non-empty glob'
+    glob="$(convert_string_to_glob_capturing_substrings "${glob}")"
+    eval "noop \"\${(S)text//\${~glob}/\$(${command})}\""
+}
+
+# ....................{ ITERATORS ~ group                  }....................
+declare_function_with_stdin <<'________________<heredoc?>________________'
+<globbable> string for_string_matches_capturing_groups(
+    string text, string glob, string command)
+
+Run the passed command for each substring of the passed string matching the
+passed glob. This function provides such command access to match globals
+${MATCH}, ${MBEGIN}, ${MEND}, ${match}, ${mbegin}, and ${mend} by prefixing such
+glob with `(#m)(#b)` if not already. See for_string_matches() for further
+details.
+________________<heredoc?>________________
+function for_string_matches_capturing_groups() {
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize changes to this function to those below.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Validate passed arguments.
+    die_unless_args_3 'expected one string, one glob, and one command'
+    string text="${1}" glob="${2}" command="${3}"
+    die_unless_string_nonempty glob 'expected non-empty glob'
+
+    # Iterate such matches.
+    for_string_matches\
+        "${text}"\
+        "$(convert_string_to_glob_capturing_substrings "${glob}")"\
+        "${command}"
+}
+
+declare_function_with_stdin <<'________________<heredoc?>________________'
+<globbable> string for_string_matches_nongreedy_capturing_groups(
+    string text, string glob, string command)
+
+Run the passed command for each substring of the passed string matching the
+passed glob non-greedily. This function provides such command access to match
+globals ${MATCH}, ${MBEGIN}, ${MEND}, ${match}, ${mbegin}, and ${mend} by
+prefixing such glob with `(#m)(#b)` if not already. See for_string_matches() and
+for_string_matches_nongreedy() for further details.
+________________<heredoc?>________________
+function for_string_matches_nongreedy_capturing_groups() {
+    # Validate passed arguments.
+    die_unless_args_3 'expected one string, one glob, and one command'
+    string text="${1}" glob="${2}" command="${3}"
+    die_unless_string_nonempty glob 'expected non-empty glob'
+
+    # Iterate such matches.
+    for_string_matches_nongreedy\
+        "${text}"\
+        "$(convert_string_to_glob_capturing_substrings "${glob}")"\
+        "${command}"
+}
+
 # ....................{ REMOVERS                           }....................
 declare_function_with_stdin <<'________________<heredoc?>________________'
 <globbable> string remove_string_matches(string text, string glob)
@@ -415,6 +486,90 @@ function replace_string_matches_with_string() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: In fact, do this *EVERYWHERE* in this component. If there's no
+    #performance impact (and there isn't), there's no compelling reason *NOT* to
+    #do so.
+
+    # Induce the passed glob to capture matched substrings.
+#FUXME: Hmm. Niiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiice. It turns out it *IS*
+#possible to match globs iteratively in a manner similar to that of regular
+#expressions. Should be fairly efficient, as well. First, note that parameter
+#expansion "${string//(#m)${~glob}/${MATCH}}" is a noop iteratively replacing
+#all substrings matching glob ${glob} with themselves. That isn't terribly
+#useful, but note that this is generalizable into a similar parameter
+#expansion "${string//(#m)${~glob}/$(run_command_on_match "${command}" "${MATCH}"; print_string "${MATCH}")}". Now *THIS* is clever. Unsure why I didn't think of it earlier,
+#honestly. For each match, pass such match to helper function
+#run_command_on_match() evaluating the passed "${command}", presumably passed
+#the current match with standard output and error redirected to the bit bucket
+#(to avoid mucking up the current match). Then, assuming such evaluation does
+#not throw an exception, print such match, thus avoiding changing such string.
+#Ah! Note that if we run the simpler parameter expansion
+#"noop ${string//(#m)${~glob}/$(run_command_on_match "${command}" "${MATCH}")}",
+#we achieve the same effect! No need to worry about whether or not we replace
+#matched substrings, since we don't bother assigning the resulting string. Nice.
+#In fact, it might even (slightly) improve efficiency to just replace all
+#matches with the empty string (e.g., ";print;"), resulting in a smaller
+#temporary string to be retained in-memory.
+
+#declare_function_with_stdin <<'________________<heredoc?>________________'
+#[status: boolean] is_string_contains_glob_characters(string text)
+#
+#Return success if the passed string contains at least one glob-reserved
+#character. This includes most ASCII punctuation (e.g., `[`, `<`, `(`, `|`, `+`).
+#________________<heredoc?>________________
+#function is_string_contains_glob_characters() {
+#    die_unless_arg 'expected one string'
+#    is_string_matches "${1}" *[\[\]\<\>\(\)\|+*?#~^]*
+#}
+
+    # Validate passed arguments
+#   die_unless_args_2\
+#       'expected one string and one glob expression'
+#   string text="${1}" glob="${2}"
+
+    #FUXME: Fairly silly, premature optimization. I mean, how often will an
+    #empty string or glob or glob with no glob-reserved characters be passed?
+    #This can all pretty much be reduced to a single command calling
+    #for_string_match(). The implementation should resemble the corresponding
+    #PCRE implementation. See such function!
+
+    # If either such string or glob is empty, there can be no possible matches.
+#   if is -z "${text}" or -z "${glob}" si {
+#       return_string 0
+    # If such glob contains no glob-reserved characters, such glob is a string
+    # literal. Get the number of instances of such literal in such string.
+#   } elif { not is_string_contains_glob_characters "${glob}" } {
+#       return_string "$(get_string_substrings_count "${text}" "${glob}")"
+    # Else, count with brute-force iteration. While zsh offers no flags or
+    # functions for optimizing counting, iterating a counter while removing each
+    # match until no matches remain suffices to yield the number of matches.
+#   } else {
+#       integer match_count=-1
+#       string text_old
+
+#       # For efficiency, avoid calling is_string_equals().
+#       until { is "${text_old}" == "${text}" si } {
+#           (( ++match_count ))
+#           text_old="${text}"
+#           text="${text/${~glob}/}"
+#       }
+
+#       return_string ${match_count}
+#   }
+
+#capture groups into canonical list globals (i.e., ${match}, ${mbegin}, ${mend})
+#and substrings into canonical string globals (i.e., ${MATCH}, ${MBEGIN},
+#${MEND}). .
+
+#This function does _not_ implicitly capture match groups into canonical `zsh`
+#globals (e.g., `${match}`). To perform such capturing, consider calling
+#is_string_matches_capturing_groups() instead.
+
+#   die_unless_args_2 'expected one string and one glob'
+#   is "${1}" == ${~2} si
+#...     Personal success is not wrong. But it is limited in importance, and once
+#...     you have enough of it it is a shame to keep striving for that, instead
+#...     of for truth, beauty, or justice."
     # If not containing globbing flags "(#b)" or "(#m)", prefix such glob with
     # such strings. For efficiency, inline such tests.
 #   is "${glob}" == *'(#b)'* si or glob="(#b)${glob}"
@@ -439,9 +594,9 @@ function replace_string_matches_with_string() {
 #function everywhere else.
 #FUXME: Rename to is_string_matches_captivated() or
 #is_string_matches_capturing(). The latter reads poorly, so... the former? Both
-#read poorly, actually. How about is_string_matches_with_capturing()? Nice one!
+#read poorly, actually. How about is_string_matches_capturing_groups()? Nice one!
 #Actually, is_string_matches_captivatingly()... nah. Scratch that. Insanity. Go
-#is_string_matches_with_capturing().
+#is_string_matches_capturing_groups().
 #FUXME: Call convert_string_to_glob_capturing_groups_and_substrings() internally
 #for improved generality.
 
@@ -456,7 +611,7 @@ function replace_string_matches_with_string() {
 #  at which the first match group ends).
 
 #When successfully matching, such glob sets list globals `${match}`, `${mbegin}`,
-#and `${mend}` containing matched groups. See is_string_matches_with_capturing()
+#and `${mend}` containing matched groups. See is_string_matches_capturing_groups()
 #for further details.
 
 #In such case, access such groups after calling this function with the following
@@ -510,8 +665,8 @@ function replace_string_matches_with_string() {
 
 #FUXME: This needs a rename. It can currently be read in two very different
 #ways, and the expected reading is *NOT* the actual reading. How about
-#is_string_matches_with_capturing_groups() or
-#is_string_matches_with_capturing()? I prefer the former, I reckon. The added
+#is_string_matches_capturing_groups_groups() or
+#is_string_matches_capturing_groups()? I prefer the former, I reckon. The added
 #"_with" makes all the difference for readability here.
 #FUXME: Rename to enable_glob_group_capturing()?
 #FUXME: Rename to enable_glob_line_matching()?
