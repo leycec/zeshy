@@ -117,7 +117,7 @@ function set_list_to_string_column() {
     #   including the desired column.
     string glob_columns_prior__sltsc
     (( column_index__sltsc >= 2 )) and
-        glob_columns_prior="([^${column_separator_class__sltsc}]#([${column_separator_class__sltsc}]##|(#e)))(#c$(( column_index__sltsc - 1 )))"
+        glob_columns_prior="([^${ZESHY_ASCII_NEWLINE}${column_separator_class__sltsc}]#([${column_separator_class__sltsc}]##|(#e)))(#c$(( column_index__sltsc - 1 )))"
 
     # Glob expression matching the desired column. Dismantled, this is:
     #
@@ -125,7 +125,7 @@ function set_list_to_string_column() {
     #   subsequent groups. Do this as late as possible to avoid capturing
     #   columns preceding such column.
     string glob_column__sltsc
-    glob_column__sltsc="(#b)([^${column_separator_class__sltsc}]#)([${column_separator_class__sltsc}]|(#e))"
+    glob_column__sltsc="(#b)([^${ZESHY_ASCII_NEWLINE}${column_separator_class__sltsc}]#)([${column_separator_class__sltsc}]|(#e))"
 
     # Split such string on newlines.
     list lines__sltsc; lines__sltsc=( ${(f)text__sltsc} )
@@ -158,6 +158,15 @@ function for_string_line_columns_split_on_whitespace() {
     # Validate passed arguments.
     die_unless_args_3 'expected one string, one column count, and one command'
 
+    #FIXME: This could probably be optimized by calling
+    #for_string_line_columns_split_on_class() instead. I'm not
+    #sure there's an equivalent glob class to "[:blank:]", but "\t " seems a
+    #reasonable approximation. Note that it's not a good idea to implement
+    #for_string_line_columns_split_on_glob(), as globs have no equivalent to
+    #multiline mode. Note also that no "_capturing_groups" suffix is required,
+    #since if you're not capturing groups, you can't capture columns, which
+    #renders the whole affair nonsensical.
+
     # Iterate such matches. Match whitespace column delimiters with PCRE
     # character class "[:blank:]" rather than "[:space:]"; the latter
     # unhelpfully matches newline, while the former does not.
@@ -174,6 +183,8 @@ declare_function_with_stdin <<'________________<heredoc?>________________'
 Run the passed command for each line of the passed string containing at most the
 passed number of columns separated by substrings matching the passed PCRE
 character class (e.g., `[:blank:]`, matching whitespace-delimited columns).
+Avoid delimiting such class with `[` and `]` characters _unless_ such class is a
+named character class (e.g., `a-zA-Z0-9` rather than `[a-zA-Z0-9]`): e.g.,
 
 .for_string_line_columns_split_on_pcre_class()
 ==========================================
@@ -184,7 +195,7 @@ character class (e.g., `[:blank:]`, matching whitespace-delimited columns).
 
 [WARNING]
 If the passed PCRE character class matches newlines either explicitly (e.g.,
-`\n\t\v `, `[:space:]`) or implicitly (e.g., `[^a-z]`, `[a-z:^alpha:]`), throw
+`\n\t\v `, `[:space:]`) or implicitly (e.g., `^a-z`, `a-z[:^alpha:]`), throw
 an exception. While the PCRE this function internally constructs from such class
 could be altered to accomodate such classes (e.g., with negative lookahead
 assertions), doing so reduces the efficiency of such PCRE -- for little gain.
@@ -201,7 +212,12 @@ function for_string_line_columns_split_on_pcre_class() {
         text="${1}"\
         column_count="${2}"\
         column_separator_class="${3}"\
-        command="${4}"
+        command="${4}"\
+        pcre_column\
+        pcre_column_separator\
+        pcre_column_separated\
+        pcre_columns_sans_last\
+        pcre_columns
     die_unless_integer_positive "${column_count}"
     die_unless_string_nonempty "${column_separator_class}"\
         'expected non-empty column separator PCRE character class'
@@ -212,22 +228,38 @@ function for_string_line_columns_split_on_pcre_class() {
         "${ZESHY_ASCII_NEWLINE}" "[${column_separator_class}]" and
         die "column separator character class \"${column_separator_class}\" matches newlines"
 
-    # PCRE fragment capturing a single column suffixed by either the string end
-    # or column separator. Dismantled, this is:
+    # PCRE capturing a single column. Dismantled, this is:
     #
     # * "([^...]*+)", possessively capturing a longest (possibly empty)
     #   substring of characters *NOT* in such class as the next column.
     #   Possessive matching is simply greedy matching with backtracking
     #   disabled, improving efficiency where not requiring backtracking. This is
-    #   usually the case where matching longest substrings of characters.
-    # * "(?:$|[...]++)", matching without capturing either the string end or a
-    #   column separator.
-    string pcre_column="([^${column_separator_class}]*+)(?:$|[${column_separator_class}]++)"
+    #   usually the case where matching longest substrings of characters. Prefix
+    #   such negation with "\n" to avoid matching newlines.
+    pcre_column="([^\n${column_separator_class}]*+)"
 
-    # PCRE capturing all such columns on a single line. Anchor such PCRE to the
-    # beginning of the string and and each string line with "^".
-    string pcre_columns
-    pcre_columns="^$(repeat_string "${pcre_column}" "${column_count}")"
+    # PCRE fragment capturing a single column separator. Dismantled, this is:
+    #
+    # * "([^...]*+)", possessively matching a longest non-empty substring of
+    #   characters in such class as the separator for the prior column.
+    pcre_column_separator="[${column_separator_class}]++"
+
+    # PCRE fragment capturing a single column suffixed by such separator.
+    pcre_column_separated="${pcre_column}${pcre_column_separator}"
+
+    # PCRE capturing all such columns excluding the last on a single line.
+    pcre_columns_sans_last="$(repeat_string "${pcre_column_separated}" "$(( column_count - 1 ))")"
+
+    # PCRE capturing the unmatched remainder of the current line.
+    pcre_remainder="(.*)"
+
+    # PCRE capturing all such columns on a single line. Dismantled, this is:
+    #
+    # * "^", anchoring to the beginning of both the string and string lines.
+    # * "(?:$|...(.*))", matching an optional trailing column separator and
+    #   capturing any remaining text on such line into the last match group.
+    # * "$", anchoring to the end of both the string and string lines.
+    pcre_columns="^${pcre_columns_sans_last}${pcre_column}(${pcre_column_separator}${pcre_remainder})?$"
 
     # Iterate such matches with such PCRE in multiline mode.
     for_string_matches_pcre_multiline "${text}" "${pcre_columns}" "${command}"
@@ -249,7 +281,19 @@ such command access to the following canonical match globals:
 * ${match}, a list global expanding to each column of such line (e.g.,
   '${match[1]}`, expanding to the first column of the currently iterated line).
 
-For example:
+For each line, all columns except the last must be suffixed by the column
+separator (i.e., substring matching the passed PCRE). In an attempt to accept
+slightly malformed strings, the last column may be suffixed by an optional
+separator itself suffixed by an optional substring _not_ matching such
+separator (i.e., a substring matching the remainder of the line). In such case,
+such remainder is captured into an additional match group
+`${match[$(( ${column_count} + 1 ))]}`. Hence, each line matches at most the
+passed number of columns plus one, where the last ``column'' is a pseudo-column
+matching the remainder of the line not matched by a genuine column. Such column
+should _not_ be generally relied upon.
+
+This function offers a pure-`zsh` alternative to conventional column processors,
+including `awk` and cohorts (e.g., `gawk`, `nawk`): e.g.,
 
 .for_string_line_columns_split_on_pcre()
 ==========================================
@@ -257,11 +301,6 @@ For example:
 ------------------------------------------
 ------------------------------------------
 ==========================================
-
-If the passed PCRE matches newlines either explicitly (e.g.,
-`[[:punct:][:space:]]++`) or implicitly (e.g., `[[0-9:^alpha:]]{3,6}`), throw an
-exception. This prevents the last column separator from erroneously consuming a
-terminating newline and hence preventing the next line from matching.
 
 [WARNING]
 If the passed PCRE matches newlines either explicitly (e.g., `[[:space:]]++`) or
@@ -280,8 +319,12 @@ function for_string_line_columns_split_on_pcre() {
     string\
         text="${1}"\
         column_count="${2}"\
-        column_separator_pcre="${3}"\
-        command="${4}"
+        pcre_column_separator="${3}"\
+        command="${4}"\
+        pcre_column\
+        pcre_column_separated\
+        pcre_columns_sans_last\
+        pcre_columns
     die_unless_integer_positive "${column_count}"
     die_unless_string_nonempty "${column_separator_pcre}"\
         'expected non-empty column separator PCRE'
@@ -296,17 +339,119 @@ function for_string_line_columns_split_on_pcre() {
         "${ZESHY_ASCII_NEWLINE}" "${column_separator_pcre}" and
         die "column separator PCRE \"${column_separator_pcre}\" matches newlines"
 
-    # PCRE fragment capturing a single column suffixed either by the string end
-    # or column separator.
-    string pcre_column="((?:(?!${column_separator_pcre}).)*?)${column_separator_pcre}"
-
-    # PCRE capturing all such columns on a single line. Anchor such PCRE to the
-    # beginning of the string and and each string line with "^".
-    string pcre_columns
-    pcre_columns="^$(repeat_string "${pcre_column}" "${column_count}")"
+    # Construct a PCRE capturing all such columns on a single line. See
+    # for_string_line_columns_split_on_pcre_class() for further details.
+    pcre_column="(.*?)"
+    pcre_column_separated="${pcre_column}${pcre_column_separator}"
+    pcre_columns_sans_last="$(repeat_string "${pcre_column_separated}" "$(( column_count - 1 ))")"
+    pcre_remainder="(.*)"
+    pcre_columns="^${pcre_columns_sans_last}${pcre_column}(${pcre_column_separator}${pcre_remainder})?$"
 
     # Iterate such matches with such PCRE in multiline mode.
     for_string_matches_pcre_multiline "${text}" "${pcre_columns}" "${command}"
+}
+
+# ....................{ ITERATORS                          }....................
+# While there exists a for_string_line_columns_split_on_pcre() generalizing
+# for_string_line_columns_split_on_pcre_class(), there exists no
+# for_string_line_columns_split_on_glob() generalizing
+# for_string_line_columns_split_on_glob_class(). The simplest explanation why is
+# that globs have no equivalent to PCRE multiline mode. Without such mode,
+# creating a column separator glob becomes an all but infeasible chore; and even
+# where feasible risky, since such glob must be explicitly engineered to *NOT*
+# match newlines. But that's not the only explanation why. Such a generalization
+# requires some equivalent to PCRE negative lookahead assertions. While globs do
+# support "(^...)"-driven glob negation, such negation consumes what it matches;
+# hence, the closest glob equivalent for capturing a column would be
+# "((^${~column_separator_glob})#)". However, notice the use of *TWO* capturing
+# subpatterns. Since glob syntax provides no means of disabling match capturing,
+# callers must ignore every other match. This becomes patently ridiculous
+# quickly -- at which point it's difficult to justify the effort.
+
+#FIXME: Shift to a new "glob/column" component.
+declare_function_with_stdin <<'________________<heredoc?>________________'
+<globbable> string for_string_line_columns_split_on_glob_class(
+    string text,
+    integer column_count,
+    string column_separator_class,
+    string command)
+
+Run the passed command for each line of the passed string containing at most the
+passed number of columns separated by substrings matching the passed glob
+character class (e.g., `[:alnum:]`, matching alphanumeric-delimited columns).
+Avoid delimiting such class with `[` and `]` characters _unless_ such class is a
+named character class (e.g., `a-zA-Z0-9` rather than `[a-zA-Z0-9]`): e.g.,
+
+.for_string_line_columns_split_on_class()
+==========================================
+[source]
+------------------------------------------
+------------------------------------------
+==========================================
+
+[WARNING]
+If the passed glob character class matches newlines either explicitly (e.g.,
+`\n\t\v `, `[:space:]`) or implicitly (e.g., `^a-z[:alpha:]`), throw an
+exception. Permitting such classes would erroneously match a portion of the line
+following the current line into the last column of such line.
+________________<heredoc?>________________
+function for_string_line_columns_split_on_class() {
+    # Validate passed arguments.
+    die_unless_args_4\
+        'expected one string, one column count, one column separator character class, and one command'
+    string\
+        text="${1}"\
+        column_count="${2}"\
+        column_separator_class="${3}"\
+        command="${4}"\
+        glob_column\
+        glob_column_separator\
+        glob_column_separated\
+        glob_columns_sans_last\
+        glob_columns
+    die_unless_integer_positive "${column_count}"
+    die_unless_string_nonempty "${column_separator_class}"\
+        'expected non-empty column separator PCRE character class'
+    die_unless_string_nonempty "${command}" 'expected non-empty command'
+
+    # If such class matches newlines, throw an exception.
+    is_string_matches_pcre\
+        "${ZESHY_ASCII_NEWLINE}" "[${column_separator_class}]" and
+        die "column separator character class \"${column_separator_class}\" matches newlines"
+
+        glob_columns_prior="([^${ZESHY_ASCII_NEWLINE}${column_separator_class}]#(|(#e)))"
+
+    # Glob expression matching the desired column. Dismantled, this is:
+    #
+    # * "(#b)", enabling back references (i.e., match groups) for all
+    #   subsequent groups. Do this as late as possible to avoid capturing
+    #   columns preceding such column.
+    string glob_column__sltsc
+    glob_column__sltsc="(#b)([^${column_separator_class__sltsc}]#)([${column_separator_class__sltsc}]|(#e))"
+
+    # PCRE anchored to the beginning of either such string or each string line.
+    glob_start="((#s)|${ZESHY_ASCII_NEWLINE})"
+
+    # Construct a PCRE capturing all such columns on a single line. See
+    # for_string_line_columns_split_on_glob_class() for further details.
+    glob_column="([^${ZESHY_ASCII_NEWLINE}${column_separator_class}]#)"
+    glob_column_separator="[${column_separator_class__sltsc}]##"
+    glob_column_separated="${glob_column}${glob_column_separator}"
+    glob_columns_sans_last="$(repeat_string "${glob_column_separated}" "$(( column_count - 1 ))")"
+    glob_remainder="([^${ZESHY_ASCII_NEWLINE}]#)"
+
+    # To avoid capturing the beginning of each string line and hence disrupting
+    # the column order as perceived by callers, begin capturing only *AFTER*
+    # matching such beginning. Likewise, to avoid capturing the optional
+    # trailing column separator, stop capturing *AFTER* matching the last
+    # column. To capture the unmatched remainder of the current line, begin
+    # capturing *AFTER* matching such optional trailing column separator.
+    #
+    # Surprisingly, this mostly works.
+    glob_columns="${glob_start}(#b)${glob_columns_sans_last}${glob_column}(#B)(${glob_column_separator}(#b)${glob_remainder}|)"
+
+    # Iterate such matches with such glob.
+    for_string_matches "${text}" "${glob_columns}" "${command}"
 }
 
 # ....................{ TABULATORS                         }....................
@@ -351,6 +496,35 @@ function tabulate_stdin_on_whitespace() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Iterate such matches with such glob. Since such glob is anchored to the
+    # beginning of each string line, prefix such string with a newline to mimic
+    # the zero-width PCRE assertion "^". While we could also anchor to the
+    # beginning of each string line or such string with
+    # "((#s)|${ZESHY_ASCII_NEWLINE})", such pattern captures such newline into
+    # the first match group if prefixed by "(#b)". Since
+    # for_string_matches_capturing_groups() does exactly that, the ad-hoc
+    # solution presented here is 
+
+    # PCRE fragment capturing a single column suffixed either by the string end
+    # or column separator.
+#   string pcre_column="((?:(?!${column_separator_pcre}).)*?)${column_separator_pcre}"
+
+    # * "$", anchoring to the end of both the string and string lines.
+#   pcre_column="((?:(?!${column_separator_pcre}).)*)"
+#If the passed PCRE matches newlines either explicitly (e.g.,
+#`[[:punct:][:space:]]++`) or implicitly (e.g., `[[0-9:^alpha:]]{3,6}`), throw an
+#exception. This prevents the last column separator from erroneously consuming a
+#terminating newline and hence preventing the next line from matching.
+
+#This function attempts to accept slightly malformed strings. If the last column
+#of any line is suffixed by an optional separator itself suffixed by an additional
+#substring _not_ matching the passed PCRE, this function readily captures such
+#substring into match group `${match[$(( ${column_count} + 1 ))]}`
+#Columns captured into ${match} are guaranteed _not_ to contain column
+#separators. The last column may  to be neither prefixed or suffixed by
+#the last column is suffixed by a substring matching such class, successfully
+#match but do _not_ ignore such character class
+
 #Dismantled, this is:
     #
     # * "^", anchoring such PCRE to the string beginning and each string line.
