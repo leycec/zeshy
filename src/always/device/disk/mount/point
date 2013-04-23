@@ -9,6 +9,26 @@
 # Handle *mount points* (i.e., directories currently mounting some disk or disk
 # partition).
 
+#FIXME: Command "findmnt", if available (as it usually is under modern systems)
+#dramatically trivializes most of the operations below. Update, please!
+#FIXME: What role does "/etc/mtab" play in all this? Specifically, doesn't it
+#serve as yet another means of searching mount points, analogous to
+#"/proc/mounts"? Also consider "/proc/self/mountinfo", yet another such path.
+#Initial research suggests "/proc/self/mountinfo" to offer the most reliable
+#glimpse of mount points. Certainly, that's what "findmnt" defers to by default.
+#Ah; O.K. So, "/proc/self/mountinfo" provides submounts (i.e., directories
+#mounted to under a mount point, such as the "/dev/pts" mount point under the
+#"/dev" mount point) as well as mounts. There are three such pseudo-files, all
+#under "/proc/self/": "mountinfo", "mounts", and "mountstats". Grepping any of
+#these three is strongly preferable to other files (e.g., "/etc/mtab",
+#"/proc/mounts"), as the set of all mount points visible to a process is
+#actually *SPECIFIC* to that process. Interesting, yes? In fact, command
+#"unshared" may be run to prevent devices mounted by the current process from
+#affecting other processes. (To such processes, such device remains unmounted!
+#Interesting, eh?) And of these three, "mountinfo" appears to be the "newest"
+#and hence most detailed. It also appears to be somewhat more readily parseable
+#than the other two pseudo-files. In any case, more research probably desirable.
+
 # ....................{ EXCEPTIONS                         }....................
 declare_function_with_stdin <<'________________<heredoc?>________________'
 void die_if_dir_mount_point(
@@ -19,13 +39,11 @@ Throw an exception with the passed message if the passed directory is an
 existing mount point. See is_dir_mount_point() for further details.
 ________________<heredoc?>________________
 function die_if_dir_mount_point() {
-    # Validate passed arguments.
+    #FIXME: In the event of an exception, print what such directory is actually
+    #mounting, for clarity.
     die_unless_args_1_to_2\
         'expected one dirname and optional error message'
     string dirname="${1}"
-
-    #FIXME: Print what it's actually mounted to, for clarity.
-    # Test and possibly throw such exception.
     is_dir_mount_point "${dirname}" and
         die "${2:-directory \"${dirname}\" already a mount point}"
 }
@@ -40,26 +58,36 @@ ________________<heredoc?>________________
 function is_dir_mount_point() {
     # Validate passed arguments.
     die_unless_arg 'expected one dirname'
-    string mount_dirname="${1}"
+    string dirname="${1}"
 
     # If the passed path is not a directory readable by the current user, fail.
-    if { not is_dir "${mount_dirname}" } {
+    if { not is_dir "${dirname}" } {
         return_false
-    # If the cross-platform portable "mountpoint" is installed, defer to such
-    # command. This is more reliable than grepping file content.
+    # If "findmnt" is installed, run such command. This tends to be more
+    # commonly available than "mountpoint".
+    } elif { is_pathable findmnt } {
+        # By default, "findmnt" searches "/proc/self/mountinfo" rather than
+        # "/etc/mtab". Sadly, when searching under the former for a submount of
+        # a mount, "findmnt" reports success whenever such mount point exists --
+        # even if such submount point does not! While bizarre, searching under
+        # the latter disables such dubious "functionality."
+        findmnt --mtab --target "${dirname}" | return_exit_status
+    # If "mountpoint" is installed, run such command. This is certainly more
+    # reliable than matching file content.
     } elif { is_pathable mountpoint } {
-        mountpoint -q "${mount_dirname}" | return_exit_status
-    #FIXME: Unclear as to why this edge case exists. Why not simply always match
-    #"mount" output?
-
-    # If the Linux-specific "/proc/mounts" exists, grep its content. This is
-    # more reliable than matching "mount" output. (See "man mount".)
+        mountpoint -q "${dirname}" | return_exit_status
+    # If "/proc/mounts" exists, grep its Linux-specific content. This is more
+    # reliable than matching "mount" output.
     } elif { is_file '/proc/mounts' } {
         #FIXME: See below.
-        awk -v DIR="${mount_dirname}"\
+        awk -v DIR="${dirname}"\
             'BEGIN {CODE=1} $2 == DIR {CODE=0} END {exit CODE}' '/proc/mounts' |
             return_exit_status
-    # Otherwise, manually match "mount" output.
+    # Otherwise, manually match "mount" output. This is the least reliable and
+    # portable method. As "man mount" notes:
+    #
+    #    "For more robust and definable output use findmnt(8), especially in your
+    #     scripts."
     } else {
         #FIXME: O.K.; this shouldn't be terribly difficult to implement in pure-
         #zsh. We'll want a new is_string_line_with_column_index_equals() function in
@@ -67,8 +95,9 @@ function is_dir_mount_point() {
         #implementable with a multiline PCRE iterated over by calling
         #for_string_pcre_matches_multiline(). The nomenclature for such function
         #resembles the similar function discussed below.
+        #FIXME: Just see below.
 
-        command mount | awk -v DIR="${mount_dirname}"\
+        command mount | awk -v DIR="${dirname}"\
             'BEGIN {CODE=1} $3 == DIR {CODE=0} END {exit CODE}' |
             return_exit_status
     }
@@ -83,19 +112,23 @@ ________________<heredoc?>________________
 function is_dir_mount_point_writable() {
     # Validate passed arguments.
     die_unless_arg 'expected one dirname'
-    string mount_dirname="${1}"
+    string dirname="${1}"
 
     # If the passed path is not a directory writable by the current user, fail.
-    if { not is_dir_writable "${mount_dirname}" } {
+    if { not is_dir_writable "${dirname}" } {
         return_false
-    #FIXME: Unclear as to why this edge case exists. Why not simply always match
-    #"mount" output?
     # Since "mountpoint" has no writability option, we manually match strings.
     # This is hardly ideal, but there you are. If the Linux-specific
     # "/proc/mounts" exists, grep its content.
     } elif { is_file '/proc/mounts' } {
-#       print_message 'testing...'
-        awk -v DIR="${mount_dirname}" '
+        #FIXME: Replace with pure-zsh iteration resembling:
+        #
+#   not for_string_line_fields_split_on_whitespace\
+#       "$(get_static_mount_point_file)" '
+#       is "${match[1]}" != [[:blank:]]#"#"* and
+#          "${match[2]-}" == "${dirname}" si and return_false'
+
+        awk -v DIR="${dirname}" '
 BEGIN { CODE = 1 }
 $2 == DIR && $4 ~ /(^|,)rw($|,)/ { CODE = 0 }
 END { exit CODE }' '/proc/mounts' | return_exit_status
@@ -130,7 +163,7 @@ END { exit CODE }' '/proc/mounts' | return_exit_status
         #function. What's great is that it permits list comprehension-style
         #code resembling the intuitive "awk" implementation below. Ah... great!
 
-        command mount | awk -v DIR="${mount_dirname}" '
+        command mount | awk -v DIR="${dirname}" '
 BEGIN { CODE = 1 }
 $3 == DIR && $NF ~ /(,|\()rw(,|\))/ { CODE = 0 }
 END { exit CODE }' | return_exit_status
@@ -160,6 +193,9 @@ function get_mount_points() {
 }
 
 # ....................{ PRINTERS                           }....................
+#FIXME: Ugh! I've just discovered the "findmnt" command. *Very* awesome tree-
+#based output. Much superior to "mount", but doubtless even less portable than
+#that venerate command.
 declare_function_with_stdin <<'________________<heredoc?>________________'
 string print_mount_points(void)
 
