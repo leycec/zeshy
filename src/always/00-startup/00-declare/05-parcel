@@ -2,10 +2,6 @@
 # --------------------( LICENSE                            )--------------------
 # Copyright 2007-2013 by Cecil Curry.
 # See "COPYING" for additional details.
-#
-# --------------------( SYNOPSIS                           )--------------------
-# Handle *parcel* (i.e., `zeshy`-specific abstractions containing aliases,
-# parcels, and functions) declarers.
 
 #FIXME: We'll need some mechanism for cross-referencing other components in
 #AsciiDoc descriptions. How about a "@{...}"-style syntax (e.g.,
@@ -29,38 +25,77 @@
 #* Continue prefixing such component name with an additional "../" until either
 #  traversing above the overlay root containing the current component or
 #  discovering such component.
+#FIXME: Actually, the above searching mechanism isn't quite enough, as parcels
+#residing under discontiguous overlay roots would never be able to find each
+#other. Frankly, it's a fairly annoying issue. It's also extremely inefficient
+#under the default premise of explicitly searching the filesystem on each
+#@{...} reference. The latter can be significantly improved, at least, by
+#performing an upfront "print -lr -- **/*": that is, caching the set of all
+#absolute paths of all zeshy scripts compiled into the current user digest file.
+#Indeed, caching such set into a map should provide reasonably efficient lookup.
+#FIXME: Ah! We could even do one better, by caching into a map whose keys are
+#script basenames and whose values are a null-delimited string list of all
+#absolute dirnames containing such basename, *SORTED* alphabetically. The
+#sorting is essential... err, perhaps it isn't. In any case, this should provide
+#*EXTREMELY* efficient lookup. If such value contains only one string, we have
+#our candidate; otherwise, search such value split on null. We're then looking
+#for a dirname with the minimum distance to the current script's dirname. Sure,
+#we could manually implement a Levenshtein or Hamming distance function,
+#calculate each such distance, and take the dirname with the minimum distance.
+#But that strikes me as overkill. Given the nature of POSIX paths, I see a
+#simpler solution. If we can efficiently find the longest common prefix of both
+#dirnames, then counting the total number of "/" characters in the remainder
+#following such prefix in *BOTH* dirnames gives the total directory distance
+#between such dirnames. Sweet, no? The question is: can we efficiently find
+#longest common prefixes? I'm not completely sure, but a PCRE-based approach
+#appears to work at least decently:
+#
+#* Append "/" to each dirname, if not already present. (This ensures the
+#  correctness of the distance calculation.)
+#* SCRATCH THIS (i.e., ignore): Determine which of the two dirnames is longer.
+#* Ah-ha! Convert the current script's dirname to a PCRE as follows:
+#  * Using a glob, replace every substring matching "([^/]##/)" to
+#    "(${match[1]})?". Actually, that's not quite right; to ensure proper
+#    nesting (and efficiency!), we need to nest such expressions. For example,
+#    convert "/usr/share/zeshy/with/all/" to
+#    "/(usr/(share/(zeshy/(with/(all/)?)?)?)?)?". Ah! Simple. Replace
+#    each such substring with "(${match[1]}", then append ${X} number of ")?"
+#    to the end of such string, where ${X} is 1 minus the number of "/"
+#    characters in such string. This is probably easiest implemented with a glob-
+#    based iterator, frankly. In any case, we have our PCRE!
+#  * Then, just match each dirname split from such null-delimited list with such
+#    PCRE. *EVERY* dirname is guaranteed to match. The longest common prefix is
+#    given by iterating match groups, starting at -1 and ending at -${X}. The
+#    last *NONEMPTY* match group giv... Actually, just concatenate match groups!
+#    Why not, right? Then "${match[*]}" with IFS="/" should give the longest
+#    common prefix. Sweet. This is rather eclectically cool, and probably
+#    deserves its own function -- say, get_path_distance()? Can't imagine we'll
+#    often need it, but... heck, it's there, anyway.
+#  * Then, remove such longest common prefix from both dirnames and count the
+#    total number of remaining "/" characters in such strings.
+#  * It's all quite doable, really.
+#* If such count is 1, stop prematurely. There can't be anything closer... Well,
+#  there could be something equally as close but in the opposite direction. Hmm;
+#  I suppose we should give precedence to subdirectories rather than parent
+#  directories, yes? *sigh*
 
 # ....................{ GLOBALS                            }....................
-# Global map from parcel names to the help strings documenting such parcels. See
-# ${ZESHY_FUNCTION_NAME_TO_HELP} for further details.
+# Global map from parcel names to the help strings documenting such parcels.
+# Avoid formally documenting such map, which zeshy precompilation subsequently
+# undefines to conserve space. See also the following lists specific to top-
+# level components, which precompilation converts into elements of related maps:
+# ${ZESHY_CORE_HELP_ALIASES}, ${ZESHY_CORE_HELP_FUNCTIONS}, and
+# ${ZESHY_CORE_HELP_GLOBALS}.
 typeset -Ag ZESHY_PARCEL_NAME_TO_HELP
 
-# Current parcel name. See "global" for such global's documentation.
-typeset -gx ZESHY_PARCEL_NAME_CURRENT
+# Current parcel name. Since the value of such global is typically specific to
+# the most recent zeshy script to have called declare_parcel(), avoid exporting
+# such global to caller scripts. See @{global} for such global's documentation.
+typeset -g ZESHY_PARCEL_NAME_CURRENT
 
 # ....................{ DECLARERS                          }....................
-declare_function_with_stdin <<'________________<heredoc?>________________'
-void declare_parcel(
-    string script_name = "${ZESHY_SCRIPT_NAME_CURRENT}",
-    string documentation)
+# See @{function} for help strings for all functions below.
 
-Declare the passed `zeshy` script (defaulting to the currently sourced script)
-to be a new parcel, documented with the passed help string.
-
-== Parcels ==
-
-*Parcels* are `zeshy`-specific abstractions associating all aliases, globals,
-and functions subsequently declared in such script with such script. While most
-high-level languages provide native support for such abstractions (e.g., `perl`
-packages, `python` modules, `ruby` gems), `zsh` does not. Even if `zsh` did,
-however, `zeshy`\'s compilation of its codebase into a ``flat'' digest file
-would likely render such abstractions moot.
-
-Parcels provide a useful, if limited, pure-`zsh` facsimile of the conventional
-package motif. By aggregating logically related `zsh` objects into abstract
-units, parcels form the building blocks of `zeshy`\'s online documentation and
-offline help system.
-________________<heredoc?>________________
 function declare_parcel() {
     # Validate passed arguments.
     (( # == 2 )) || die 'expected one script name and one help string'
@@ -68,42 +103,58 @@ function declare_parcel() {
     is_args_2 and script_name="${1}"
     die_unless_file "${script_name}"
 
-    #FIXME: O.K.; convert the script to a parcel name by stripping the prefix
-    #corresponding to the current overlay root from such name. Again, we'll need
-    #a similar global to "${ZESHY_SCRIPT_NAME_CURRENT}" expanding to the
-    #absolute path of the current overlay root. Simple!
-
-    # Name of such parcel.
-    local parcel_name
+    # If such path is relative, throw an exception. Permitting relative parcels
+    # invites ambiguity issues.
+    die_unless_path_absolute "${script_name}"
 
     # If such parcel has already been declared, throw an exception. Since
     # parcels are typically associated with unique paths, this should never
     # happen. Make sure it doesn't! See is_map_key() for further details.
-    (( ${+ZESHY_PARCEL_NAME_TO_HELP[${parcel_name}]} )) and
-        die "parcel \"${parcel_name}\" already declared"
+    (( ${+ZESHY_PARCEL_NAME_TO_HELP[${script_name}]} )) and
+        die "parcel \"${script_name}\" already declared"
 
     # Map such parcel name to such help string.
-    ZESHY_PARCEL_NAME_TO_HELP[${parcel_name}]="${help}"
+    ZESHY_PARCEL_NAME_TO_HELP[${script_name}]="${help}"
 
-    #FIXME: Set the current parcel, as well.
+    # Set the current parcel to such name.
+    ZESHY_PARCEL_NAME_CURRENT="${script_name}"
 }
 
-declare_function_with_stdin <<'________________<heredoc?>________________'
-void declare_parcel_with_stdin[
-    args: string script_name = "${0}", stdin: string documentation]
-
-Declare a new *parcel* (i.e., `zeshy`-specific abstractions containing aliases,
-parcels, and functions) corresponding to the passed shell script (defaulting to
-the current shell script) documented with standard input. This function is the
-standard input-specific analogue to declare_parcel(), which accepts a string
-argument rather than standard input. See declare_function_with_stdin() for
-further details on why this function is preferable to declare_parcel().
-________________<heredoc?>________________
 function declare_parcel_with_stdin() {
-    run_runnable_with_stdin declare_parcel
+    run_runnable_with_stdin declare_parcel "${@}"
+}
+
+# ....................{ RUNNERS                            }....................
+function run_runnable_with_stdin() {
+    # Validate passed arguments. If standard input is empty, throw an exception.
+    # See is_stdin_nonempty() for further details.
+    (( # == 1 )) || die 'expected one function name'
+    read -t 0 || die 'standard input empty'
+    local function_name__rrws="${1}"
+    shift_arg
+
+    # Unless such function exists, throw an exception. See is_runnable() for
+    # further details.
+    whence -- "${function_name__rrws}" &>/dev/null ||
+        die "runnable \"${function_name__rrws}\" undefined"
+
+    # Run such runnable. See get_stdin() for further details.
+    "${function_name__rrws}" "${@}" "$(< /dev/stdin)"
+
+    # Close standard input. See close_stdin() for further details.
+    exec 0<&-
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: O.K.; convert the script to a parcel name by stripping the prefix
+    #corresponding to the current overlay root from such name. Again, we'll need
+    #a similar global to "${ZESHY_SCRIPT_NAME_CURRENT}" expanding to the
+    #absolute path of the current overlay root. Simple!
+    #FUXME: Set the current parcel, as well.
+
+    # Name of such parcel.
+#   local parcel_name
+
 #alias, global, and function help strings into
 #logically related units.
 # ....................{ DECLARERS                          }....................
@@ -111,11 +162,11 @@ function declare_parcel_with_stdin() {
 #void declare_parcel(string documentation)
 #
 #Declare the current shell script to be a new parcel documented with the passed
-#help string. See declare_parcel_for_script() for further details.
+#help string. See declare_parcel() for further details.
 #________________<heredoc?>________________
 #function declare_parcel() {
 #    (( # == 1 )) || die 'expected one help string'
-#    declare_parcel_for_script "${ZESHY_SCRIPT_NAME_CURRENT}" "${1}"
+#    declare_parcel "${ZESHY_SCRIPT_NAME_CURRENT}" "${1}"
 #}
 
 #FUXME: Are we not overthinking this? Why not simply rename "parcels" to
