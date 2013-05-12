@@ -14,55 +14,63 @@ ______________<heredoc?>______________
 #positive bonus, however, the codebase will be moderately more readable.
 
 # ....................{ GLOBALS                            }....................
-#FIXME: Document. Massive sigh on this one.
+#FIXME: Should probably be initialized to 0 and the global below to "" when
+#serialized into zeshy's user digest file. Unsure how to reliably accomplish
+#that. Perhaps perform such initialization in a *VERY* late precompilation hook
+#function? Alternately, we should probably just have a list global declared at
+#the "src/compile" level of the names of all globals to be initialized to "="
+#(i.e., the empty string) immediately before compilation into the digest. This
+#is necessary for all globals tracking transient state and hence likely to be
+#useful elsewhere in the future.
+
 declare_global_with_stdin <<'-\-'
 integer ZESHY_PRINT_PRIOR_STDOUT_MTIME
+
+Modification time of standard output at the time of the most recent call to
+update_print_prior_globals() or 0 if such function has yet to be called.
 -\-
 
-#FIXME: Document. Massive sigh on this one.
 declare_global_with_stdin <<'-\-'
-string ZESHY_PRINT_PRIOR_FUNCTION_NAME
+string ZESHY_PRINT_PRIOR_RUNNABLE_ID
+
+Unique identifier of the previous runnable (e.g., print_message()) to have most
+recently called update_print_prior_globals() or the empty string if such
+function has yet to be called. Such identifier is the topmost element of stack
+${funcfiletrace} at the time of such call.
+
+`zsh` tracks call stack state with two list globals: ${funcname} and
+${funcfiletrace}. Since ${funcname} elements are runnable names, such list
+distinguishes between calls to different runnables but _not_ between different
+calls to the same runnable. Since ${funcfiletrace} elements are filename and
+line pairs signifying a runnable called on such line, such list distinguishes
+between all calls and hence subsumes ${funcname} for purposes of uniquely
+identifying runnables on the call stack.
 -\-
 
-#FIXME: Excise everywhere, shifting documentation above where applicable. I
-#recall only referencing this global in this component. Check on that...
-declare_global_with_stdin <<'-\-'
-string ZESHY_PRINT_CALL_STACK_ROOT
+# ....................{ GLOBALS ~ trackers                 }....................
+declare_function_with_stdin <<'-\-'
+void reset_print_prior_globals(void)
 
-Most recent call stack root to have called a high-level print function (e.g.,
-print_message(), print_warning()) or the empty string if no such function has
-been called, where "call stack root" is the first zsh function, script, or
-command line to have initiated the current call stack.
-
-Specifically, this string is the first element of list global ${funcfiletrace}
-at the time of the most recent call to a high-level print function as recorded
-by print_whitespace_if_needed(). zsh tracks call stack state with
-two list globals: ${funcname} and ${funcfiletrace}. The former distinguishes
-between calls to different functions and scripts but *NOT* between different
-calls to the same function or script or between different command lines. The
-latter distinguishes between all such calls, hence subsuming the former. Given
-only a filename and line, inspecting such line usually furnishes the function
-name called on such line. Therefore, each element of ${funcfiletrace} uniquely
-identifies the corresponding call in the call stack. Since the first element of
-such list corresponds to the caller responsible for initiating the entire call
-stack, such element effectively differentiates such stack from subsequent call
-stacks initiated by other callers.
-
-See print_whitespace_if_needed() for further details.
+Reset globals tracking state for `zeshy` printer functions, including
+${ZESHY_PRINT_PRIOR_STDOUT_MTIME} and ${ZESHY_PRINT_PRIOR_RUNNABLE_ID}. See
+update_print_prior_globals() further details.
 -\-
+function reset_print_prior_globals() {
+    # Validate sanity.
+    die_if_args
 
-# ....................{ UPDATERS                           }....................
-#FIXME: Rewrite documentation.
+    # Reset such globals.
+    ZESHY_PRINT_PRIOR_STDOUT_MTIME=0
+    ZESHY_PRINT_PRIOR_RUNNABLE_ID=
+}
+
 declare_function_with_stdin <<'-\-'
 void update_print_prior_globals(void)
 
-If standard output for the current shell is attached to a terminal, set the
-stored call stack root specific to Zeshy print functions to the current call
-stack root. This function is typically called by low-level Zeshy print functions
-(e.g., print_string()) to notify subsequently called high-level print functions
-(e.g., print_message()) that at least one such print function has already been
-called under the current call stack root and that
-print_whitespace_if_needed() should thus print a delimiting newline.
+Update globals tracking state for `zeshy` printer functions, including
+${ZESHY_PRINT_PRIOR_STDOUT_MTIME} and ${ZESHY_PRINT_PRIOR_RUNNABLE_ID}. Such
+state assists subsequent calls to print_whitespace_if_needed() in deciding
+whether prior output should be delimited from subsequent output with whitespace.
 -\-
 function update_print_prior_globals() {
     # Validate sanity.
@@ -72,28 +80,45 @@ function update_print_prior_globals() {
     ZESHY_PRINT_PRIOR_STDOUT_MTIME="$(get_stdout_mtime)"
 
     # Store the caller name (hopefully, a printer function).
-    ZESHY_PRINT_PRIOR_FUNCTION_NAME="${funcfiletrace[2]}"
-    print "resetting ZESHY_PRINT_PRIOR_STDOUT_MTIME: ${ZESHY_PRINT_PRIOR_STDOUT_MTIME}; ZESHY_PRINT_PRIOR_FUNCTION_NAME: ${ZESHY_PRINT_PRIOR_FUNCTION_NAME}" 1>&2
+    ZESHY_PRINT_PRIOR_RUNNABLE_ID="${funcfiletrace[2]}"
+#   print "resetting ZESHY_PRINT_PRIOR_RUNNABLE_ID: ${ZESHY_PRINT_PRIOR_RUNNABLE_ID}" 1>&2
+#    print "resetting ZESHY_PRINT_PRIOR_STDOUT_MTIME: ${ZESHY_PRINT_PRIOR_STDOUT_MTIME}; ZESHY_PRINT_PRIOR_RUNNABLE_ID: ${ZESHY_PRINT_PRIOR_RUNNABLE_ID}" 1>&2
 }
 
 declare_function_with_stdin <<'-\-'
 string print_whitespace_if_needed(void)
 
-Print whitespace delimiting subsequent from prior shell output, if the following
-conditions all hold:
+Print whitespace separating subsequent from prior shell output if:
 
-* The current shell previously called at least one zeshy-specific printer
-  function (e.g., `print_string`, `print_heading`).
-* The current function was _not_ called directly from the command line (i.e.,
-  was called by another function).
-* The function calling the current function differs from the most recently
-  called printer function.
-* The current modification time of standard output differs from such time at
-  the time of the most recently called printer function.
+* All of the following hold:
+** The current shell previously called at least one `zeshy`-specific printer
+   function (e.g., print_string(), print_heading()), a prerequisite of the
+   condition below.
+** The current function was _not_ called directly from the command line (i.e.,
+   was called by another function), a prerequisite of the condition below.
+** The function calling the current function differs from the most recently
+   called printer function. If such functions are the same, their output should
+   usually be conjoined rather than separated by whitespace; if such functions
+   differ, however, separating their output with whitespace usually improves
+   readability and aesthetics.
+* Or:
+** The current modification time of standard output (in seconds since the Unix
+   epoch) differs from the previous such time recorded by the most recently
+   called printer function, implying that another runnable run at least one
+   second before the current call but after the most recently called printer
+   function has printed to standard output without calling
+   update_print_prior_globals() to update such time. In theory, all runnables
+   should update such time after printing to standard output; in practice, the
+   ``regulatory burden'' imposed by such a rule guarantees its unlikelihood.
+   While this condition fails to detect runnables run in the same second as the
+   current call which printed to standard output without updating such time, it
+   does reliably detect older such runnables. This condition is a convenience
+   fallback and should _not_ be counted upon.
 -\-
 function print_whitespace_if_needed() {
     # Validate sanity.
     die_if_args
+#   print "funcfiletrace[2]: ${funcfiletrace[2]-}\nZESHY_PRINT_PRIOR_RUNNABLE_ID: ${ZESHY_PRINT_PRIOR_RUNNABLE_ID-}"
 #   print_call_stack
 
     # Prefer an "if"- to "and"-style conditional to avoid returning false.
@@ -101,37 +126,13 @@ function print_whitespace_if_needed() {
     # the latter behaves poorly when either such string expands to the empty
     # string (as curiously appears to be the case when called from an exception
     # handler). Subtleties abound, dear acolytes.
-    if is -n "${ZESHY_PRINT_PRIOR_FUNCTION_NAME-}" and
+    if is -n "${ZESHY_PRINT_PRIOR_RUNNABLE_ID-}" and
         "${#funcfiletrace}" -ge 2 and
-        "${funcfiletrace[2]}" == "${ZESHY_PRINT_PRIOR_FUNCTION_NAME}" and\
-        "${ZESHY_PRINT_PRIOR_STDOUT_MTIME-0}" -ne "$(get_stdout_mtime)" si {
+        "${funcfiletrace[2]}" != "${ZESHY_PRINT_PRIOR_RUNNABLE_ID}" si or
+       (( ${+ZESHY_PRINT_PRIOR_STDOUT_MTIME} &&
+             ZESHY_PRINT_PRIOR_STDOUT_MTIME != $(get_stdout_mtime) )) {
         print_newline
     }
-
-#      (( ZESHY_PRINT_PRIOR_STDOUT_MTIME )) and
-    #FIXME: Convert to an "if" statement and attempt to remove the trailing
-    #return_true().
-
-    # If the previously recorded call stack root (defaulting to the empty string
-    # if not previously recorded) is the current call stack root, at least one
-    # message has already been output under such call stack, so this function
-    # must prefix the current message to be output with whitespace.
-    #
-    # Else the previously recorded call stack root and current call stack root
-    # differ, suggesting no message has been output under such call stack, so no
-    # prefixing whitespace is required.
-    #
-    # Prefer explicit string equality testing to calling is_string_equals(), as
-    # the latter behaves poorly when either such string expands to the empty
-    # string (as curiously appears to be the case when called from an exception
-    # handler). Subtleties abound, dear acolytes.
-#   print "printing newline if equals: ZESHY_PRINT_CALL_STACK_ROOT: ${ZESHY_PRINT_CALL_STACK_ROOT-}; funcfiletrace[-1]: ${funcfiletrace[-1]}" 1>&2; print_call_stack 1>&2
-#   is "${ZESHY_PRINT_CALL_STACK_ROOT-}" == "${funcfiletrace[-1]}" si and
-#       print_newline
-#       print "printing newline; call stack ends: ${funcfiletrace[-1]} / ${funcfiletrace[-1]}"
-
-    # Succeed regardless of whether such newline was printed.
-#   return_true
 }
 
 # ....................{ PRINTERS ~ newline                 }....................
@@ -370,9 +371,80 @@ function print_string_block_with_line_prefix() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: Excise everywhere, shifting documentation above where applicable. I
+#recall only referencing this global in this component. Check on that...
+#declare_global_with_stdin <<'-\-'
+#string ZESHY_PRINT_CALL_STACK_ROOT
+#
+#Most recent call stack root to have called a high-level print function (e.g.,
+#print_message(), print_warning()) or the empty string if no such function has
+#been called, where "call stack root" is the first zsh function, script, or
+#command line to have initiated the current call stack.
+#
+#Specifically, this string is the first element of list global ${funcfiletrace}
+#at the time of the most recent call to a high-level print function as recorded
+#by print_whitespace_if_needed(). zsh tracks call stack state with
+#two list globals: ${funcname} and ${funcfiletrace}. The former distinguishes
+#between calls to different functions and scripts but *NOT* between different
+#calls to the same function or script or between different command lines. The
+#latter distinguishes between all such calls, hence subsuming the former. Given
+#only a filename and line, inspecting such line usually furnishes the function
+#name called on such line. Therefore, each element of ${funcfiletrace} uniquely
+#identifies the corresponding call in the call stack. Since the first element of
+#such list corresponds to the caller responsible for initiating the entire call
+#stack, such element effectively differentiates such stack from subsequent call
+#stacks initiated by other callers.
+#
+#See print_whitespace_if_needed() for further details.
+#-\-
+#
+#stored call stack root specific to `zeshy` printer functions to the current call
+#stack root. This function is typically called by low-level `zeshy` printer functions
+#(e.g., print_string()) to notify subsequently called high-level print functions
+#(e.g., print_message()) that at least one such print function has already been
+#called under the current call stack root and that
+#print_whitespace_if_needed() should thus print a delimiting newline.
+#If standard output for the current shell is attached to a terminal, set the
+#stored call stack root specific to `zeshy` printer functions to the current call
+#stack root. This function is typically called by low-level `zeshy` printer functions
+#(e.g., print_string()) to notify subsequently called high-level print functions
+#(e.g., print_message()) that at least one such print function has already been
+#called under the current call stack root and that
+#print_whitespace_if_needed() should thus print a delimiting newline.
+#      (( ZESHY_PRINT_PRIOR_STDOUT_MTIME )) and
+    #FUXME: Convert to an "if" statement and attempt to remove the trailing
+    #return_true().
+
+    # If the previously recorded call stack root (defaulting to the empty string
+    # if not previously recorded) is the current call stack root, at least one
+    # message has already been output under such call stack, so this function
+    # must prefix the current message to be output with whitespace.
+    #
+    # Else the previously recorded call stack root and current call stack root
+    # differ, suggesting no message has been output under such call stack, so no
+    # prefixing whitespace is required.
+    #
+    # Prefer explicit string equality testing to calling is_string_equals(), as
+    # the latter behaves poorly when either such string expands to the empty
+    # string (as curiously appears to be the case when called from an exception
+    # handler). Subtleties abound, dear acolytes.
+#   print "printing newline if equals: ZESHY_PRINT_CALL_STACK_ROOT: ${ZESHY_PRINT_CALL_STACK_ROOT-}; funcfiletrace[-1]: ${funcfiletrace[-1]}" 1>&2; print_call_stack 1>&2
+#   is "${ZESHY_PRINT_CALL_STACK_ROOT-}" == "${funcfiletrace[-1]}" si and
+#       print_newline
+#       print "printing newline; call stack ends: ${funcfiletrace[-1]} / ${funcfiletrace[-1]}"
+
+    # Succeed regardless of whether such newline was printed.
+#   return_true
+# the following conditions all hold 
+    #FUXME: This isn't quite right, and one can readily see why when
+    #uncommenting the print() statement below: a granularity of seconds is
+    #simply too low to reliably detect changes. Ideally, "mtime" would be
+    #recorded in milli- or nanoseconds. Since it isn't, another approach is
+    #required. 
+
 #FUXME: Adjust the conditions under which a newline is printed to the following:
 #
-#* If ${ZESHY_PRINT_PRIOR_FUNCTION_NAME} is unequal to the currently called printer
+#* If ${ZESHY_PRINT_PRIOR_RUNNABLE_ID} is unequal to the currently called printer
 #  function name (e.g., "print_message"),
 #* If ${ZESHY_PRINT_PRIOR_STDOUT_MTIME} is non-empty (or non-zero, if we
 #  decide to use an integer as we probably should) *AND* unequal to the
