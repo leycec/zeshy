@@ -246,6 +246,29 @@ alias_cli_abbreviation rmdi="rmdir --parents --verbose --"
 ==========================================
 -/-
 
+#FIXME: Actually, this *CAN* and should be implemented as a process
+#substitution-driven alias: e.g.,
+#
+#    define_alias "${alias_name}" '$(
+#        if { is_context_cli_command_substitution } {
+#            output_string "'${alias_expansion}'"
+#        } else {
+#            output_string "'${alias_name}'"
+#        }
+#    )'
+#
+#I've verified we do *NOT* need to disable such alias name within such
+#expansion, unlike the equivalent function-based implementation. The only
+#downside, of course, is in the forking of a subshell. But, honestly, the
+#advantages appear to substantially outweigh this single disadvantage.
+#FIXME: We'll need a new alias is_context_cli_command_substitution(). Shouldn't
+#be *TOO* terribly hard, eh? I've just confirmed this to test for context
+#"toplevel:cmdsubst". Go-go!
+#FIXME: Actually, we (probably) need to retain the current function-based
+#implementation. Why? Well, I'm unconvinced we can pass arguments to an alias
+#defined in such way. We certainly can't use a herestring approach. This
+#implies we'll need to add additional aliases to
+#"00-declare/05-alias/zsh/context" for handling functions called from the CLI.
 #FIXME: I'm fairly certain that there's no justifiable reason to continue
 #internally implementing CLI aliases as functions. No, really. They should just
 #be aliases expanding to code embedded in a "{"- and "}"-delimited block: e.g.,
@@ -266,12 +289,6 @@ alias_cli_abbreviation rmdi="rmdir --parents --verbose --"
 #It also allows functions to be aliased with CLI substitutions, which is *MUCH*
 #more interesting and important than allowing aliases to be aliased with CLI
 #substitutions (which really doesn't make much sense, on the face of it.)
-#FIXME: Embody the above test in a new alias in a new parcel
-#"05-alias/zsh/context" as follows:
-#
-#   alias is_context_toplevel='is "${ZSH_EVAL_CONTEXT}" == 'toplevel' si'
-#
-#Simple.
 
 #FIXME: Actually, the approach below effects nothing, effectively. Why? Simple:
 #any function already defined by the current shell remains defined even if the
@@ -389,29 +406,40 @@ alias_cli_abbreviation rmdi="rmdir --parents --verbose --"
 #implementation?
 
 # ....................{ GLOBALS                            }....................
-declare_global_with_stdin <<'/---'
-map ZESHY_CLI_ALIAS_NAME_TO_EXPANSION
+#FIXME: Rename "ZESHY_CLI_ALIAS" to "ZESHY_ALIAS_CLI" everywhere.
+#FIXME: Ensure that keys of this map actually contain the original "{" and "}"
+#passed delimiters.
+declare_global_with_stdin map ZESHY_CLI_ALIAS_NAME_TO_EXPANSION <<'/---'
+Map from CLI alias name and expansion originally specified for such alias. Since
+CLI aliases are high-level `zeshy` abstractions implemented as low-level `zsh`
+aliases by extracting `{` and `}` delimiters from such names and wrapping
+additional logic around such expansions, the actual names and expansions of the
+associated `zsh` aliases differ from the original names and expansions specified
+for such `zeshy` abstractions. Specifically:
 
-Map from interactive alias name to corresponding expansion. Each call to
-alias_cli(), alias_cli_abbreviation(), and alias_cli_substitution()
-adds the selected alias name and passed expansion to this map.
+* Alias names in this map may contain `{` and `}` delimiters omitted from their
+  actual alias names in `zsh`.
+* Alias expansions in this map never contain the additional logic of their
+  actual alias expansions in `zsh`.
 /---
 
-declare_global_with_stdin <<'/---'
-map ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION
-
-Map from interactive abbreviation name to corresponding expansion. Each call to
-alias_cli_abbreviation() and alias_cli_substitution() (if embedding a `{`-
-and `}`-delimited abbreviation name in the passed alias name) adds the selected
-abbreviation name and passed expansion to this map.
+#FIXME: Actually append to this list below.
+declare_global_with_stdin map ZESHY_ALIAS_CLI_UNTYPED_NAMES <<'/---'
+Map from *CLI untyped alias* (i.e., a CLI alias neither a substitution or
+abbreviation) names to the empty string. This structure is a map rather than
+list as the former permits efficient lookup.
 /---
 
-declare_global_with_stdin <<'/---'
-map ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION
+declare_global_with_stdin map ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES <<'/---'
+Map from CLI substitution alias names (sans `{` and `}` delimiters) to the empty
+string. This structure is a map rather than list as the former permits efficient
+lookup.
+/---
 
-Map from interactive substitution name to corresponding expansion. Each call to
-alias_cli_substitution() adds the passed substitution name sans `{`- and `}`-
-delimited abbreviation name and passed expansion to this map.
+declare_global_with_stdin map ZESHY_ALIAS_CLI_ABBREVIATION_NAMES <<'/---'
+Map from CLI abbreviation alias names (sans `{` and `}` delimiters) to the empty
+string. This structure is a map rather than list as the former permits efficient
+lookup.
 /---
 
 # ....................{ DEFINERS ~ abbreviation            }....................
@@ -618,30 +646,12 @@ function alias_cli() {
     string\
         alias_name\
         alias_expansion\
-        alias_name_type command_name\
-        alias_expansion_if_interactive alias_expansion_if_non_interactive\
-        alias_logic_if_interactive alias_logic_if_non_interactive
+        alias_type_readable\
+        alias_name_type\
+        alias_expansion_if_noncli\
+        alias_logic_if_cli\
+        alias_logic_if_noncli
 #   print "cli alias: ${*}"  # print "args: ${*%%=*}"
- 
-    #FIXME: Wherever we print a message prefixed by "CLI ${ZESHY_ALIAS_CLI_TYPE}",
-    #we should *REALLY* be printing a message prefixed by a new string local
-    #"${alias_cli_type}", expanding to a human-readable version of such prefix
-    #(e.g., "CLI abbreviation alias", "CLI alias"). I believe we've already
-    #doctored up code elsewhere that does so, so... recover that code here!
-
-    # If passed only one argument, such argument must be a "="-delimited alias
-    # specification. Parse the name and expansion from such specification.
-    if { is_arg } {
-        string alias_specification="${1}"
-        is "${alias_specification}" == (*)'='(*) si or
-            die "CLI ${ZESHY_ALIAS_CLI_TYPE} specifier \"${*}\" contains no '=' delimiter"
-        alias_name="${1%%[[:space:]]#\=*}"
-        alias_expansion="${1#*\=[[:space:]]#}"
-    # Else, the name and expansion were explicitly passed.
-    } else {
-        alias_name="${1}"
-        alias_expansion="${2}"
-    }
 
     # Type of interactive alias to be defined, defaulting to "alias" if not
     # already set by the caller. Recognized types include:
@@ -650,17 +660,42 @@ function alias_cli() {
     # * "abbreviation", only set by alias_cli_abbreviation().
     # * "alias", only set by this function.
     string ZESHY_ALIAS_CLI_TYPE="${ZESHY_ALIAS_CLI_TYPE:-alias}"
+
+    # If passed only one argument, such argument must be a "="-delimited alias
+    # specification. Parse the name and expansion from such specification.
+    if { is_arg } {
+        # The glob expression '(*)=(*)' is glorious to behold, indeed.
+        string alias_specification="${1}"
+        die_unless_string_glob_matches_capturing_groups\
+            "${alias_specification}" '([^=]#)=(*)'\
+            "CLI ${ZESHY_ALIAS_CLI_TYPE:-alias} specifier \"${*}\" contains no '=' delimiter"
+        alias_name="${match[1]}"
+        alias_expansion="${match[2]}"
+#       print_string "alias name: ${alias_name}; expansion: ${alias_expansion}"
+    # Else, the name and expansion were explicitly passed.
+    } else {
+        alias_name="${1}"
+        alias_expansion="${2}"
+    }
+
 #   is "${ZESHY_ALIAS_CLI_TYPE}" == abbreviation si and print "alias type: ${ZESHY_ALIAS_CLI_TYPE}\nalias name: ${alias_name}\nalias expansion: ${alias_expansion}" 1>&2
 #   is "${alias_name}" == '{acr}oread' si and { print "acroread!"; curse_call_stack }
 
-    # Validate passed arguments.
-    is "${ZESHY_ALIAS_CLI_TYPE}" ==\
-        ('substitution'|'abbreviation'|'alias') si or
-        die "CLI alias type \"${ZESHY_ALIAS_CLI_TYPE}\" unrecognized (expected \"substitution\", \"abbreviation\", or \"alias\")"
-    (( ${#alias_name} )) or
-        die "CLI ${ZESHY_ALIAS_CLI_TYPE} specifier \"${*}\" contains no '='-suffixed alias name"
-    (( ${#alias_expansion} )) or
-        die "CLI ${ZESHY_ALIAS_CLI_TYPE} specifier \"${*}\" contains no '='-prefixed alias expansion"
+    # For readability, convert such type to a human-readable label.
+    string alias_type_readable
+    case "${ZESHY_ALIAS_CLI_TYPE}" {
+    abbreviation) alias_type_readable='CLI abbreviation alias';;
+    substitution) alias_type_readable='CLI substitution alias';;
+    alias)        alias_type_readable='CLI alias';;
+    # If such type is unrecognized, throw an exception.
+    *) die "CLI alias type \"${ZESHY_ALIAS_CLI_TYPE}\" unrecognized (expected \"substitution\", \"abbreviation\", or \"alias\")";;
+    }
+
+    # If such name or expansion are the empty string, throw an exception.
+    die_unless_string_nonempty "${alias_name}"\
+        "expected nonempty alias name in ${alias_type_readable}:${ZESHY_ASCII_NEWLINE}${*}"
+    die_unless_string_nonempty "${alias_expansion}"\
+        "expected nonempty alias expansion in ${alias_type_readable}:${ZESHY_ASCII_NEWLINE}${*}"
 
     # If such alias name contains at least one "{"- and "}"-delimited substring,
     # concatenating all such substrings provides the abbreviation name embedded
@@ -670,24 +705,31 @@ function alias_cli() {
         alias_cli_parse_embedding
     }
 
-    # If such alias name is already a declared...
-    if { alias_name_type="$(get_runnable_type "${alias_name}")" } {
-        # ...zsh function, throw an exception. CLI aliases are genuine aliases
-        # and hence cannot replace aliases of the same name without destroying
-        # such aliases. As there's no compelling reason for CLI aliases to
-        # silently replace previously declared aliases, don't.
-        if is "${alias_name_type}" == 'alias' si {
-            die "CLI ${ZESHY_ALIAS_CLI_TYPE} \"${alias_name}\" already a defined function:\n$(which "${alias_name}")"
+    # If such alias name is already a declared runnable, handle such case.
+    if { alias_name_type="$(get_runnable_type_if_found "${alias_name}")" } {
+        #FIXME: Remove this case; it *REALLY* shouldn't apply.
+        # If such alias does not exist but was erroneously detected as existing,
+        # throw an exception. This constitutes a fatal bug and shouldn't happen!
+        if is -z "${alias_name_type}" si {
+            die "${alias_type_readable} \"${alias_name}\" undefined:${ZESHY_ASCII_NEWLINE}$(print_runnable "${alias_name}")"
+        # If such alias already exists, throw an exception. CLI aliases are
+        # implemented as actual aliases and hence cannot replace aliases of the
+        # same name without silently obliterating such aliases. As there is no
+        # compelling use case for permitting this, don't.
+        } elif is "${alias_name_type}" == 'alias' si {
+            die "${alias_type_readable} \"${alias_name}\" already a defined alias:${ZESHY_ASCII_NEWLINE}$(print_runnable "${alias_name}")"
         # ...any other runnable (e.g., alias, builtin, command) and this is a
         # CLI abbreviation alias, throw an exception. Such aliases *NEVER*
         # replace existing runnables.
         } elif is "${ZESHY_ALIAS_CLI_TYPE}" == 'abbreviation' si {
-            die "CLI ${ZESHY_ALIAS_CLI_TYPE} \"${alias_name}\" already a defined ${alias_name_type}:\n$(which "${alias_name}")"
+            die "${alias_type_readable} \"${alias_name}\" already a defined ${alias_name_type}:${ZESHY_ASCII_NEWLINE}$(print_runnable "${alias_name}")"
         # Else, silently wrap such runnable in the passed alias.
         }
-    # If such alias name is *NOT* already a declared runnable and this is an
-    # interactive substitution alias, there exists nothing to be substituted.
-    # Throw an exception.
+    # Else, such alias name is *NOT* already an existing runnable, in which case
+    # ${alias_name_type} is now the string "none" as tested below.
+    #
+    # If this is a CLI substitution alias, however, there exists nothing to be
+    # substituted. Throw an exception!
     } elif is "${ZESHY_ALIAS_CLI_TYPE}" == 'substitution' si {
         # Type of failure action to perform, defaulting to "die" if not already
         # set by the caller. Recognized types include:
@@ -698,125 +740,75 @@ function alias_cli() {
         string ZESHY_CLI_SUBSTITUTION_ACTION_IF_NOT_PATHABLE="${ZESHY_CLI_SUBSTITUTION_ACTION_IF_NOT_PATHABLE:-die}"
 
         # Error message to be printed.
-        string error_message="interactive substitution \"${alias_name}\" not an existing command or builtin"
+        string error_message="${alias_type_readable} \"${alias_name}\" not an existing command or builtin"
 
         #FIXME: This is terrible. Just *ALWAYS* throw an exception. If the
         #caller doesn't like that, it's *THEIR* responsibility to manually
         #catch such exception and convert it into a warning. Eliminate this
         #horrific kludge immediately. *feigned sigh*
+        #FIXME: Wait the distinction between throwing an exception ("die") and
+        #merely returning non-zero exit status is still required ("return"). The
+        #"cry" action, however, is *NOT* required. Such action should simply
+        #throw an exception, as with "die". Since this leaves two actions, we
+        #should implement this as a simple boolean. Much simpler and readable.
+        #FIXME: Rename ${ZESHY_CLI_SUBSTITUTION_ACTION_IF_NOT_PATHABLE} to
+        #${ZESHY_ALIAS_CLI_SUBSTITUTION_IS_RETURNING_IF_NONEXTANT}. If such
+        #boolean global is unset, simply throw an exception. Since throwing an
+        #exception should always be the default action, such nomenclature
+        #strikes me as inherently sane.
 
         # Perform such failure action.
         case "${ZESHY_CLI_SUBSTITUTION_ACTION_IF_NOT_PATHABLE}" {
         die) die "${error_message}";;
         cry) print_warning "${error_message}"; return_false;;
         return) return_false;;
-        *) die "interactive substitution error action \"${ZESHY_CLI_SUBSTITUTION_ACTION_IF_NOT_PATHABLE}\" unrecognized";;
+        *) die "${alias_type_readable} error action \"${ZESHY_CLI_SUBSTITUTION_ACTION_IF_NOT_PATHABLE}\" unrecognized";;
         }
-    # Otherwise, declare such runnable as the the passed alias.
+    # Else, declare such runnable to be such CLI alias.
     }
 #   is "${ZESHY_ALIAS_CLI_TYPE}" == abbreviation si and print "still alias name: ${alias_name}" 1>&2
-
-    # If the first shell word such alias expands to equals its name but not an
-    # existing command or builtin, the caller is probably attempting to
-    # interactively alias a function of the same name: e.g.,
-    #
-    #  alias_cli recursion='recursion -not -ok'
-    #  function recursion() { print 'does not work as expected'; }
-    #
-    # While zsh does permit aliases to functions of the same name, interactive
-    # aliases are themselves implemented as functions. Hence, the above
-    # definition of "function recursion()" silently destroys the previously
-    # defined "alias_cli recursion". To avoid subtle bugs, explicitly
-    # prohibit such situations by throwing an exception here.
-    command_name="${alias_expansion[(w)1]}"
-    is "${alias_name}" == "${command_name}" si and
-        not whence -- "${command_name}" &>/dev/null and
-        die "interactive alias \"${alias_name}\" recursively expands to undefined command or builtin"
-#   command_name_type="${$(whence -w -- "${command_name}")##*: }" or
-#   is "${ZESHY_ALIAS_CLI_TYPE}" == abbreviation si and print "still alias name: ${alias_name}" 1>&2
-
-    #FIXME: We use "run_command_" as a magic string in numerous contexts,
-    #probably all of them globs matching "run_command_"*. If the latter is the
-    #case, define a new string global ${ZESHY_FUNCTION_NAME_RUN_COMMAND_GLOB}
-    #(probably in parcel "runnable/command/command"): e.g.,
-    #
-    #    ZESHY_FUNCTION_NAME_RUN_COMMAND_GLOB='run_command_*'
-
-    # If the first shell word such alias expands to is prefixed by "run_command_", assume
-    # such word to be a Zeshy function transitively calling run() with arguments
-    # requiring quote protection.
-    if is "${command_name}" == 'run_command_'* si {
-        alias_expansion_if_interactive="${alias_expansion} \"\${(q)@}\" and return_exit_status"
-    # Otherwise, pass arguments to such expansion as is.
-    } else {
-        alias_expansion_if_interactive="${alias_expansion} \"\${@}\" and return_exit_status"
-    }
 
     # Interactive logic to be performed by the function definition below.
-    alias_logic_if_interactive="
+    alias_logic_if_cli='
     if { is_stdin_pipe } {
-        run_command_with_stdin_piped ${alias_expansion_if_interactive}
+        output_string "get_stdin | '${alias_expansion}'"
     } else {
-        ${alias_expansion_if_interactive}
-    }"
+        output_string "'${alias_expansion}'"
+    }'
 
     # Non-interactive logic to be performed by the function definition below. If
     # this alias name is not already an existing runnable (e.g., as in the case
     # of interactive abbreviations), throw an exception. Otherwise, call this alias
     # name as is without expanding the passed expansion.
-    if is "${alias_name_type}" == 'none' si {
-        # Since this alias name is not already an existing runnable, this alias
-        # cannot be a substitution. To improve error readability, produce a
-        # human-readable alias type as follows.
-        string alias_type_readable
-        if is ${ZESHY_ALIAS_CLI_TYPE} == 'abbreviation' si {
-            alias_type_readable="CLI abbreviation alias"
-        } else {
-            alias_type_readable="CLI alias"
-        }
-
-        alias_logic_if_non_interactive="die '${alias_type_readable} \"${alias_name}\" expandable only at the command line'"
+    if { is_string_empty "${alias_name_type}" } {
+        alias_logic_if_noncli='output_string "die '''${alias_type_readable}' \"'${alias_name}'\" expandable only at the command line; passed arguments:'${ZESHY_ASCII_NEWLINE}'''"'
     } else {
-        alias_expansion_if_non_interactive="${alias_name} \"\${@}\" and return_exit_status"
-        alias_logic_if_non_interactive="
+        alias_logic_if_noncli='
     if { is_stdin_pipe } {
-        run_command_with_stdin_piped ${alias_expansion_if_non_interactive}
+        output_string "run_command_with_stdin_piped '${alias_name}'"
     } else {
-        ${alias_expansion_if_non_interactive}
-    }"
+        output_string "'${alias_name}'"
+    }'
     }
 
-    # Define such alias as a function of the same name. Specifically:
-    #
-    # * Temporarily disable such function to prevent infinite recursion if
-    #   such expansion transitively calls an alias, builtin, or command of the
-    #   same name.
-    # * If the current shell is interactive (thus excluding non-interactive
-    #   scripts) and such function was called directly from the command line
-    #   (thus excluding intermediate calls by interactively called functions),
-    #   run the interactive expansion; else run the non-interactive expansion.
-    # * Regardless of whether an exception is thrown, reenable such function.
-    eval "function \"${alias_name}\"() {
-    {
-        disable -f ${alias_name}
-        if [[ -o interactive && \${#funcstack} -eq 1 ]] {
-            ${alias_logic_if_interactive}
+    # Define such alias.
+    define_alias "${alias_name}" '$(
+        if { is_context_cli_command_substitution } {
+            '${alias_logic_if_cli}'
         } else {
-            ${alias_logic_if_non_interactive}
-        }
-    } always {
-        enable -f ${alias_name}
-    }
-}"
+            '${alias_logic_if_noncli}'
+        })'
 
-    # Since such alias has now been successfully declared, record such success
-    # by mapping the selected alias name to the passed alias expansion in the
-    # global maps appropriate to such alias.
+    # Since such alias has been successfully defined, record such success by
+    # mapping the selected alias name to such expansion.
     ZESHY_CLI_ALIAS_NAME_TO_EXPANSION[${alias_name}]="${alias_expansion}"
-        if is "${ZESHY_ALIAS_CLI_TYPE}" == 'abbreviation' si {
-        ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION[${alias_name}]="${alias_expansion}"
-    } elif is "${ZESHY_ALIAS_CLI_TYPE}" == 'substitution' si {
-        ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION[${alias_name}]="${alias_expansion}"
+    case "${ZESHY_ALIAS_CLI_TYPE}" {
+    abbreviation)
+        ZESHY_ALIAS_CLI_ABBREVIATION_NAMES[${alias_name}]='';;
+    substitution)
+        ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES[${alias_name}]='';;
+    alias)
+        ZESHY_ALIAS_CLI_UNTYPED_NAMES[${alias_name}]='';;
     }
 }
 
@@ -844,14 +836,14 @@ function alias_cli_parse_embedding() {
     die_if_args
 
     # If such abbreviation is invalid, throw an exception.
-    is "${ZESHY_ALIAS_CLI_TYPE-}" == 'alias' si and
-        die "interactive ${ZESHY_ALIAS_CLI_TYPE} \"${alias_name}\" contains a \"{...}\" but is neither an abbreviation or substitution"
+    is "${ZESHY_ALIAS_CLI_TYPE}" == 'alias' si and
+        die "${alias_type_readable} \"${alias_name}\" contains \"{\" and \"}\" delimiters but is neither an abbreviation or substitution"
     is "${alias_name}" == \{[^\{\}]#\} si and
-        die "interactive ${ZESHY_ALIAS_CLI_TYPE} \"${alias_name}\" contains a full \"{...}\""
+        die "${alias_type_readable} \"${alias_name}\" consists of only a \"{\"- and \"}\"-delimited abbreviation"
     is "${alias_name}" == *\{\}* si and
-        die "interactive ${ZESHY_ALIAS_CLI_TYPE} \"${alias_name}\" contains an empty \"{}\""
+        die "${alias_type_readable} \"${alias_name}\" contains an empty \"{\"- and \"}\"-delimited abbreviation"
     is "${alias_name}" == *\{[^\}]# si and
-        die "interactive ${ZESHY_ALIAS_CLI_TYPE} \"${alias_name}\" contains an unclosed '{'"
+        die "${alias_type_readable} \"${alias_name}\" contains an unpaired \"{\" delimiter"
 
     # Copy of the passed alias name.
     string alias_name_copy="${alias_name}"
@@ -874,6 +866,10 @@ function alias_cli_parse_embedding() {
     while { true } {
         abbre_name="${alias_name_copy//[^\{\}]#\{(#b)([^\{\}]##)\}[^\{\}]#/${match[1]}}"
 #       print_string_with_escapes "abbreviation: ${abbre_name}"
+
+        # If such abbreviation name is *NOT* claimed by an existing runnable,
+        # break. For efficiency, inline such implementation. See is_runnable()
+        # for further details.
         whence -- "${abbre_name}" &>/dev/null or break
 
         # Find the index of the leftmost "}" in ${alias_name_copy} by
@@ -921,22 +917,22 @@ function alias_cli_parse_embedding() {
     #   use the entire alias name stripped of "{" and "}" characters as the
     #   abbreviation name).
     if (( abbre_next_char_index == ${#alias_name_copy} )) {
-        is "${ZESHY_ALIAS_CLI_TYPE}" == 'substitution' si and {
+        if is "${ZESHY_ALIAS_CLI_TYPE}" == 'substitution' si {
             string abbre_name_type
             abbre_name="${alias_name//[^\{\}]#\{(#b)([^\{\}]##)\}[^\{\}]#/${match[1]}}"
-            abbre_name_type="${$(whence -w -- "${abbre_name}")##*: }"
-            print_warning "abbreviation \"${abbre_name}\" in interactive substitution \"${alias_name}\" already a defined ${abbre_name_type}:\n$(which "${abbre_name}")"
+            abbre_name_type="$(get_runnable_type "${abbre_name}")"
+            print_warning "abbreviation \"${abbre_name}\" in ${alias_type_readable} \"${alias_name}\" already a defined ${abbre_name_type}:${ZESHY_ASCII_NEWLINE}$(print_runnable "${abbre_name}")"
         }
     # If this is an interactive substitution, define an interactive
     # abbreviation of the above abbreviation name and same expansion as this
     # substitution. While this does recursively call alias_cli(), such
-    # call *NEVER* performs another recursive call. (Why? Listen closely: such
+    # call *NEVER* performs another recursive call. (Why? Listen close: such
     # abbreviation name contains no "{" or "}" characters and hence no embedded
-    # abbreviation. Since such recursive call never calls this function, the
+    # abbreviation. Since such recursive call never calls this function, all
     # recursion is guaranteed to "bottom out" after the first recursion.)
     } elif is "${ZESHY_ALIAS_CLI_TYPE}" == 'substitution' si {
 #       print "abbreviating embedded ${abbre_name}=\"${alias_expansion}\"" 1>&2
-        alias_cli_abbreviation ${abbre_name}="${alias_expansion}"
+        alias_cli_abbreviation "${abbre_name}" "${alias_expansion}"
     # If this is an interactive abbreviation, set the alias name to be returned
     # to the above abbreviation name.
     } else {
@@ -949,38 +945,46 @@ function alias_cli_parse_embedding() {
 
 # ....................{ PRINTERS                           }....................
 declare_function_with_stdin <<'/---'
-void print_alias_clies(void)
+string print_aliases_cli(void)
 
-Print a human-readable list of all previously declared interactive aliases.
+Print a human-readable list of all CLI aliases and corresponding expansions.
 /---
-function print_alias_clies() {
+function print_aliases_cli() {
     # Validate sanity.
     die_if_args
-    string type
+    string alias_type
 
     # Colors to be expanded below.
-    string quotes="${ZESHY_COLOR_STYLE[print_alias_clies.quotes]}\""
+    string quotes="${ZESHY_COLOR_STYLE[print_aliases_cli.quotes]}\""
+
+    # List of all CLI alias names sans "{" and "}" delimiters for lexical
+    # sorting purposes. While the keys of ${ZESHY_CLI_ALIAS_NAME_TO_EXPANSION}
+    # also list all CLI alias names, such names include "{" and "}" delimiters
+    # conflicting with lexical sorting.
+    list alias_names; alias_names=(
+        "${ZESHY_ALIAS_CLI_ABBREVIATION_NAMES[@]}"
+        "${ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES[@]}"
+        "${ZESHY_ALIAS_CLI_UNTYPED_NAMES[@]}"
+    )
 
     # For each currently declared interactive alias in lexicographic order...
-    for_map_keys_sorted_lexically_ascending\
-        ZESHY_CLI_ALIAS_NAME_TO_EXPANSION name '
-        # Get such alias'' type by map lookup. Since is_map_key() imposes
-        # perceptible delays, use zsh builtins. See is_map_key() for details.
-        if (( ${+ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION[${alias_name}]} )) {
-            type="${ZESHY_COLOR_STYLE[print_alias_clies.type_abbreviation]}alias_cli_abbreviation"
-        } elif (( ${+ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION[${alias_name}]} )) {
-            type="${ZESHY_COLOR_STYLE[print_alias_clies.type_substitution]}alias_cli_substitution"
+    for_list_elements_sorted_lexically_ascending alias_names alias_name '
+        # Get such alias'' type by map lookup.
+            if (( ${+ZESHY_ALIAS_CLI_ABBREVIATION_NAMES[${alias_name}]} )) {
+            alias_type="${ZESHY_COLOR_STYLE[print_aliases_cli.type_abbreviation]}alias_cli_abbreviation"
+        } elif (( ${+ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES[${alias_name}]} )) {
+            alias_type="${ZESHY_COLOR_STYLE[print_aliases_cli.type_substitution]}alias_cli_substitution"
         } else {
-            type="${ZESHY_COLOR_STYLE[print_alias_clies.type_alias]}alias_cli"
+            alias_type="${ZESHY_COLOR_STYLE[print_aliases_cli.type_untyped]}alias_cli"
         }
 
         # Print such alias.
-        print_string_colored "${type} ${ZESHY_COLOR_STYLE[print_alias_clies.name]}${alias_name}${ZESHY_COLOR_STYLE[print_alias_clies.equals]}=${quotes}${ZESHY_COLOR_STYLE[print_alias_clies.expansion]}${ZESHY_CLI_ALIAS_NAME_TO_EXPANSION[${alias_name}]}${quotes}"
+        print_string_colored "${alias_type} ${ZESHY_COLOR_STYLE[print_aliases_cli.name]}${alias_name}${ZESHY_COLOR_STYLE[print_aliases_cli.equals]}=${quotes}${ZESHY_COLOR_STYLE[print_aliases_cli.expansion]}${ZESHY_CLI_ALIAS_NAME_TO_EXPANSION[${alias_name}]}${quotes}"
     ' | page_stdin
 }
 
 # ....................{ MAKERS                             }....................
-# Define interactive aliases at digest recompilation rather than Zeshy startup
+# Define interactive aliases at digest recompilation rather than zeshy startup
 # time, for both efficiency and sanity.
 run_hook_on_zeshy_precompile precompile_zeshy_aliases_cli
 
@@ -992,6 +996,7 @@ Define interactive aliases specified by `zeshy`\'s user configuration files.
 function precompile_zeshy_aliases_cli() {
     # Validate sanity.
     die_if_args
+    string command_name
 
     #FIXME: Shift to calling the higher-level declarers
     #declare_alias_cli_abbreviation() and declare_alias_cli_substitution()
@@ -999,45 +1004,202 @@ function precompile_zeshy_aliases_cli() {
     #CLI aliases under the current parcel -- which seems quite sensible, really.
     #We'll need to supply sensible documentation for each type of such alias,
     #which seems quite doable.
+    #FIXME: Comments fairly off, below.
 
-    # Define listed abbreviations.
+    # Define listed abbreviations. To avoid disrupting digest compilation,
+    # reduce fatal exceptions to nonfatal warnings.
     for_map_key_value_pairs ZESHY_ALIAS_CLI_ABBREVIATIONS\
-        alias_name alias_expansion\
-        'alias_cli_abbreviation "${alias_name}" "${alias_expansion}"'
+        alias_name alias_expansion '{
+        alias_cli_abbreviation "${alias_name}" "${alias_expansion}"
+    } always_convert_exception_to_warning'
 #       print "alias_cli_abbreviation ${alias_name}=${alias_expansion}"
 
     #FIXME: Remind me again why we don't simply precede a call to
     #alias_cli_substitution() with an "is_pathable ${alias_name} and" check? Why
     #do we have a discrete function devoted to this admittedly simple task?
 
-    # Define listed substitutions. Avoid calling alias_cli_substitution(),
-    # which throws exceptions and hence disrupts digest recompilation for
-    # aliases not existing pathables.
+    # Define configured substitutions.
     for_map_key_value_pairs ZESHY_ALIAS_CLI_SUBSTITUTIONS\
-        alias_name alias_expansion\
-        'alias_cli_substitution_if_pathable_or_warn\
-            "${alias_name}" "${alias_expansion}"'
+        alias_name alias_expansion '{
+        alias_cli_substitution "${alias_name}" "${alias_expansion}"
+    } always_convert_exception_to_warning'
+
+    # Define configured substitutions conditionally dependent on existing
+    # pathables.
 #       print "alias_cli_substitution ${alias_name}=${alias_expansion}"
     for_map_key_value_pairs ZESHY_ALIAS_CLI_SUBSTITUTIONS_IF_PATHABLE\
-        alias_name alias_expansion\
-        'alias_cli_substitution_if_pathable\
-            "${alias_name}" "${alias_expansion}"'
+        alias_name alias_expansion '{
+        alias_cli_substitution_if_pathable "${alias_name}" "${alias_expansion}"
+    } always_convert_exception_to_warning'
 
-    # Though this implementation could simply call
-    # alias_cli_substitution_if_pathable(), this is altogether more efficient
-    # and straightforward. (Since we have to match the command name anyway, we'd
-    # might as well employ it.)
-    string command_name
+    # Define configured substitutions conditionally dependent on existing
+    # pathables and run disowned from their parent shell.
     for alias_name (
-        "${ZESHY_CLI_SUBSTITUTION_NAMES_IF_PATHABLE_RUN_DISOWNED}") {
-        command_name="${alias_name//[\{\}]}"
-        output_string "run disowned: ${alias_name}"
-        is_pathable "${command_name}" and alias_cli_substitution\
-            "${alias_name}" "run_command_disowned \"${command_name}\""
+        "${ZESHY_CLI_SUBSTITUTION_NAMES_IF_PATHABLE_RUN_DISOWNED[@]}") {
+        {
+#           output_string "run disowned: ${alias_name}"
+            command_name="${alias_name//[\{\}]}"
+            is_pathable "${command_name}" and alias_cli_substitution\
+                "${alias_name}" "run_command_disowned \"${command_name}\""
+        } always_convert_exception_to_warning
     }
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#       alias_expansion_if_noncli='"'${alias_name}'" "${@}" and return_exit_status"'
+#       alias_name="${1%%[[:space:]]#\=*}"
+#       alias_expansion="${1#*\=[[:space:]]#}"
+    # If the first shell word such alias expands to equals its name but not an
+    # existing command or builtin, the caller is probably attempting to
+    # interactively alias a function of the same name: e.g.,
+    #
+    #  alias_cli recursion='recursion -not -ok'
+    #  function recursion() { print 'does not work as expected'; }
+    #
+    # While zsh does permit aliases to functions of the same name, interactive
+    # aliases are themselves implemented as functions. Hence, the above
+    # definition of "function recursion()" silently destroys the previously
+    # defined "alias_cli recursion". To avoid subtle bugs, explicitly
+    # prohibit such situations by throwing an exception here.
+#   command_name="${alias_expansion[(w)1]}"
+#   is "${alias_name}" == "${command_name}" si and
+#       not whence -- "${command_name}" &>/dev/null and
+#       die "${alias_type_readable} alias \"${alias_name}\" recursively expands to undefined command or builtin"
+#   command_name_type="${$(whence -w -- "${command_name}")##*: }" or
+#   is "${ZESHY_ALIAS_CLI_TYPE}" == abbreviation si and print "still alias name: ${alias_name}" 1>&2
+
+    #FUXME: Sadly, this *CANNOT* be made to work with the current alias-driven
+    #approach. I'm afraid there's no way around that. That said, everything
+    #*SHOULD* still work as advertised, simply because *NO* CLI alias should
+    #ever directly call a run_command_*() function. *shrug*
+    # If the first shell word such alias expands to is prefixed by
+    # "run_command_", assume such word to be a zeshy function transitively
+    # calling run_command() with arguments requiring quote protection.
+#   if is "${command_name}" == 'run_command_'* si {
+#       alias_expansion_if_cli=${alias_expansion}' \"${(q)@}\" and return_exit_status'
+#   # Otherwise, pass arguments to such expansion as is.
+#   } else {
+#       alias_expansion_if_cli=${alias_expansion}' \"${@}\" and return_exit_status'
+#   }
+
+    #FUXME: The alias name sorting isn't quite right, as sorting should be
+    #performed on alias names *SANS* rather than including "{" and "}"
+    #delimiters. We could conceivably declare a new list global
+    #${ZESHY_CLI_ALIAS_NAMES_ACTUAL}, but this single use hardly seems worth it.
+    #Instead, just cobble together 
+
+#Each direct call to
+#alias_cli() adds the passed alias name sans `{` and `}` delimiters to this map.
+#Each call to alias_cli_abbreviation() and
+#alias_cli_substitution() (when the latter is passed an alias name containing `{`
+#and `}` delimiters) appends such name sans such delimiters to this list.
+# For efficiency, inline such
+        # implementations. See is_map_key() for further details.
+#    as strings such aliases expand to include but are
+#guaranteed to be longer than these original expansions.
+#
+#Since 
+#Unlike lists
+#${ZESHY_ALIAS_CLI_UNTYPED_NAMES},
+#${ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES}, and
+#${ZESHY_ALIAS_CLI_ABBREVIATION_NAMES}, such alias names are exactly as passed.
+#
+#Since alias_cli() implements CLI aliases by wrapping such expansions in
+#additional logic, the actual strings such aliases expand to include but are
+#guaranteed to be longer than these original expansions.
+
+#Since `{` and `}` delimiters in such names are only of use at  mapped alias names omit such delimiters.
+
+# Each call to
+#alias_cli(), alias_cli_abbreviation(), and alias_cli_substitution()
+#adds the selected alias name and passed expansion to this map.
+#FUXME: Rename to ${ZESHY_CLI_ALIAS_ABBREVIATION_NAMES} and convert to list
+#type. There's no demonstrable reason to duplicate expansions into another map,
+#when ${ZESHY_CLI_ALIAS_NAME_TO_EXPANSION} already reliably maps *ALL* CLI
+#alias expansions.
+#FUXME: Rename to ${ZESHY_CLI_ALIAS_SUBSTITUTION_NAMES} and convert to list
+#type as above.
+#Map from interactive abbreviation name to corresponding expansion. Each call to
+#alias_cli_abbreviation() and alias_cli_substitution() (if embedding a `{`-
+#and `}`-delimited abbreviation name in the passed alias name) adds the selected
+#abbreviation name and passed expansion to this map.
+
+#Map from interactive substitution name to corresponding expansion. Each call to
+#alias_cli_substitution() adds the passed substitution name sans `{`- and `}`-
+#delimited abbreviation name and passed expansion to this map.
+
+    # Define such alias as a function of the same name. Specifically:
+    #
+    # * Temporarily disable such function to prevent infinite recursion if
+    #   such expansion transitively calls an alias, builtin, or command of the
+    #   same name.
+    # * If the current shell is interactive (thus excluding non-interactive
+    #   scripts) and such function was called directly from the command line
+    #   (thus excluding intermediate calls by interactively called functions),
+    #   run the interactive expansion; else run the non-interactive expansion.
+    # * Regardless of whether an exception is thrown, reenable such function.
+#   eval "function \"${alias_name}\"() {
+#   {
+#       disable -f ${alias_name}
+#       if [[ -o interactive && \${#funcstack} -eq 1 ]] {
+#           ${alias_logic_if_cli}
+#       } else {
+#           ${alias_logic_if_noncli}
+#       }
+#   } always {
+#       enable -f ${alias_name}
+#   }
+#}"
+
+#FUXME: Embody the above test in a new alias in a new parcel
+#"05-alias/zsh/context" as follows:
+#
+#   alias is_context_toplevel='is "${ZSH_EVAL_CONTEXT}" == 'toplevel' si'
+#
+#Simple.
+    # Though this implementation could simply call
+    # alias_cli_substitution_if_pathable(), this is altogether more efficient
+    # and straightforward. (Since we have to match the command name anyway, we'd
+    # might as well employ it.)
+# Avoid calling alias_cli_substitution(),
+    # which throws exceptions and hence disrupts digest recompilation for
+    # aliases not existing pathables.
+#always {
+        # If an exception was thrown, convert such exception to a nonfatal
+        # warning and proceed to the next alias.
+#       catch * and print_warning "${CAUGHT}"
+#   }
+        # If an exception was thrown, convert such exception to a nonfatal
+        # warning and proceed to the next alias.
+#       catch * and print_warning "${CAUGHT}"
+    # If an exception was thrown, convert such exception to a nonfatal
+    # warning and proceed to the next alias.
+    # Define listed substitutions. Avoid calling alias_cli_substitution(),
+    # which throws exceptions and hence disrupts digest recompilation for
+    # aliases not existing pathables.
+#   for_map_key_value_pairs ZESHY_ALIAS_CLI_SUBSTITUTIONS\
+#       alias_name alias_expansion\
+#       'alias_cli_substitution_if_pathable_or_warn\
+#           "${alias_name}" "${alias_expansion}"'
+    #FUXME: Wherever we print a message prefixed by "CLI ${ZESHY_ALIAS_CLI_TYPE}",
+    #we should *REALLY* be printing a message prefixed by a new string local
+    #"${alias_cli_type}", expanding to a human-readable version of such prefix
+    #(e.g., "CLI abbreviation alias", "CLI alias"). I believe we've already
+    #doctored up code elsewhere that does so, so... recover that code here!
+
+#       "${alias_type_readable} \"${1}\" contains no alias expansion"
+    # Validate passed arguments.
+#   (( ${#alias_name} )) or
+#       die "CLI ${ZESHY_ALIAS_CLI_TYPE} specifier \"${*}\" contains no '='-suffixed alias name"
+#   (( ${#alias_expansion} )) or
+#       die "CLI ${ZESHY_ALIAS_CLI_TYPE} specifier \"${*}\" contains no '='-prefixed alias expansion"
+
+#   is "${ZESHY_ALIAS_CLI_TYPE}" ==\
+#       ('substitution'|'abbreviation'|'alias') si or
+#       die "CLI alias type \"${ZESHY_ALIAS_CLI_TYPE}\" unrecognized (expected \"substitution\", \"abbreviation\", or \"alias\")"
+    # Since this alias name is not already an existing runnable, this alias
+    # cannot be a substitution. To improve error readability, produce a
+    # human-readable alias type as follows.
         #FUXME: O.K.; this doesn't apply anymore. Instead, check whether it's an
         #existing alias and, if so, simply *REPLACE* such alias. Ideally, we
         #should be a bit circumspect about this. While replacing an existing
@@ -1261,8 +1423,8 @@ function precompile_zeshy_aliases_cli() {
 #
 #    # List such aliases.
 #    for name ( $(get_map_keys_sorted_lexically_ascending\
-#        ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION) ) {
-#        print_string "alias_cli_abbreviation ${name}=\"${ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION[${name}]}\""
+#        ZESHY_ALIAS_CLI_ABBREVIATION_NAMES) ) {
+#        print_string "alias_cli_abbreviation ${name}=\"${ZESHY_ALIAS_CLI_ABBREVIATION_NAMES[${name}]}\""
 #    } | page_stdin
 #}
 #
@@ -1277,8 +1439,8 @@ function precompile_zeshy_aliases_cli() {
 #
 #    # List such aliases.
 #    for name ( $(get_map_keys_sorted_lexically_ascending\
-#        ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION) ) {
-#        print_string "alias_cli_substitution ${name}=\"${ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION[${name}]}\""
+#        ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES) ) {
+#        print_string "alias_cli_substitution ${name}=\"${ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES[${name}]}\""
 #    } | page_stdin
 #}
 #
@@ -1298,13 +1460,13 @@ function precompile_zeshy_aliases_cli() {
 #FUXME: Colorify such output; it's a tad difficult to read without helpful
 #syntax highlighting.
 
-#       if is_map_key ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION "${name}"
-#       elif is_map_key ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION "${name}"
+#       if is_map_key ZESHY_ALIAS_CLI_ABBREVIATION_NAMES "${name}"
+#       elif is_map_key ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES "${name}"
         #FUXME: Let's try improving is_map_key() efficiency, shall we?
-#       if is_map_key ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION "${name}"
-#       elif is_map_key ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION "${name}"
-#       if is_map_key ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION "${name}"
-#       elif is_map_key ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION "${name}"
+#       if is_map_key ZESHY_ALIAS_CLI_ABBREVIATION_NAMES "${name}"
+#       elif is_map_key ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES "${name}"
+#       if is_map_key ZESHY_ALIAS_CLI_ABBREVIATION_NAMES "${name}"
+#       elif is_map_key ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES "${name}"
         # If such alias is an abbreviation, prefix such declaration with that.
         # If such alias is a substitution, prefix such declaration with that.
         # Otherwise, prefix such declaration with a generic alias type.
@@ -1314,13 +1476,13 @@ function precompile_zeshy_aliases_cli() {
 #       list_alias_cli_substitutions
 #   } | page_stdin
 #   =(
-#       "${ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION[@]}"
-#       "${ZESHY_CLI_SUBSTITUTION_NAME_TO_EXPANSION[@]}"
+#       "${ZESHY_ALIAS_CLI_ABBREVIATION_NAMES[@]}"
+#       "${ZESHY_ALIAS_CLI_SUBSTITUTION_NAMES[@]}"
 #   )
 #       say_first_section 'interactive abbreviation list'
 #       say_next_section 'interactive substitution list'
 
-#       ${(k)ZESHY_CLI_ABBREVIATION_NAME_TO_EXPANSION}) {
+#       ${(k)ZESHY_ALIAS_CLI_ABBREVIATION_NAMES}) {
 
 # This includes list element of:
 #* ${ZESHY_ALIAS_CLI_ABBREVIATIONS}, define:
@@ -1776,24 +1938,24 @@ function precompile_zeshy_aliases_cli() {
     #     that builtin or command name.
     #   * Otherwise, raise an exception.
 
-#   then alias_logic_if_non_interactive="die '\"${alias_name}\" and \"${command_name}\" are neither builtins or commands and hence cannot be called non-interactively'"
+#   then alias_logic_if_noncli="die '\"${alias_name}\" and \"${command_name}\" are neither builtins or commands and hence cannot be called non-interactively'"
 #alias_cli ff="firefox"
     # The string to expand this alias to when called non-interactively.
 #   if is "${alias_name}" == "${command_name}" and\
 #      "$(whence -w "${command_name}")" == *': function' si
-#   then alias_logic_if_non_interactive="die '\"${alias_name}\" and \"${command_name}\" are neither builtins or commands and hence cannot be called non-interactively'"
+#   then alias_logic_if_noncli="die '\"${alias_name}\" and \"${command_name}\" are neither builtins or commands and hence cannot be called non-interactively'"
         #FUXME: Have my doubts about this logic; it feels... dubious. Too
         #clever, and arguably bug-prone. Let's ride bareback for a bit.
 #       if is "${alias_name_type}" != 'function' si
-#       then alias_expansion_if_non_interactive="${alias_name}"
-#       else alias_expansion_if_non_interactive=
+#       then alias_expansion_if_noncli="${alias_name}"
+#       else alias_expansion_if_noncli=
 #       fi
 #   else
-#       alias_expansion_if_non_interactive="${command_name} \"\${@}\""
-#       alias_logic_if_non_interactive="
+#       alias_expansion_if_noncli="${command_name} \"\${@}\""
+#       alias_logic_if_noncli="
 #   if is_stdin_pipe
-#   then run_command_with_stdin_piped ${alias_expansion_if_non_interactive}
-#   else ${alias_expansion_if_non_interactive}
+#   then run_command_with_stdin_piped ${alias_expansion_if_noncli}
+#   else ${alias_expansion_if_noncli}
 #   fi"
 #   fi
 
@@ -1876,14 +2038,14 @@ function precompile_zeshy_aliases_cli() {
         #FUXME: Hmm; we can't print_message whether or not an alias is invalid without
         #expanding it to its expansion and then taking the name of 
     # Non-interactive logic to be performed by the function definition below.
-#   if is -n "${alias_expansion_if_non_interactive}" si; then
-#       alias_expansion_if_non_interactive+=' "${@}"'
-#       alias_logic_if_non_interactive="
+#   if is -n "${alias_expansion_if_noncli}" si; then
+#       alias_expansion_if_noncli+=' "${@}"'
+#       alias_logic_if_noncli="
 #   if is_stdin_pipe
-#   then run_command_with_stdin_piped ${alias_expansion_if_non_interactive}
-#   else ${alias_expansion_if_non_interactive}
+#   then run_command_with_stdin_piped ${alias_expansion_if_noncli}
+#   else ${alias_expansion_if_noncli}
 #   fi"
-#   else alias_logic_if_non_interactive="die '\"${alias_name}\" and \"${command_name}\" are neither builtins or commands and hence cannot be called non-interactively'"
+#   else alias_logic_if_noncli="die '\"${alias_name}\" and \"${command_name}\" are neither builtins or commands and hence cannot be called non-interactively'"
 #   fi
 
     # Otherwise, such alias name is either an existing zsh function or has yet
@@ -1940,7 +2102,7 @@ function precompile_zeshy_aliases_cli() {
 #       typeset command
 #       if [[ -o interactive && \${#funcstack} -eq 1 ]]
 #       then command=\"${(q)alias_expansion}\"
-#       else command=\"${(q)alias_expansion_if_non_interactive}\"
+#       else command=\"${(q)alias_expansion_if_noncli}\"
 #       fi
 #       if is_stdin_pipe
 #       then run_command_with_stdin_piped \${command}
