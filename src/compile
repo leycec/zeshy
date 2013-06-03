@@ -824,6 +824,13 @@ function precompile_zeshy_digest_dependency_paths() {
         >!"${ZESHY_CACHE_DIGEST_DEPENDENCIES_FILE}"
 }
 
+#FIXME: Compiling lists of alias, function, and global names into the digest is
+#inherently silly. For one, we no longer need to do so, so it unnecessarily
+#increases both compilation and startup time. It'd be a loss to simply unset
+#such globals, however; ideally, they should simply be serialized to disk
+#(e.g., "~/.zeshy/cache/names.zsh", a zsh script containing all such lists).
+#This shouldn't be terribly difficult, so see to it.
+
 #FIXME: I'm exceedingly tired of *ALL* of the rather stupid timing problems
 #inherent in this function. One simple thing that can be done to eliminate such
 #issues is to add placeholder calls to define_function() for all functions to be
@@ -846,6 +853,9 @@ function precompile_zeshy_digest_dependency_paths() {
 #FIXME: I'm fairly certain we don't need the ${alias_names_quoted} nonsense
 #anymore. Testing whether this is the case is fairly simple: disable such block
 #of code and append ZESHY_ALIAS_SUFFIX_NAMES to ZESHY_GLOBAL_NAMES earlier.
+
+#FIXME: This function has become lengthy enough to warrant splitting into
+#numerous subfunctions. See to it, young stalwart lad!
 
 ZESHY_CORE_HELP_FUNCTIONS+='
 void precompile_zeshy_functions_startup_aliases_and_globals(void)
@@ -927,14 +937,27 @@ function precompile_zeshy_functions_startup_aliases_and_globals() {
     #zeshy globals to be compiled into the digest are exported. I suspect we'll
     #probably catch a few errant strays.
 
-    # The "typeset -p" command fails to print the "-g" modifier for global
-    # variables. Since "typeset -x" commands do not imply such modifier under
-    # zsh option "no_global_export", failing to print such modifier effectively
-    # localizes such globals to the startup_zeshy_globals() function. Of course,
-    # this constitutes a zsh bug. (Submit a report please.) In the meanwhile,
-    # forcefully add the "-g" modifier to all output "typeset" commands.
-    local globals; globals="${$(\
-        typeset -p "${ZESHY_GLOBAL_NAMES[@]}")//typeset -/typeset -g}"
+    # The "typeset -p" command fails to annotate global variable declarations
+    # with option "-g", thus localizing all such globals to
+    # startup_zeshy_globals(). Of course, this constitutes a horrible zsh bug.
+    # (Submit a report please.) In the meanwhile, forcefully add such option
+    # immediately after any line output by "typeset -p" starting with "typeset".
+    # To do so, first split such output into lines and for each such line
+    # perform such insertion with array glob replacement. Dismantled, this is:
+    #
+    # * "(f)", splitting such output on newline.
+    # * "/", performing such replacement at most once for each output line.
+    # * "(#s)", matching only at the start of each such line.
+    #
+    # Do *NOT* quote the outermost expansion. See set_list_to_string_lines() for
+    # further details.
+    local -a global_declarations; global_declarations=(
+        ${${(f)"$(typeset -p -- "${ZESHY_GLOBAL_NAMES[@]}")"}/(#s)typeset /typeset -g }
+    )
+
+    # Join such lines on newline back into a string. See join_list_on_newline()
+    # for further details.
+    local globals; globals="$(print -lr -- "${global_declarations[@]}")"
 
     # Manually add the definition of the list of zeshy-specific aliases to such
     # string of global definitions, quote-protecting global alias names from
@@ -945,6 +968,34 @@ typeset -ga ZESHY_ALIAS_NAMES
 ZESHY_ALIAS_NAMES=( ${alias_names_quoted[@]} )"
 #   print -r -- "globals: ${globals}"|less
 
+    # Undefine all previously defined zeshy aliases. The reasons why are,
+    # unsurprisingly, subtle. The subsequent definition of
+    # startup_zeshy_globals() may attempt to declare nonscalar globals
+    # containing unquoted elements equal to zeshy-specific global alias names
+    # (e.g., "is", "or"), in which case such call will fail with an unhelpful
+    # parse error if such global aliases exist. Undefining *ALL* aliases also
+    # undefines such problematic global aliases, as desired.
+    if [[ -n "${ZESHY_ALIAS_NAMES-}" ]] {
+        unalias -- "${ZESHY_ALIAS_NAMES[@]}"
+    }
+
+    #FIXME: The following call dies with an unhelpful parse error if *ANY* list
+    #element or map key or value in the string ${globals} equals a reserved
+    #keyword (e.g., "&&"). Why? Because the above "typeset -p" command fails to
+    #quote such elements, and there's currently no way to enforce such quoting.
+    #Doing so manually is certainly feasible, but *EXTREMELY* inefficient and
+    #hence effectively infeasible. Fortunately, a simpler (though still annoying
+    #solution) presents itself. Run the following command at the *VERY* start of
+    #the function body of startup_zeshy_globals():
+    #
+    #    disable -r --\
+    #       do done esac then elif else fi for case if while function\
+    #       repeat time until select coproc nocorrect foreach end ! [[ { }
+    #
+    #Naturally, we'd need to insert a corresponding "enable -r --" command at the
+    #end of such function body -- perhaps in an "} always { ... }" block for
+    #safety.
+
     # Make the final zeshy function. (Phew!)
     redefine_function startup_zeshy_globals "${globals}"
 }
@@ -954,6 +1005,23 @@ ZESHY_ALIAS_NAMES=( ${alias_names_quoted[@]} )"
 compile_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+#   local globals; globals="${"$(\
+#       typeset -p -- "${ZESHY_GLOBAL_NAMES[@]}")"// #typeset /typeset -g }"
+#       typeset -p -- "${ZESHY_GLOBAL_NAMES[@]}")"//typeset /typeset -g }"
+#       typeset -p -- "${ZESHY_GLOBAL_NAMES[@]}")"/(#s)[[:space]]#typeset /$'\t'typeset -g }"
+#       typeset -p -- "${ZESHY_GLOBAL_NAMES[@]}")}"
+#       typeset -p -- "${ZESHY_GLOBAL_NAMES[@]}")/(#s)(#m)[[:space]]#typeset /${match[1]}-g }"
+#       ${${(f)"$(typeset -p -- "${ZESHY_GLOBAL_NAMES[@]}")"}/(#s)(#m)[[:space]]#typeset /${match[1]}-g }
+
+    # The "typeset -p" command fails to print the "-g" modifier for global
+    # variables. Since "typeset -x" commands do not imply such modifier under
+    # zsh option "no_global_export", failing to print such modifier effectively
+    # localizes such globals to the startup_zeshy_globals() function. Of course,
+    # this constitutes a zsh bug. (Submit a report please.) In the meanwhile,
+    # forcefully add the "-g" modifier to all output "typeset" commands.
+#   local globals; globals="${$(\
+#       typeset -p "${ZESHY_GLOBAL_NAMES[@]}")//typeset /typeset -g}"
+
     #FUXME: Tie *ALL* of the prior aliases to strings like so:
     #
     #   export -T ZESHY_GLOBAL_NAMES_STRINGS ZESHY_GLOBAL_NAMES
