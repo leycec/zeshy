@@ -386,7 +386,15 @@ function redefine_function() {
     [[ -n "${function_name__rf}" ]] || die 'expected nonempty function name'
 #   is_zeshy_verbose_and print "zeshy: defining ${function_name__rf}()..."
 
-    # All standard output and error printed by the eval() call below.
+    # Function to be defined. For obscure error handling reasons, the eval()
+    # call below is repeated twice. While localizing the function definition as
+    # a variable is hardly essential, it does streamline such calls below.
+    local function__rf="function \"\${function_name__rf}\" () {
+    ${function_body__rf}
+}"
+
+    # All standard output and error printed by the latter of the two eval()
+    # calls below.
     local function_error__rf
 
     # Temporarily enable shell option "EVAL_LINENO". If such eval() call fails
@@ -407,19 +415,33 @@ function redefine_function() {
     # conventional command substitution declares such function only in a
     # subshell rather than the current shell (e.g.,
     # function_error="$(eval "function ..." 2>&1)"), capture such output with a
-    # pipe in the current shell instead. Dismantled, this is:
+    # pipe in the current shell instead.
     #
-    # * "|&", piping both standard output and error from such eval() call.
-    # * "IFS='' read -r -d ''", capturing all piped standard output and error to
-    #   ${function_error}.
-    eval "function \"\${function_name__rf}\" () {
-    ${function_body__rf}
-}" |& IFS='' read -r -d '' function_error__rf
+    # Ideally, that would simply suffice: pipe such output into the necessary
+    # read() command and test the result. Naturally, it doesn't. While it
+    # remains unclear why eval() behaves in this manner, one thing is clear: if
+    # eval() succeeds in defining such function *AND* is piped into *ANYTHING*,
+    # eval() silently fails and undefines such function. While this is fairly
+    # crazy, the solution is fairly simple: only pipe eval() output if a prior
+    # eval() call passed the same arguments returns non-zero exit status. This
+    # is the most obscure code in any language I've ever had the shame to admit
+    # having contributed. It's hard to be proud of something like this.
+    eval "${function__rf}" || {
+        # Dismantled, this is:
+        #
+        # * "|&", piping both standard output and error from such eval() call.
+        # * "IFS='' read -r -d ''", capturing all piped standard output and
+        #   error to ${function_error}.
+        eval "${function__rf}" |& IFS='' read -r -d '' function_error__rf
+    }
 #    print -r -- "function \"${function_name__rf}\" () {
 #    ${function_body__rf}
 #}"
 
     # If such function body is syntactically invalid, throw an exception.
+    # Technically, shifting this conditional into the prior block would slightly
+    # improve efficiency -- while indenting this conditional two tabs to the
+    # right and hence rendering it unreadable. (You decide.)
     if [[ -n "${function_error__rf}" ]] {
 #       print "error: ${function_error__rf}"
         # If such error message is in canonical zsh format (e.g.,
@@ -435,8 +457,10 @@ function redefine_function() {
             # Parse error emitted by zsh, stripped of trailing whitespace.
             local parse_error__rf="${match[2]%%[[:space:]]#}"
 
-            # Line number of such error.
-            integer line_number__rf="${match[1]}"
+            # Line number of such error. Such number is relative to the
+            # function definition rather than function body and hence is one
+            # larger than it should be. Amend this.
+            integer line_number__rf=$(( match[1] - 1 ))
 
             # Line number of the second lines preceding and succeeding such
             # error, for textual context.
@@ -451,31 +475,54 @@ function redefine_function() {
             # Constrain such numbers to [1, ${max_line_number}], where
             # ${max_line_number} is the number of lines in such function body.
             if (( line_number_start__rf < 1 )) {
-                  line_number_start__rf = 1
+                  line_number_start__rf=1
             }
             if (( line_number_end__rf > ${#function_body_lines__rf} )) {
-                  line_number_end__rf = ${#function_body_lines__rf}
+                  line_number_end__rf=${#function_body_lines__rf}
             }
 
             # String of relative function body lines, numbered for convenience.
             local function_body_context__rf
 
+            #FIXME: Hardly an ideal implementation. Ideally, we should implement
+            #a function leveraging color styles printing such textual context
+            #with decent aesthetics. To do so, we'll need test here whether such
+            #function exists; if it does, call it, passing such call
+            #"${function_body__rf}" and the desired function line; else, defer
+            #to the default implementation below. (Actually, don't we have an
+            #existing function for numbering arbitrary code lines? I recall such
+            #function requiring a bit of touch-up, as well...)
+
             # Append each such line prefixed by its line number to such string.
             integer i__rf
-            for (( i__rf=${line_number_start__rf};
-                           i__rf <= ${line_number_end__rf};
-                           i__rf++ )) {
-                function_body_context__rf+=$'\n'"[line ${i__rf}]  ${function_body_lines__rf[${i__rf}]}"
+            for ((  i__rf=${line_number_start__rf};
+                    i__rf <= ${line_number_end__rf};
+                    i__rf++ )) {
+                function_body_context__rf+=$'\n'"[${i__rf}]  ${function_body_lines__rf[${i__rf}]}"
             }
 
             # Set such error message.
-            function_error__rf="${parse_error__rf} on line ${line_number__rf}:"$'\n'"${function_body_context__rf}"
+            function_error__rf="${parse_error__rf} on line ${line_number__rf} of ${function_name__rf}():"$'\n'"${function_body_context__rf}"
         }
 
         # Throw such exception.
         die "${function_error__rf}"
     }
+
+    # If such function was *NOT* successfully defined *AND* no errors or
+    # warnings were printed, throw an exception. While this should never happen,
+    # of course, it occasionally does (much to our horrified chagrin).
+    #
+    # This is purely a precaution to avoid silent regressions.
+    typeset -f -- "${function_name__rf}" &>/dev/null ||
+        die "${function_name__rf}() could not be defined with body:"$'\n'"${function_body__rf}"
 }
+
+#FIXME: In lieu of unit tests, I'm afraid.
+#() {
+#    # This should fail with a parse error.
+#    define_function yu '()'
+#}
 
 # ....................{ DOCUMENTERS                        }....................
 # Document functions previously defined by this parcel.
@@ -1338,6 +1385,14 @@ same proportion is the proletariat, the modern working class, developed
 /---
 
 # --------------------( WASTELANDS                         )--------------------
+        # * "read -t 0", reading standard input only if such input is nonempty.
+        #   See is_stdin_nonempty() for further details.
+#   }" |& { read -t 0 && IFS='' read -r -d '' function_error__rf }
+#    eval "function \"\${function_name__rf}\" () {
+#    ${function_body__rf}
+#}" || {
+    # Technically, shifting this conditional into the prior block would slightly
+    # improve efficiency -- while also r
 #requires 
 #The syntax for cross-referencing another `zeshy` entity depends on the type of
 #such entity, typically in a human-readable manner corresponding to underlying
