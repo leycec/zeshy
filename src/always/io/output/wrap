@@ -1,0 +1,342 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'______________<heredoc?>______________'
+Handle *line wrapping* (i.e., soft wrapping strings to the width of the current
+terminal by inserting newlines into such strings at appropriate break points).
+______________<heredoc?>______________
+
+# ....................{ GETTERS                            }....................
+#FIXME: This function employs the naive greedy algorithm minimizing the
+#resulting number of lines. Since this is no better than modern word processors
+#do, this is hardly a calamity. That said, an alternative algorithm minimizing
+#the "raggedness" of the end of each line is *CLEARLY* a better approach, as
+#LaTeX demonstrates. To that end, it would be helpful to implement a modern
+#variant on Knuth's now-infamous "minimization of the square of the space at the
+#end of all paragraph lines" algorithm. While the most common solutions are
+#O(n^2), a number of novel linear-time soutions appear to exist. Furthermore,
+#note this interesting addendum, http://search.cpan.org/perldoc?Text::Reflow --
+#"The reflow algorithm tries to keep the lines the same length but also tries to
+#break at punctuation, and avoid breaking within a proper name or after certain
+#connectives ("a", "the", etc.). The result is a file with a more "ragged" right
+#margin than is produced by fmt or Text::Wrap but it is easier to read since
+#fewer phrases are broken across line breaks." In any case, there's no want of
+#great alternatives. Here are a few other extensions to the core Knuth
+#algorithm:
+#
+#* http://www.leverkruid.eu/GKPLinebreaking/elements.html
+#* http://wiki.apache.org/xmlgraphics-fop/PageLayout/
+#
+#The best resource on linear time and near-linear time implementations is
+#probably "Comment 8" by (clearly academic) poster "callcc" at:
+#
+#* https://bugzilla.mozilla.org/show_bug.cgi?id=630181
+#
+#He (?) gives an excellent synopsis of the current state of the art. Great stuff!
+
+declare_function_with_stdin <<'/---'
+string get_pcre_wrapping_at_line_length(integer line_length)
+
+Get a PCRE matching at most the passed number of characters suffixed by either a
+hyphen, whitespace, or the string end. By design, this PCRE is suitable for
+iteratively wrapping lines to such length in a multiline-aware manner by calling
+for_string_pcre_multiline_matches(). This PCRE assumes *multiline matching*
+(i.e., the `.` quantifier matches all characters _except_ newline) and hence
+should only be used under such matching: e.g.,
+
+.get_pcre_wrapping_at_line_length()
+==========================================
+[source]
+------------------------------------------
+>>> string on_neoclassical_economics=\
+...    "The neoclassical school is the dominant (and probably the numerically"\
+...    "largest) school in contemporary economics. For neoclassical economists,"\
+...    "microeconomic theory (i.e., welfare economics) underlies every"\
+...    "theoretical subfield of specialization and every theoretical, practical,"\
+...    "and policy-oriented conclusion at which they arrive. All of their cost-"\
+...    "benefit analyses, their demonstrations of the universal gains from"\
+...    "foreign trade, their notions of market efficiency that are encountered"\
+...    "in every branch of applied economics, as well as their notion of"\
+...    "rational prices, have absolutely no meaning whatsoever other than that"\
+...    "manifested in their faith that a free-enterprise, competitive market"\
+...    "system will tend toward a Pareto optimal situation. Without a Pareto"\
+...    "optimal situation in effect, these phrases and notions cannot be"\
+...    "defended. In fact, in the absence of an optimal situation, these"\
+...    "phrases have no meaning whatsoever. They are given meaning only when"\
+...    "the neoclassical economists first posit the existence of a Pareto"\
+...    "optimum; then, by definition, all exchangers are said to 'gain,'"\
+...    "resources are said to be 'efficiently allocated,' prices are said to"\
+...    "be 'rational' and therefore conducive to making accurate assessments —"\
+...    "on utilitarian grounds — of the social costs and social benefits of"\
+...    "various government projects. Utilitarian neoclassical welfare"\
+...    "economics pervades and dominates nearly all neoclassical analyses on"\
+...    "all theoretical and practical matters."
+>>> for_string_pcre_multiline_matches\
+...     "$(get_string_lines "${on_neoclassical_economics}" 5 11)"\
+...     "$(get_pcre_wrapping_at_line_length 70)"\
+...     'output_string ${match[1]}'
+and policy-oriented conclusion at which they arrive. All of their
+cost-benefit analyses, their demonstrations of the universal gains
+from foreign trade, their notions of market efficiency that are
+encountered in every branch of applied economics, as well as their
+notion of rational prices, have absolutely no meaning whatsoever other
+than that manifested in their faith that a free-enterprise,
+competitive market system will tend toward a Pareto optimal situation.
+Without a Pareto
+------------------------------------------
+==========================================
+
+== Algorithmic Alternatives ==
+
+This PCRE efficiently implements the naive greedy algorithm for wrapping lines
+in a word-aware manner. By fitting maximally many words per line, this PCRE
+minimizes the resulting number of lines. While equally efficient and simple,
+such algorithm typically fails to produce a reasonably uniform ragged right
+edge and hence aesthetically pleasing and readable output. Since this is no
+better than modern word processors do, this is hardly a calamity. Yet we can do
+better. (Indeed, the prior example exhibits an extremely ragged right edge.)
+
+Ideally, lines should be wrapped so as to minimize *right raggedness* (i.e., the
+difference between the length of each line in a contiguous paragraph). The
+canonical algorithm for doing so remains Donald Knuth's implementation of line
+wrapping in [La]TeX, minimizing the square of the space at the end of all
+paragraph lines. Such algorithm requires numerical computation and hence cannot
+be implemented as a PCRE. For further details, see the corresponding
+https://en.wikipedia.org/wiki/Word_wrap[Wikipedia article].
+/---
+function get_pcre_wrapping_at_line_length() {
+    # Validate passed arguments.
+    die_unless_arg 'expected one integer'
+    string line_length="${1}"
+    die_unless_integer_positive "${line_length}"
+
+    # Get such PCRE. Dismantled, this is:
+    #
+    # * "\G", anchoring such match immediately after the end of the prior match.
+    # * "\h*+", matching ignorable horizontal whitespace (i.e., non-newline)
+    #   without backtracking, for efficiency.
+    # * "(?:...)", matching either:
+    #   * "\n", a newline, in which case ${match[1]} will be the empty string,
+    #     ensuring an equivalent of 'output_string "${match[1]}"' will simply
+    #     reprint the matched newline.
+    #   * "(.{...})", a line's worth of text to ${match[1]}, optionally:
+    #     * "(-)", capturing a hyphen suffix to ${match[2]}.
+    # * "(?(2)|(?:...))", matching either:
+    #   * If a hyphen suffix previously matched, then nothing else.
+    #   * Else, mandatory horizontal whitespace, a newline, or the string end.
+    #     In any case, such suffix will typically be converted into a newline.
+    #
+    # To accept arbitrary strings (e.g., embedded zeshy code), avoid character
+    # classes "\w" and "\W" matching only spoken language words.
+    return_string '\G\h*+(?:\n|(.{1,'${line_length}'}(-)?)(?(2)|(?:\h+|$))'
+}
+
+# ....................{ GETTERS ~ string                   }....................
+declare_function_with_stdin <<'/---'
+string get_string_wrapped(string text, integer line_length)
+
+Get the passed string wrapped to the passed line length in a word-aware manner.
+See get_pcre_wrapping_at_line_length() for further details: e.g.,
+
+.get_string_wrapped()
+==========================================
+[source]
+------------------------------------------
+>>> string on_salvia_divinorum=\
+...    "An extremely rare cultigen, found only at a few locations in Oaxaca."\
+...    "There are specimens in botanical gardens, and in a few private"\
+...    "collections, but lack of genetic diversity is a concern."
+>>> string on_ska_maria_pastora=\
+...    "The plant is endangered by the forces of imperialistic religion, and"\
+...    "has been for four hundred years, possibly longer."
+>>> string on_yerba_de_maria=\
+...    "Her real name must not be told—"\
+...    "Her real name is closer to Medusa than to Mary."\
+...    "  \"They came with crosses—"\
+...    "    they came to drag us"\
+...    "from our huts, from our beds,"\
+...    "    the soldiers that serve the priests.\""
+>>> get_string_wrapped "${on_salvia_divinorum}"\
+...     "${on_ska_maria_pastora}" "${on_yerba_de_maria}"
+An extremely rare cultigen, found only at a few locations in Oaxaca. There are
+specimens in botanical gardens, and in a few private collections, but lack of
+genetic diversity is a concern. The plant is endangered by the forces of
+imperialistic religion, and has been for four hundred years, possibly longer.
+Her real name must not be told—
+Her real name is closer to Medusa than to Mary.
+"They came with crosses—
+they came to drag us
+from our huts, from our beds,
+the soldiers that serve the priests."
+------------------------------------------
+==========================================
+/---
+function get_string_wrapped() {
+    die_unless_args 'expected at least one string'
+    get_string_wrapped_at_line_length "${*}" "$(get_terminal_width)"
+}
+
+declare_function_with_stdin <<'/---'
+string get_string_wrapped_at_line_length(string text, integer line_length)
+
+Get the passed string wrapped to the passed line length in a word-aware manner.
+See get_pcre_wrapping_at_line_length() for further details: e.g.,
+
+.get_string_wrapped_at_line_length()
+==========================================
+[source]
+------------------------------------------
+>>> string on_peasant_rebellion=\
+...    "Peasant rebellions were not exceptional events. They erupted so"\
+...    "frequently in the course of these four centuries that they may be said"\
+...    "to have been as common in this agrarian society as factory strikes"\
+...    "would be in the industrial world. In southwestern France alone, some"\
+...    "450 rebellions occurred between 1590 and 1715. No region of Western"\
+...    "Europe was exempted from this pattern of chronic violence. The fear of"\
+...    "sedition was always present in the minds of those who ruled. It was a"\
+...    "corrective, a salutary fear — since only the threat of insurrection"\
+...    "could act as a check against unlimited exactions."
+>>> get_string_wrapped_at_line_length "${on_peasant_rebellion}" 66
+Peasant rebellions were not exceptional events. They erupted so
+frequently in the course of these four centuries that they may be
+said to have been as common in this agrarian society as factory
+strikes would be in the industrial world. In southwestern France
+alone, some 450 rebellions occurred between 1590 and 1715. No
+region of Western Europe was exempted from this pattern of chronic
+violence. The fear of sedition was always present in the minds of
+those who ruled. It was a corrective, a salutary fear — since only
+the threat of insurrection could act as a check against unlimited
+exactions.
+------------------------------------------
+==========================================
+/---
+function get_string_wrapped_at_line_length() {
+    # Validate passed arguments.
+    die_unless_args_2 'expected one string and one integer'
+    string text="${1}" line_length="${2}" text_wrapped
+
+    # For each text substring to be printed on each output line, print such
+    # substring prefixed by the message prefix and suffixed by newline. Match
+    # multiline to prevent "." from matching newlines.
+    for_string_pcre_multiline_matches\
+        "${text}" "$(get_pcre_wrapping_at_line_length "${line_length}")"\
+        'text_wrapped+="${match[1]}"'
+
+    # Return such string.
+    return_string "${text_wrapped}"
+}
+
+# ....................{ PRINTERS                           }....................
+declare_function_with_stdin <<'/---'
+string print_string_wrapped_with_line_prefix(string text, string line_prefix)
+
+Print the passed string wrapped to the current terminal width, prefixing each
+resulting line with the passed prefix. Specifically:
+
+. Split such string into substrings satisfying the following constraints:
+** Each substring is suffixed by either whitespace or the end of such string.
+** Each substring is no longer than the current terminal width subtracted by the
+   length of such prefix.
+. Print each substring prefixed by such prefix and suffixed by a newline.
+
+For example:
+
+.print_string_wrapped_with_line_prefix()
+==========================================
+[source]
+------------------------------------------
+>>> string on_boxes=\
+...    "The box is full of salmon, and a man sits atop the box. Long ago this"\
+...    "man hired armed guards to keep anyone from eating his fish. The many"\
+...    "people who sit next to the empty river starve to death. But they do"\
+...    "not die of starvation. They die of a belief. Everyone believes that"\
+...    "the man atop the box owns the fish. The soldiers believe it, and they"\
+...    "will kill to protect the illusion. The others believe it enough that"\
+...    "they are willing to starve. But the truth is that there is a box,"\
+...    "there is an emptied river, there is a man sitting atop the box, there"\
+...    "are guns, and there are starving people."
+>>> print_string_wrapped_with_line_prefix "${on_boxes}" box
+box: The box is full of salmon, and a man sits atop the box. Long ago this man
+box: hired armed guards to keep anyone from eating his fish. The many people who
+box: sit next to the empty river starve to death. But they do not die of
+box: starvation. They die of a belief. Everyone believes that the man atop the
+box: box owns the fish. The soldiers believe it, and they will kill to protect
+box: the illusion. The others believe it enough that they are willing to starve.
+box: But the truth is that there is a box, there is an emptied river, there is a
+box: man sitting atop the box, there are guns, and there are starving people.
+------------------------------------------
+==========================================
+/---
+function print_string_wrapped_with_line_prefix() {
+    # Validate passed arguments.
+    die_unless_args_2 'expected one string and one line prefix'
+    string text="${1}" line_prefix="${2}"
+
+    # Lengths of the current terminal, message text, and message prefix. The
+    # latter lengths exclude non-printable characters, including ANSI escapes.
+    integer terminal_width text_length line_prefix_length
+    terminal_width="$(get_terminal_width)"
+    text_length="$(get_string_length_printable_sans_ansi_colors "${text}")"
+    line_prefix_length="$(\
+        get_string_length_printable_sans_ansi_colors "${prefix}")"
+
+    # Maximum length of each text substring to be printed on each output line.
+    integer line_length; line_length=$(( terminal_width - prefix_length ))
+
+    #FIXME: Call a new function reset_terminal_color() in lieu of such logic
+    #both here and below.
+
+    # Sanitize the current terminal in preparation for subsequent output.
+    output_string "${ZESHY_COLOR[reset]-}"
+
+    # If required, print delimiting prefixing whitespace.
+    print_whitespace_if_needed
+
+    # For each text substring to be printed on each output line, print such
+    # substring prefixed by the message prefix and suffixed by newline. Match
+    # multiline to prevent "." from matching newlines.
+    for_string_pcre_multiline_matches\
+        "${text}" "$(get_pcre_wrapping_at_line_length "${line_length}")"\
+        'output_string "${line_prefix}${match[1]}"'
+
+    # Sanitize the current terminal in preparation for subsequent output.
+    output_string "${ZESHY_COLOR[reset]-}"
+    update_print_prior_globals
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#Wouldn't you like to see a positive LSD story on the news? To base your decision on information rather than scare tactics and superstition? Perhaps? Wouldn't that be interesting? Just for once?
+#   "Today, a young man on acid realized that all matter is merely energy condensed to a slow vibration – that we are all one consciousness experiencing itself subjectively. There's no such thing as death, life is only a dream, and we're the imagination of ourselves. Here's Tom with the weather."
+
+    # PCRE wrapping lines to such length.
+#   pcre_wrapping_lines="$(get_pcre_wrapping_at_line_length "${line_length}")"
+
+    #FUXME: Abstract into a string global.
+    # PCRE matching such a substring. To ensure human-readable output, wrap at
+    # word endings by requiring such substring be suffixed by either whitespace
+    # or the end of such string. To accept zsh code embedded in such input,
+    # avoid character classes "\w" and "\W" matching spoken language words.
+    # Dismantled, this is:
+    #
+    # * "\G", anchoring such match immediately after the end of the prior match.
+    # * "\h*+", matching ignorable horizontal whitespace (i.e., non-newline)
+    #   without backtracking, for efficiency.
+    # * "(?:...)", matching either:
+    #   * "\n", a newline, in which case ${match[1]} will be the empty string,
+    #     ensuring an equivalent of 'output_string "${match[1]}"' will simply
+    #     reprint the matched newline.
+    #   * "(.{...})", a line's worth of text to ${match[1]}, optionally:
+    #     * "(-)", capturing a hyphen suffix to ${match[2]}.
+    # * "(?(2)|(?:...))", matching either:
+    #   * If a hyphen suffix previously matched, then nothing else.
+    #   * Else, mandatory horizontal whitespace, a newline, or the string end.
+    #     In any case, such suffix will typically be converted into a newline.
+#   line_pcre='\G\h*+(?:\n|(.{1,'${line_length}'}(-)?)(?(2)|(?:\h+|$))'
+    # * "(?:...)", matching such line's delimiter as either:
+
+#Minimizing Line Count versus Right Raggedness 
+#a maximal line's worth  substring. To ensure human-readable output, wrap at
+#word endings by requiring such substring be suffixed by either whitespace
+#or the end of such string.
