@@ -1,0 +1,205 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'______________<heredoc?>______________'
+Handle globals tracking standard output *state*, including:
+
+* The modification time of standard output at the time of the most recent call
+  to a `zeshy` printer function (e.g., print_string()).
+* The filename and line number at which such function was defined.
+______________<heredoc?>______________
+
+#FIXME: *SWEET*. The existing tracking nomenclature is exceedingly awkward. I
+#consequently propose renaming:
+#
+#* print_whitespace_if_needed()      to handle_stdout_tracking().
+#* update_terminal_stdout_tracking() to update_stdout_tracking().
+#* reset_terminal_stdout_tracking()  to reset_stdout_tracking().
+#
+#Remove update_stdout_tracking() and reset_stdout_tracking(). They're just
+#overkill; it's not clear such a distinction will ever be useful.
+
+# ....................{ GLOBALS                            }....................
+declare_global_with_stdin float ZESHY_STDOUT_PRIOR_MTIME <<'/---'
+Modification time of standard output at the time of the most recent call to
+update_stdout_tracking() or 0 if such function has yet to be called.
+/---
+
+declare_global_with_stdin string ZESHY_STDOUT_PRIOR_SCRIPT_LINE <<'/---'
+Unique identifier of the previous runnable (e.g., print_message()) to have most
+recently called update_stdout_tracking() or the empty string if such
+function has yet to be called. Such identifier is the topmost element of stack
+${funcfiletrace} at the time of such call.
+
+`zsh` tracks call stack state with two list globals: ${funcname} and
+${funcfiletrace}. Since ${funcname} elements are runnable names, such list
+distinguishes between calls to different runnables but _not_ between different
+calls to the same runnable. Since ${funcfiletrace} elements are filename and
+line pairs signifying a runnable called on such line, such list distinguishes
+between all calls and hence subsumes ${funcname} for purposes of uniquely
+identifying runnables on the call stack.
+/---
+
+# ....................{ RESETTERS                          }....................
+#FIXME: To ensure such globals are compiled to zeshy's user digest files in
+#their initial empty states, reset_stdout_tracking() should be called as the
+#*ABSOLUTELY* last precompile_zeshy() hook function to be called. Arguably, this
+#calls for a new hook type:
+#
+#    function run_hook_before_zeshy_define_startup_functions() { ... }
+#
+#Like run_hook_on_zeshy_precompile(), such hook must be explicitly handled at the
+#top-level by parcel "compile". Such hook is widely useful and will certainly be
+#of use elsewhere to (attempt to) ensure that aliases and globals to be compiled
+#into startup functions (e.g., startup_zeshy_globals()) are assigned the desired
+#initial values.
+
+declare_function_with_stdin <<'/---'
+void reset_stdout_tracking(void)
+
+Reset global tracking state for `zeshy` printer functions, including
+${ZESHY_STDOUT_PRIOR_MTIME} and ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}. See
+update_stdout_tracking() further details.
+/---
+function reset_stdout_tracking() {
+    # Reset such globals.
+    die_if_args
+    ZESHY_STDOUT_PRIOR_MTIME=0
+    ZESHY_STDOUT_PRIOR_SCRIPT_LINE=
+}
+
+declare_function_with_stdin <<'/---'
+void reset_terminal_stdout_tracking(void)
+
+Reset global tracking state for `zeshy` printer functions _and_ color attributes
+for the current terminal to such terminal's defaults, in the correct order. See
+reset_terminal_color() and reset_stdout_tracking() for further details.
+/---
+function reset_terminal_stdout_tracking() {
+    # Unlike update_output_state_and_reset_terminal_color(), output state and
+    # terminal colors may be reset in either order.
+    die_if_args
+    reset_terminal_color
+    reset_stdout_tracking
+}
+
+# ....................{ UPDATERS                           }....................
+declare_function_with_stdin <<'/---'
+void update_stdout_tracking(void)
+
+Update global tracking state for `zeshy` printer functions, including
+${ZESHY_STDOUT_PRIOR_MTIME} and ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}. Such
+state assists subsequent calls to print_whitespace_if_needed() in deciding
+whether prior output should be delimited from subsequent output with whitespace.
+/---
+function update_stdout_tracking() {
+    # Validate sanity.
+    die_if_args
+    # When debugging, note that it's not genuinely possible to safely print
+    # ${ZESHY_STDOUT_PRIOR_MTIME}. Why? Because merely printing such float
+    # changes the return value of get_stdout_mtime(), guaranteeing the next call
+    # to print_whitespace_if_needed() to erroneously print whitespace. (Ugh.)
+#   output_string "resetting ZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}" 1>&2
+
+    # Store the modification time of standard output.
+    set_float_to_stdout_mtime ZESHY_STDOUT_PRIOR_MTIME
+
+    # Store the caller name (hopefully, a printer function).
+    ZESHY_STDOUT_PRIOR_SCRIPT_LINE="${funcfiletrace[-2]-}"
+#   print "resetting ZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}" 1>&2
+}
+
+declare_function_with_stdin <<'/---'
+void update_terminal_stdout_tracking(void)
+
+Update global tracking state for `zeshy` printer functions _and_
+reset color attributes for the current terminal to such terminal's defaults, in
+the correct order. See reset_terminal_color() and update_stdout_tracking() for
+further details.
+/---
+function update_terminal_stdout_tracking() {
+    # Reset terminal color *BEFORE* updating output state, as the former
+    # necessarily modifies standard output that the latter tests.
+    die_if_args
+    reset_terminal_color
+    update_stdout_tracking
+}
+
+# ....................{ PRINTERS                           }....................
+declare_function_with_stdin <<'/---'
+string print_whitespace_if_needed(void)
+
+Print whitespace separating subsequent from prior shell output _and_ reset color
+attributes for the current terminal to such terminal's defaults. Only print such
+whitespace if:
+
+* _All of the following hold_:
+** The current shell previously called at least one `zeshy`-specific printer
+   function (e.g., print_string(), print_heading()), a prerequisite of the
+   condition below.
+** The current function was _not_ called directly from the command line (i.e.,
+   was called by another function), a prerequisite of the condition below.
+** The function calling the current function differs from the most recently
+   called printer function. If such functions are the same, their output should
+   usually be conjoined rather than separated by whitespace; if such functions
+   differ, however, separating their output with whitespace usually improves
+   readability and aesthetics.
+* _Or_:
+** The current modification time of standard output (in seconds since the Unix
+   epoch) differs from the previous such time recorded by the most recently
+   called printer function, implying that another runnable run at least one
+   second before the current call but after the most recently called printer
+   function has printed to standard output without calling
+   update_stdout_tracking() to update such time. In theory, all runnables
+   should update such time after printing to standard output; in practice, the
+   ``regulatory burden'' imposed by such a rule guarantees its unlikelihood.
+   While this condition fails to detect runnables run in the same second as the
+   current call which printed to standard output without updating such time, it
+   does reliably detect older such runnables. This condition is a convenience
+   fallback and should _not_ be counted upon.
+/---
+function print_whitespace_if_needed() {
+    # Validate sanity.
+    die_if_args
+#   output_string "funcfiletrace[2]: ${funcfiletrace[2]-}\nZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE-}"
+#   print_call_stack
+
+    # Sanitize the current terminal in preparation for subsequent output,
+    # regardless of whether whitespace is subsequently printed.
+    reset_terminal_color
+
+    # Prefer an "if"- to "and"-style conditional to avoid returning false.
+    #
+    # Prefer explicit string equality testing to calling is_string_equals(), as
+    # the latter behaves poorly when either such string expands to the empty
+    # string (as curiously appears to be the case when called from an exception
+    # handler).
+    #
+    # Avoid comparing nonextant variables rather than defaulting such variables
+    # to seemingly sane default values (e.g., null). The latter behaves
+    # unpredictably. For example, if ${funcfiletrace[2]} is set but
+    # ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE} is not, defaulting the latter to a
+    # seemingly sane default value erroneously guarantees delimiting whitespace
+    # will be printed.
+    #
+    # Subtleties abound, ribald bald acolytes.
+    if is -n "${ZESHY_STDOUT_PRIOR_SCRIPT_LINE-}" and
+        "${funcfiletrace[-2]-$'\0'}" !=\
+        "${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}" si or {
+        # Sadly, this is the only reliable means of obtaining such time.
+        float stdout_mtime; set_float_to_stdout_mtime stdout_mtime
+        (( ${+ZESHY_STDOUT_PRIOR_MTIME} &&
+              ZESHY_STDOUT_PRIOR_MTIME != stdout_mtime ))
+    } {
+#       float stdout_mtime; set_float_to_stdout_mtime stdout_mtime; output_string "funcfiletrace[-2]: ${funcfiletrace[-2]-}; ZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE-}; ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}; stdout_mtime: ${stdout_mtime}" 1>&2
+        output_newline
+    }
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#FUXME: Find everywhere we currently do this and replace with a call to this
+#function.
+#FUXME: Rename to ZESHY_OUTPUT_STATE_STDOUT_MTIME.
+#FUXME: Rename to ZESHY_OUTPUT_STATE_RUNNABLE_ID.
