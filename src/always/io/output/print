@@ -12,15 +12,15 @@ maintaining globals tracking standard output state). Such state includes:
 * The filename and line number at which such function was defined.
 ______________<heredoc?>______________
 
-#FIXME: *SWEET*. The existing tracking nomenclature is exceedingly awkward. I
-#consequently propose renaming:
-#
-#* print_whitespace_if_needed()      to handle_stdout_tracking().
-#* update_terminal_stdout_tracking() to update_stdout_tracking().
-#* reset_terminal_stdout_tracking()  to reset_stdout_tracking().
-#
-#Remove update_stdout_tracking() and reset_stdout_tracking(). They're just
-#overkill; it's not clear such a distinction will ever be useful.
+#FIXME: No longer convinced we require update_stdout_tracking(). We still need
+#stop_stdout_printing() for resetting terminal colors and settings --
+#but as for update_stdout_tracking(), what's the point? Since we are inevitably
+#going to perform message wrapping in print_message(), etc., there's no longer a
+#need to prevent delimiting output with a newline when such output is output by
+#the same printer function as the most recent output.
+#FIXME: Excising update_stdout_tracking() allows us to dramatically simplify the
+#implementation of start_stdout_printing_delimited() as well, which is certainly nice.
+#The only condition such function should now test is stdout mtime.
 
 # ....................{ GLOBALS                            }....................
 declare_global_with_stdin float ZESHY_STDOUT_PRIOR_MTIME <<'/---'
@@ -72,13 +72,13 @@ function reset_stdout_tracking() {
 }
 
 declare_function_with_stdin <<'/---'
-void reset_terminal_stdout_tracking(void)
+void reset_stdout_printing(void)
 
 Reset global tracking state for `zeshy` printer functions _and_ color attributes
 for the current terminal to such terminal's defaults, in the correct order. See
 reset_terminal_color() and reset_stdout_tracking() for further details.
 /---
-function reset_terminal_stdout_tracking() {
+function reset_stdout_printing() {
     # Unlike update_output_state_and_reset_terminal_color(), output state and
     # terminal colors may be reset in either order.
     die_if_args
@@ -92,7 +92,7 @@ void update_stdout_tracking(void)
 
 Update global tracking state for `zeshy` printer functions, including
 ${ZESHY_STDOUT_PRIOR_MTIME} and ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}. Such
-state assists subsequent calls to print_whitespace_if_needed() in deciding
+state assists subsequent calls to start_stdout_printing_delimited() in deciding
 whether prior output should be delimited from subsequent output with whitespace.
 /---
 function update_stdout_tracking() {
@@ -101,7 +101,7 @@ function update_stdout_tracking() {
     # When debugging, note that it's not genuinely possible to safely print
     # ${ZESHY_STDOUT_PRIOR_MTIME}. Why? Because merely printing such float
     # changes the return value of get_stdout_mtime(), guaranteeing the next call
-    # to print_whitespace_if_needed() to erroneously print whitespace. (Ugh.)
+    # to start_stdout_printing_delimited() to erroneously print whitespace. (Ugh.)
 #   output_string "resetting ZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}" 1>&2
 
     # Store the modification time of standard output.
@@ -113,14 +113,14 @@ function update_stdout_tracking() {
 }
 
 declare_function_with_stdin <<'/---'
-void update_terminal_stdout_tracking(void)
+void stop_stdout_printing(void)
 
 Update global tracking state for `zeshy` printer functions _and_
 reset color attributes for the current terminal to such terminal's defaults, in
 the correct order. See reset_terminal_color() and update_stdout_tracking() for
 further details.
 /---
-function update_terminal_stdout_tracking() {
+function stop_stdout_printing() {
     # Reset terminal color *BEFORE* updating output state, as the former
     # necessarily modifies standard output that the latter tests.
     die_if_args
@@ -129,8 +129,18 @@ function update_terminal_stdout_tracking() {
 }
 
 # ....................{ PRINTERS                           }....................
+#FIXME: Document me.
+function start_stdout_printing() {
+    # Validate sanity.
+    die_if_args
+
+    # Sanitize the current terminal in preparation for subsequent output,
+    # regardless of whether whitespace is subsequently printed.
+    reset_terminal_color
+}
+
 declare_function_with_stdin <<'/---'
-string print_whitespace_if_needed(void)
+string start_stdout_printing_delimited(void)
 
 Print whitespace separating subsequent from prior shell output _and_ reset color
 attributes for the current terminal to such terminal's defaults. Only print such
@@ -161,7 +171,7 @@ whitespace if:
    does reliably detect older such runnables. This condition is a convenience
    fallback and should _not_ be counted upon.
 /---
-function print_whitespace_if_needed() {
+function start_stdout_printing_delimited() {
     # Validate sanity.
     die_if_args
 #   output_string "funcfiletrace[2]: ${funcfiletrace[2]-}\nZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE-}"
@@ -169,7 +179,7 @@ function print_whitespace_if_needed() {
 
     # Sanitize the current terminal in preparation for subsequent output,
     # regardless of whether whitespace is subsequently printed.
-    reset_terminal_color
+    start_stdout_printing
 
     # Prefer an "if"- to "and"-style conditional to avoid returning false.
     #
@@ -244,77 +254,9 @@ function print_stdin() {
     update_stdout_tracking
 }
 
-# ....................{ PRINTERS                           }....................
-# No print_string*() functions call prepend_args_with_stdin_if_piped(),
-# as doing so often invites obscene issues. When called by a caller receiving
-# piped input, print_string*() functions silently capturing and closing such
-# input before the caller can do so break such caller in subtle and *VERY*
-# difficult to debug ways. Moreover, there are no to few reasonable scenarios in
-# which print_string*() functions would be piped rather than merely passed input
-# strings. For straightforward safety, avoid inviting such wayward breakage.
-
-declare_function_with_stdin <<'/---'
-string print_string(string text1, string text2, ...)
-
-Print the passed strings to standard output with default trailing newline.
-Unlike low-level builtins echo() and print(), this and most other printer
-functions print embedded escape sequences as is rather than converting such
-sequences to the corresponding characters. Such conversions often mangle
-arbitrary output and hence are generally unhelpful. See
-print_string_with_escapes() for further details.
-
-Avoid calling such low-level builtins, which behave unexpectedly dangerously
-when passed hyphen-prefixed strings: e.g.,
-
-.print_string() versus print()
-==========================================
-[source]
-------------------------------------------
->>> string lammoth="-z" morgoth="rm -rf *"
-
-# Bad! Never do this, unless guaranteed no hyphens prefix such string.
-# If hyphens do prefix such string, zsh treats the first word of such
-# string as options to print(). This can be extremely unsafe, as this
-# example demonstrates.
->>> print "${lammoth}" "${morgoth}"
->>> rm -rf *   # Don't accidentally hit <Enter> here. WHAT, YOU JUST DID!?!
-
-# Good. Always do this, instead.
->>> print_string "${lammoth}" "${morgoth}"
--z rm -rf *    # That's more like it.
-------------------------------------------
-==========================================
-/---
-function print_string() {
-    die_unless_args 'expected at least one string'
-    output_string "${*}"
-    update_stdout_tracking
-}
-
-#FIXME: Unconvinced this to be a helpful function. Certainly, the name is not
-#helpful at all. Grep the codebase for where this is actually called from.
-declare_function_with_stdin <<'/---'
-string curse_string(string text1, string text2, ...)
-
-Print the passed strings to standard error with default trailing newline. See
-print_string() for further details.
-/---
-function curse_string() {
-    die_unless_args 'expected at least one string'
-    output_string "${*}" 1>&2
-    update_stdout_tracking
-}
-
 # ....................{ PRINTERS ~ string                  }....................
-#FIXME: Given the current implementation, this function name's a bit of a
-#misnomer. Rename to... what? I mean, ideally, shouldn't *THIS* function become
-#the new print_string() and the existing print_string() and curse_string()
-#functions simply excised? I reckon that's probably the way forward -- but to
-#get there, we'll need to make darn sure that most existing calls to
-#print_string() be renamed to return_string() instead.
-
 declare_function_with_stdin <<'/---'
-string print_string_colored(string text1 = "", string text2, ...)
+string print_string(string text1 = "", string text2, ...)
 
 Print the passed strings (defaulting to the empty string) to standard output
 suffixed by a newline while handling and tracking state for standard output.
@@ -323,12 +265,12 @@ Specifically:
 . Reset color attributes for the current terminal to such terminal's defaults.
 . Print whitespace delimiting the passed strings from prior terminal output,
   if the global tracking state for standard output indicates such output. See
-  print_whitespace_if_needed() for further details.
+  start_stdout_printing_delimited() for further details.
 . Print such strings in **raw mode** (i.e., printing embedded escape sequences
   such as `\n` as is rather than converting such sequences to the corresponding
   characters). See output_string() for further details.
 . Update global tracking state for standard output. See
-  update_terminal_stdout_tracking() for further details.
+  stop_stdout_printing() for further details.
 . Reset color attributes for the current terminal again.
 
 == Comparison ==
@@ -359,15 +301,15 @@ hyphen-prefixed strings): e.g.,
 ------------------------------------------
 ==========================================
 /---
-function print_string_colored() {
+function print_string() {
     # Handle previously updated standard output tracking.
-    print_whitespace_if_needed
+    start_stdout_printing_delimited
 
     # Print such string.
     output_string "${*}"
 
     # Update standard output tracking in preparation for subsequent handling.
-    update_terminal_stdout_tracking
+    stop_stdout_printing
 }
 
 declare_function_with_stdin <<'/---'
@@ -379,19 +321,106 @@ See print_string() for further details.
 /---
 function print_string_sans_newline() {
     # Handle previously updated standard output tracking.
-    print_whitespace_if_needed
+    start_stdout_printing_delimited
 
     # Print such string sans newline suffix.
     output_string_sans_newline "${*}"
 
     # Update standard output tracking in preparation for subsequent handling.
-    update_terminal_stdout_tracking
+    stop_stdout_printing
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# ....................{ PRINTERS                           }....................
+#FUXME: Unconvinced this to be a helpful function. Certainly, the name is not
+#helpful at all. Grep the codebase for where this is actually called from.
+#declare_function_with_stdin <<'/---'
+#string curse_string(string text1, string text2, ...)
+#
+#Print the passed strings to standard error with default trailing newline. See
+#print_string() for further details.
+#/---
+#function curse_string() {
+#    die_unless_args 'expected at least one string'
+#    output_string "${*}" 1>&2
+#    update_stdout_tracking
+#}
+
+# No print_string*() functions call prepend_args_with_stdin_if_piped(),
+# as doing so often invites obscene issues. When called by a caller receiving
+# piped input, print_string*() functions silently capturing and closing such
+# input before the caller can do so break such caller in subtle and *VERY*
+# difficult to debug ways. Moreover, there are no to few reasonable scenarios in
+# which print_string*() functions would be piped rather than merely passed input
+# strings. For straightforward safety, avoid inviting such wayward breakage.
+
+#declare_function_with_stdin <<'/---'
+#string print_string(string text1, string text2, ...)
+#
+#Print the passed strings to standard output with default trailing newline.
+#Unlike low-level builtins echo() and print(), this and most other printer
+#functions print embedded escape sequences as is rather than converting such
+#sequences to the corresponding characters. Such conversions often mangle
+#arbitrary output and hence are generally unhelpful. See
+#print_string_with_escapes() for further details.
+#
+#Avoid calling such low-level builtins, which behave unexpectedly dangerously
+#when passed hyphen-prefixed strings: e.g.,
+#
+#.print_string() versus print()
+#==========================================
+#[source]
+#------------------------------------------
+#>>> string lammoth="-z" morgoth="rm -rf *"
+#
+## Bad! Never do this, unless guaranteed no hyphens prefix such string.
+## If hyphens do prefix such string, zsh treats the first word of such
+## string as options to print(). This can be extremely unsafe, as this
+## example demonstrates.
+#>>> print "${lammoth}" "${morgoth}"
+#>>> rm -rf *   # Don't accidentally hit <Enter> here. WHAT, YOU JUST DID!?!
+#
+## Good. Always do this, instead.
+#>>> print_string "${lammoth}" "${morgoth}"
+#-z rm -rf *    # That's more like it.
+#------------------------------------------
+#==========================================
+#/---
+#function print_string() {
+#    die_unless_args 'expected at least one string'
+#    output_string "${*}"
+#    update_stdout_tracking
+#}
+
+#FUXME: Given the current implementation, this function name's a bit of a
+#misnomer. Rename to... what? I mean, ideally, shouldn't *THIS* function become
+#the new print_string() and the existing print_string() and curse_string()
+#functions simply excised? I reckon that's probably the way forward -- but to
+#get there, we'll need to make darn sure that most existing calls to
+#print_string() be renamed to return_string() instead.
+
+#FUXME: *SWEET*. The existing tracking nomenclature is exceedingly awkward. I
+#consequently propose renaming:
+#
+#* start_stdout_printing_delimited()      to handle_stdout_tracking().
+#* stop_stdout_printing() to update_stdout_tracking().
+#* reset_stdout_printing()  to reset_stdout_tracking().
+#
+#Remove update_stdout_tracking() and reset_stdout_tracking(). They're just
+#overkill; it's not clear such a distinction will ever be useful.
+#FUXME: Consider instead renaming:  instead to:
+#
+#* start_stdout_printing_delimited()      to vivify_stdout_tracking().
+#* start_stdout_printing_delimited()      to initiate_stdout_printing().
+#* stop_stdout_printing() to finalize_stdout_printing().
+#
+#Hmm. What about simply start_stdout_printing_delimited() and stop_stdout_printing()?
+#FUXME: Right... Simply start_stdout_printing_delimited() and stop_stdout_printing(), I
+#should think.
+
 # ....................{ PRINTERS ~ newline                 }....................
 #FUXME: What the heck is this? I fail to see any demonstrable benefit here. In
-#fact, this function *SHOULD* be calling print_whitespace_if_needed() to serve
+#fact, this function *SHOULD* be calling start_stdout_printing_delimited() to serve
 #as a genuine printer function, in which case the implementation makes utterly
 #no sense. Replace all instances of this function will output_newline().
 #declare_function_with_stdin <<'/---'
@@ -458,18 +487,18 @@ function print_string_sans_newline() {
 
 #Unlike such low-level
 #aliases and builtins, this function:
-# subject to the conditions of print_whitespace_if_needed().
+# subject to the conditions of start_stdout_printing_delimited().
 #suffixed by a newline in a color-aware manner. Prefix and suffix such output
 #with ANSI color codes resetting color attributes to terminal-specific defaults.
 
     #FUXME: It'd be far more symmetric to simply call
-    #reset_terminal_stdout_tracking() here, which incidentally would probably
+    #reset_stdout_printing() here, which incidentally would probably
     #also simplify caller logic. Grep where this function is used and see
     #whether or not all calls to this function are preceded by
-    #print_whitespace_if_needed() (as I suspect they are). Since that function
+    #start_stdout_printing_delimited() (as I suspect they are). Since that function
     #already calls reset_terminal_color() internally, we can *GREATLY* simplify
     #such logic by simply shifting all such calls to
-    #print_whitespace_if_needed() into this function right here, replacing
+    #start_stdout_printing_delimited() into this function right here, replacing
     #reset_terminal_color() here with a call to such function.
 
 #FUXME: Is this function still called anywhere? The implementation is rather
@@ -494,10 +523,10 @@ function print_string_sans_newline() {
     #recorded mtime of "/dev/stdout". But, honestly, this function just doesn't
     #work, because ${ZESHY_OUTPUT_STATE_RUNNABLE_ID} will be this function if
     #we call update_stdout_tracking(), guaranteeing the next call to
-    #print_whitespace_if_needed() will simply *ALWAYS* print such whitespace,
+    #start_stdout_printing_delimited() will simply *ALWAYS* print such whitespace,
     #which is the opposite effect of what we want.
     #FUXME: We could introduce a new global set by this function and tested by
-    #print_whitespace_if_needed() to avoid such complexities; but, really, this
+    #start_stdout_printing_delimited() to avoid such complexities; but, really, this
     #is all *EXTREME* overkill. Excise this function, I should think.
 
     # Unlike output printed by most printer functions, output printed by this
@@ -649,7 +678,7 @@ function print_string_sans_newline() {
 #
 #Specifically, this string is the first element of list global ${funcfiletrace}
 #at the time of the most recent call to a high-level print function as recorded
-#by print_whitespace_if_needed(). zsh tracks call stack state with
+#by start_stdout_printing_delimited(). zsh tracks call stack state with
 #two list globals: ${funcname} and ${funcfiletrace}. The former distinguishes
 #between calls to different functions and scripts but *NOT* between different
 #calls to the same function or script or between different command lines. The
@@ -661,7 +690,7 @@ function print_string_sans_newline() {
 #stack, such element effectively differentiates such stack from subsequent call
 #stacks initiated by other callers.
 #
-#See print_whitespace_if_needed() for further details.
+#See start_stdout_printing_delimited() for further details.
 #/---
 #
 #stored call stack root specific to `zeshy` printer functions to the current call
@@ -669,14 +698,14 @@ function print_string_sans_newline() {
 #(e.g., print_string()) to notify subsequently called high-level print functions
 #(e.g., print_message()) that at least one such print function has already been
 #called under the current call stack root and that
-#print_whitespace_if_needed() should thus print a delimiting newline.
+#start_stdout_printing_delimited() should thus print a delimiting newline.
 #If standard output for the current shell is attached to a terminal, set the
 #stored call stack root specific to `zeshy` printer functions to the current call
 #stack root. This function is typically called by low-level `zeshy` printer functions
 #(e.g., print_string()) to notify subsequently called high-level print functions
 #(e.g., print_message()) that at least one such print function has already been
 #called under the current call stack root and that
-#print_whitespace_if_needed() should thus print a delimiting newline.
+#start_stdout_printing_delimited() should thus print a delimiting newline.
 #      (( ZESHY_STDOUT_PRIOR_MTIME )) and
     #FUXME: Convert to an "if" statement and attempt to remove the trailing
     #return_true().
