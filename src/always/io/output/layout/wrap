@@ -9,18 +9,10 @@ terminal by inserting newlines into such strings at appropriate break points).
 ______________<heredoc?>______________
 
 # ....................{ GLOBALS                            }....................
-declare_global_with_stdin integer ZESHY_PCRE_WRAPPING_INDEX_DELIMITED=2 <<'/---'
-1-based index in list ${match} of a line's worth of text suffixed by a word
-delimiter or the empty string if no such text exists, after matching a PCRE
-returned by get_pcre_wrapping_at_line_length(). See such function for further
-details.
-/---
-
-declare_global_with_stdin integer ZESHY_PCRE_WRAPPING_INDEX_UNDELIMITED=4 <<'/---'
-1-based index in list ${match} of a line's worth of text _not_ suffixed by a
-word delimiter or the empty string if no such text exists, after matching a PCRE
-returned by get_pcre_wrapping_at_line_length(). See such function for further
-details.
+declare_global_with_stdin integer ZESHY_PCRE_WRAPPING_INDEX_TEXT=2 <<'/---'
+1-based index in list ${match} of the next text substring to be wrapped by a
+PCRE returned by get_pcre_wrapping_at_line_length(). By design, such substring
+is guaranteed to be no longer than the line length passed to such function.
 /---
 
 # ....................{ GETTERS                            }....................
@@ -86,18 +78,14 @@ for_string_pcre_matches(): e.g.,
 ...     various government projects. Utilitarian neoclassical welfare
 ...     economics pervades and dominates nearly all neoclassical analyses on
 ...     all theoretical and practical matters."
->>> for_string_pcre_multiline_matches\
-...     "$(get_string_lines "${on_neoclassical_economics}" 5 11)"\
+>>> for_string_pcre_matches\
+...     "${on_neoclassical_economics}"\
 ...     "$(get_pcre_wrapping_at_line_length 70)"\
-...     'output_string ${match[1]}'
-and policy-oriented conclusion at which they arrive. All of their
-cost-benefit analyses, their demonstrations of the universal gains
-from foreign trade, their notions of market efficiency that are
-encountered in every branch of applied economics, as well as their
+...     'is_string_glob_matches "${match[2]}" *meaning* and
+...         output_string "${match[2]}"'
 notion of rational prices, have absolutely no meaning whatsoever other
-than that manifested in their faith that a free-enterprise,
-competitive market system will tend toward a Pareto optimal situation.
-Without a Pareto
+situation, these phrases have no meaning whatsoever. They are given
+meaning only when the neoclassical economists first posit the
 ------------------------------------------
 ==========================================
 
@@ -122,7 +110,7 @@ https://en.wikipedia.org/wiki/Word_wrap[Wikipedia article].
 function get_pcre_wrapping_at_line_length() {
     # Validate passed arguments.
     die_unless_arg 'expected one integer'
-    string line_length="${1}"
+    string line_length="${1}" pcre_wrapping
     die_unless_integer_positive "${line_length}"
 
     #FIXME: We've significantly updated this PCRE. Update everywhere we use it
@@ -132,13 +120,28 @@ function get_pcre_wrapping_at_line_length() {
     #
     #* ${match[2]}, matching a line's worth of text suffixed by a word delimiter.
     #* ${match[4]}, matching a line's worth of text *NOT* suffixed by a word delimiter.
-    #FIXME: Does this PCRE behave sanely if the passed line length is only 1?
-    #This depends on whether or not libpcre matches ".{1,0}" sanely (e.g.,
-    #matches such subpattern as the empty string).
 
-    # Get such PCRE. Dismantled, this is:
+    # Construct such PCRE. Dismantled, this is:
     #
     # * "\G", anchoring such match immediately after the end of the prior match.
+    pcre_wrapping="${ZESHY_PCRE_OPTION_MULTILINE}"'\G'
+
+    # If such line length is 1, such PCRE should not attempt to break lines at
+    # hyphens preceded by at least one character. Instead, only break lines at
+    # each character. While this remains an unlikely edge case, handling such
+    # case is critical to avoid spurious exceptions and behavior.
+    #
+    # To ensure the expected match groups, capture each character to the match
+    # group typically matching words *NOT* exceeding line length and the empty
+    # string to all other match groups. Since "libpcre" sadly lacks a means of
+    # explicitly specifying the number to assign to a match group, ensure this
+    # implicitly with empty match groups. (Lame? This is my uncaring face.)
+    if (( line_length == 1 )) {
+        pcre_wrapping+='()(.)()()'
+    #FIXME: Documentation outdated.
+    # Else, such line length is greater than 1, the common case. Dismantled,
+    # this is:
+    #
     # * "\h*+", matching ignorable horizontal whitespace (i.e., non-newline)
     #   without backtracking, for efficiency.
     # * "(?:...)", matching either:
@@ -153,19 +156,34 @@ function get_pcre_wrapping_at_line_length() {
     #       the following condition to test whether a hyphen matched.
     #     * "(?(-1)|(?:...))", matching either:
     #       * If a hyphen suffix previously matched, then nothing else.
-    #       * Else, mandatory horizontal whitespace, a newline, or the string end.
-    #         In any case, such suffix will typically be converted into a newline.
-    #   * "(.{...})", matching a a line's worth of text *NOT* suffixed by a word
-    #     delimiter to ${match[4]}. This fallback condition handles such edge
+    #       * Else, one of the following suffixes:
+    #         * Mandatory horizontal whitespace.
+    #         * A newline.
+    #         * The string end.
+    #         In any case, such suffix will typically be converted into a single
+    #         newline by the caller.
+    #   * "(.{...})", matching a line's worth of text *NOT* suffixed by a word
+    #     delimiter. This fallback condition handles such edge
     #     cases as single words exceeding the length of a single line, without
     #     which such words would be silently ignored during PCRE iteration. In
     #     such case, such words will typically be broken at the passed line
     #     length into substrings suffixed by a hyphen followed by a newline.
+    #     Hence, match the line length minus one.
+    # * "\n?", matching an ignorable newline suffixing such text. Since the
+    #   caller typically suffixes such text by a newline already, an additional
+    #   newline should not be captured and hence printed as well.
     #
     # To accept arbitrary strings (e.g., possibly containing zsh or zeshy code),
     # avoid character classes "\w" and "\W" matching only spoken language words.
-    return_string\
-        "${ZESHY_PCRE_OPTION_MULTILINE}"'\G\h*+(?:(\n)|(.{1,'$(( line_length - 1 ))'}(?:[^-]|(-)))(?(-1)|(?:\h+|$))|(.{1,'${line_length}'})'
+    } else {
+        integer line_length_minus_one=$(( line_length - 1 ))
+        pcre_wrapping+='\h*+(?:(\n)|(?|(.{1,'${line_length}'})(?:\h+|$)|(.{1,'${line_length_minus_one}'}-)|(.{1,'${line_length_minus_one}'})))\n?'
+#       pcre_wrapping+='\h*+(?:(\n)|(.{1,'$(( line_length - 1 ))'}(?:[^-\n]|(-)))(?(-1)|(?:\h+\n?|$))|(.{1,'${line_length}'}))'
+    }
+
+    # Get such PCRE.
+#   output_string "pcre wrapping at line length ${line_length}/$(get_terminal_width):${ZESHY_ASCII_NEWLINE}${pcre_wrapping}" 1>&2
+    return_string "${pcre_wrapping}"
 }
 
 # ....................{ GETTERS ~ string                   }....................
@@ -248,24 +266,76 @@ exactions.
 ==========================================
 /---
 function get_string_wrapped_at_line_length() {
-    # Validate passed arguments.
     die_unless_args_2 'expected one string and one integer'
-    string text="${1}" line_length="${2}"
+    for_string_wrapped_at_line_length "${@}" 'output_string "${LINE}"'
+}
+
+# ....................{ ITERATORS                          }....................
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: integer]
+    for_string_wrapped_at_line_length(
+        string text,
+        integer line_length,
+        string line_name = "LINE",
+        string command)
+
+Run the passed command for each line of the passed string wrapped to the passed
+line length in a word-aware manner, setting the passed local string variable
+(defaulting to `${LINE}`) to each such line. See
+get_pcre_wrapping_at_line_length() for further details: e.g.,
+
+.for_string_wrapped_at_line_length()
+==========================================
+[source]
+------------------------------------------
+>>> string on_boxes=\
+...    "The box is full of salmon, and a man sits atop the box. Long ago this"\
+...    "man hired armed guards to keep anyone from eating his fish. The many"\
+...    "people who sit next to the empty river starve to death. But they do"\
+...    "not die of starvation. They die of a belief. Everyone believes that"\
+...    "the man atop the box owns the fish. The soldiers believe it, and they"\
+...    "will kill to protect the illusion. The others believe it enough that"\
+...    "they are willing to starve. But the truth is that there is a box,"\
+...    "there is an emptied river, there is a man sitting atop the box, there"\
+...    "are guns, and there are starving people."
+>>> for_string_wrapped_at_line_length "${on_boxes}" 75 on_parables\
+...    'is_string_glob_matches "${on_parables}" [Tt]he* and
+...         output_string "${on_parables}"'
+The box is full of salmon, and a man sits atop the box. Long ago this man
+the illusion. The others believe it enough that they are willing to starve.
+------------------------------------------
+==========================================
+/---
+function for_string_wrapped_at_line_length() {
+    # Validate passed arguments.
+    die_unless_args_3_to_4\
+        'expected one string, one integer, optional line name, and one command'
+    string\
+        text__fswall="${1}"\
+        line_length__fswall="${2}"\
+        line_name__fswall='LINE'\
+        command__fswall="${@[-1]}"\
+        pcre__fswall
+    is_args_4 and line_name__fswall="${3}"
+    die_unless_variable_name "${line_name__fswall}"
+    die_unless_string_nonempty "${command__fswall}" 'expected nonempty command'
+
+    # PCRE wrapping lines at such length.
+    pcre__fswall="$(get_pcre_wrapping_at_line_length "${line_length__fswall}")"
 
     # For each line's worth of text, print such line suffixed by a newline.
     # If such line is *NOT* already suffixed by a word delimiter (e.g., hyphen),
     # suffix such line by a hyphen. The latter case typically arises when
     # splitting single words exceeding such line length.
-    for_string_pcre_matches\
-        "${text}" "$(get_pcre_wrapping_at_line_length "${line_length}")"\
-        'if is -n "${match['${ZESHY_PCRE_WRAPPING_INDEX_DELIMITED}']}" si {
-            output_string "${match['${ZESHY_PCRE_WRAPPING_INDEX_DELIMITED}']}"
-        } else {
-            output_string "${match['${ZESHY_PCRE_WRAPPING_INDEX_UNDELIMITED}']}-"
-        }'
+    string "${line_name__fswall}"
+    for_string_pcre_matches "${text__fswall}" "${pcre__fswall}" '
+        (( ${#match} )) or die "PCRE \"${pcre__fswall}\" failed to wrap current line"
+        '${line_name__fswall}'="${match['${ZESHY_PCRE_WRAPPING_INDEX_TEXT}']}"
+        '${command__fswall}
 }
 
 # ....................{ PRINTERS                           }....................
+#FIXME: Right. Absolutely excise this.
 #FIXME: Unconvinced this method is still widely useful, now that it's
 #effectively been extended into print_box() (or the equivalent function now).
 declare_function_with_stdin <<'/---'
@@ -347,6 +417,42 @@ function print_string_wrapped_with_line_prefix() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#       if is -n "${match['${ZESHY_PCRE_WRAPPING_INDEX_DELIMITED}']}" si {
+#           '${line_name__fswall}'="${match['${ZESHY_PCRE_WRAPPING_INDEX_DELIMITED}']}"
+#       } else {
+#           '${line_name__fswall}'="${match['${ZESHY_PCRE_WRAPPING_INDEX_UNDELIMITED}']}-"
+#       }
+
+#       (( ${#match} >= '${ZESHY_PCRE_WRAPPING_INDEX_TEXT}' )) ||
+#declare_global_with_stdin integer ZESHY_PCRE_WRAPPING_INDEX_DELIMITED=2 <<'/---'
+#1-based index in list ${match} of a line's worth of text suffixed by a word
+#delimiter or the empty string if no such text exists, after matching a PCRE
+#returned by get_pcre_wrapping_at_line_length(). See such function for further
+#details.
+#/---
+#
+#declare_global_with_stdin integer ZESHY_PCRE_WRAPPING_INDEX_UNDELIMITED=4 <<'/---'
+#1-based index in list ${match} of a line's worth of text _not_ suffixed by a
+#word delimiter or the empty string if no such text exists, after matching a PCRE
+#returned by get_pcre_wrapping_at_line_length(). See such function for further
+#details.
+#/---
+
+    # For each line's worth of text, print such line suffixed by a newline.
+    # If such line is *NOT* already suffixed by a word delimiter (e.g., hyphen),
+    # suffix such line by a hyphen. The latter case typically arises when
+    # splitting single words exceeding such line length.
+#   for_string_pcre_matches\
+#       "${text}" "$(get_pcre_wrapping_at_line_length "${line_length}")"\
+#       'if is -n "${match['${ZESHY_PCRE_WRAPPING_INDEX_DELIMITED}']}" si {
+#           output_string "${match['${ZESHY_PCRE_WRAPPING_INDEX_DELIMITED}']}"
+#       } else {
+#           output_string "${match['${ZESHY_PCRE_WRAPPING_INDEX_UNDELIMITED}']}-"
+#       }'
+
+    #FUXME: Does this PCRE behave sanely if the passed line length is only 1?
+    #This depends on whether or not libpcre matches ".{1,0}" sanely (e.g.,
+    #matches such subpattern as the empty string).
     #FUXME: Call a new function reset_terminal_color() in lieu of such logic
     #both here and below.
 
