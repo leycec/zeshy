@@ -1,0 +1,253 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'-/-'
+Handle *glob iterators* (i.e., functions iterating glob matches).
+-/-
+
+#FIXME: I got a generalized mechanism. *HOLY JEEBUS*, but it was rough. See
+#below.
+#FIXME: Actually, there *ARE* meaningful operations that may be performed from
+#within such glob replacement expressions. Command substitutions do *NOT*,
+#however, happen to be one of them. Useful operations are capable of effecting
+#side effects in the current shell, and hence include:
+#
+#* Arithmetic expansions (e.g., "$(( ... = ... ))").
+#* Non-idempotent parameter expansions (e.g., "${${variable_name}::=...}", by
+#  which one could not only assign but also *APPEND* to a scalar, one of the
+#  simpler but more common uses of glob iteration).
+#* Non-idempotent command substitutions (e.g.,
+#  "$(append_file_with_string ...)").
+#
+#So, there's plenty that can be done. We'll want to, in no particular order:
+#
+#* Document such uses (hard). Callers should be encouraged to consider calling
+#  for_string_matches_pcre(), instead, which behaves *MUCH* more sensibly.
+#* Generalize the iterators below to support such uses (easy, given that we
+#  already execute them under an "eval" statement).
+#* Grep the codebase for uses of such iterators and fix them accordingly, if
+#  they even can be (medium).
+#FIXME: Since such expansions do not constitute genuine commands, we should
+#rename *ALL* such iterators. Why? Because we'll probably eventually invent a
+#mechanism for efficiently iterating glob matches that does permit genuine
+#commands. How about renaming to, say, for_string_matches_glob_expand()? This
+#is still relatively concise, while yet descriptive.
+#FIXME: Possible other mechanisms of glob replacement-style iteration include:
+#
+#* Filename globbing operator (e:...:): e.g., "*(e:'reply=(${REPLY}{1,2})':)".
+#  The question is, does such code execute in the current shell or a subshell?
+#  "man zshexpn" doesn't make this clear. Investigate.
+#* Parameter expansion operator (e:...:): e.g., "${(e):-...}". Oh, bother; I
+#  suppose that gains us next to nothing, does it?
+#
+#I need a method for executing a genuine "eval" statement in the current shell
+#from a parameter expansion. Pretty much infeasible at the moment, I should
+#think, eh?
+#FIXME: *WOOP*! That's it. I can hardly believe it, but zsh actually dynamically
+#evaluates the filename globbing operator argument in the current shell. Here's
+#the canonical test, and it actually works:
+#
+#    string yi
+#    noop *(e:'yi+="${REPLY}":)
+#
+#Since we don't actually want to bother wasting time filename globbing, we could
+#simply try something resembling... Wait. How do we actually *APPLY* such
+#operator? Surely, there's a way. How about simply appending such string to the
+#passed *GLOB* rather than value: e.g.,
+#
+#    eval "noop \"\${text__fsgm//\${~glob__fsgm}(e:$(${command__fsgm}))}\""
+#
+#Ugh. That doesn't seem to work. Hmm... I can't seem to unify the two. Bloody
+#hell. I suppose this remains unsolved, for the moment.
+#FIXME: Oh, man. I think I see a glimmer of a way... but, boy, is it a bit ugly.
+#Here's the idea: we want the code in (e:...:) to be executed for each match,
+#right? Right. Since that only happens under filename generation which only
+#happens at the outermost level, we need to do something resembling the
+#following, which I'm dead-nearly-certain will actually work:
+#
+#    noop /dev/null/*${~text__fsgm//\${~glob__fsgm}/(#qe:${command__fsgm}:)}
+#
+#To see why this should work, note what it's doing:
+#
+#* We're globbing against "/dev/null/", which, while it doesn't exist, should
+#  still initiate one expansion and interpretation of the following glob.
+#* "${~...}", interpreting the result of such expansion as a glob.
+#* "//.../...", replacing each matching substring with a filename generation
+#  globbing modifier evaluating the passed command.
+#
+#Something like this, if not exactly this, should *DEFINITELY* work. Why?
+#Because it follows zsh logic to the tee. I can *FEEL* this one. It works,
+#probably with only slight perturbation. See to it, my friend.
+#
+#I don't believe we require a surrounding eval() call either, in this case.
+#FIXME: *WOHOO*! I got it. Son of a fucking bitch, but that was rough. Here
+#goes a canonical example:
+#
+#    >>> string text='hohum' accumulator
+#    >>> noop ${PWD}${~text//(#m)?/(#qe:accumulator+="${MATCH}":)}
+#    >>> print $accumulator
+#    hohum
+#
+#Since ${PWD} always exists (and there exists only one of it), such filename
+#globbing is guaranteed to be performed as expected. There is a slight (major?)
+#catch, of course: the token used to delimit the argument to "(#qe...)" can and
+#probably will conflict with the passed command. We can mostly get around this
+#by calling that useful function we concocted to find a free token given such
+#command... Right. Suppose that's not really a concern, then. Solved!
+
+#FIXME: Actually, execution from a subshell basically renders such functions
+#useless. No, really. I *CLEARLY* never tested any of them. About the only thing
+#useful you can do from a subshell is output to standard error. Everything else
+#is effectively ignored, rendering such technique largely useless. Which is
+#*CRAZY*. I mean, contemplate the sheer effort that went into not only this
+#parcel but @{field} as well. And you mean to tell me that I didn't actually
+#test any of this craziness? My Gods! What was I contemplating that week?
+#FIXME: We need to *STRONGLY* emphasize the fact that such commands are executed
+#from a *SUBSHELL* and hence may not behave as expected.
+#FIXME: Examples below should be revised to append "1>&2" after expansions of
+#output_string(). Though, really, we just need a new output_string_to_stderr()
+#function.
+
+# ....................{ ITERATORS                          }....................
+declare_function_with_stdin <<'/---'
+<globbable> string for_string_matches_glob(
+    string text, string glob, string command)
+
+Run the passed command for each substring of the passed string matching the
+passed glob, capturing such substring into local string variable ${MATCH} and
+such substring's start and end index in such string into local integer variables
+${MBEGIN} and ${MEND}.
+
+This function does _not_ implicitly capture parenthetical groups in such glob
+into local list variable ${match} _or_ such groups' start and end indices in
+such string into local list variables ${mbegin} and ${mend}, as such capturing
+slightly reduces match efficiency. To capture groups, either call
+for_string_matches_glob_capturing_groups() or explicitly prefix the first group
+to be captured from such glob with `(#b)`: e.g.,
+
+.for_string_matches_glob()
+==========================================
+[source]
+------------------------------------------
+>>> string on_proprietary_software="
+...     I could have made money this way and perhaps amused myself writing code.
+...     But I knew that at the end of my career, I would look back on years of
+...     building walls to divide people, and feel I had spent my life making the
+...     world a worse place."
+>>> for_string_matches_glob "${on_proprietary_software}"\
+...     I\ (#b)([[:WORD:]]##) 'output_string "${MATCH}" ("${match[1]}")'
+I could (could)
+I knew (knew)
+I would (would)
+I had (had)
+------------------------------------------
+==========================================
+/---
+function for_string_matches_glob() {
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize changes to this function to those below.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Validate passed arguments.
+    die_unless_args_3 'expected one string, one glob, and one command'
+    string text__fsgm="${1}" glob__fsgm="${2}" command__fsgm="${3}"
+    die_unless_string_nonempty "${glob__fsgm}" 'expected non-empty glob'
+    glob__fsgm="$(convert_string_to_glob_capturing_substrings "${glob__fsgm}")"
+
+    # Localize string and list match globals, in case such glob enables "(#b)".
+    string MATCH MBEGIN MEND
+    list   match mbegin mend
+
+    # Iterate such matches. While zsh provides no explicit mechanism for doing
+    # so, cleverly misusing parameter expansion replacement suffices to do so.
+    # Dismantled, this is:
+    #
+    # * "noop", discarding the result of such replacement.
+    # * "//.../...", replacing each substring matching such glob with the output
+    #   of running such command. By discarding such output, this has the effect
+    #   of running such command for each such match. Great, and very efficient!
+    eval "noop \"\${text__fsgm//\${~glob__fsgm}/\$(${command__fsgm})}\""
+}
+
+declare_function_with_stdin <<'/---'
+<globbable> string for_string_matches_glob_nongreedy(
+    string text, string glob, string command)
+
+Run the passed command for each substring of the passed string matching the
+passed glob *non-greedily* (i.e., matching shortest rather than longest possible
+substrings), capturing such substring into local string variable ${MATCH} and
+such substring's start and end index in such string into local integer variables
+${MBEGIN} and ${MEND}. Specifically, coerce glob quantifiers `*`, `#`, and `##`
+to match non-greedily. See for_string_matches_glob() for further details.
+/---
+function for_string_matches_glob_nongreedy() {
+    # Specifying parameter expansion flag "(S)" enables non-greedy matching.
+    # Sadly, this requires reimplementing for_string_matches_glob().
+    die_unless_args_3 'expected one string, one glob, and one command'
+    string text__fsgmn="${1}" glob__fsgmn="${2}" command__fsgmn="${3}"
+    die_unless_string_nonempty "${glob__fsgmn}" 'expected non-empty glob'
+    glob="$(convert_string_to_glob_capturing_substrings "${glob__fsgmn}")"
+    string MATCH MBEGIN MEND
+    list   match mbegin mend
+    eval "noop \"\${(S)text__fsgmn//\${~glob__fsgmn}/\$(${command__fsgmn})}\""
+}
+
+# ....................{ ITERATORS ~ group                  }....................
+declare_function_with_stdin <<'/---'
+<globbable> string for_string_matches_glob_capturing_groups(
+    string text, string glob, string command)
+
+Run the passed command for each substring of the passed string matching the
+passed glob. This function provides such command access to match globals
+${MATCH}, ${MBEGIN}, ${MEND}, ${match}, ${mbegin}, and ${mend} by prefixing such
+glob with `(#m)(#b)` if not already. See for_string_matches_glob() for further
+details.
+/---
+function for_string_matches_glob_capturing_groups() {
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize changes to this function to those below.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Validate passed arguments.
+    die_unless_args_3 'expected one string, one glob, and one command'
+    string text__fsgmcg="${1}" glob__fsgmcg="${2}" command__fsgmcg="${3}"
+    die_unless_string_nonempty "${glob__fsgmcg}" 'expected non-empty glob'
+
+    # Localize string and list match globals, in case such glob enables "(#b)".
+    string MATCH MBEGIN MEND
+    list   match mbegin mend
+
+    # Iterate such matches.
+    for_string_matches_glob\
+        "${text__fsgmcg}"\
+        "$(convert_string_to_glob_capturing_groups_and_substrings\
+            "${glob__fsgmcg}")"\
+        "${command__fsgmcg}"
+}
+
+declare_function_with_stdin <<'/---'
+<globbable> string for_string_matches_glob_nongreedy_capturing_groups(
+    string text, string glob, string command)
+
+Run the passed command for each substring of the passed string matching the
+passed glob non-greedily. This function provides such command access to match
+globals ${MATCH}, ${MBEGIN}, ${MEND}, ${match}, ${mbegin}, and ${mend} by
+prefixing such glob with `(#m)(#b)` if not already. See for_string_matches_glob() and
+for_string_matches_glob_nongreedy() for further details.
+/---
+function for_string_matches_glob_nongreedy_capturing_groups() {
+    die_unless_args_3 'expected one string, one glob, and one command'
+    string text__fsgmncg="${1}" glob__fsgmncg="${2}" command__fsgmncg="${3}"
+    die_unless_string_nonempty "${glob__fsgmncg}" 'expected non-empty glob'
+    string MATCH MBEGIN MEND
+    list   match mbegin mend
+    for_string_matches_glob_nongreedy\
+        "${text__fsgmncg}"\
+        "$(convert_string_to_glob_capturing_groups_and_substrings\
+            "${glob__fsgmncg}")"\
+        "${command__fsgmncg}"
+}
+
+# --------------------( WASTELANDS                         )--------------------
