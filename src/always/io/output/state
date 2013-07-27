@@ -1,0 +1,335 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'______________<heredoc?>______________'
+Handle *output tracking* of globals recording the state of standard output and
+error after the most recent call to a printer function (e.g., print_string()),
+where ``state'' typically means the modification time of the device files
+associated with standard output and error at the time of such call.
+______________<heredoc?>______________
+
+# ....................{ GLOBALS                            }....................
+declare_global_with_stdin float ZESHY_STDOUT_PRIOR_MTIME <<'/---'
+Modification time of the device file associated with standard output for the
+current shell at the time of the most recent call to update_stdout_state() or 0
+if such function has yet to be called.
+/---
+
+declare_global_with_stdin float ZESHY_STDERR_PRIOR_MTIME <<'/---'
+Modification time of the device file associated with standard error for the
+current shell at the time of the most recent call to update_stdout_state() or 0
+if such function has yet to be called.
+/---
+
+# ....................{ UPDATERS                           }....................
+declare_function_with_stdin <<'/---'
+void update_stdout_state(void)
+
+Update globals recording the state of standard output after the most recent call
+to a printer function (e.g., print_string()), where ``state'' implies the
+modification time of the device file associated with standard output at the time
+of such call. Such state assists subsequent calls to start_stdout_delimited() in
+deciding whether prior and subsequent output should be delimited by a newline.
+/---
+# Since standard output and error are typically both muxed to the same terminal,
+# testing the modification time of the device file associated with standard
+# output implicitly tests the same for standard error. Hence, testing only the
+# latter suffices to ensure that prior and subsequent output are properly
+# delimited -- even if such output was to standard error rather than output.
+function update_stdout_state() {
+    die_if_args
+    set_float_to_stdout_mtime ZESHY_STDOUT_PRIOR_MTIME
+}
+
+declare_function_with_stdin <<'/---'
+void update_stderr_state(void)
+
+Update globals recording the state of standard error after the most recent call
+to a printer function (e.g., print_string()). See update_stdout_state() for
+further details.
+/---
+function update_stderr_state() {
+    die_if_args
+    set_float_to_stderr_mtime ZESHY_STDERR_PRIOR_MTIME
+}
+
+# ....................{ RESETTERS                          }....................
+declare_function_with_stdin <<'/---'
+void reset_stdout_state(void)
+
+Reset output state in preparation for subsequent output. See
+stop_stdout_delimited() for further details.
+/---
+function reset_stdout_state() {
+    die_if_args
+    stop_stdout_delimited
+}
+
+# ....................{ STARTERS                           }....................
+#FIXME: Honestly, I'm unconvinced we still need a distinction between
+#start_stdout() and start_stdout_delimited(). Ideally, the latter should simply
+#be renamed to the former. Check if any other functions still call
+#start_stdout().
+#FIXME: O.K.; start_stdout() is *OFFICIALLY* only called by print_string(),
+#which should also be simplified back to output_string_colored(), at which point
+#start_stdout() will never be called elsewhere. Remove it and stop_stdout() then.
+#FIXME: Removing print_string(), in turn, requires refactoring @{message/error}
+#in accordance with @{message/message}. Not terribly difficult -- we just have
+#to lamentably finally do it.
+
+declare_function_with_stdin <<'/---'
+string start_stdout(void)
+
+Prepare the current terminal for subsequent printing to standard output. See
+reset_terminal_color() for further details.
+/---
+function start_stdout() {
+    die_if_args
+    reset_terminal_color
+}
+
+declare_function_with_stdin <<'/---'
+string start_stderr(void)
+
+Prepare the current terminal for subsequent printing to standard error. See
+start_stderr() for further details.
+/---
+function start_stderr() {
+    die_if_args
+    start_stdout 1>&2
+}
+
+#FIXME: This function is stdout-specific in the sense that the newline it prints
+#is printed to stdout. However, stderr-specific printer functions (e.g.,
+#print_error()) really want to print such newline to stderr instead. It's a
+#rather minor point at the moment, but will probably necessitate splitting this
+#function into start_stdout_delimited() and start_stderr_delimited() at some
+#point.
+#FIXME: Update documentation.
+
+declare_function_with_stdin <<'/---'
+string start_stdout_delimited(void)
+
+Prepare the current terminal for subsequent printing to standard output.
+
+Print whitespace separating subsequent from prior shell output _and_ reset color
+attributes for the current terminal to such terminal's defaults. Only print such
+whitespace if:
+
+* _All of the following hold_:
+** The current shell previously called at least one `zeshy`-specific printer
+   function (e.g., print_string(), print_heading()), a prerequisite of the
+   condition below.
+** The current function was _not_ called directly from the command line (i.e.,
+   was called by another function), a prerequisite of the condition below.
+** The function calling the current function differs from the most recently
+   called printer function. If such functions are the same, their output should
+   usually be conjoined rather than separated by whitespace; if such functions
+   differ, however, separating their output with whitespace usually improves
+   readability and aesthetics.
+* _Or_:
+** The current modification time of standard output (in seconds since the Unix
+   epoch) differs from the previous such time recorded by the most recently
+   called printer function, implying that another runnable run at least one
+   second before the current call but after the most recently called printer
+   function has printed to standard output without calling
+   update_stdout_tracking() to update such time. In theory, all runnables
+   should update such time after printing to standard output; in practice, the
+   ``regulatory burden'' imposed by such a rule guarantees its unlikelihood.
+   While this condition fails to detect runnables run in the same second as the
+   current call which printed to standard output without updating such time, it
+   does reliably detect older such runnables. This condition is a convenience
+   fallback and should _not_ be counted upon.
+/---
+function start_stdout_delimited() {
+    # Validate sanity.
+    die_if_args
+    float stdout_mtime stderr_mtime
+#   output_call_stack
+
+    # Get the time at which the current shell last printed to standard output
+    # *BEFORE* resetting terminal attributes, as the former examines device
+    # files touched by the latter.
+    set_float_to_stdout_mtime stdout_mtime
+
+    # Reset terminal attributes.
+    start_stdout
+
+    # If the global tracking standard output is sane (i.e., is set, nonzero, and
+    # more recent than the time at which the current shell was started), get and
+    # test the time at which such shell last printed to standard output against
+    # such global. If the two differ, output printed to standard output since
+    # the last call to a printer function necessitates a newline delimiting such
+    # output from subsequent output.
+    if (( ${ZESHY_STDOUT_PRIOR_MTIME-0} >= ${ZESHY_TIME_START-1} &&\
+          stdout_mtime > ZESHY_STDOUT_PRIOR_MTIME )) {
+#       output_string_to_stderr "ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}; stdout_mtime: ${stdout_mtime}"
+        output_newline
+    }
+}
+
+# ....................{ STOPPERS                           }....................
+declare_function_with_stdin <<'/---'
+void stop_stdout(void)
+
+Sanitize the current terminal in preparation for subsequent output. See
+reset_terminal_color() for further details.
+/---
+function stop_stdout() {
+    # Reset terminal color *BEFORE* updating output state, as the former
+    # necessarily modifies standard output that the latter tests.
+    die_if_args
+    reset_terminal_color
+}
+
+#FIXME: Fix documentation.
+declare_function_with_stdin <<'/---'
+void stop_stdout_delimited(void)
+
+Update global tracking state for `zeshy` printer functions _and_
+reset color attributes for the current terminal to such terminal's defaults, in
+the correct order. See reset_terminal_color() and update_stdout_tracking() for
+further details.
+
+Update global tracking state for `zeshy` printer functions, including
+${ZESHY_STDOUT_PRIOR_MTIME} and ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}. Such
+state assists subsequent calls to start_stdout_delimited() in deciding
+whether prior output should be delimited from subsequent output with whitespace.
+/---
+function stop_stdout_delimited() {
+    # When debugging, note that it's not genuinely possible to safely print
+    # ${ZESHY_STDOUT_PRIOR_MTIME}. Why? Because merely printing such float
+    # changes the return value of get_stdout_mtime(), guaranteeing the next call
+    # to start_stdout_delimited() to erroneously print whitespace. (Ugh.)
+
+    # Validate sanity.
+    die_if_args
+
+    # Reset terminal attributes *BEFORE* updating output state, as the former
+    # touches device files tested by the latter.
+    stop_stdout
+
+    # Record the modification times of standard output and error.
+    update_stdout_state
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#   return
+    # Technically, we should simply be able to call stop_stdout_delimited() in
+    # lieu of defining and calling a reset-specific state updater. Oddly, that
+    # appears to result in ${ZESHY_STDOUT_PRIOR_MTIME} being several
+    # milliseconds behind the time reported by set_float_to_stdout_mtime() when
+    # called by start_stdout_delimited(). This is almost certainly a zsh-
+    # specific implementation detail. (For example, perhaps zsh silently molests
+    # the terminal device immediately before executing the current command.)
+    #
+    # In any case, this logic suffices.
+#   die_if_args
+
+    # Reset terminal attributes *BEFORE* updating output state, as the former
+    # touches device files tested by the latter.
+#   reset_terminal_color
+
+    # Set such global to a value guaranteeing the main conditional of
+    # stop_stdout_delimited() to fail.
+#   ZESHY_STDOUT_PRIOR_MTIME=0
+
+#Sanitize the current terminal in preparation for subsequent output,
+    # regardless of whether a newline is subsequently printed.
+#FUXME: Identical implementation to stop_stdout_delimited(). Since the latter is
+#considerably more important and sensible than this function, replace this
+#function with stop_stdout_delimited(); excise this function!
+
+#FUXME: Actually, we need to track ZESHY_STDOUT_PRIOR_MTIME as well.
+#Standard output and error are typically both muxed to the terminal and hence
+#should both be considered when deciding whether or not to print a newline
+#prefix.
+
+#       output_string_to_stderr "funcfiletrace[2]: ${funcfiletrace[2]-}; ZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE-}; ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}; stdout_mtime: ${stdout_mtime}"
+#FUXME: Identical implementation to stop_stdout_delimited(). Since the latter is
+#considerably more important and sensible than this function, replace this
+#function with stop_stdout_delimited(); excise this function!
+
+#declare_function_with_stdin <<'/---'
+#void reset_output(void)
+#
+#Reset output state in preparation for subsequent output.
+#
+#global tracking state for `zeshy` printer functions _and_ color attributes
+#for the current terminal to such terminal's defaults, in the correct order. See
+#reset_terminal_color() and reset_stdout_tracking() for further details.
+#/---
+#function reset_output() {
+    # Unlike update_stdout_state_and_reset_terminal_color(), output state and
+    # terminal colors may be reset in either order.
+#   reset_terminal_color
+
+    # Record the modification times of standard output and error.
+#   update_stdout_state
+#}
+
+#   output_string "resetting ZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}" 1>&2
+    # Sanitize the current terminal in preparation for subsequent output.
+    # Time at which the current shell last printed to standard output.
+
+    # If the 
+    # Prefer an "if"- to "and"-style conditional to avoid returning false.
+    # Subtleties abound, ribald bald acolytes.
+
+# ....................{ RESETTERS                          }....................
+#declare_function_with_stdin <<'/---'
+#void reset_terminal_color(void)
+#
+#Reset color attributes for the current terminal to such terminal's defaults
+#(e.g., regular typeface on white foreground and black background).
+#/---
+#function reset_terminal_color() {
+#    die_if_args
+#    output_string_sans_newline_suffix "${ZESHY_STYLE_TO_COLOR[color.reset]-}"
+#}
+
+    # Store the caller name (hopefully, a printer function).
+#   ZESHY_STDOUT_PRIOR_SCRIPT_LINE="${funcfiletrace[2]-}"
+#   print "resetting ZESHY_STDOUT_PRIOR_SCRIPT_LINE: ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}" 1>&2
+
+#FUXME: To ensure such globals are compiled to zeshy's user digest files in
+#their initial empty states, reset_stdout_tracking() should be called as the
+#*ABSOLUTELY* last precompile_zeshy() hook function to be called. Arguably, this
+#calls for a new hook type:
+#
+#    function run_hook_before_zeshy_define_startup_functions() { ... }
+#
+#Like run_hook_on_zeshy_precompile(), such hook must be explicitly handled at the
+#top-level by parcel "compile". Such hook is widely useful and will certainly be
+#of use elsewhere to (attempt to) ensure that aliases and globals to be compiled
+#into startup functions (e.g., startup_zeshy_globals()) are assigned the desired
+#initial values.
+#FUXME: Update documentation.
+
+#declare_function_with_stdin <<'/---'
+#void reset_stdout_tracking(void)
+#
+#Reset global tracking state for `zeshy` printer functions, including
+#${ZESHY_STDOUT_PRIOR_MTIME} and ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}. See
+#update_stdout_tracking() further details.
+#/---
+#function reset_stdout_tracking() {
+#    # Reset such globals.
+#    die_if_args
+#    ZESHY_STDOUT_PRIOR_MTIME=0
+##   ZESHY_STDOUT_PRIOR_SCRIPT_LINE=
+#}
+
+#FUXME: Right. Rename the existing parcel "io/output/output" to
+#"io/output/print" and shift the following output_*() functions to a new parcel
+#"io/output/output".
+#FUXME: Rename to output_line_horizontal(). The caller requires fine control over
+#prefixing and suffixing whitespace; in this case, such whitespace cannot be
+#reliably automated away.
+#FUXME: Not necessarily the best parcel for such function, as it's a tad lower-
+#level.
+#FUXME: Shouldn't we suffix rather than prefix such output with delimiting
+#whitespace, unlike most printer functions? If so, we'll need to call a new
+#print_string_*() variant.
