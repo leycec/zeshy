@@ -66,6 +66,61 @@ input is empty, `zsh` quietly blocks on reading from standard input, which is
 terribly bad.
 /---
 function is_stdin_nonempty() {
+    #FIXME: Ugh. Just because stdin is a pipe does *NOT* imply such input to be
+    #nonempty. I mean, obviously; consider:
+    #    print -n | { is_stdin_pipe and print $(get_stdin) }
+    #The above blocks forever. (I think?) Stdin is an empty pipe! Woops. We've
+    #fixed this below, but I'm unsure if there will be knockon effects elsewhere
+    #in the codebase.
+    #FIXME: Woops. Commenting out "or is_stdin_pipe" basically caused the entire
+    #system to collapse in a demented and feeble manner. What we really need is
+    #a new function is_stdin_pipe_nonempty() and to revise below to:
+    #
+    #   is -s "${ZESHY_STDIN_PATH-/dev/stdin}" si or {
+    #       is_stdin_pipe and is_stdin_pipe_nonempty }
+    #
+    #Problem is, I'm none too sure how to implement is_stdin_pipe_nonempty().
+    #How do we "peek" at a pipe without modifying the stdin it provides? Right.
+    #You can't. Instead, you read a single byte. If it's EOF, you return false;
+    #else, you return true and have to push the byte of stdin on to where it's
+    #supposed to go. This works when you *KNOW* what you want to do with stdin
+    #but utterly fails in the general case (i.e., here). Here's what the
+    #implementation resembles, though I can't imagine using it:
+    #
+    #first_byte=$(dd bs=1 count=1 2>/dev/null | od -t o1 -A n)
+    #if [ -z "$first_byte" ]; then
+    #  # stuff to do if the input is empty
+    #else
+    #  {
+    #    printf "\\${first_byte# }"
+    #    cat
+    #  } | {
+    #    # stuff to do if the input is not empty
+    #  }
+    #fi
+    #FIXME: Apparently, there's a command "ifne" that does something like this.
+    #Ugh. No way we're adding a dependency on some obscure "moreutils" utility.
+    #FIXME: O.K.; forget it. This *CANNOT* be reliably tested. It's infeasible,
+    #because stdin can't be pushed back onto. *EXCISE THIS FUNCTION*. I'm
+    #serious. It's dangerous. Carefully note why this cannot be reliably
+    #achieved. Fortunately, we only call this function in two or three other
+    #functions -- which is great. What we *CAN* do is replace this function with
+    #the following viable alternative:
+    #
+    #function get_stdin_if_found() {
+    #    #FIXME: I think this should work. Test me up.
+    #    string stdin
+    #    if { read -t ${ZESHY_STDIN_FILE_DESCRIPTOR-0} stdin }
+    #        return_string "${stdin}"
+    #    } else {
+    #        return_false
+    #    }
+    #}
+    #
+    #A similar setter is also definable, of course. Do so! Naturally, such
+    #functions are non-blocking. We could also implement blocking versions; but,
+    #honestly, I hardly see the point.
+
     # Ideally, such test would elegantly reduce to the following:
     #
     #     >>> read -t ${ZESHY_STDIN_FILE_DESCRIPTOR-0} -k 0 or is_stdin_pipe
@@ -87,7 +142,7 @@ function is_stdin_nonempty() {
     #
     # Happily, an efficient alternative presents itself: simply test whether the
     # device file for standard input has nonzero size. If it does, standard
-    # input is nonempty; otherwise, as above, standard input still exist in the
+    # input is nonempty; otherwise, as above, standard input still exists in the
     # guise of piped input, which must thus also be tested.
     #
     # Given the criticality and commonality of this operation, one would assume
@@ -132,8 +187,9 @@ function is_stdin_terminal() {
 declare_function_with_stdin <<'/---'
 void set_string_to_stdin[args: string string_name, stdin: string input]
 
-Set the passed string variable to all standard input for this function. For
-safety, this function closes standard input after doing so: e.g.,
+Set the passed string variable to all standard input piped or written by the
+current shell to this function. See set_variable_to_stdin() for further details:
+e.g.,
 
 .set_string_to_stdin()
 ==========================================
@@ -152,32 +208,17 @@ psychological luxury, the most delicious of moral treats.
 ==========================================
 /---
 function set_string_to_stdin() {
-    # Validate passed arguments.
     die_unless_arg 'expected one string name'
-    string string_name="${1}"
-    die_if_stdin_empty
-    die_unless_variable_string "${string_name}"
-
-    # Set such string. Avoid expanding alias get_stdin() here. Naturally, the
-    # reason is fairly subtle. This function is transitively called by printer
-    # functions themselves transitively called by exception handlers. Since
-    # zeshy defines aliases in a startup_zeshy() hook *AND* since exceptions
-    # may be thrown prior to such hook, this function *CANNOT* safely expand any
-    # aliases -- including get_stdin().
-    noop ${(P)string_name::=$(< "${ZESHY_STDIN_PATH-/dev/stdin}")}
-
-    # Close such input, ensuring is_stdin_nonempty() subsequently returns false.
-    # Since expanding alias close_stdin() directly in the body of this function
-    # ensures its expansion at function definition rather than call time,
-    # expanding such alias here is inherently safe -- unlike above.
-    close_stdin
+    string string_name__ssts="${1}"
+    die_unless_variable_string "${string_name__ssts}"
+    set_variable_to_stdin      "${string_name__ssts}"
 }
 
 declare_function_with_stdin <<'/---'
 void set_float_to_stdin[args: string float_name, stdin: float input]
 
-Set the passed float variable to all standard input for this function. For
-safety, this function closes standard input after doing so: e.g.,
+Set the passed float variable to all standard input piped or written by the
+current shell to this function. See set_variable_to_stdin() for further details:
 
 .set_float_to_stdin()
 ==========================================
@@ -191,16 +232,66 @@ safety, this function closes standard input after doing so: e.g.,
 ==========================================
 /---
 function set_float_to_stdin() {
-    # See set_string_to_stdin() for further details.
     die_unless_arg 'expected one float name'
-    string float_name="${1}"
-    die_if_stdin_empty
-    die_unless_variable_float "${float_name}"
-    noop ${(P)float_name::=$(< "${ZESHY_STDIN_PATH-/dev/stdin}")}
-    close_stdin
+    string float_name__sfts="${1}"
+    die_unless_variable_float "${float_name__sfts}"
+    set_variable_to_stdin     "${float_name__sfts}"
+}
+
+#FIXME: Add examples.
+declare_function_with_stdin <<'/---'
+void set_variable_to_stdin[args: string variable_name, stdin: string input]
+
+Set the passed variable to the concatenation of all standard input piped or
+written by the current shell to this function. For safety, this function closes
+such input after doing so.
+/---
+function set_variable_to_stdin() {
+    # Validate passed arguments.
+    die_unless_arg 'expected one string name'
+    string variable_name__svts="${1}"
+    die_unless_variable "${variable_name__svts}"
+
+    # If standard input is nonempty (i.e., at least one byte of input has either
+    # been piped or written to this function), read such input into such string.
+    if { is_stdin_nonempty } {
+#       print 'reading stdin...' 2>&1
+        # Set such string. Avoid expanding alias get_stdin() here. Naturally, the
+        # reason is fairly subtle. This function is transitively called by printer
+        # functions themselves transitively called by exception handlers. Since
+        # zeshy defines aliases in a startup_zeshy() hook *AND* since exceptions
+        # may be thrown prior to such hook, this function *CANNOT* safely expand any
+        # aliases -- including get_stdin().
+        #
+        # The double quotes surrounding such command substitution are *ESSENTIAL*.
+        # Their omission results in newlines in such input being silently converted
+        # to spaces, which (of course) is awful and awfully difficult to debug.
+        noop ${(P)variable_name__svts::="$(< "${ZESHY_STDIN_PATH-/dev/stdin}")"}
+#       print 'reading stdin... ok' 2>&1
+
+        # Close such input, ensuring is_stdin_nonempty() subsequently returns false.
+        # Since expanding alias close_stdin() directly in the body of this function
+        # ensures its expansion at function definition rather than call time,
+        # expanding such alias here is inherently safe -- unlike above.
+        close_stdin
+    # Else, standard input is empty, in which case attempting to read such input
+    # would silently block the current shell until reading such input. As this
+    # would be terrible, *NEVER* read from an empty stream of standard input.
+    } else {
+        noop ${(P)variable_name__svts::=}
+    }
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#       if { is_stdin_pipe } { print 'piped stdin!' 1>&2
+#       } else               { print 'written stdin!' 1>&2 }
+
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with setters below.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+#   noop ${(P)string_name::=$(< "${ZESHY_STDIN_PATH-/dev/stdin}")}
+
 #, running only such command does *NOT*
     # suffice to prove no such input
 #Set the passed float variable to the entirety of standard input. For safety,
