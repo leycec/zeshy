@@ -60,10 +60,9 @@ declare_function_with_stdin <<'/---'
 [status: boolean] is_stdin_nonempty(void)
 
 Return success if standard input for this function is *nonempty* (i.e., if such
-input contains at least one character to be read). Consider calling either this
+input contains at least one byte to be read). Consider calling either this
 function or die_if_stdin_empty() before reading from standard input; if such
-input is empty, `zsh` quietly blocks on reading from standard input, which is
-terribly bad.
+input is empty, `zsh` quietly blocks on reading, which is bad.
 /---
 function is_stdin_nonempty() {
     #FIXME: Ugh. Just because stdin is a pipe does *NOT* imply such input to be
@@ -121,6 +120,8 @@ function is_stdin_nonempty() {
     #functions are non-blocking. We could also implement blocking versions; but,
     #honestly, I hardly see the point.
 
+    #FIXME: Fix such documentation. Namely, remove the "or is_stdin_pipe" and
+    #all discussion thereof.
     # Ideally, such test would elegantly reduce to the following:
     #
     #     >>> read -t ${ZESHY_STDIN_FILE_DESCRIPTOR-0} -k 0 or is_stdin_pipe
@@ -149,7 +150,62 @@ function is_stdin_nonempty() {
     # there to exist a simple builtin or command for doing it. One would be
     # wrong.
     die_if_args
-    is -s "${ZESHY_STDIN_PATH-/dev/stdin}" si or is_stdin_pipe
+    integer exit_status
+    list zselect_status
+
+    # Load zsh module "zselect", if not already. While @{zsh/module} already
+    # autoloads modules on zeshy startup, this function is often called
+    # before completing such startup and hence autoloading.
+    zmodload zsh/zselect
+
+    # Test standard input. Since zselect() returns 2 when the underlying
+    # operating system fails to export the system call select(), capture the
+    # return value and test such value rather than implicitly returning such
+    # return value from this function (as is often done). Since standard input
+    # is shell-specific, such return value *CANNOT* be trivially captured by
+    # command substitution (e.g., "$(zselect ... | get_exit_status)"). Instead,
+    # implement the equivalent of alias set_integer_to_exit_status().
+    # Unfortunately, such alias transitively calls this function; to break the
+    # recursion, this function internally re-implements the
+    # set_integer_to_stdin() function such alias calls. *sigh*
+    #
+    # Dismantled, this is:
+    #
+    # * "-t 0", returning immediately without waiting for standard input to
+    #   receive input. This is essential for non-blocking behavior.
+    # * "-a ...", setting such list to contain a string resembling either
+    #   "-r 0" if standard input is nonempty or "" if standard input is empty.
+    #   Since zselect() defaults such list to ${reply} if unpassed and since
+    #   such list is commonly used by callers and should *NOT* be overwritten by
+    #   such a low-level function as this, explicitly specify such list. Since
+    #   this function never references such list, our specifying it here is
+    #   simply to avoid overwriting ${reply}. Frankly, this "unique" choice of
+    #   API design is one of the more eclectic that we've ever seen. And we were
+    #   proficient in ML... Once.
+    # * "-r ...", testing such file descriptor for nonempty reading.
+    #
+    # Note that the "{" and "}" delimiters surrounding such integer assignment
+    # are essential; neglecting delimiters assigns such integer standard input
+    # to *THIS* function rather than such exit status. (O^o)
+    #
+    # Thus does another feeble mind break.
+    zselect -t 0 -a zselect_status -r ${ZESHY_STDIN_FILE_DESCRIPTOR-0} and
+        output_string ${status} | { exit_status="$(get_stdin)" } or
+        output_string ${status} | { exit_status="$(get_stdin)" }
+
+    # If such status indicates such function to be absent, throw an exception.
+    if (( exit_status == 2 )) {
+        die 'kernel function select() undefined'
+    }
+
+    # Else, return such status as is. Technically, zselect() returns:
+    #
+    # * 0 if any passed file descriptor is both nonempty and readable.
+    # * 1 otherwise.
+    #
+    # Since this function tests only one file descriptor for nonempty reading,
+    # such status exactly coincides with what the caller expects. (Scoooooore!)
+    return ${exit_status}
 }
 
 declare_function_with_stdin <<'/---'
@@ -175,13 +231,13 @@ function is_stdin_terminal() {
 }
 
 #FIXME: In lieu of unit tests...
-#function empo() {
-#    print ok | { if { is_stdin_pipe     } { print 'ok!' } else { print 'ko!' } }
-#    print ok | { if { is_stdin_nonempty } { print 'ok!' } else { print 'ko!' } }
-#    {   print "stdin: $(< /dev/stdin)"
-#        if { is_stdin_nonempty } { print 'ok!' } else { print 'ko!' } } <<< yumo
-#    string yimo; set_string_to_stdin yimo <<< hamo; print "yimo: ${yimo}"
-#}
+function empo() {
+    print ok | { is_stdin_pipe     and print 'ok!' or print 'ko!' }
+    print ok | { is_stdin_nonempty and print 'ok!' or print 'ko!' }
+    {   print "stdin: $(< /dev/stdin)"
+        is_stdin_nonempty and print 'ok!' or print 'ko!' } <<< yumo
+    string yimo; set_string_to_stdin yimo <<< hamo; print "yimo: ${yimo}"
+}
 
 # ....................{ SETTERS                            }....................
 declare_function_with_stdin <<'/---'
@@ -283,6 +339,10 @@ function set_variable_to_stdin() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#   is -s "${ZESHY_STDIN_PATH-/dev/stdin}" si or is_stdin_pipe
+
+#There exists no is_stdin_nonempty()
+
 #       if { is_stdin_pipe } { print 'piped stdin!' 1>&2
 #       } else               { print 'written stdin!' 1>&2 }
 
