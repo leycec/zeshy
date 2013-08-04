@@ -27,9 +27,6 @@ insecurities, such implementation borrows algorithmic inspiration from both
 `mktemp` implementations -- particularly for generating temporary pathnames.
 /---
 
-#FIXME: Note that "POSIX.1-2008 adds a requirement that  the  file  be  created
-#with mode 0600" (i.e., only owner-readable and -writable). In other words,
-#ensure the umask is properly set (...with a subshell, I should think).
 #FIXME: Even this new implementation -- although *MUCH* better -- is still not
 #nearly as secure as simply calling the glibc function mkstemp() would give us.
 #Of course, that brings up a new issue: if zsh ever supported such function
@@ -38,31 +35,51 @@ insecurities, such implementation borrows algorithmic inspiration from both
 #Hence, we'll pretty much *ALWAYS* retain this implementation -- if only as a
 #fallback.
 
-# ....................{ GETTERS                            }....................
-#FIXME: Rename to get_home_temporary().
-declare_function_with_stdin <<'/---'
-string get_home_temporary(void)
-
-Get the absolute path of the first temporary directory writable by the
-current user in the following list (in order):
-
-* `${HOME}/tmp`, the canonical user-specific temporary home.
-* `/tmp`, the canonical system-wide temporary home for non-persistent files.
-* `/var/tmp`, the canonical system-wide temporary home for persistent files.
-/---
-function get_home_temporary() {
-    die_if_args
-    get_dir_writable_first ${HOME}'/tmp' '/tmp' '/var/tmp'
-}
-
 # ....................{ MAKERS                             }....................
 declare_function_with_stdin <<'/---'
-string make_temporary_path(string make_command_name)
+string make_dir_temporary(void)
 
-Get the absolute path of a new temporary file or directory created by passing a
-suitably random basename to the passed command. To obviate common race
-conditions and security concerns, this function guarantees such path to be
-sufficiently:
+Create a temporary directory and return its absolute path: e.g.,
+
+.make_dir_temporary()
+==========================================
+[source]
+------------------------------------------
+>>> make_dir_temporary
+/tmp/zeshy-leycec/703693778
+------------------------------------------
+==========================================
+/---
+function make_dir_temporary() {
+    make_temporary_path 'make_dir' "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+string make_file_temporary(void)
+
+Create a temporary file and return its absolute path: e.g.,
+
+.make_file_temporary()
+==========================================
+[source]
+------------------------------------------
+>>> make_file_temporary
+/tmp/zeshy-leycec/703693778
+------------------------------------------
+==========================================
+/---
+function make_file_temporary() {
+    make_temporary_path 'make_file' "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+string make_path_temporary(string make_command_name)
+
+Create a temporary path by calling the passed command with such path and return
+such path. By design, such path is guaranteed to be the absolute path of a file
+or directory with suitably pseudorandom basename under
+${ZESHY_DIR_USER_TEMPORARY} (e.g., `/tmp/zeshy-leycec/84653626`) satisfying the
+following security concerns:
 
 * **Unique.** Such path will be specifically created by this call and hence
   _never_ overwrite an existing path.
@@ -80,151 +97,80 @@ theory, another concurrent process could delete (or move) this path after
 this function creates this path but before returning. It bears mentioning that
 the external `mktemp` command itself suffers the same caveats.
 /---
-function make_temporary_path() {
+function make_path_temporary() {
     # Validate sanity.
     die_unless_arg 'Expected one command name.'
-    string\
-        make_command_name="${1}"\
-        temporary_home\
-        temporary_dirname_prefix="${2+${2}~}"\
-        temporary_dirname
+    string make_command_name="${1}"
     die_unless_runnable "${make_command_name}"
+    die_unless_path_writable "${ZESHY_DIR_USER_TEMPORARY}"
 
-    # Directory to create such path under.
-    temporary_home="$(get_home_temporary)"
+    # Create such path in a subshell, localizing the side effect of the call to
+    # set_path_creation_mask() (i.e., setting the umask) to such subshell. While
+    # forking a subshell to do so is mildly regrettable, the alternatives are
+    # notably worse.
+    (
+        string pathname basename
+        integer attempt_number basename_index characters_count
 
-    # There exist numerous versions of "mktemp". The GNU coreutils version only
-    # calls glibc function mkstemp(), which zsh does not provide access to. The
-    # independent http://www.mktemp.org version calls arc4random_uniform(), an
-    # OpenBSD-based cryptography algorithm for generating secure random numbers.
-    # Since reimplementing either in zsh is out of the question, the algorithm
-    # below is inspired by the markedly simpler attempt at:
-    #
-    # http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=495193#89
-    while (true) {
-        # If the desired temporary path does not exist...
-        temporary_dirname="${temporary_home}/${temporary_dirname_prefix}$(date +'%F_%H-%M-%S_%N')"
-        if { not is_path "${temporary_dirname}" } {
-            # ...and is successfully created, return its absolute path.
-            if { "${make_command_name}" "${temporary_dirname}" } {
-                return_string "${temporary_dirname}"
-            # ...and is *NOT* successfully created and the temporary home
-            # directory is not writable, throw an exception. This is probably
-            # incredibly rare, but could theoretically occur if the current user
-            # loses write permissions to the temporary home directory after the
-            # prior call to get_home_temporary(). In such a case, failing to
-            # explicitly test this case induces an infinite loop. Which is bad.
-            } elif { not is_path_writable "${temporary_home}" } {
-                die "\"${temporary_home}\" unwritable."
-            # Else, another concurrent process (probably calling this
-            # function) successfully created this directory after the call to
-            # is_path() but before the call to make_directory(). Try again!
+        # For security, ensure such path will be readable and writable only by
+        # the current user (an approach also taken by most if not all `mktemp`
+        # implementations).
+        set_path_creation_mask u=rw
+
+        # Reseed zsh's internal random number generator. For efficiency and
+        # generality, prefer such generation to rand48()-based generation. See
+        # get_integer_random_in_range() for further details.
+        RANDOM=${EPOCHREALTIME##*.}
+
+        # Placeholder basename of such path to be overwritten below. Such string
+        # should contain a sufficiently secure number of characters. For example,
+        # the gnu coreutils version of `mktemp` defaults to a basename suffix of 10
+        # random characters.
+        basename='XXXXXXXXXX'
+
+        # Number of possible random characters to be inserted into such basename.
+        characters_count=${#ZESHY_CHARACTERS_ALPHANUMERIC}
+
+        # There exist numerous versions of "mktemp". The GNU coreutils version only
+        # calls glibc function mkstemp(), which zsh does not provide access to. The
+        # independent http://www.mktemp.org version calls arc4random_uniform(), an
+        # OpenBSD-based cryptography algorithm for generating secure random numbers.
+        # Since reimplementing either in zsh is out of the question, the algorithm
+        # below is inspired by the markedly simpler attempt at:
+        #
+        # http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=495193#89
+        for (( attempt_number=1; attempt_number < 8; ++attempt_number )) {
+            # Randomize such basename. For efficiency, overwrite existing characters
+            # of such string rather than appending characters to an empty string.
+            # For safety, insert only alphanumeric characters into such string (an
+            # approach also taken by most if not all `mktemp` implementations). For
+            # efficiency, inline such implementation. See
+            # get_character_random_alphanumeric() for further details.
+            for (( basename_index=1;
+                   basename_index <= ${#basename};
+                 ++basename_index )) {
+                # Since ${RANDOM} ranges [0, 32768], normalize such integer to the
+                # list length of ${ZESHY_CHARACTERS_ALPHANUMERIC}. See
+                # get_integer_random_in_range() for further details.
+                basename[${basename_index}]=${ZESHY_CHARACTERS_ALPHANUMERIC[$(( 1 + (RANDOM % ${characters_count}) ))]}
             }
-        # Else, the desired temporary path already exists (probably
-        # by some prior call to this function). Try again!
-        }
-    }
-}
 
-# ....................{ MAKERS ~ prefix                    }....................
-#FIXME: These should all simply be deleted. *HONESTLY*. Where's the benefit in
-#obscene complexity? They don't conform to "mkstemp" or "mktemp" syntax,
-#rendering them both useless *AND* insecure. Hack; kill; excise.
-#FIXME: Rename to make_dir_temporary_with_prefix() and similarly below. Require
-#such prefix to be mandatory. (The function name makes little sense otherwise.)
+            # Temporary pathname to be created.
+            pathname="${ZESHY_DIR_USER_TEMPORARY}/${basename}"
 
-declare_function_with_stdin <<'/---'
-string make_dir_temporary_prefixed_with(string prefix = "")
-
-Make a new temporary directory with basename prefixed by the passed prefix
-(defaulting to the empty string) and return its absolute path: e.g.,
-
-.make_dir_temporary_prefixed_with()
-==========================================
-[source]
-------------------------------------------
->>> make_dir_temporary_prefixed_with ursus_maritimus
-/tmp/ursus_maritimus~2012-04-18_22-58-34_609198275
-------------------------------------------
-==========================================
-/---
-function make_dir_temporary_prefixed_with() {
-    make_temporary_path_prefixed_with 'make_dir' "${@}"
-}
-
-declare_function_with_stdin <<'/---'
-string make_file_temporary_prefixed_with(string prefix = "")
-
-Make a new temporary file with basename prefixed by the passed prefix
-(defaulting to the empty string) and return its absolute path: e.g.,
-
-.make_file_temporary_prefixed_with()
-==========================================
-[source]
-------------------------------------------
->>> make_file_temporary_prefixed_with ursus_nanulak
-/tmp/ursus_nanulak~2012-04-18_22-58-34_609198275
-------------------------------------------
-==========================================
-/---
-function make_file_temporary_prefixed_with() {
-    make_temporary_path_prefixed_with 'make_file' "${@}"
-}
-
-declare_function_with_stdin <<'/---'
-string make_temporary_path_prefixed_with(
-    string make_command_name, string prefix = '')
-
-Make a new temporary path with basename prefixed by the passed prefix
-(defaulting to the empty string) by calling the passed command and return its
-absolute pathname. This helper function avoids common race conditions by
-guaranteeing only this and no prior call created this path, with caveats.
-
-== Caveats ==
-
-This function _cannot_ guarantee the returned path exists on returning. It
-guarantees only that the returned path once existed prior to returning. In
-theory, another concurrent process could delete (or move) this path after
-this function creates this path but before returning.
-
-It bears mentioning that the external `mktemp` command itself suffers the same
-caveats -- as indeed do _all_ 
-/---
-function make_temporary_path_prefixed_with() {
-    # If the caller passed a prefix, suffix such prefix with a delimiter
-    # separating that prefix from a uniquifying current date and time string.
-    die_unless_args_1_to_2\
-        'Expected one command name and optional dirname prefix.'
-    string\
-        make_command_name="${1}"\
-        temporary_home="$(get_home_temporary)"\
-        temporary_dirname_prefix="${2+${2}~}"\
-        temporary_dirname
-    die_unless_runnable "${make_command_name}"
-
-    while (true) {
-        # If the desired temporary path does not exist...
-        temporary_dirname="${temporary_home}/${temporary_dirname_prefix}$(date +'%F_%H-%M-%S_%N')"
-        if { not is_path "${temporary_dirname}" } {
-            # ...and is successfully created, return its absolute path.
-            if { "${make_command_name}" "${temporary_dirname}" } {
-                return_string "${temporary_dirname}"
-            # ...and is *NOT* successfully created and the temporary home
-            # directory is not writable, raise an exception. This is probably
-            # incredibly rare, but could theoretically occur if the current user
-            # loses write permissions to the temporary home directory after the
-            # prior call to get_home_temporary(). In such a case, failing to
-            # explicitly test this case induces an infinite loop. Which is bad.
-            } elif { not is_path_writable "${temporary_home}" } {
-                die "\"${temporary_home}\" unwritable."
-            # ...otherwise, another concurrent process (probably calling this
-            # function) successfully created this directory after the call to
-            # is_path() but before the call to make_directory(). Try again!
+            # If such path did not exist but was successfully created by such
+            # command, return such pathname. For efficiency, inline such test. See
+            # is_path() for further details.
+            if { not is -e "${pathname}" si and
+                 "${make_command_name}" "${pathname}" } {
+                return_string "${pathname}"
             }
-        # ...otherwise, the desired temporary path already exists (probably
-        # by some prior call to this function). Try again!
         }
-    }
+    )
+
+    # Such loop failed to return a pathname and hence must have broached the
+    # maximum number of attempts. Throw an exception!
+    die "${make_command_name}() failed to create a temporary path under \"${ZESHY_DIR_USER_TEMPORARY}\" after ${attempt_number} attempts."
 }
 
 # ....................{ MOVERS                             }....................
@@ -282,6 +228,148 @@ function move_to_temporary_dir() {
 #}
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: Note that "POSIX.1-2008 adds a requirement that  the  file  be  created
+#with mode 0600" (i.e., only owner-readable and -writable). In other words,
+#ensure the umask is properly set (...with a subshell, I should think).
+
+#Make a new temporary directory with basename prefixed by the passed prefix
+#(defaulting to the empty string) and return its absolute path: e.g.,
+
+#Get the absolute path of a new temporary file or directory created by passing a
+#suitably random basename to the passed command. To obviate common race
+#conditions and security concerns, this function guarantees such path to be
+#sufficiently:
+
+# ....................{ MAKERS ~ prefix                    }....................
+#FUXME: These should all simply be deleted. *HONESTLY*. Where's the benefit in
+#obscene complexity? They don't conform to "mkstemp" or "mktemp" syntax,
+#rendering them both useless *AND* insecure. Hack; kill; excise.
+#FUXME: Rename to make_dir_temporary_with_prefix() and similarly below. Require
+#such prefix to be mandatory. (The function name makes little sense otherwise.)
+
+#declare_function_with_stdin <<'/---'
+#string make_dir_temporary_prefixed_with(string prefix = "")
+#
+#Make a new temporary directory with basename prefixed by the passed prefix
+#(defaulting to the empty string) and return its absolute path: e.g.,
+#
+#.make_dir_temporary_prefixed_with()
+#==========================================
+#[source]
+#------------------------------------------
+#>>> make_dir_temporary_prefixed_with ursus_maritimus
+#/tmp/ursus_maritimus~2012-04-18_22-58-34_609198275
+#------------------------------------------
+#==========================================
+#/---
+#function make_dir_temporary_prefixed_with() {
+#    make_temporary_path_prefixed_with 'make_dir' "${@}"
+#}
+#
+#declare_function_with_stdin <<'/---'
+#string make_file_temporary_prefixed_with(string prefix = "")
+#
+#Make a new temporary file with basename prefixed by the passed prefix
+#(defaulting to the empty string) and return its absolute path: e.g.,
+#
+#.make_file_temporary_prefixed_with()
+#==========================================
+#[source]
+#------------------------------------------
+#>>> make_file_temporary_prefixed_with ursus_nanulak
+#/tmp/ursus_nanulak~2012-04-18_22-58-34_609198275
+#------------------------------------------
+#==========================================
+#/---
+#function make_file_temporary_prefixed_with() {
+#    make_temporary_path_prefixed_with 'make_file' "${@}"
+#}
+#
+#declare_function_with_stdin <<'/---'
+#string make_temporary_path_prefixed_with(
+#    string make_command_name, string prefix = '')
+#
+#Make a new temporary path with basename prefixed by the passed prefix
+#(defaulting to the empty string) by calling the passed command and return its
+#absolute pathname. This helper function avoids common race conditions by
+#guaranteeing only this and no prior call created this path, with caveats.
+#
+#== Caveats ==
+#
+#This function _cannot_ guarantee the returned path exists on returning. It
+#guarantees only that the returned path once existed prior to returning. In
+#theory, another concurrent process could delete (or move) this path after
+#this function creates this path but before returning.
+#
+#It bears mentioning that the external `mktemp` command itself suffers the same
+#caveats -- as indeed do _all_ 
+#/---
+#function make_temporary_path_prefixed_with() {
+#    # If the caller passed a prefix, suffix such prefix with a delimiter
+#    # separating that prefix from a uniquifying current date and time string.
+#    die_unless_args_1_to_2\
+#        'Expected one command name and optional dirname prefix.'
+#    string\
+#        make_command_name="${1}"\
+#        temporary_home="$(get_home_temporary)"\
+#        temporary_dirname_prefix="${2+${2}~}"\
+#        temporary_dirname
+#    die_unless_runnable "${make_command_name}"
+#
+#    while (true) {
+#        # If the desired temporary path does not exist...
+#        temporary_dirname="${temporary_home}/${temporary_dirname_prefix}$(date +'%F_%H-%M-%S_%N')"
+#        if { not is_path "${temporary_dirname}" } {
+#            # ...and is successfully created, return its absolute path.
+#            if { "${make_command_name}" "${temporary_dirname}" } {
+#                return_string "${temporary_dirname}"
+#            # ...and is *NOT* successfully created and the temporary home
+#            # directory is not writable, raise an exception. This is probably
+#            # incredibly rare, but could theoretically occur if the current user
+#            # loses write permissions to the temporary home directory after the
+#            # prior call to get_home_temporary(). In such a case, failing to
+#            # explicitly test this case induces an infinite loop. Which is bad.
+#            } elif { not is_path_writable "${temporary_home}" } {
+#                die "\"${temporary_home}\" unwritable."
+#            # ...otherwise, another concurrent process (probably calling this
+#            # function) successfully created this directory after the call to
+#            # is_path() but before the call to make_directory(). Try again!
+#            }
+#        # ...otherwise, the desired temporary path already exists (probably
+#        # by some prior call to this function). Try again!
+#        }
+#    }
+#}
+
+            # Else, such path could not be created. If temporary home
+            # directory is not writable, throw an exception. This is probably
+            # incredibly rare, but could theoretically occur if the current user
+            # loses write permissions to the temporary home directory after the
+            # prior call to get_home_temporary(). In such a case, failing to
+            # explicitly test this case induces an infinite loop. Which is bad.
+#           } elif { not is_path_writable "${temporary_home}" } {
+#               die "\"${temporary_home}\" unwritable."
+            # Else, another concurrent process (probably calling this
+            # function) successfully created this directory after the call to
+            # is_path() but before the call to make_directory(). Try again!
+
+# ....................{ GETTERS                            }....................
+#FUXME: Rename to get_home_temporary().
+#declare_function_with_stdin <<'/---'
+#string get_home_temporary(void)
+#
+#Get the absolute path of the first temporary directory writable by the
+#current user in the following list (in order):
+#
+#* `${HOME}/tmp`, the canonical user-specific temporary home.
+#* `/tmp`, the canonical system-wide temporary home for non-persistent files.
+#* `/var/tmp`, the canonical system-wide temporary home for persistent files.
+#/---
+#function get_home_temporary() {
+#    die_if_args
+#    get_dir_writable_first ${HOME}'/tmp' '/tmp' '/var/tmp'
+#}
+
 # Short of patching `zsh`
 #with mutual exclusion primitives, this is unlikely to be correctable.
 
