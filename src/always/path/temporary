@@ -51,7 +51,7 @@ Create a temporary directory and return its absolute path: e.g.,
 ==========================================
 /---
 function make_dir_temporary() {
-    make_temporary_path 'make_dir' "${@}"
+    make_path_temporary make_dir "${@}"
 }
 
 declare_function_with_stdin <<'/---'
@@ -69,7 +69,7 @@ Create a temporary file and return its absolute path: e.g.,
 ==========================================
 /---
 function make_file_temporary() {
-    make_temporary_path 'make_file' "${@}"
+    make_path_temporary make_file "${@}"
 }
 
 declare_function_with_stdin <<'/---'
@@ -89,89 +89,115 @@ following security concerns:
   processes with access to such path (e.g., running as the current user).
 * **Simple.** Such path contains only alphanumeric characters.
 
+For example:
+
+.make_path_temporary()
+==========================================
+[source]
+------------------------------------------
+>>> string pathname
+>>> pathname="$(make_path_temporary touch)"
+>>> print_string "${pathname}"
+/tmp/zeshy-leycec/HC7IcSzQhq
+>>> list_path_verbosely "${pathname}"
+-rw------- 1 leycec leycec 0 2013-08-05 03:58 HC7IcSzQhq
+------------------------------------------
+==========================================
+
 == Caveats ==
+
+This function modifies the shell umask and hence should be called only from
+subshells (e.g., command substitution, as in the example). Improperly calling
+this function from the current shell will silently _and_ permanently restrict
+such shell's umask to 0600. Since this function can only be usefully called
+from command substitutions and the left-hand side of pipes, this is typically
+not a concern.
 
 This function _cannot_ guarantee such path to exist on returning. It
 guarantees only that the returned path once existed prior to returning. In
 theory, another concurrent process could delete (or move) this path after
 this function creates this path but before returning. It bears mentioning that
-the external `mktemp` command itself suffers the same caveats.
+the external `mktemp` command itself suffers the same race condition.
 /---
 function make_path_temporary() {
     # Validate sanity.
     die_unless_arg 'Expected one command name.'
     string make_command_name="${1}"
     die_unless_runnable "${make_command_name}"
-    die_unless_path_writable "${ZESHY_DIR_USER_TEMPORARY}"
+    die_unless_dir_writable "${ZESHY_DIR_USER_TEMPORARY}"
 
-    # Create such path in a subshell, localizing the side effect of the call to
-    # set_path_creation_mask() (i.e., setting the umask) to such subshell. While
-    # forking a subshell to do so is mildly regrettable, the alternatives are
-    # notably worse.
-    (
-        string pathname basename
-        integer attempt_number basename_index characters_count
+    # All of the following functionality *MUST* be executed in a subshell, to
+    # avoid permanently setting such umask. We implicitly assume the caller does
+    # so on our behalf.
+    string pathname basename
+    integer attempt_number basename_index characters_count
 
-        # For security, ensure such path will be readable and writable only by
-        # the current user (an approach also taken by most if not all `mktemp`
-        # implementations).
-        set_path_creation_mask u=rw
+    # For security, ensure such path will be readable and writable only by
+    # the current user (an approach also taken by most if not all `mktemp`
+    # implementations).
+    set_path_creation_mask u=rw,g=,o=
 
-        # Reseed zsh's internal random number generator. For efficiency and
-        # generality, prefer such generation to rand48()-based generation. See
-        # get_integer_random_in_range() for further details.
-        RANDOM=${EPOCHREALTIME##*.}
+    # Reseed zsh's internal random number generator. For efficiency and
+    # generality, prefer such generation to rand48()-based generation. See
+    # get_integer_random_in_range() for further details.
+    RANDOM=${EPOCHREALTIME##*.}
 
-        # Placeholder basename of such path to be overwritten below. Such string
-        # should contain a sufficiently secure number of characters. For example,
-        # the gnu coreutils version of `mktemp` defaults to a basename suffix of 10
-        # random characters.
-        basename='XXXXXXXXXX'
+    # Placeholder basename of such path to be overwritten below. Such string
+    # should contain a sufficiently secure number of characters. For example,
+    # the gnu coreutils version of `mktemp` defaults to a basename suffix of 10
+    # random characters.
+    basename='XXXXXXXXXX'
 
-        # Number of possible random characters to be inserted into such basename.
-        characters_count=${#ZESHY_CHARACTERS_ALPHANUMERIC}
+    # Number of possible random characters to be inserted into such basename.
+    characters_count=${#ZESHY_CHARACTERS_ALPHANUMERIC}
 
-        # There exist numerous versions of "mktemp". The GNU coreutils version only
-        # calls glibc function mkstemp(), which zsh does not provide access to. The
-        # independent http://www.mktemp.org version calls arc4random_uniform(), an
-        # OpenBSD-based cryptography algorithm for generating secure random numbers.
-        # Since reimplementing either in zsh is out of the question, the algorithm
-        # below is inspired by the markedly simpler attempt at:
-        #
-        # http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=495193#89
-        for (( attempt_number=1; attempt_number < 8; ++attempt_number )) {
-            # Randomize such basename. For efficiency, overwrite existing characters
-            # of such string rather than appending characters to an empty string.
-            # For safety, insert only alphanumeric characters into such string (an
-            # approach also taken by most if not all `mktemp` implementations). For
-            # efficiency, inline such implementation. See
-            # get_character_random_alphanumeric() for further details.
-            for (( basename_index=1;
-                   basename_index <= ${#basename};
-                 ++basename_index )) {
-                # Since ${RANDOM} ranges [0, 32768], normalize such integer to the
-                # list length of ${ZESHY_CHARACTERS_ALPHANUMERIC}. See
-                # get_integer_random_in_range() for further details.
-                basename[${basename_index}]=${ZESHY_CHARACTERS_ALPHANUMERIC[$(( 1 + (RANDOM % ${characters_count}) ))]}
-            }
-
-            # Temporary pathname to be created.
-            pathname="${ZESHY_DIR_USER_TEMPORARY}/${basename}"
-
-            # If such path did not exist but was successfully created by such
-            # command, return such pathname. For efficiency, inline such test. See
-            # is_path() for further details.
-            if { not is -e "${pathname}" si and
-                 "${make_command_name}" "${pathname}" } {
-                return_string "${pathname}"
-            }
+    # There exist numerous versions of "mktemp". The GNU coreutils version only
+    # calls glibc function mkstemp(), which zsh does not provide access to. The
+    # independent http://www.mktemp.org version calls arc4random_uniform(), an
+    # OpenBSD-based cryptography algorithm for generating secure random numbers.
+    # Since reimplementing either in zsh is out of the question, the algorithm
+    # below is inspired by the markedly simpler attempt at:
+    #
+    # http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=495193#89
+    for (( attempt_number=1; attempt_number < 8; ++attempt_number )) {
+        # Randomize such basename. For efficiency, overwrite existing characters
+        # of such string rather than appending characters to an empty string.
+        # For safety, insert only alphanumeric characters into such string (an
+        # approach also taken by most if not all `mktemp` implementations). For
+        # efficiency, inline such implementation. See
+        # get_character_random_alphanumeric() for further details.
+        for (( basename_index=1;
+               basename_index <= ${#basename};
+             ++basename_index )) {
+            # Since ${RANDOM} ranges [0, 32768], normalize such integer to the
+            # list length of ${ZESHY_CHARACTERS_ALPHANUMERIC}. See
+            # get_integer_random_in_range() for further details.
+            basename[${basename_index}]=${ZESHY_CHARACTERS_ALPHANUMERIC[$(( 1 + (RANDOM % ${characters_count}) ))]}
         }
-    )
+
+        # Temporary pathname to be created.
+        pathname="${ZESHY_DIR_USER_TEMPORARY}/${basename}"
+
+        # If such path did not exist but was successfully created by such
+        # command, return such pathname. For efficiency, inline such test. See
+        # is_path() for further details.
+        if { not is -e "${pathname}" si and
+             "${make_command_name}" "${pathname}" } {
+            return_string "${pathname}"
+        }
+    }
 
     # Such loop failed to return a pathname and hence must have broached the
     # maximum number of attempts. Throw an exception!
     die "${make_command_name}() failed to create a temporary path under \"${ZESHY_DIR_USER_TEMPORARY}\" after ${attempt_number} attempts."
 }
+
+#FIXME: In lieu of unit tests...
+#function tamp() {
+#    string pathname
+#    pathname="$(make_file_temporary)"
+#    list_path_verbosely "${pathname}"
+#}
 
 # ....................{ MOVERS                             }....................
 #FIXME: Obsolete, once we complete a working remove_file() function. Also, the
@@ -228,6 +254,11 @@ function move_to_temporary_dir() {
 #}
 
 # --------------------( WASTELANDS                         )--------------------
+# Create such path in a subshell, localizing the side effect of the call to
+# set_path_creation_mask() (i.e., setting the umask) to such subshell. While
+# forking a subshell to do so is mildly regrettable, the alternatives are
+# notably worse.
+
 #FUXME: Note that "POSIX.1-2008 adds a requirement that  the  file  be  created
 #with mode 0600" (i.e., only owner-readable and -writable). In other words,
 #ensure the umask is properly set (...with a subshell, I should think).
