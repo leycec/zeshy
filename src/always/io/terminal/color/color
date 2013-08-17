@@ -14,11 +14,347 @@ Handle terminal colors.
 #FIXME: Add support for fish-like syntax highlighting. Happily, someone's
 #already gone to the work of zshifying this; we'll just want to zeshify it a
 #bit: https://github.com/zsh-users/zsh-syntax-highlighting
+
 #FIXME: Add support for 256 color-enabled terminals (e.g., xterm-(256)color,
 #urxvt-unicode-256color). Oooooooh, man. I'm pretty sure I crawled across
 #some zsh code the other day simplifying such support... Hmmmmmmmm.
 #FIXME: It looks like KDE's Konsole even supports 24-bit colors! Wild. See:
 #https://github.com/robertknight/konsole/blob/master/user-doc/README.moreColors
+#FIXME: O.K.; I've heavily looked into the issue. It's certainly more than
+#feasible, but we'll need to liberally borrow from a few different sources.
+#
+#First, note function wmiintf() at
+#https://github.com/zOrg1331/zsh-configs/blob/master/.zsh/rc/S58_wmii. This
+#function retrieves the RGB color values given a passed X11 color name. We
+#actually want to do something like the reserve: for each such name, we want to
+#define a corresponding "color."-prefixed pseudo-style in ${ZESHY_STYLE_TO_COLOR}
+#expanding to the ANSI sequence best approximating such color on the current
+#terminal. Err. Actually, don't do that. It sounds rather expensive! Certainly,
+#most users would never use most such colors. O.K.; well, we could at least
+#define a converter convert_color_name_to_ansi() converting the passed X11 color
+#name to the ANSI sequence best approximating such color on the current
+#terminal. How do you do that, exactly? Read onward!
+#
+#Next, note Perl script "~/tmp/xterm-*/vttests/256colors.pl". Pretty awesome.
+#It's by the "xterm" authors and hence the canonical definition for calculating
+#indices and color values for both the 6x6x6 color cube and greyscale ramp. It's
+#also *VERY* readable, which is great. But this alone isn't quite enough...
+#
+#We also need "CSApprox.vim" at "~/tmp/csapprox/", an utterly awesome ViM
+#plugin that does pretty much everything we need. (If he can do it in ViM, we
+#can certainly do it in zeshy!) The core components to look at are:
+#
+#* "autoload/csapprox/per_component.vim", whose function
+#  csapprox#per_component#Approximate() maps the passed RGB value to the closest
+#  256-color index. Pretty sweet stuff. This function in turn leverages...
+#* "autoload/csapprox/common.vim", which defines the "ramp" (i.e., distance
+#  between) for each of the 6 possible "steps" of each of the 3 dimensions (red,
+#  green, and blue) in such color cube -- as well as for the greyscale line.
+#  Ignore everything but the "xterm" values, here -- the industry has very well
+#  standardized on such pallette for most intents and purposes.
+#* "autoload/csapprox.vim", which basically converts "/usr/share/X11/rgb.txt"
+#  into ViM format. This is nice -- but, arguably, we should be using the
+#  "rgb.txt" bundled with the current system... Err, or should we? Hmmmmm. No,
+#  perhaps not. X11 is going away, so "rgb.txt" is probably going away as well.
+#  But X11 also isn't applicable to non-UNIX systems. Right. So, just bundle our
+#  own copy in "zsh" map format. Sweet!
+#* "plugin/CSApprox.vim". The helpful part here is the part where it leverages
+#  "showrgb" if available and otherwise manually parses apart "rgb.txt". That
+#  said, it only does any of this if an option is set (...defaulting to "false"?)
+#  Right. We can probably rely on a bundled "rgb.txt" in map format, for now.
+#  The remainder of this file appears ViM-specific and hence functionally
+#  useless for our vagabond purposes.
+#
+#Last, note the variants on the zsh-specific code snippet "spectrum":
+#
+#* https://github.com/sykora/etc/blob/master/zsh/functions/spectrum
+#  The official "spectrum". Since this uses ANSI rather than prompt escapes,
+#  this is somewhat more useful for our purposes.
+#* https://github.com/robbyrussell/oh-my-zsh/blob/master/lib/spectrum.zsh
+#  The unofficial "oh-my-zsh" variant. While less useful, this does provide a
+#  helpful function spetrum_ls() for printing all such colors. Note this version
+#  prints foreground rather than background colors, however, and hence could be
+#  demonstrably improved.
+#
+#That's it. It's all basically in the "autoload/" subdirectory. Get thee hence!
+#FIXME: O.K.; I've started mucking around with the math. Efficiently mapping
+#arbitrary RGB values to 6x6x6 RGB color cube values is an interesting topic.
+#Thankfully, it's clearly doable. The steps are as follows:
+#
+#    list steps; steps=(0, 95, 135, 175, 215, 255)
+#
+#While the first step is 95 units apart, the remainder are all only 40 units
+#apart. Hence, each R, G, and B component can be mapped as follows:
+#
+#    # Original R, G, or B component (i.e., in [0, 255]).
+#    integer color_value
+#
+#    # Such component mapped to a color cube index (i.e., in [0, 5]). For
+#    # math simplicity, such indices are 0- rather than 1-based!
+#    integer color_index
+#
+#    # Map the former to latter, implicitly rounding down to the largest integer
+#    # less than or equal to the result.
+#    color_index=$(( (color_value - 95)/160*4 + 1 ))
+#
+#    # If such index is negative, coerce such index to 0. The prior mapping
+#    # erroneously maps color values in [0, 55] to -1. While this is
+#    # unavoidable, the correction is quite efficient.
+#    if (( color_index < 0 )) {
+#       color_index=0
+#    }
+#
+#This isn't *QUITE* right, of course, but it's close. We want to map values
+#according to their proximity to the mid-point of each step. Contemplate.
+#
+#Let's see. The mid-points are integers (excluding the first mid-point, a float)
+#as follows:
+#
+#    list mpoints; mpoints=(47.5, 115, 155, 195, 235)
+#
+#The distances between each such mid-points are:
+#
+#    list mpoint_dists; mpoint_dists=(47.5, 67.5, 40, 40, 40, 20)
+#
+#That doesn't look terribly good. Let's try a different tact. We want to bin as
+#follows:
+#
+#* Color values in [  0,  48] (rounding up, as the eye perceives darker
+#  intensities with less granularity) to color index 0.
+#* Color values in [ 49, 115] to color index 1.
+#* Color values in [116, 155] to color index 2.
+#* Color values in [156, 195] to color index 3.
+#* Color values in [196, 235] to color index 4.
+#* Color values in [235, 255] to color index 5.
+#
+#Woops. That clearly short-changes index 5 and overly apportions into index 1.
+#Contemplate a new mapping that gives equal apportionment to such values. How
+#about:
+#
+#* Color values in [  0,  48] to color index 0.
+#* Color values in [ 49,  95] to color index 1.
+#* Color values in [ 95, 135] to color index 2.
+#* Color values in [135, 175] to color index 3.
+#* Color values in [175, 215] to color index 4.
+#* Color values in [215, 255] to color index 5.
+#
+#Ugh. Mathematically, that *IS* more pristine -- but think about. Colors with R,
+#G, and B values all in [215, 255] will be mapped to pure white! Under the above
+#transformation, this only happens with R, G, and B values all in [235, 255],
+#which is quite a bit more tolerable. Given the rather arbitrary choice of color
+#pallette ("Curse you, xterm! We love you, but... really."), we may not have
+#terribly much choice. For a similar reason, we should (however) probably
+#tighten the lower bounds. We really don't want to map to pure black unless we
+#can help it. How about the following mid-points with distances:
+#
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=(  65, 105, 145, 185, 225)
+#    list mpoint_dists; mpoint_dists=(65, 40, 40, 40, 40, 30)
+#
+#Or, perhaps:
+#
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=(  70, 110, 150, 190, 230)
+#    list distans; distans=( 70, 40, 40,  40, 40,  25)
+#
+#The latter are centered somewhat more cleanly around the bilinear midpoints
+#(i.e., (47.5, 115, 155, 195, 235)), apportioning slightly more values to the
+#first and last indices and substantially fewer to the second index. Though,
+#perhaps we want something even *MORE* graduated: e.g.,
+#
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=(  65, 115, 155, 195, 230)
+#    list distans; distans=( 65, 50, 40,  40, 35,  25)
+#    list distan2; distan2=(   15, 10, 10,   5, 10)
+#
+#    # Still not quite right, clearly. How about:
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=(  60, 110, 150, 190, 220)
+#    list distans; distans=( 60, 50, 40,  40, 30,  30)
+#    list distan2; distan2=(   10, 10,  0,   10, 0)
+#
+#    # That looks pretty sweet. But we can do better:
+#    list mpoints; mpoints=(  48, 115, 155, 195, 235)    # original
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=(  60, 110, 155, 195, 230)
+#    list distans; distans=( 60, 50, 45,  40,  35, 25)
+#    list distan2; distan2=(  -10, -5, -5,  -5, -10)
+#
+#    # What's nice about that is that the upper ends are twice as compressed as
+#    # everything else in the "middle". This is probably what we want, to avoid
+#    # mapping to much to either pure white. That said, we do still map quite a
+#    # bit to pure black. Perhaps we can do better:
+#    list mpoints; mpoints=(  48, 115, 155, 195, 235)    # original
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=( 55,  110, 155, 195, 230)
+#    list distans; distans=(55, 55,  45,  40,  35, 25)
+#    list distan2; distan2=(  0,  -10, -5,  -5,  -10)
+#
+#    # Perhaps we can do better:
+#    list mpoints; mpoints=(  48, 115, 155, 195, 235)    # original
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=( 50, 100, 145, 185, 220)
+#    list distans; distans=(50, 50, 45,  40,  35, 35)
+#    list distan2; distan2=(  0,  -5, -5,  -5,  0)
+#
+#    # Perhaps we can do better:
+#    list mpoints; mpoints=(  48, 115, 155, 195, 235)    # original
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#
+#                             0    1    2    3    4
+#    list mpoints; mpoints=( 50,  98, 143, 184, 220)     # new!
+#
+#    list distans; distans=(50, 48, 45,  41,  36, 30)
+#    list distan2; distan2=(  -2, -3, -4,  -5,  -6)
+#
+#    # Wow! Perfect. The midpoints telescope into the upper end, with the
+#    # distance between each midpoint decreasing as one approaches 255,
+#    # coinciding with the human perception of intensity. The midpoints are
+#    # also reasonably close to the average. Much better! This results in:
+#
+#* Color values in [  0,  50] to color index 0. (size: 50)
+#* Color values in [ 51,  98] to color index 1. (size: 48)
+#* Color values in [ 99, 143] to color index 2. (size: 45)
+#* Color values in [144, 184] to color index 3. (size: 41)
+#* Color values in [185, 220] to color index 4. (size: 36)
+#* Color values in [221, 255] to color index 5. (size: 30)
+#
+#    # Given the uniformity, I wonder if in fact an equation doesn't exist...
+#    # Whatever it is, it's clearly non-linear, requiring polynomial regression.
+#    # To solve, note that the color indices are what we want and hence the
+#    # dependent variable (typically "y") and the color midpoints are what we
+#    # are given and hence the indepedent variable (typically "x").
+#
+#    # Via http://www.xuru.org/rt/PR.asp with data:
+#50 0.666666666666666
+#98 1.333333333333333
+#143 2
+#184 2.66666666666666
+#220 3.33333333333333
+#255 4
+#    # ..., I obtain the following quadratic equation with error less than 0.001:
+#    color_index =\
+#        1.463463115*(10**-5)*(color_value**2) +\
+#        1.184779466*(10**-2)* color_value     +\
+#        1.611297386*(10**-2) ))
+#
+#    # Not terribly beautiful, but let's see if it works! This results in:
+#
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=( 50,  98, 143, 184, 220)
+#* Color values in [  0,  38] to color index 0. (size: 38)
+#* Color values in [ 39, 110] to color index 1. (size: 71)
+#* Color values in [111, 173] to color index 2. (size: 62)
+#* Color values in [174, 229] to color index 3. (size: 38)
+#* Color values in [230, 255] to color index 4. (size: 38)
+#
+#    # Not the best. The key issue is that the best curve fit is likely to
+#    # either be a fractional polynomial (e.g., square root) or logarithm, which
+#    # even reasonably strong solvers tend not to support. I've opted instead to
+#    # use Eureqa, which is a pretty awesome application (despite its abject
+#    # non-freeness). I had two realizations while doing so:
+#    #
+#    # 1. The key to efficiently mapping a smooth line to stepwise bins (as we
+#    #    want to do) is to map one greater than the maximum value for each bin
+#    #    (e.g., 51 for the first bin) to one greater than the desired index for
+#    #    all values in that bin.
+#    # 2. What does this accomplish? It ensures that simply rounding down the
+#    #    resulting fractional bin indices gives the desired integer bin
+#    #    indices, guaranteed to be an efficient operation.
+#    #
+#    # Given such observations, we concocted the following data:
+#
+#x	y
+#0	0
+#51	1
+#99	2
+#144	3
+#185	4
+#221	5
+#256	6
+#
+#    # Note, for example, that 255 will map to something like 5.9876 and hence
+#    # to 5 after rounding, as desired. Likewise, pretty much everything between
+#    # 221 to 255 will be binned to index 5 -- exactly as desired.
+#FIXME: Hmm. My original supposition appears to be incorrect, as could probably
+#be surmised by merely contemplating the survival fitness of adequate perception
+#in the dark. As culled from a random (but informative!) blog, "...humans
+#perceive brightness changes non-linearly. We have better sensitivity at low
+#luminance than high luminance. For example, when we control LED brightness using
+#Arduino PWM, we see a large brightness change between analogWrite(9,1) and
+#analogWrite(9,2) but only a small brightness change between analogWrite(9,244)
+#and analogWrite(9,255)." This means that xterm pretty much got it backwards.
+#Their color cube should have allotted *MORE*, not *LESS*, space to darker
+#colors. In any case, however, we have to work with what we have -- and the
+#xterm color cube is most certainly what we have. Given that, we should probably
+#revisit our remapping above. How about...  Wait. The old one works quite well:
+#
+#                             0    1    2    3    4
+#    list oldmidp; oldmidp=(  48, 115, 155, 195, 235)
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list newmidp; newmidp=( 50,  98,  143, 184, 220)
+#    list distans; distans=(50, 48, 45,  41,  36, 30)
+#    list distan2; distan2=(  -2, -3, -4,  -5,  -6)
+#
+#Perhaps we already accidentally hit on an adequate solution.
+#Consider. By binning everything in [51, 98] to index 1 rather than everything
+#in [48, 115], we're binning substantially less than in the default approach at
+#the darker end. Similarly, by binning everything in [221, 255] to index 5 rather
+#than everything in [236, 255], we're binning substantially more than in the
+#default approach at the brighter end. What do you say, hey? Lookin' good...
+#
+#O.K.; Eureqa got us to:
+#
+#    color_index=$((\
+#        0.0196327201550869*color_value + 5.8056465992094*(10**-8)*(color_value**3) ))
+#
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=( 50,  98, 143, 184, 220)
+#* Color values in [  0,  50] to color index 0. (size: 50)
+#* Color values in [ 51, 100] to color index 1. (size: 49)
+#* Color values in [101, 143] to color index 2. (size: 42)
+#* Color values in [144, 185] to color index 3. (size: 41)
+#* Color values in [186, 222] to color index 4. (size: 36)
+#* Color values in [223, 255] to color index 5. (size: 32)
+#
+#Right. It's not *QUITE* perfect. But it's *VERY* close. It certainly captures
+#the large-order issues. I substantially doubt anyone would be able to discern
+#the difference between this and something slightly tighter. (After all, the
+#residual error is down to 0.003 already.)
+#FIXME: Right. So I gave an alternative with exponents in the "-22" range a try.
+#It utterly failed, probably due to rounding errors at such small exponents.
+#It's nice to know, at least, that we can ignore such solutions.
+#Instead, I gave the next iteration down a try:
+#
+#    color_index=$((\
+#       0.0193126795857809*color_value +\
+#       3.43371646960515*(color_value**2)*(10**-6) +\
+#       4.95268905499403*(color_value**3)*(10**-8) ))
+#
+#    list steps;   steps  =(0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=( 50,  98, 143, 184, 220)
+#* Color values in [  0,  50] to color index 0. (size: 50)
+#* Color values in [ 51, 100] to color index 1. (size: 49)
+#* Color values in [101, 143] to color index 2. (size: 42)
+#* Color values in [144, 184] to color index 3. (size: 40)
+#* Color values in [185, 222] to color index 4. (size: 37)
+#* Color values in [223, 255] to color index 5. (size: 32)
+#
+#Right. The difference between the two is exceedingly small. Let's just go with:
+#
+#    color_index=$((\
+#        0.0196327201550869*color_value + 5.8056465992094*(10**-8)*(color_value**3) ))
+#
+#Aaand... we're done!
+#FIXME: A question also remains of how we map to the 16 initial system colors.
+#Are these colors simply duplicates of color cube colors or do they provide
+#genuinely new values? If the latter, then we also need to consider mapping to
+#such colors. In any case, given the greyscale line, we'll probably want to try
+#mapping to both the color cube *AND* greyscale line for each color value and
+#"taking" the mapped value with minimum distance (...or error?) to the actual
+#value. We can render this slightly more efficient by checking after obtaining
+#the first mapped value whether such distance is sufficiently minimum (e.g., <=
+#0.1), in which case we don't need to bother obtaining the second mapped value.
 
 # ....................{ GLOBALS                            }....................
 # Defer initialization of most globals to precompile_zeshy_terminal_colors() and
@@ -398,6 +734,27 @@ function startup_zeshy_terminal_color() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#I'll note that, while such bins are likely to produce aesthetically better
+#results, they do preclude use of efficient math functions to map into such
+#bins. However, that's not all bad; since *MOST* color values are brighter
+#than not, performing a linear search from the upper end (i.e., closer to 255)
+#should prove slightly faster.
+#
+#Urhm:
+#
+#* Color values in [  0,  48] to color index 0.
+#* Color values in [ 49, 115] to color index 1.
+#* Color values in [116, 155] to color index 2.
+#* Color values in [156, 195] to color index 3.
+#* Color values in [196, 235] to color index 4.
+#* Color values in [235, 255] to color index 5.
+#
+#    list steps;   steps  =(   0,  95, 135, 175, 215, 255)
+#    list mpoints; mpoints=(47.5, 115, 155, 195, 235)
+#    list mpoints; mpoints=(65, 105, 145, 185, 225)
+#
+#    list steps; steps=(255, 215, 175, 135, 95, 0)
+
 #FUXME: Ah-ha! Right. I have another generalization that can help us
 #significantly, here. We've begun to repeat our use of certain theme-specific
 #characters over-and-over (e.g., "•"), which rather hampers sane maintenance.
