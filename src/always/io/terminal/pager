@@ -3,9 +3,18 @@
 # Copyright 2007-2013 by Cecil Curry.
 # See "COPYING" for additional details.
 
-declare_parcel_as_script_with_stdin <<'-/-'
+#FIXME: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#We appear to have a critical error on our hands, folks. It's pretty easy to
+#replicate, too: just type "ll /usr/portage/distfiles". That's it. Guess what
+#happens? The *ENTIRE* shell freezes indeterminately. I'm not kidding. That's
+#terrible and it needs to be fixed immediately. Clearly, we're failing to handle
+#signals sanely.
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+#FIXME: This could use some sprucing up.
+declare_parcel_as_script_with_stdin <<'---'
 Handle *output paging* (e.g., `more`, `less`).
--/-
+---
 
 #FIXME: When *NOT* paging, visually demarcate wrapped lines (ideally with color
 #or perhaps simply with a simple prefix). So, rather than printing:
@@ -206,6 +215,17 @@ function page_stdin() {
         # ourselves instead.
         output_string "${stdin_line}"
 
+        #FIXME: This is *EXCESSIVELY* inefficient. Which is to say, it's dumb.
+        #Instead, just do this inside the loop:
+        #
+        #   stdin+="${stdin_line}${ZESHY_ASCII_NEWLINE}"
+        #
+        #Then, after looping, if we *REALLY* don't want the suffixing newline:
+        #
+        #   stdin="${stdin[1,-2]}"
+        #
+        #That's it. *facepalm*
+
         # If this is any line *EXCEPT* the first, prefix such line by a newline.
         # Since this is the common case, test for this first. For efficiency,
         # inline such test.
@@ -215,6 +235,7 @@ function page_stdin() {
         } else {
             stdin+="${stdin_line}"
         }
+#       print "stdin line read: ${stdin_line}"
     }
 #   print "stdin read: ${stdin}"
 
@@ -224,16 +245,16 @@ function page_stdin() {
 }
 
 #FIXME: In lieu of unit tests...
-function pins() {
-    print 'ok' | page_stdin
-    print '================'
-    print 'ok\nko' | page_stdin
-    print '================'
-    print 'ok\nko\nokko' | page_stdin
-    print '================'
-    string yoko; yoko="$(print 'ok\nko\nokko' | page_stdin)"
-    print "yoko: ${yoko}"
-}
+#function pins() {
+#    print 'ok' | page_stdin
+#    print '================'
+#    print 'ok\nko' | page_stdin
+#    print '================'
+#    print 'ok\nko\nokko' | page_stdin
+#    print '================'
+#    string yoko; yoko="$(print 'ok\nko\nokko' | page_stdin)"
+#    print "yoko: ${yoko}"
+#}
 
 # ....................{ RUNNERS                            }....................
 declare_function_with_stdin <<'/---'
@@ -255,25 +276,128 @@ function run_code_paged() {
     # If not called from a terminal, run such command without paging.
     if { not is_stdout_terminal } {
         run_code "${@}"
-    # If passed piped input and no arguments, page such input.
-    } elif { is_args_0 and is_stdin_pipe } {
-        page_string
-    # Otherwise, run the passed command with redirection.
+    # Else, run the passed command with redirection.
     } else {
         # Validate passed arguments.
-        die_unless_args 'expected one command'
+        die_unless_args 'Expected one or more commands.'
+        string output
 #       print_string "run_code_paged: ${@}..."
 
-        # Run such command and capture its output. Dismantled, this is:
-        string output; run_code_and_set_string_to_stdout "${@}" output
+        # Run such command and capture standard output from such command.
+#       run_code_and_set_string_to_stdout "${@}" output
 
-        # Page such output, ignoring a false return value if such output needs
-        # no paging.
+        #FIXME: Great! This *ACTUALLY* works, implying that our current
+        #implementation of get_stdin_until_eot() is *VERY* broken. Replace
+        #such function with get_stdin_until_eot_working() immediately; then
+        #revert to the above function call. That's it!
+        string string_name__rcassto="output" redirection__rcassto="1>&1 1>&p"
+#       string string_name__rcassto="output" redirection__rcassto="1>&1"
+
+        # Coprocess outputting all standard input piped to such subshell until
+        # receiving a line containing only an EOT character. See such function
+        # for further details.
+        open_coprocess get_stdin_until_eot_working
+#       open_coprocess set_string_to_stdin_until_eot "${string_name__rcassto}"
+
+        {
+            # Run such command. To prevent the passed redirection from conflicting
+            # with redirections already embedded in such command, explicitly
+            # segregate the former from the latter with "{" and "}" delimiters.
+    #       output_string "variable: ${string_name__rcassto}; command: ${@}"
+            run_code '{' "${@}" '} '${redirection__rcassto}
+#           print 'We never get here, do we?'
+
+            # Write a line containing only the EOT character to such function,
+            # which should now successfully return.
+            output_string_to_coprocess "${ZESHY_ASCII_EOT}"
+
+            # Set the passed string to all standard error cached via such coprocess.
+            # To quote modern culture, "Shit just got real."
+            set_string_to_coprocess_output "${string_name__rcassto}"
+        } always close_coprocess
+#       print "output: ${output}"
+
+        # Page such output, ignoring failure if such output requires no paging.
         page_string_if_needed "${output}" or ignore_exit_status
     }
 }
 
+function get_stdin_until_eot_working() {
+    # Validate sanity.
+    die_if_args
+    string stdin stdin_line
+
+    # Cache each line of standard input, to be output all-at-once after such
+    # input completes. Critically, do *NOT* incrementally output such lines
+    # (e.g., with output_string()) in the loop body. While doing so behaves as
+    # expected on "small" input, such behavior catastrophically fails on
+    # sufficiently large input when invoked from a pipeline or coprocess
+    # subshell.
+    #
+    # How badly? Badly. Indefinitely, randomly, and silently. Clearly, there's
+    # some devious interplay of shell-enforced standard input and/or output
+    # buffering at work here. It's unfortunate this particular piece of critical
+    # machinery is so (seemingly) fragile, but there you are.
+    #
+    # See page_stdin() for related logic.
+    while { IFS= read -r stdin_line and\
+        is "${stdin_line}" != "${ZESHY_ASCII_EOT}" si } {
+        stdin+="${stdin_line}${ZESHY_ASCII_NEWLINE}"
+    }
+
+    # Return such input to the caller via a *SINGLE* output statement. Avoid
+    # suffixing such input with a newline; the prior loop already did.
+    output_string_sans_newline_suffix "${stdin[1,-2]}"
+}
+
+#FIXME: In lieu of unit tests...
+function fata() {
+#    # This command induces an eventual infinite loop in get_stdin_until_eot()
+#    # if we've mucked that function up. Nice way to reliably test it, anyway.
+    run_code_paged command ls -l --color /usr/portage/distfiles
+#   list_path_verbosely /usr/portage/distfiles
+}
+
 # --------------------( WASTELANDS                         )--------------------
+#   output_string "read!"
+#   output_string "${line}"
+#FUXME: O.K.; we don't actually need this. It appears that a string local in the
+#function body below suffices.
+#declare_global_with_stdin string ZESHY_COPROCESS_STDIN_CACHE <<'/---'
+#string ZESHY_COPROCESS_STDIN_CACHE
+#/---
+    # Clear the cache in the coprocess subshell.
+#   ZESHY_COPROCESS_STDIN_CACHE=""
+
+    # Output all lines of standard input back to the caller until either
+    # reaching the end of such input or a line containing only an EOT character.
+    # See page_stdin() for related logic.
+    #
+    # Critically, cache such lines to a string local to be output all-at-once
+    # after getting all such lines. Do *NOT* output such lines via incremental calls to builtin
+    # print(). While doing so behaves as expected on "small" input,
+    # induces a spin weight on sufficiently large input when called from a
+    # pipeline or coprocess.
+
+        # If this is any line *EXCEPT* the first, prefix such line by a newline.
+        # Since this is the common case, test for this first. For efficiency,
+        # inline such test.
+#       if is -n "${ZESHY_COPROCESS_STDIN_CACHE}" si {
+#           ZESHY_COPROCESS_STDIN_CACHE+="${ZESHY_ASCII_NEWLINE}${stdin_line}"
+        # Else, this is the first line. Append such line as is.
+#       } else {
+#           ZESHY_COPROCESS_STDIN_CACHE+="${stdin_line}"
+#       }
+
+    # Dismantled, this is:
+    #
+    # * "IFS=", preventing read() from splitting input on field separators.
+    # * "-r", preserving input characters (e.g., backslashes do not escape).
+    #
+    # If passed piped input and no arguments, page such input.
+#   } elif { is_args_0 and is_stdin_pipe } {
+#       page_stdin
+
 #If the passed string exceeds the current terminal's dimensions, print such
 #string with the current user's preferred pager; otherwise, return false.
 #>>> { lsblk; lscpu; lsmod; lsof; lspci; lsusb } | page_stdin
