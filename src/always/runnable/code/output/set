@@ -59,11 +59,10 @@ get_stdin_until_eot() for further details on the function such coprocess calls.
 #     { run_code "${@}" 1>/dev/null } |&
 #         set_string_to_stdin "${string_name__rcasste}"
 #
-# While such pipeline succeeds for commands *NOT* modifying the current
-# shell environment (e.g.,
-# "output_string 'Our national flower is the concrete cloverleaf.'"), such
-# pipeline fails all other commands (e.g., "list war;
-# war=( War is the supreme drama of a completely mechanized society. )").
+# Such pipeline succeeds for commands *NOT* modifying the current shell
+# environment (e.g., "print 'Our national flower is the concrete cloverleaf.'")
+# but fails for all other commands (e.g., "list war; war=( War is the supreme
+# drama of a completely mechanized society. )").
 #
 # The reason why is subtle, for those unfamiliar with the arcane viscera of
 # zsh operation: all subcommands of a pipeline except the last are executed
@@ -97,12 +96,16 @@ function run_code_and_set_string_to_coprocess_output_from_redirection() {
         'Expected one command, one string name, and one redirection string.'
     string string_name__rcassto="${@[-2]}" redirection__rcassto="${@[-1]}"
     integer exit_status
+
+    #FIXME: While a pleasant alias, pop_args() is simply *TOO* heavyweight to
+    #expanded in such a core function as this. We really need to define a new
+    #pop_args_2() alias and expand that here instead.
     pop_args 2
 
     # Coprocess outputting all standard input piped to such subshell until
     # receiving a line containing only an EOT character. See such function
     # for further details.
-    open_coprocess get_stdin_until_eot
+    open_coprocess_running_command get_stdin_until_eot
 
     {
         #FIXME: O.K.; we have a trap() problem here. Soft termination signals
@@ -116,6 +119,77 @@ function run_code_and_set_string_to_coprocess_output_from_redirection() {
         #Well, that or explicitly do the latter. Hmm; right. For a "soft
         #termination", we'd might as well try to close it cleanly. So, do output
         #EOT as well.
+        #FIXME: O.K.; the reason why is that we've implicitly disabled option
+        #"monitor" in the above expansion of open_coprocess(). As a first try,
+        #I wonder if just locally enabling "monitor" again immediately after (or
+        #in) such expansion would do it? Of course, that opens up the slim
+        #possibility of the current process receiving a termination signal in
+        #between the window of the coprocess starting and "monitor" being
+        #reenabled. Really, we just *NEED* to stop disabling job monitoring
+        #altogether. But there appears to be no way of silencing only job
+        #monitoring output, which is fairly annoying. So, we'll probably have to
+        #accept some degree of improbable race conditions here.
+        #FIXME: Alternately, perhaps we could avoid coprocesses entirely? For
+        #example, one of the better (though still terrible) solutions for
+        #coloring stderr red is to redirect stderr to a backgrounded subshell:
+        #e.g.,
+        #
+        #    exec 2>>(while read line; do
+        #       print '\e[91m'${(q)line}'\e[0m' > /dev/tty; done &)
+        #
+        #Oh, never mind. While we could buffer to a string local in such loop,
+        #where would we write such buffer to after loop termination? Coprocesses
+        #neatly solve this entanglement. It's just zsh's somewhat unjudicious
+        #printing of job control output that we'd like to circumvent. Well, we
+        #may not be able to... entirely.
+        #FIXME: Hmm. It's is a bit crazy, but how about this: rather than
+        #locally disabling "monitor", how about capturing all stderr produced by
+        #this function and squelching anything matching output specific to
+        #coprocess job control? If it weren't for the "always" block below, I'd
+        #say this is probably the way to go. Or perhaps not. There's no reliable
+        #means of deciding whether such output originated from the current
+        #process or was actually a legitimate substring of stderr output by the
+        #passed code.
+        #FIXME: Ah! Wait. We can redirect stderr from the always block to
+        #"/dev/null", right? Let's first try that in lieu of the current
+        #approach in the expansion of close_coprocess(). If that actually works,
+        #consider expanding to squelch only sterr lines matching coprocess job
+        #control. (Ugh. Probably not worth it. But what it happens of that block
+        #of code were to actually print a legitimate error or warning? If we
+        #just indiscriminantly squelch *ALL* stderr, we'll miss such output.)
+        #FIXME: O.K.; to test this, get rid of the open_coprocess() disabling of
+        #option "monitor" and give the above squelching in close_coprocess() a
+        #try. There should still be an initial coprocess job control string
+        #output, but we can go from there...
+        #FIXME: O.K.; we've successfully implemented the reenabling of job
+        #monitoring, which is nice. What isn't nice, however, is that it fixed
+        #nothing! *sigh* Here's my current thinking on the subject:
+        #
+        #    enable_shell_option_local local_traps
+        #    trap send_coprocess_eot HUP
+        #
+        #Note that we can't trap the zsh-specific "EXIT" signal, as zsh signals
+        #such trap when defined in a function only when such function exits --
+        #which, of course, it won't if a <Ctrl-c> interrupt is triggered.
+        #FIXME: We should also test what happens when <Ctrl-z> interrupts are
+        #triggered. No deadlocks, I should hope!
+
+        if { is_shell_interactive and not is_shell_subshell } {
+            enable_shell_option monitor
+        }
+
+        enable_shell_option_local local_traps
+#       enable_shell_option local_traps
+#       trap 'print "sending INT EOT!"; output_string_to_coprocess "${ZESHY_ASCII_EOT}"' INT
+        trap '
+#           output_string_to_stderr "sending INT EOT!"
+#           send_coprocess_eot
+#           close_coprocess
+#           die "Handling SIGINT."
+#           kill -2 $$
+            send_coprocess_eot
+#           close_coprocess
+        ' INT
 
         # Run such command. To prevent the passed redirection from conflicting
         # with redirections already embedded in such command, explicitly
@@ -126,7 +200,7 @@ function run_code_and_set_string_to_coprocess_output_from_redirection() {
 
         # Write a line containing only the EOT character to such function,
         # which should now successfully return.
-        output_string_to_coprocess "${ZESHY_ASCII_EOT}"
+        send_coprocess_eot
 
         # Set the passed string to all standard error cached via such coprocess.
         # To quote modern culture, "Shit just got real."
@@ -134,6 +208,118 @@ function run_code_and_set_string_to_coprocess_output_from_redirection() {
     } always close_coprocess
 
     # Return the exit status returned by such command.
+    return ${exit_status}
+}
+
+#FIXME: Obliterate me. *sigh*
+function laro() {
+    string stri string_name__rcassto="stri" redirection__rcassto='1>&1 1>&p'
+    integer exit_status
+
+#   setopt local_options no_monitor
+    open_coprocess_running_code {
+#       trap 'print "[int] coprocess received SIGINT" 1>&2' INT
+        get_stdin_until_eot
+    }
+#   integer coprocess_pid="${!}"
+#   print "opened coprocess ${coprocess_pid} ($$)"
+
+    {
+#       if { is_shell_interactive and not is_shell_subshell } {
+#           enable_shell_option monitor
+#       }
+
+#       enable_shell_option_local local_traps
+#       enable_shell_option local_traps
+#       trap 'print "sending INT EOT!"; output_string_to_coprocess "${ZESHY_ASCII_EOT}"' INT
+#       trap '
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] main shell received SIGINT"
+#           send_coprocess_eot
+#           print -n
+
+        #FIXME: O.K.; we got it. This is pretty crazy, but here's why I think
+        #this works while nothing else does:
+        #
+        #* When printing to a coprocess with "-p", zsh appears to *NOT* suffix
+        #  such output with a newline. (Try it: remove the "\n" and you no
+        #  longer receive a termination message from the coprocess. Insanity.)
+        #* And I have no idea why the second print() is required. Interestingly,
+        #  it doesn't matter *WHAT* that print() prints so long as it includes a
+        #  newline. ("print -n" doesn't work, for example.) Also interestingly,
+        #  that print() has to appear *AFTER* the prior print() to the coprocess.
+        #  (How did I ever stumble upon this insanity?) Presumably, that's doing
+        #  something like flushing buffers somewhere... O.K.; you got me. It
+        #  probably won't be possible to flush out exactly what's happening here
+        #  without Bart's help.
+        #
+        #*THIS IS INSANITY.* It works, but... my God. I have a horrible sense
+        #that it's probably specific to either the Linux kernel or the Linux
+        #implementation of the "stdio" library. Either way, this is pretty
+        #horrible. We *REALLY* need to push a thread to "zsh-workers" and suss
+        #out exactly what's going on here.
+        #
+        #Incidentally, as you can see, the value of option "monitor" has utterly
+        #no effect on whether or not SIGINT is signalled -- which is great! So,
+        #keep that functionality as is.
+        #print -rp $'\C-D\n'
+        run_trap_on_signal_interrupt_local\
+            'send_coprocess_eot
+             output_newline'
+
+#       setopt local_options no_monitor
+#       trap "print -rp $'\C-D\n'; print" INT
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] sent EOT once"
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] coprocess ID: ${coprocess_pid} ($$)"
+#           wait ${coprocess_pid}
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] sent EOT"
+#           kill -9 "${coprocess_pid}"
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] killed coprocess"
+#           close_coprocess
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] closed coprocess"
+#           die "Handling SIGINT."
+#           kill -2 $$
+#           send_coprocess_eot
+#           close_coprocess
+#       ' INT
+
+#       output_string "variable: ${string_name__rcassto}; command: ${@}"
+        eval "list_path_recursive '${HOME}/tmp' "${redirection__rcassto} and
+            set_integer_to_exit_status exit_status
+
+        # Reset the trap handling the interrupt signal to such trap's default
+        # implementation immediately *BEFORE* instructing such coprocess to
+        # terminate. Failing to do so induces the following worst case:
+        #
+        # * send_coprocess_eot() instructs the current coprocess running
+        #   get_stdin_until_eot() to cease iterating and hence terminate by
+        #   sending a newline-delimited end-of-transmission (EOT) character to
+        #   the standard input for such coprocess.
+        # * The current user interactively enters <Ctrl-c> prior to the
+        #   termination of this function.
+        # * The current terminal sends the current shell the interrupt signal.
+        # * The above trap handler resends a newline-delimited EOT character to
+        #   the standard input for such coprocess.
+        # * Since such coprocess is closed and hence *NOT* reading such input,
+        #   the socket buffer retains such input.
+        # * The current user interactively enters <Ctrl-c> prior to the
+        #   termination of this function, again.
+        # * The above process repeats, gradually filling the socket buffer for
+        #   the current coprocess.
+        # * When such buffer is eventually filled, the current process waits for
+        #   the current coprocess to begin reading such input and hence emptying
+        #   such buffer -- which it never does, inducing deadlock.
+        #
+        # While admittedly unlikely, such worst case remains avoidable by simply
+        # resetting such trap here. So we do.
+        reset_trap_to_signal_defaults
+
+#       print '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nlisted path'
+        send_coprocess_eot
+
+#       print '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nsent EOT'
+        set_string_to_coprocess_output "${string_name__rcassto}"
+#       print '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nreceived coprocess output'
+    } always close_coprocess
     return ${exit_status}
 }
 
@@ -346,6 +532,12 @@ function run_code_silent_and_set_string_to_stderr() {
 #}
 
 # --------------------( WASTELANDS                         )--------------------
+#redirecting all possible command
+        # output to the coprocess.
+#       setopt no_monitor
+#       output_string_to_coprocess "${ZESHY_ASCII_EOT}"
+#       enable_shell_option_local monitor
+
     # Validate passed arguments.
 #   die_unless_args_2_or_more 'Expected one command and one string name.'
 #   string string_name__rcasste="${@[-1]}"
