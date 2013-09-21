@@ -10,6 +10,40 @@ where ``state'' typically means the modification time of the device files
 associated with standard output and error at the time of such call.
 /---
 
+#FIXME: Wild. O.K.; I think I've tracked down a bit of why start_stdout() no
+#longer works as intended: "stat" caching, probably induced by a recent kernel
+#upgrade changing internal behavior. We need to find a way of circumventing
+#this.
+#FIXME: O.K.; I've discovered that zstat() appears to be performing caching
+#independent of kernel behavior, which we can't seem to get around. That said,
+#the following command (admittedly GNU-specific, but beggers can't particularly
+#be choosers) appears to circumvent both this issue *AND* the nanoseconds issue:
+#
+#    >>> command stat --format='%y' /dev/fd/1
+#    2013-09-21 04:12:10.531266625 -0400
+#    >>> command stat --format='%y' /dev/fd/1
+#    2013-09-21 04:12:10.875260409 -0400
+#    >>> command stat --format='%Y~~~%y' /dev/fd/1
+#    1379751717~~~2013-09-21 04:21:57.688637663 -0400
+#
+#A few things to note:
+#
+#* You *MUST* reference "/dev/fd/1" directly rather than its symbolic link
+#  "/dev/stdout", for the simple reason that "stat" doesn't follow such links by
+#  default. Of course, you can obviate this by passing "-L" to "stat" -- but,
+#  then, why not just avoid the symbolic link altogether? Do so, I should think.
+#* This is GNU-specific. *shrug*
+#* Naturally, we'll need to parse such output apart. Happily, we already do so.
+#* I'm *STRONGLY* concerned that get_path_mtime() will not behave sanely when
+#  run from a piped subshell (which could also be a contributing factor in none
+#  of this quite working right). This is easily circumventable by defining a new
+#  set_float_to_path_mtime() function and redefining both get_path_mtime() and
+#  set_float_to_stdout_mtime() to call such function -- which actually
+#  simplifies matters, quite a bit. (Unsure why I didn't just define such
+#  function from the beginning, really!)
+#
+#Reimplement get_path_mtime() and cohorts, then.
+
 #FIXME: On attempting to track down our spurious start_stdout() issue, I noted
 #the following output:
 #
@@ -98,27 +132,26 @@ function update_stderr_state() {
 declare_function_with_stdin <<'/---'
 void reset_stdout_state(void)
 
-Reset global tracking state for `zeshy` printer functions _and_ color attributes
-for the current terminal to such terminal's defaults. See stop_stdout() for
-further details.
+Reset tracking for standard output to its default state. Specifically, reset
+color attributes for the current terminal to such terminal's defaults _and_
+nullify tracking globals for standard output. See stop_stdout() for further
+details.
 /---
 function reset_stdout_state() {
-    # This function (effectively) implements the same logic as stop_stdout() but
-    # in a slightly different order. Specifically, this function writes to
-    # standard output *AFTER* rather than *BEFORE* 
-
     # Validate sanity.
     die_if_args
 
-    # Reset terminal attributes *BEFORE* updating output state, as the former
-    # touches device files tested by the latter.
+    # Reset terminal attributes.
     reset_terminal_color
 
-    # Record the modification times of standard output and error.
-    update_stdout_state
+    # Reset tracking globals.
+    ZESHY_STDOUT_PRIOR_MTIME=0
+    ZESHY_STDOUT_PRIOR_PATH=''
 }
 
 # ....................{ STARTERS                           }....................
+#FIXME: Rename to start_stdout_state(). Hmm; perhaps not. How about
+#initiate_stdout_state()? Excellent! Fits with nomenclature below.
 #FIXME: Update documentation.
 
 declare_function_with_stdin <<'/---'
@@ -171,6 +204,7 @@ function start_stdout() {
 
     # Reset terminal attributes.
     reset_terminal_color
+#   output_string_to_stderr "stdout_path: ${stdout_path}; stdout_mtime: ${stdout_mtime}${ZESHY_ASCII_NEWLINE}ZESHY_STDOUT_PRIOR_PATH: ${ZESHY_STDOUT_PRIOR_PATH}; ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}"
 
     # If the global tracking standard output is sane (i.e., is set, nonzero, and
     # more recent than the time at which the current shell was started), get and
@@ -186,6 +220,7 @@ function start_stdout() {
 }
 
 # ....................{ STOPPERS                           }....................
+#FIXME: Rename to finalize_stdout_state().
 declare_function_with_stdin <<'/---'
 void stop_stdout(void)
 
@@ -212,6 +247,13 @@ function stop_stdout() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Record the modification times of standard output and error.
+# *BEFORE* updating output state, as the former
+    # touches device files tested by the latter
+    # This function (effectively) implements the same logic as stop_stdout() but
+    # in a slightly different order. Specifically, this function writes to
+    # standard output *AFTER* rather than *BEFORE* 
+
 #Update global tracking state for `zeshy` printer functions, including
 #${ZESHY_STDOUT_PRIOR_MTIME} and ${ZESHY_STDOUT_PRIOR_SCRIPT_LINE}. Such
 #state assists subsequent calls to start_stdout() in deciding
