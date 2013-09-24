@@ -3,13 +3,18 @@
 # Copyright 2007-2013 by Cecil Curry.
 # See "COPYING" for additional details.
 
-declare_parcel_as_script_with_stdin <<'---'
+declare_parcel_as_script_with_stdin <<'/---'
 Handle *path grepping* (i.e., recursive pattern matching on file content).
----
+/---
 
-#FIXME: Define is_path_matches_grep() and is_path_matches_grep_recursive() to
-#*SILENTLY* grep such paths. Don't bother accepting "grep" arguments: these
-#functions are solely for non-interactive use.
+#FIXME: Add examples!
+
+#FIXME: All ${path_command}_with_options() functions should be improved so as
+#to defer to:
+#
+#    ${path_command}_recursive_with_options "${@}" and report_status
+#
+#...when passed options "-r", "-R", and/or "--recursive" (depending on command).
 
 #FIXME: It'd be nice to emit a progress bar for long `grep` operations. Investigate.
 #Yes. It looks like this is halfway there:
@@ -18,16 +23,89 @@ Handle *path grepping* (i.e., recursive pattern matching on file content).
 #the total number of files to "pv" (...perhaps it has a mode or option for
 #this already), and that...uhm. Well, it'll be a bit of work, anyway! But
 #it's well doable.
+#FIXME: The principle difficulty with a "grep" progress bar is that "grep" is
+#concurrently printing matching lines to stdout. To circumvent this, one *COULD*
+#silently capture such output into a variable while printing only a progress bar
+#and then print such output after completion. While a tolerable improvement for
+#small to medium jobs, such an approach is probably unhelpful for large jobs in
+#which the user really just cares about the initial matches. What is *REALLY*
+#needed is an external command (probably implemented in C) running the passed
+#command and displaying dynamically updated terminal output -- probably with the
+#first line of such output a progress bar and all subsequent lines the
+#sequential output of such command.
+#FIXME: Actually, we could probably implement this is a page_stdin()-style zeshy
+#function iterating over "grep" output (i.e., matching lines) and updating a
+#progress bar. Which, now that I consider it, should probably be at the bottom
+#of the terminal, yes? This is probably nice, assuming it preserves the shell
+#scroll buffer *AND* allows us to cleanly erase the progress bar from such
+#buffer after completion. (Which it should, whereas a progress bar at the top
+#would probably complicate such issues.)
+#FIXME: Actually, such logic should be performed by a new function in the
+#page_stdin*() family with a corresponding new function in the
+#run_code_paged*() family that we call in lieu of the current call to
+#run_code_paged() below. Wait. Scratch the latter. We want to pipe "grep" *INTO*
+#such function rather than *FROM* such function (as in the case of "pv"),
+#implying that a run_code_paged() function won't cut it. Hence, we'll just pipe
+#grep_path() into a new function page_stdin_with_... Wait. How would such
+#function receive the count of how many files "grep" had already processed?
+#FIXME: Ugh. Forget all that. "pv" provides the ideal route for this. I've
+#already tested it a bit, and the following behaves tolerably well:
+#
+#    command find . -type f -name '*' -print0 | command pv | command xargs --null grep "${pattern}"
+#
+#This does exactly what we could hope for, although (admittedly) without ANSI
+#embellishment.
+#FIXME: Replace the above "find" with pure-zeshy functions implementing the
+#equivalent in both recursive and non-recursive variants -- say,
+#get_paths_globbed() and get_paths_globbed_recursive(). Such nomenclature
+#complies with existing nomenclature (e.g., set_list_to_paths_globbed(),
+#is_path_globbed_matches_qualifier()). Note that get_paths_globbed_recursive()
+#could probably be implemented in terms of get_paths_globbed() by suffixing
+#passed directory names with "/**/*". (Nice!) Naturally, such functions should
+#delimited paths with null rather than newline characters (as paths may contain
+#the latter but not former), possibly suggesting alternative names -- say,
+#get_paths_globbed_on_null(). Err... maybe not. (Surprisingly difficult to
+#concoct a function name that isn't terrible here. Probably just go with
+#get_paths_globbed() -- at least initially.) In any case, get_paths_globbed()
+#should itself defer to set_list_to_paths_globbed(). Oh, yes -- it all begins to
+#come together.
+#FIXME: Wait. We really need to just call set_list_to_paths_globbed() *BEFORE*
+#calling "pv" to grab the number of matching paths and then do something
+#resembling:
+#
+#    list pathnames; set_list_to_paths_globbed pathnames "${glob}"
+#    joint_list_on_null pathnames |
+#       command pv --size "$(get_string_length "${pathnames[*]}")" |
+#       command xargs --null grep "${pattern}"
+#
+#While "pv" has a means of counting by newlines, it sadly lacks a means of
+#counting by nulls. This means the only means of using "pv" in this context is
+#having it count pathname bytes -- which, while quite strange, does actually
+#work. Since this is quite strange, however, we should probably just disable the
+#portion of "pv" output displaying how many bytes have been processed. *shrug*
+#FIXME: "pv" output is pure ASCII, which isn't necessarily ideal. Unfortunately,
+#uncountable *HOURS* of grepping about online yielded basically nothing. There's
+#really no viable alternative to "pv", at the moment. Which is fine, because
+#"pv" is more than sufficient as is.
+
+# ....................{ TESTERS                            }....................
+declare_function_with_stdin <<'/---'
+[status: boolean] is_file_line_matching_grep(
+    string pathname1, ...,
+    string pattern)
+
+Return success if at least one line of at least one passed text file matches the
+passed pattern with the currently configured `grep`-specific options (e.g.,
+${ZESHY_OPTIONS_GREP}).
+/---
+function is_file_line_matching_grep() {
+    die_unless_args_2_or_more 'Expected one or more filenames and one pattern.'
+    run_code_silent get_file_lines_matching_grep_if_found "${@}"
+}
 
 # ....................{ GETTERS                            }....................
-# While the grep_path*() family of functions accept arguments in "grep" order
-# (i.e., pattern followed by pathnames), the getter functions below accept
-# arguments in conventional zeshy order (i.e., pathnames followed by pattern) as
-# well as *NOT* paging such output.
-
-#FIXME: Add examples!
 declare_function_with_stdin <<'/---'
-[stdout: string, status: boolean] get_file_text_matching_grep_if_found(
+[stdout: string, status: boolean] get_file_lines_matching_grep_if_found(
     string pathname1, ...,
     string pattern)
 
@@ -36,15 +114,27 @@ passed pattern with the currently configured `grep`-specific options (e.g.,
 ${ZESHY_OPTIONS_GREP}). If all such files exist _and_ at least one such file
 matches, success is returned; else, failure.
 /---
-function get_file_text_matching_grep_if_found() {
+function get_file_lines_matching_grep_if_found() {
     # Validate sanity.
     die_unless_args_2_or_more 'Expected one or more filenames and one pattern.'
-    string pattern="${@[-1]}"
+    string pattern="${@[-1]}" option_list_names
     pop_arg
 
+    #FIXME: Shift such logic into a new run_code_with_options_noninteractive()
+    #function. We'll certainly want to leverage such functionality elsewhere.
+
+    # Option lists to be applied to the grep below. If a non-interactive variant
+    # of such list is defined, apply such list as well. However, do *NOT* apply
+    # an interactive variant of such list even if defined. This function *MUST*
+    # return raw lines rather than ANSI-embellished lines.
+    option_list_names='ZESHY_OPTIONS_GREP'
+    if { is_list ZESHY_OPTIONS_GREP_IF_NONINTERACTIVE } {
+        option_list_names+='ZESHY_OPTIONS_GREP_IF_NONINTERACTIVE'
+    }
+
     # Grep such paths.
-    run_code_with_options 'command grep' ZESHY_OPTIONS_GREP --\
-        "${(q)pattern}" "${(q)@}"
+    run_code_with_options 'command grep'\
+        "${option_list_names}" -- "${(q)pattern}" "${(q)@}"
 }
 
 # ....................{ GREPPERS                           }....................
@@ -144,11 +234,12 @@ function grep_path_recursive_with_options() {
         die_unless_args_2_or_more\
             'Expected optional "grep" options, one pattern, and one or more pathnames.'
     }
+    list run_code_args
 
     # Arguments to be passed to calls to run_code() below excluding the
     # prefixing command name. To accommodate multiple executions of such
     # command, manually add such command name below.
-    list run_code_args; run_code_args=(
+    run_code_args=(
         'ZESHY_OPTIONS_GREP ZESHY_OPTIONS_GREP_IF_RECURSIVE'
         "${(q)@}"
     )
@@ -273,6 +364,21 @@ function grep_path_recursive_caseless_with_options() {
 #}
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: Or perhaps we don't really care about "pv" interleaving its stderr
+#output with "grep"'s stdout output.
+
+# with non-interactive options, coercing such output into
+    # raw lines rather than ANSI-embellished lines.
+#FUXME: Define is_file_line_matches_grep() and
+#is_file_line_matches_grep_recursive() to *SILENTLY* grep such paths. Don't
+#bother accepting "grep" arguments: these functions are solely for
+#non-interactive use.
+
+# While the grep_path*() family of functions accept arguments in "grep" order
+# (i.e., pattern followed by pathnames), the getter functions below accept
+# arguments in conventional zeshy order (i.e., pathnames followed by pattern) as
+# well as *NOT* paging such output.
+
 #Grep the passed paths (defaulting to the current directory) for the passed
 #case-insensitive pattern recursively with both the passed and currently
 #configured `grep`-specific options. See grep_path() for further details.
@@ -288,9 +394,9 @@ function grep_path_recursive_caseless_with_options() {
 #Note this also solves the issue under default recursion of fatal errors on
 #broken symlinks and such, which is quite nice.
 
-#FUXME: Provide getter-style synonyms resembling get_file_text_matching_grep().
+#FUXME: Provide getter-style synonyms resembling get_file_lines_matching_grep().
 #Or perhaps just rename such functions, I should think!
-#FUXME: Sweet! O.K.; get_file_text_matching_grep() should be a separate
+#FUXME: Sweet! O.K.; get_file_lines_matching_grep() should be a separate
 #function accepting arguments in a zeshy-style order: e.g., as
 #   string pathname1, ...,
 #   string pattern)
@@ -365,7 +471,7 @@ function grep_path_recursive_caseless_with_options() {
 #}
 
 #FUXME: For simplicity, grep_path() functions should simply defer to
-#get_file_text_matching_grep() functions by reversing their argument order.
+#get_file_lines_matching_grep() functions by reversing their argument order.
 #Done!
 
 # returning success if all such files exist _and_ at least one such file matches

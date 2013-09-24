@@ -361,6 +361,26 @@ autoload -U throw catch
 # unavailable on the first call to catch(), define such alias here.
 alias catch='noglob catch'
 
+#FIXME: Interesting. I believe we've implemented the entire exception handling
+#apparatus here somewhat improperly, largely because we rarely bother catching
+#thrown exceptions. When a thrown exception is caught and hence handled, its
+#error message should *NOT* be printed to standard error. Clearly, right? But
+#that's not how die() currently behaves. Instead, die() currently prints the
+#passed error message to standard error immediately -- regardless of whether
+#such exception is ever caught higher up the call stack. This is nonsensical.
+#So how do we reliably correct this? I'm not terribly sure. A couple choices:
+#
+#* Since ${CAUGHT} is a shell-specific global *AND* since exceptions can't
+#  traverse shell boundaries, we could define a new global
+#  ${ZESHY_EXCEPTION_MESSAGE} set by die() to the passed error message. This
+#  is probably the most sensible choice. die() should then *NOT* call
+#  die_with_status(). The question is: what calls die_with_status()?
+#  Specifically, does zsh call TRAPZERR() on unhandled exceptions? I suspect
+#  not, in which case I have no idea how to sanely respond to this. I will note
+#  that canonical function throw() sets a global ${EXCEPTION} containing the
+#  string passed to throw(), which could conceivably replace our use of
+#  ${ZESHY_EXCEPTION_MESSAGE} above.
+
 #FIXME: Signal handling requires generalization. Rename our current
 #implementation of TRAPZERR() to die_from_command_error(). Initialize a new
 #list global ${ZESHY_TRAPZERR_HOOKS} to contain only such function name. Define
@@ -371,30 +391,32 @@ alias catch='noglob catch'
 ZESHY_CORE_HELP_FUNCTIONS+='
 [status: integer] TRAPZERR(integer signal_number = SIGZERR)
 
-Trap SIGZERR, a zsh-specific signal on non-zero exit status from zsh builtins
-and functions and external commands. Doing so effectively globally enables
-"setopt ERR_RETURN", such that on any command returning non-zero exit status:
+Trap SIGZERR, a `zsh`-specific signal on non-zero exit status from `zsh`
+builtins and functions and external commands. Doing so effectively globally
+enables shell option `ERR_RETURN`, ensuring that on any command returning
+*failure* (i.e., non-zero exit status):
 
 * If the current shell is interactive, implicitly throw an exception unwinding
   the call stack of such shell. If such exception is uncaught, return the
   current user to the prompt.
 * Else, the current shell is non-interactive. Immediately exit such shell with
   non-zero exit status.
-* If the calling shell fails to handle such exit status (e.g., by using
-  "or true") and is also running Zeshy, repeat the above logic until either
+* If the calling shell fails to handle such exit status (e.g., with
+  `or true`) and is also running `zeshy`, repeat the above logic until either
   exiting all non-interactive shells or returning to an interactive shell.
 
-In either case, handle such error according to the current user''s Zeshy
+In either case, handle such error according to the current user''s `zeshy`
 configuration (e.g., by printing a stack trace, documentation, and/or source
 code related to such error). See die() for further details.
 
-Unlike "setopt ERR_EXIT", this handler explicitly unwinds the call stack of
-only the current shell rather than all parent shells.
+Unlike shell option `ERR_EXIT`, this handler explicitly unwinds the call stack
+of only the current shell rather than all parent shells.
 '
 function TRAPZERR() {
     # Save the exit status of the prior command prior to overwriting this status
     # by handling such error.
     integer exit_status=${?}
+    print -r -- "TRAPZERR() triggered with ${exit_status}"
 
     # Handle such exception and return such command's exit status, mimicking the
     # action of "setopt ERR_RETURN". (See "man zshoptions" for further details.)
@@ -402,11 +424,17 @@ function TRAPZERR() {
     return ${exit_status}
 }
 
-ZESHY_CORE_HELP_FUNCTIONS+='
-string die(string error_message1, string error_message2, ...)
+ZESHY_CORE_HELP_ALIASES+='
+string die(string error_message1 = "", ...)
 
-Print the passed exception message and related metadata requested by the current
-user to standard error and throw an exception. Metadata includes the following:
+Throw an exception with the passed error message (defaulting to the empty
+string). If such exception remains uncaught (i.e., _not_ handled by a
+`try {...} always` block on the current call stack), such message and related
+metadata will be printed to standard error and failure returned from such stack.
+
+== Exception Metadata ==
+
+Such metadata includes the following:
 
 * If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK} is enabled, a stack
   trace of the current call path. See output_call_stack() for further details.
@@ -460,7 +488,7 @@ function die() {
         throw ZeshyException
     # Else, something awful. Print a bleak warning.
     } else {
-        print 'zeshy: throw() undefined, probably as exception handler threw exception' 1>&2
+        print 'zeshy: throw() undefined (e.g., due to exception handler throwing exception)' 1>&2
     }
 
     # Return success to avoid triggering TRAPZERR and hence another exception.
@@ -469,7 +497,8 @@ function die() {
 
 ZESHY_CORE_HELP_FUNCTIONS+='
 string die_with_status(
-    string error_message1 = "", string error_message2, ..., integer exit_status)
+    string error_message1 = "", ...,
+    integer exit_status)
 
 Print the passed exception message (defaulting to the empty string) and related
 metadata requested by the current user to standard error. See die() for further
@@ -505,17 +534,18 @@ function die_with_status() {
             return 0
         }
 
-        # Validate passed arguments. See is_integer_nonnegative() for details.
-        (( # )) || die 'expected optional error message and one exit status'
+        # Validate sanity. See is_integer_nonnegative() for details.
+        (( # )) || die 'Expected optional error message and one exit status.'
         local exit_status="${@[-1]}"
-        [[ "${exit_status}" == <-> ]] ||
-            die "exit status \"${exit_status}\" not a positive integer"
+        { [[ "${exit_status}" == <-> ]] &&
+          (( 0 <= exit_status && exit_status <= 127 )) } ||
+            die "Exit status \"${exit_status}\" not an integer in [0, 127]."
 
         # Pop such status from the list of passed arguments.
         set -- ${@[1,-2]}
 
         # If called directly from the command line, no such exception exists.
-        (( ${#funcstack} >= 2 )) || die 'exception not thrown'
+        (( ${#funcstack} >= 2 )) || die 'No exception thrown.'
 
         # If such message exists, print such message.
         if (( # )) {
@@ -577,7 +607,7 @@ function die_with_status() {
     } always {
         # If an exception was thrown...
         if (( ${+EXCEPTION} )) {
-            # ...and if canonical function catch() is defined, catch such
+            # ...and if the canonical function catch() is defined, catch such
             # exception and print a warning.
             if { typeset -f catch &>/dev/null } {
                 # If catch() sets global ${CAUGHT} to the name of the uncaught
@@ -596,7 +626,7 @@ function die_with_status() {
                 }
             # ...else, something awful. Print a despicable warning.
             } else {
-                print 'zeshy: catch() undefined, probably as exception handler threw exception'
+                print 'zeshy: catch() undefined (e.g., due to exception handler throwing exception)'
             }
         }
     } 1>&2
@@ -748,7 +778,7 @@ integer -g ZESHY_IS_DEBUG
 #more appropriate -- say, run_is_zeshy_debug_and().
 ZESHY_CORE_HELP_ALIASES+='
 string is_zeshy_debug_and(
-    string command_name, string command_arg1, string command_arg2, ...)
+    string command_name, string command_arg1?, ...)
 
 If `zeshy` is currently being *debugged* (i.e., if `zeshy` either resides in a
 developer-specific git repository or was passed command-line option
@@ -1185,6 +1215,39 @@ if [[ -n "${*}" ]] {
 return 0
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: Fantastic idea. Unfortunately, it doesn't work for the intended use
+#case. The reason appears to be that zsh performs command substitutions *BEFORE*
+#applying the assignment to the temporary integer global ${COLUMNS}. This can be
+#circumvented by implementing a new die_evaluated() function evaluating the
+#passed string in the context of such assignment. Rather ugly, but there we are.
+
+# Wrap the die() function in an alias of the same name to ensure error messages
+# are formatted to a reduced terminal width. This ensures commands resembling
+# the following behave as expected:
+#
+#     >>> die "Runnable info() already defined as: $(print_runnable info)"
+#
+# In the prior example, the embedded call to print_runnable() calls
+# print_message_heading() calling get_terminal_width() to restrict such heading
+# to the current terminal width. When print_error() becomes available during
+# zeshy startup, die() defers to such function for printing exception messages.
+# Since such function confines such messages to an ANSI box, however, such
+# messages and hence the prior heading embedded in such message should actually
+# be restricted to less than the current terminal width (namely, to the
+# current terminal width minus the width of the left and right box borders).
+#
+# This alias ensures such restriction by temporarily overriding the current
+# terminal width for the duration of the call to die() if the helper function
+# get_terminal_width_for_errors() is defined or doing nothing otherwise.
+#alias die='COLUMNS="$(\
+#    if { typeset -f get_terminal_width_for_errors &>/dev/null } {
+#        get_terminal_width_for_errors
+#    } else {
+#        print -r -- "${COLUMNS}"
+#    })" die'
+
+        #FUXME: Ensure tighter bounds on such status -- specifically, that it
+        #resides in the range [
 #setopt notify            # report background job status immediately only before prompt printing
         # Print a blank line.
 #       print
