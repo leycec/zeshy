@@ -109,7 +109,7 @@
 #* Strip comments from such variable with "${(Z:C)...}", implicitly also
 #  converting such string into a list.
 #* Convert such list back into a string with a simple
-#  'print_string "${list[@]}"', or some such.
+#  "join_list_on_newline script_lines", or some such.
 #* Serialize out the resulting string. Would it actually work? I have no idea.
 #  But the following command-line test run looks *REALLY* promising:
 #
@@ -119,7 +119,7 @@
 #  Wow! The output looks perfectly safe for sourcing. It does include redundant
 #  substrings of semicolons (e.g., "; ; ; ; ; ; ; ;"), but that at least is
 #  easily globally substituted out. To truly test this, we'll want to take
-#  something that's genuinely zsh with no extraneous Zeshy -- say
+#  something that's genuinely zsh with no extraneous zeshy -- say
 #  "/usr/share/zsh/5.0.0/functions/v Completion/Unix/_git", the largest such
 #  autoloadable function. If this works on *THAT* file, it probably works
 #  anywhere. Worth a shot, anyway, due to the simplicity of the implementation.
@@ -350,18 +350,6 @@ zmodload -F zsh/stat b:zstat
 zmodload zsh/parameter
 
 # ....................{ EXCEPTIONS                         }....................
-#FIXME: Excise. We now implement zeshy-specific analogues of such functions.
-# Astonishingly, zsh implements throw() and catch() as user-defined functions
-# autoloaded from list ${fpath} for the current user. Autoload such functions
-# before called by functions below. Defer all other autoloads to
-# startup_zeshy_autoloads().
-#autoload -U throw catch
-
-# The catch() implementation selectively disables filename globbing for such
-# function by defining an alias of the same name. Since such alias is
-# unavailable on the first call to catch(), define such alias here.
-#alias catch='noglob catch'
-
 #FIXME: Interesting. I believe we've implemented the entire exception handling
 #apparatus here somewhat improperly, largely because we rarely bother catching
 #thrown exceptions. When a thrown exception is caught and hence handled, its
@@ -375,7 +363,7 @@ zmodload zsh/parameter
 #  traverse shell boundaries, we could define a new global
 #  ${ZESHY_EXCEPTION_MESSAGE} set by die() to the passed error message. This
 #  is probably the most sensible choice. die() should then *NOT* call
-#  die_with_status(). The question is: what calls die_with_status()?
+#  print_exception_with_status(). The question is: what calls print_exception_with_status()?
 #  Specifically, does zsh call TRAPZERR() on unhandled exceptions? I suspect
 #  not, in which case I have no idea how to sanely respond to this. I will note
 #  that canonical function throw() sets a global ${EXCEPTION} containing the
@@ -453,31 +441,6 @@ zmodload zsh/parameter
 #FIXME: We need to document a caveat, now. truly() blocks aren't *QUITE* truly.
 #Basically, the code of the truly() block 
 
-alias try='typeset -ag ZESHY_TRY_LEVEL; ZESHY_TRY_LEVEL[${SHLVL}]=$(( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} + 1 ))
-'
-
-alias ':{'='{'
-alias '}:'='    if (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
-        if (( ${+ZESHY_TRY_LEVEL[${SHLVL}]} == 0 )) {
-            print "zeshy: \${ZESHY_TRY_LEVEL[${SHLVL}]\} undefined" 1>&2
-        } else {
-            print "zeshy: \"always\" block preceded by no \"try\" block" 1>&2
-            ZESHY_TRY_LEVEL[${SHLVL}]=0
-        }
-
-        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
-    } else {
-        ZESHY_TRY_LEVEL[${SHLVL}]=$(( ZESHY_TRY_LEVEL[${SHLVL}] - 1 ))
-
-        if (( ${+EXCEPTION} && ZESHY_TRY_LEVEL[${SHLVL}] == 0 )) {
-            (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
-
-            die_with_status "${TRY_BLOCK_ERROR}"
-            print ok
-        }
-    }
-}'
-
 ZESHY_CORE_HELP_FUNCTIONS+='
 void throw_exception(string error_message1 = "", ...)
 
@@ -493,104 +456,51 @@ functionality. Such function performs poorly under `zeshy`, however
 # rather than declaring zeshy-specific alternatives (e.g.,
 # ${ZESHY_EXCEPTION_MESSAGE}).
 function throw_exception() {
-    # Announce such exception globally. Subsequent exception handling
-    # functionality tests the global to decide whether an exception was called.
-    typeset -g EXCEPTION="${*}"
+    # Preserve such exception and related metadata to globals. For convenience,
+    # this function accepts no passed exit status. Instead, harvest such status
+    # from the current runtime environment -- specifically, of the last command
+    # regardless of whether such command was resided in a pipeline or not. 
+    #
+    # ${pipestatus} is a canonical list global whose elements are the exit
+    # statuses of each subcommand of the prior pipe command or of the prior
+    # command if not a pipe command. Conversely, ${?} and ${status} are
+    # canonical integer globals containing the exit status of the prior command
+    # *ONLY* when not such a subcommand. Since the former plainly subsumes the
+    # latter, defer to the former. Consider:
+    #
+    #     # Define helper functions.
+    #     >>> pipe_status() { print ${pipestatus[-1]} }
+    #     >>> exit_status() { print $? }
+    #
+    #     # ${pipestatus} provides the required values.
+    #     >>> true; pipe_status  # this works...
+    #     0
+    #     >>> true; true | false || pipe_status  # ...and so does this.
+    #     1
+    #
+    #     # ${?} does *NOT* provide the required values.
+    #     >>> true; exit_status  # this works...
+    #     0
+    #     >>> true; true | false || exit_status  # ...but this doesn't.
+    #     0
+    store_exception_with_status "${*}" "${pipestatus[-1]}"
 
     # By default, zsh coerces integer global ${TRY_BLOCK_ERROR} to -1. On entry,
-    # an "always {...}" block sets such integer to the exit status of the last
-    # command in the corresponding "{...}" block.
-    #
-    # If such integer is 0, then this function must be being called from within
-    # an "always {...}" block of a "{...}" block whose last command
-    # succeeded. While fairly rare, handle such case by coercing the current
-    # "always {...}" block to return failure rather than success.
+    # "always :{...}:" blocks set such integer to the exit status of the last
+    # command in the corresponding "try {...}" block. If such integer is 0, this
+    # function was called from within the "always :{...}:" block of such a "try
+    # {...}" block whose last command succeeded. While fairly rare, handle such
+    # case by coercing the current "always :{...}:" block to return failure
+    # rather than success.
     (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
 
-    #FIXME: I have no idea what this does. It doesn't appear to be strictly
-    #necessary, in any case. Disabled for now.
-    #FIXME: I get it. I think throw() is actually trying to induce an error
-    #here. Which is a bit odd, admittedly. This sort-of implies that zsh does
-    #something internally to know that a call to throw() should unwind the
-    #current call stack. Without having actually looked, I have no idea what.
-    #It doesn't particularly matter, I suppose, as return 1 suffices as well.
-    #FIXME: "return 1" does *NOT* suffice. The error this induces appears to
-    #produce exactly the sort of stack-unwinding that exception handling
-    #requires. Interesting... Document, anyway.
-
-    # Throw an exception. (What?)
+    # Throw an exception by intentionally triggering a fatal error -- in this
+    # case, by silently attempting to redefine a local string constant. Such
+    # logic is directly inspired by the canonical zsh function throw(). For
+    # reasons that are not entirely clear, such logic is *NOT* replaceable by
+    # typical commands for signalling errors (e.g., "return 1").
     readonly THROW=
     THROW= 2>/dev/null
-
-    #FIXME: Correct documentation.
-    # Return failure, triggering TRAPZERR() and hence 
-#   return 1
-}
-
-ZESHY_CORE_HELP_ALIASES+='
-[status: boolean] catch_exception_matching_glob_if_found(string exception_glob)
-
-Catch an exception matching the passed glob thrown by the `{...}` block
-preceding the `always {...}` block presumably calling this function if an
-exception was thrown matching such glob or return failure otherwise. In the
-former case, this function ``catches'' such exception by setting string global
-${CAUGHT} to ${EXCEPTION} (i.e., the string that was thrown), unsetting
-${EXCEPTION}, and returning success. If no exception was thrown _or_ was but
-fails to match such glob _or_ this function was _not_ called in an
-`always {...}` block, failure is returned. See throw_exception() for further
-details.
-'
-# Permit globs to be passed unquoted to catch_exception_matching_glob_if_found()
-# by disabling filename globbing for such function.
-alias    catch_exception_matching_glob_if_found='noglob catch_exception_matching_glob_if_found'
-function catch_exception_matching_glob_if_found() {
-    # Validate sanity. Since this function is typically called from within
-    # exception handlers (i.e., "always {...}" blocks), return failure from such
-    # handler rather than throwing yet another exception.
-    (( # == 1 )) || {
-        print "zeshy: catch_exception_matching_glob_if_found() expected one glob but received:\n${*}" 1>&2
-        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
-        return 1
-    }
-    die_unless_in_always
-
-    # If an exception was thrown *AND* such exception matches such glob, return
-    # success from both the current function and "always {...}" block *AND*
-    # "catch" such exception as documented above.
-    if (( ${+EXCEPTION} )) && [[ "${EXCEPTION}" == ${~1} ]] {
-        TRY_BLOCK_ERROR=0
-        typeset -g CAUGHT="${EXCEPTION}"
-        unset EXCEPTION
-        return 0
-    }
-
-    # Else, return failure.
-    return 1
-}
-
-#FIXME: Nice nomenclature. Rename the rather clunky
-#die_unless_context_current_function() to die_unless_in_function(). (Much
-#better!)
-ZESHY_CORE_HELP_FUNCTIONS+='
-void die_unless_in_always(void)
-
-Throw an exception if either this function was not called from within an `always
-{...}` block _or_ `zsh` integer global ${TRY_BLOCK_ERROR} is undefined (which it
-should never be).
-'
-function die_unless_in_always() {
-    # Validate sanity.
-    (( # == 0 )) || throw_exception\
-        "zeshy: catch_exception_matching_glob_if_found() expected one glob but received:\n${*}" 1>&2
-
-    # Test the current context.
-    if (( ${TRY_BLOCK_ERROR--1} <= -1 )) {
-        if (( ${+TRY_BLOCK_ERROR} == 0 )) {
-            throw_exception 'Global ${TRY_BLOCK_ERROR} undefined.'
-        } else {
-            throw_exception 'catch_exception_matching_glob_if_found() not called in an "always {...}" block.'
-        }
-    }
 }
 
 #FIXME: Signal handling requires generalization. Rename our current
@@ -630,103 +540,245 @@ function TRAPZERR() {
     integer exit_status=${?}
 #   print -r -- "TRAPZERR() triggered with ${exit_status}"
 
-    #FIXME: Once we've refactored everything appropriately, dropkick this call
-    #to die_with_status().
+    #FIXME: Once we've refactored everything appropriately, dropkick the call
+    #to print_exception_with_status().
+    #FIXME: Actually, we may *NOT* be able to treat such errors as exceptions.
+    #After all, where would we get... Oh, nevermind. There *IS* no exception
+    #message. Naturally, we have to construct it ourselves from the current call
+    #path (namely, the caller name) and ...
+    #FIXME: Oh, wait. We need a new zeshy global caching the contents of the
+    #current call path -- say, ${ZESHY_EXCEPTION_FUNCFILETRACE} -- to be
+    #displayed by print_exception_with_status() when such function is eventually
+    #subsequently called. throw_exception() should handle this!
+    #FIXME: Note that throw_exception() needs to handle an additional task as
+    #well. If (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) evaluates to true in
+    #such function, then such function needs to explicitly call
+    #print_exception_if_unhandled(). Hmm. Actually, I suppose
+    #throw_exception() could simply call
+    #print_exception_if_unhandled() as is -- at least, if it were
+    #not for the initial checks such function performed. To amend this, the
+    #easiest solution is probably as follows:
+    #
+    #function throw_exception() {
+    #   ...
+    #   try {
+    #   } always :{
+    #   }:
+    #}
+    #
+    #Or perhaps not. That *WOULD* work, but it does seem rather... hacky, yes?
+    #The alternative is simply to split the meaningful latter half of
+    #print_exception_if_unhandled() into a separate function
+    #print_exception_uncaught() and then have throw_exception() call such
+    #function.
+    #FIXME: Incidentally, rename print_exception_if_unhandled() to
+    #print_exception_if_unhandled_in_always(). The verb "unhandled" encapsulates
+    #the exact concept of an uncaught exception being propagated up by the
+    #topmost "always :{...}:" block. In such case, the new function previously
+    #described would be named print_exception_if_unhandled(). So, we have:
+    #
+    #* print_exception_if_unhandled_in_always() calling...
+    #* print_exception_if_unhandled().
+    #
+    #Then throw_exception() calls print_exception_if_unhandled() as well. Done!
+    #FIXME: Wait. O.K.; nice idea, but throw_exception() needs to just copy the
+    #few shared lines of code from print_exception_if_unhandled(). The two
+    #differ too widely. *shrug*
+    #FIXME: What we *DO* need is a shared function store_exception_with_status()
+    #called by both this and throw_exception(). Such function is passed the
+    #exception message *AND* exit status associated with such exception and:
+    #
+    #* Copies such message into string global ${EXCEPTION}.
+    #* Copies such status into integer global ${ZESHY_EXCEPTION_STATUS}.
+    #* Copies list globals ${funcstack} and ${funcfiletrace} into list globals
+    #  ${ZESHY_EXCEPTION_FUNCSTACK} and ${ZESHY_EXCEPTION_FUNCFILETRACE}.
+    #
+    #Bloody sweet, yah?
 
     # Handle such exception and return such command's exit status, mimicking the
     # action of "setopt ERR_RETURN". (See "man zshoptions" for further details.)
-    die_with_status "${exit_status}"
+#   print_exception_with_status "${exit_status}"
+
+    # Convert such error into an exception. Since zsh only passes this function
+    # an exit status, do *NOT* bother fabricating an error message. Subsequent
+    # exception handling does so more adequately.
+    store_exception_with_status '' "${exit_status}"
+
+    # Return such command's status as this trip's status, thus mimicking the
+    # action of "setopt ERR_RETURN". See "man zshoptions" for further details.
     return ${exit_status}
 }
 
-#FIXME: die() should arguably be refactored into an alias expanding to simply
-#throw_exception(). In any case, throw_exception() should suffice for all
-#top-level use now. Refactor all top-level parcels to simply call
-#throw_exception() instead and shift die() to, say, @{00-declare/00-pcre}.
+ZESHY_CORE_HELP_FUNCTIONS+='
+void store_exception_with_status(string exception_message, integer exit_status)
 
-ZESHY_CORE_HELP_ALIASES+='
-string die(string error_message1 = "", ...)
+Store the passed exception message, exit status, and current call stack to
+globals. Although `zsh` lacks builtin support for exception handling, such
+globals supply a reasonable facade of such support. Specifically:
 
-Throw an exception with the passed error message (defaulting to the empty
-string). If such exception remains uncaught (i.e., _not_ handled by an
-`always {...}` block on the current call stack), such message and related
-metadata will be printed to standard error and failure returned from such stack.
-
-== Exception Metadata ==
-
-Such metadata includes the following:
-
-* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK} is enabled, a stack
-  trace of the current call path. See output_call_stack() for further details.
-* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_DOCUMENTATION} is enabled,
-  documentation for the function or script throwing such exception. See
-  print_exception_thrower_documentation() for further details.
-* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_SOURCE} is enabled, the
-  source code of the function or script throwing such exception. See
-  print_exception_thrower_implementation() for further details.
+* Store such message to string global ${EXCEPTION}, a canonical `zsh` global
+  first invented by non-`zeshy` functions throw() and catch(). For backwards
+  compatibility with existing `zsh` code, `zeshy` preserves such nomenclature.
+* Store such status to integer global ${ZESHY_EXCEPTION_STATUS}.
+* Store list globals ${funcstack} and ${funcfiletrace} to list globals
+  ${ZESHY_EXCEPTION_FUNCSTACK} and ${ZESHY_EXCEPTION_FUNCFILETRACE}.
 '
-function die() {
-    # Exit status of the prior command. zsh defines "pipestatus" to be a global
-    # list with elements the return values of each subcommand of the prior pipe
-    # command or of the prior command if not a pipe command. Conversely, zsh
-    # defines "?" to be a global integer with the return value of the prior
-    # command. Since the former subsumes the latter *AND* the latter fails to
-    # provide the return value of the prior command when a subcommand of a pipe
-    # command, we defer to the former. For example, consider:
-    #
-    #     # Define helper functions.
-    #     >>> pipe_status() { print ${pipestatus[-1]} }
-    #     >>> exit_status() { print $? }
-    #
-    #     # Show "pipestatus" to return the required values.
-    #     >>> true; pipe_status  # this works...
-    #     0
-    #     >>> true; true | false || pipe_status  # ...and so does this.
-    #     1
-    #
-    #     # Show "?" to *NOT* return the required values.
-    #     >>> true; exit_status  # this works...
-    #     0
-    #     >>> true; true | false || exit_status  # ...but this doesn't.
-    #     0
-    integer exit_status=${pipestatus[-1]}
-
-    # If the prior command succeeded, coerce such exit status into an error.
-    if (( ${exit_status} == 0 )) {
-        exit_status=1
+function store_exception_with_status() {
+    # Validate sanity. Since throw_exception() calls this function, avoid
+    # calling such function; in the event of an error, simply print a message to
+    # standard error and return failure.
+    (( # == 2 )) || {
+        print "zeshy: store_exception_with_status() expected one exception message and one exit status." 1>&2
+        return 1
     }
 
-    # Handle such exception.
-    die_with_status "${@}" "${exit_status}"
-
-    #FIXME: Suffix the exception name by the name of the function directly
-    #responsible for throwing this exception. See curse_exception_status()
-    #for simple logic getting this function name.
-
-    # If throw_function() is still defined, unwind the current call stack,
-    # returning the current user to an interactive prompt if the current shell
-    # is interactive or exiting such shell otherwise.
-    if { typeset -f throw_exception &>/dev/null } {
-        throw_exception ZeshyException
-    # Else, something awful. Print a bleak warning.
-    } else {
-        print 'zeshy: throw_exception() undefined (e.g., due to exception handler throwing exception)' 1>&2
+    # See is_integer_nonnegative() for details.
+    local exception_message="${1}" exit_status="${2}"
+    { [[ "${exit_status}" == <-> ]] &&
+      (( 0 <= exit_status && exit_status <= 255 )) } || {
+        print "zeshy: store_exception_with_status() exit status \"${exit_status}\" not an integer in [0, 255]." 1>&2
+        return 1
     }
 
-    # Return success to avoid triggering TRAPZERR and hence another exception.
-    return 0
+    # Store such metadata as documented above.
+    typeset -g EXCEPTION="${exception_message}"
+
+    #FIXME: Define these as fully fledged documented globals above.
+    integer -g ZESHY_EXCEPTION_STATUS="${exit_status}"
+    typeset -ag ZESHY_EXCEPTION_FUNCSTACK ZESHY_EXCEPTION_FUNCFILETRACE
+    ZESHY_EXCEPTION_FUNCSTACK=( "${funcstack[@]}" )
+    ZESHY_EXCEPTION_FUNCFILETRACE=( "${funcfiletrace[@]}" )
 }
 
-ZESHY_CORE_HELP_FUNCTIONS+='
-string die_with_status(
-    string error_message1 = "", ...,
-    integer exit_status)
+ZESHY_CORE_HELP_ALIASES+='
+void try(void)
 
-Print the passed exception message (defaulting to the empty string) and related
-metadata requested by the current user to standard error. See die() for further
-details, which calls this function to perform such printing.
+`zeshy`-specific prefix for `{...} always :{...}:` blocks. While plain `zsh`
+requires no such prefix, `zeshy` provides improved exception handling requiring
+initialization by this alias prior to entering such blocks. Specifically, while
+plain `zsh` fails to print uncaught exceptions or provide user-configurable
+hooks for programmatically doing so, `zeshy` always handles such exceptions.
+
+== Implementation Details ==
+
+This alias increments ${ZESHY_TRY_LEVEL[${SHLVL}]}, the *try level* for the
+current shell (i.e., the number of `try {...} always :{...}:` blocks on such
+shell''s call path), subsequently decremented by alias `}:` to detect the
+topmost `always :{...}:` block on such path and hence whether uncaught
+exceptions should be handled immediately or allowed to propagate back up to a
+parent `always :{...}:` block.
 '
-function die_with_status() {
+alias try='typeset -ag ZESHY_TRY_LEVEL; ZESHY_TRY_LEVEL[${SHLVL}]=$(( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} + 1 ))
+'
+
+ZESHY_CORE_HELP_ALIASES+='
+void :{(void)
+
+`zeshy`-specific brace suffixing keyword `always` in `always :{...}:` blocks.
+While plain `zsh` requires no such brace, `zeshy` exception handling implements
+additional functionality requiring initialization prior to entering such blocks.
+
+== Implementation Details ==
+
+This alias currently expands to `{` and hence (technically) performs no
+initialization at the moment. Since this alias will probably be revised to
+initialize something at some future date, prefer this alias to merely `{`.
+'
+alias ':{'='{'
+
+ZESHY_CORE_HELP_ALIASES+='
+void }:(void)
+
+'
+alias '}:'='print_exception_if_unhandled
+}'
+
+#FIXME: It'd be nice to extend such functionality with a list of user-
+#configurable hooks called on uncaught exceptions. Not terribly critical at the
+#moment, but something to eventually... integrate.
+ZESHY_CORE_HELP_FUNCTIONS+='
+[stderr: string] print_exception_if_unhandled()
+
+Catch an *unhandled exception* (i.e., an exception caught by no `always :{...}:`
+block on the call path for the current shell) by printing such exception to
+standard error or return silently if no such exception was thrown. Specifically,
+standard error is printed to if all of the following conditions apply:
+
+* An exception was thrown (i.e., `zsh` string global ${EXCEPTION} is defined).
+* This function was called from within the topmost `always :{...}:` block on
+  the call path for the current shell.
+* Such block failed to catch such exception.
+'
+# While such functionality could be inserted directly into the expansion of
+# "}--", doing so inflates the implementation of all runnables expanding such
+# alias -- in some cases, unreadably so. 
+function print_exception_if_unhandled() {
+    # If not called from within an "always :{...}:" block, throw an exception.
+    # See die_unless_in_always() for further details.
+    if (( ${TRY_BLOCK_ERROR--1} < 0 )) {
+        print "zeshy: print_exception_if_unhandled() not called within an \"always :{...}:\" block" 1>&2
+        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+    # Else if list global ${ZESHY_TRY_LEVEL} is not defined or has no element
+    # corresponding to the current shell or such element is non-positive, throw
+    # an exception. Assuming the current "always :{...}:" block was preceded by
+    # a sane "try {...}" block, such element should always be positive. See
+    # try() for further details.
+    } elif (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
+        if (( ${+ZESHY_TRY_LEVEL[${SHLVL}]} == 0 )) {
+            print "zeshy: \${ZESHY_TRY_LEVEL[${SHLVL}]\} undefined" 1>&2
+        } else {
+            print "zeshy: \"always :{...}:\" block preceded by no \"try {...}\" block" 1>&2
+            ZESHY_TRY_LEVEL[${SHLVL}]=0
+        }
+
+        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+    # Else, the current context is sane.
+    } else {
+        # Decrement the shell-specific try level incremented by the prior "try
+        # {...}" block. See try() for further details.
+        ZESHY_TRY_LEVEL[${SHLVL}]=$(( ZESHY_TRY_LEVEL[${SHLVL}] - 1 ))
+
+        # If an exception was thrown and the current "always :{...}:" block is
+        # the topmost such block, catch such exception. Unlike
+        # catch_exception_matching_glob_if_found(), retain the current exit
+        # status (i.e., ${TRY_BLOCK_ERROR}) to report such status to the shell.
+        # See catch_exception_matching_glob_if_found() for further details.
+        if (( ${+EXCEPTION} && ZESHY_TRY_LEVEL[${SHLVL}] == 0 )) {
+            print_exception
+#           print_exception_with_status "${EXCEPTION}" "${TRY_BLOCK_ERROR}"
+
+            #FIXME: Don't forget to erase the other ${ZESHY_EXCEPTION_*} globals
+            #both here and wherever else we catch exceptions! Grep the codebase
+            #for the following line. Since this is becoming unsettingly
+            #redundant, we should probably define a new catch_exception()
+            #function implementing such behavior. Naturally, call such function
+            #both here and in catch_exception_matching_glob_if_found().
+            #catch_exception() should make the customary sanity checks, of
+            #course.
+            unset EXCEPTION
+        }
+    }
+}
+
+#FIXME: Define new functions
+#print_call_stack_with_funcstack_and_funcfiletrace() and
+#print_exception_call_stack(). The former is the lowest-level function for
+#doing so; the latter calls the former with list globals storing such call
+#stacks for the currently thrown exception. Likewise, print_call_stack() should
+#call print_call_stack_with_funcstack_and_funcfiletrace() with the current such
+#globals. Sweet, yes?
+ZESHY_CORE_HELP_FUNCTIONS+='
+[stderr: string] print_exception(void)
+
+Print the currently thrown exception to standard error. See
+store_exception_with_status() for further details.
+'
+function print_exception() {
+    #FIXME: This requires a *MAJOR* simplification. For one, this function is
+    #no longer passed anything and hence should reference globals. For another,
+    #we really want to reduce the series of printer calls below to a single
+    #printer function. It's time to just do it.
+
     # Redirect all output printed below to standard error. Yes, a single
     # suffixing "} 1>&2" actually suffices. You rock, zsh! (Sometimes.)
     {
@@ -739,7 +791,7 @@ function die_with_status() {
         # do so efficiently, search from the end (i.e., root) of such stack; if
         # the first matching caller is not the first, a witch! As below, return
         # success to avoid triggering TRAPZERR and hence another exception.
-        if (( ${funcstack[(I)die_with_status]} != 1 )) {
+        if (( ${funcstack[(I)print_exception_with_status]} != 1 )) {
             # Print a synopsis of such exception.
             print
             print "zeshy: exception handler threw exception: ${*}"
@@ -797,12 +849,12 @@ function die_with_status() {
         if (( ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK-0} +\
               ${ZESHY_IS_DEBUG-0} )) {
 #           print "printing call stack"
-            # If output_call_stack() is defined, call such function.
-            if { typeset -f output_call_stack &>/dev/null } {
-#               print "calling output_call_stack()"
-                output_call_stack
+            # If print_call_stack() is defined, call such function.
+            if { typeset -f print_call_stack &>/dev/null } {
+#               print "calling print_call_stack()"
+                print_call_stack
             # Else, print such stack with an implementation distilled from
-            # output_call_stack(). See such function for further details.
+            # print_call_stack(). See such function for further details.
             } else {
                 integer funcstack_size=${#funcstack} i caller_line
                 local frame_prefix='    \\_' filename caller_name
@@ -813,8 +865,9 @@ function die_with_status() {
                     caller_line="${funcfiletrace[${i}]##*:}"
                        filename="${funcfiletrace[${i}]%:*}"
 
-                    typeset -f -- "${caller_name}" &>/dev/null &&
+                    if { typeset -f -- "${caller_name}" &>/dev/null } {
                         caller_name="${caller_name}()"
+                    }
                     print -r --\
                         "${frame_prefix} ${caller_name} { ${filename}: ${caller_line} }"
 
@@ -822,39 +875,104 @@ function die_with_status() {
                 }
             }
         }
-    # If such handling itself throws an exception, catch such exception here to
-    # prevent uncaught exceptions from recursively triggering TRAPZERR(). Since
-    # zeshy functions may sadly be the source of such exception, avoid calling
-    # zeshy functions in catch logic.
     } always {
-        # If an exception was thrown, handle such exception (hopefully) without
-        # inducing additional exceptions.
+        # If prior exception handling threw an exception, catch such exception
+        # to prevent uncaught exceptions from recursively triggering TRAPZERR().
+        # Since aliases and functions typically throw exceptions *AND* cannot be
+        # guaranteed to exist (e.g., due to intentional or unintentional
+        # deletion), avoid expanding aliases or calling functions below.
+        # Specifically, print and delete such exception and return success from
+        # this "always {...}" block. See
+        # catch_exception_matching_glob_if_found() for further details.
         if (( ${+EXCEPTION} )) {
-            # If catch_exception_matching_glob_if_found() is still defined, catch such exception
-            # and print a warning.
-            if { typeset -f catch_exception_matching_glob_if_found &>/dev/null } {
-                # Call such function to catch such exception.  While
-                # catch_exception_matching_glob_if_found() has been aliased to disable filename
-                # globbing for such function and hence could be passed an
-                # unquoted glob, quote such glob for safety (e.g., when such
-                # alias is intentionally or unintentionally deleted).
-                if { catch_exception_matching_glob_if_found '*' } {
-                    # If such function set ${CAUGHT} to the thrown string, print
-                    # such string. This is the typical case.
-                    if (( ${+CAUGHT} )) {
-                        print "zeshy: exception handler threw exception \"${CAUGHT}\""
-                    # Else, ${CAUGHT} remains unset. While this should never
-                    # happen, one can never be too careful.
-                    } else {
-                        print "zeshy: exception handler failed with non-zero exit status"
-                    }
-                }
-            # Else, something awful. Print a despicable warning.
-            } else {
-                print 'zeshy: catch_exception_matching_glob_if_found() undefined (e.g., due to exception handler throwing exception)'
-            }
+            print "zeshy: exception handler threw exception \"${EXCEPTION}\""
+            unset EXCEPTION
+            TRY_BLOCK_ERROR=0
+        # Else if the last command of prior exception handling failed with
+        # nonzero exit status, print such failure and again return success.
+        } elif (( ${TRY_BLOCK_ERROR-0} > 0 )) {
+            print "zeshy: exception handler failed with exit status ${TRY_BLOCK_ERROR}"
+            TRY_BLOCK_ERROR=0
         }
     } 1>&2
+
+    # Return success to avoid triggering TRAPZERR and hence another exception.
+    return 0
+}
+
+#FIXME: die() should arguably be refactored into an alias expanding to simply
+#throw_exception(). In any case, throw_exception() should suffice for all
+#top-level use now. Refactor all top-level parcels to simply call
+#throw_exception() instead and shift die() to, say, @{00-declare/00-pcre}.
+
+ZESHY_CORE_HELP_ALIASES+='
+string die(string error_message1 = "", ...)
+
+Throw an exception with the passed error message (defaulting to the empty
+string). If such exception remains uncaught (i.e., _not_ handled by an
+`always :{...}:` block on the current call stack), such message and related
+metadata will be printed to standard error and failure returned from such stack.
+
+== Exception Metadata ==
+
+Such metadata includes the following:
+
+* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK} is enabled, a stack
+  trace of the current call path. See print_call_stack() for further details.
+* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_DOCUMENTATION} is enabled,
+  documentation for the function or script throwing such exception. See
+  print_exception_thrower_documentation() for further details.
+* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_SOURCE} is enabled, the
+  source code of the function or script throwing such exception. See
+  print_exception_thrower_implementation() for further details.
+'
+function die() {
+    # Exit status of the prior command. zsh defines "pipestatus" to be a global
+    # list with elements the return values of each subcommand of the prior pipe
+    # command or of the prior command if not a pipe command. Conversely, zsh
+    # defines "?" to be a global integer with the return value of the prior
+    # command. Since the former subsumes the latter *AND* the latter fails to
+    # provide the return value of the prior command when a subcommand of a pipe
+    # command, we defer to the former. For example, consider:
+    #
+    #     # Define helper functions.
+    #     >>> pipe_status() { print ${pipestatus[-1]} }
+    #     >>> exit_status() { print $? }
+    #
+    #     # Show "pipestatus" to return the required values.
+    #     >>> true; pipe_status  # this works...
+    #     0
+    #     >>> true; true | false || pipe_status  # ...and so does this.
+    #     1
+    #
+    #     # Show "?" to *NOT* return the required values.
+    #     >>> true; exit_status  # this works...
+    #     0
+    #     >>> true; true | false || exit_status  # ...but this doesn't.
+    #     0
+    integer exit_status=${pipestatus[-1]}
+
+    # If the prior command succeeded, coerce such exit status into an error.
+    if (( ${exit_status} == 0 )) {
+        exit_status=1
+    }
+
+    # Handle such exception.
+    print_exception_with_status "${@}" "${exit_status}"
+
+    #FIXME: Suffix the exception name by the name of the function directly
+    #responsible for throwing this exception. See curse_exception_status()
+    #for simple logic getting this function name.
+
+    # If throw_function() is still defined, unwind the current call stack,
+    # returning the current user to an interactive prompt if the current shell
+    # is interactive or exiting such shell otherwise.
+    if { typeset -f throw_exception &>/dev/null } {
+        throw_exception ZeshyException
+    # Else, something awful. Print a bleak warning.
+    } else {
+        print 'zeshy: throw_exception() undefined (e.g., due to exception handler throwing exception)' 1>&2
+    }
 
     # Return success to avoid triggering TRAPZERR and hence another exception.
     return 0
@@ -1432,7 +1550,7 @@ if [[ -n "${*}" ]] {
 #   is_zeshy_debug_and print "zeshy: sourcing \"${@}\"..."
 
     #FIXME: The output is still subpar. We *REALLY* just want to slightly tweak
-    #output_call_stack() so that such function omits the first element on the
+    #print_call_stack() so that such function omits the first element on the
     #stack if such element is the absolute path of this "main" script. Very
     #simple. Just need to do it, as ever! Then, remove the "or die..." below.
 
@@ -1454,6 +1572,166 @@ if [[ -n "${*}" ]] {
 return 0
 
 # --------------------( WASTELANDS                         )--------------------
+#[stderr: string] print_exception_with_status(
+#    string error_message1 = "", ...,
+#    integer exit_status)
+#
+#Print the passed exception message (defaulting to the empty string) and exit
+#status (presumably associated with such exception via `zsh` integer global
+#${TRY_BLOCK_ERROR}) to standard error.
+#'
+
+    # Announce such exception globally. Subsequent exception handling
+    # functionality tests the global to decide whether an exception was called.
+#   typeset -g EXCEPTION="${*}"
+
+# Subsequent exception handling. Record a. Associate the current
+    #FUXME: Decent message, but hardly ideal. Instead, check if a function
+    #get_exception_message_for_signal_zerr() (or some such) is defined and, if
+    #so, defer to such function; else, this seems an adequate fallback.
+#   store_exception_with_status "${funcstack[2]-}() failed with " "${exit_status}"
+    #FUXME: O.K.; so we currently just pass an empty exception message. Ensure
+    #that print_exception_with_status() doesn't attempt to display such message,
+    #please!
+    #FUXME: Actually, rather than have an empty message, it'd be great to do the
+    #following:
+    #
+    #* If function 
+
+#FUXME: Rename print_call_stack() to print_call_stack(). I'm not really
+#concerned that such function fails to page output. It does pretty much
+#everything else expected of a high-level printer, so... There you go.
+#If this function was called from within the topmost `always {...}` block of the
+#call path for the current shell _and_ such block failed to catch a thrown
+#exception, catch such exception. Specifically, print such exception to standard
+#error, .
+
+# See die() for further
+#details, which calls this function to perform such printing.
+#metadata requested by the current user 
+
+#alias '}--'='    if (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
+#        if (( ${+ZESHY_TRY_LEVEL[${SHLVL}]} == 0 )) {
+#            print "zeshy: \${ZESHY_TRY_LEVEL[${SHLVL}]\} undefined" 1>&2
+#        } else {
+#            print "zeshy: \"always\" block preceded by no \"try\" block" 1>&2
+#            ZESHY_TRY_LEVEL[${SHLVL}]=0
+#        }
+#
+#        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+#    } else {
+#        ZESHY_TRY_LEVEL[${SHLVL}]=$(( ZESHY_TRY_LEVEL[${SHLVL}] - 1 ))
+#
+#        if (( ${+EXCEPTION} && ZESHY_TRY_LEVEL[${SHLVL}] == 0 )) {
+#            (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+#
+#            print_exception_with_status "${TRY_BLOCK_ERROR}"
+#            print ok
+#        }
+#    }
+
+        # If an exception was thrown, handle such exception (hopefully) without
+        # inducing additional exceptions. Specifically, return success from both
+        # the current function and "always {...}"
+        # block *AND* "catch" such exception as documented above. For
+        # robustness, inline such test rather than calling
+        # catch_exception_matching_glob_if_found(). Since no function is
+        # guaranteed to exist , . See such function for further details.
+            # If catch_exception_matching_glob_if_found() is still defined, catch such exception
+            # and print a warning.
+#            if { typeset -f catch_exception_matching_glob_if_found &>/dev/null } {
+#                # Call such function to catch such exception.  While
+#                # catch_exception_matching_glob_if_found() has been aliased to disable filename
+#                # globbing for such function and hence could be passed an
+#                # unquoted glob, quote such glob for safety (e.g., when such
+#                # alias is intentionally or unintentionally deleted).
+#                if { catch_exception_matching_glob_if_found '*' } {
+#                    # If such function set ${CAUGHT} to the thrown string, print
+#                    # such string. This is the typical case.
+#                    if (( ${+CAUGHT} )) {
+#                        print "zeshy: exception handler threw exception \"${CAUGHT}\""
+#                    # Else, ${CAUGHT} remains unset. While this should never
+#                    # happen, one can never be too careful.
+#                    } else {
+#                        print "zeshy: exception handler failed with non-zero exit status"
+#                    }
+#                }
+#            # Else, something awful. Print a despicable warning.
+#            } else {
+#                print 'zeshy: catch_exception_matching_glob_if_found() undefined (e.g., due to exception handler throwing exception)'
+#            }
+
+#FUXME: Excise. We now implement zeshy-specific analogues of such functions.
+# Astonishingly, zsh implements throw() and catch() as user-defined functions
+# autoloaded from list ${fpath} for the current user. Autoload such functions
+# before called by functions below. Defer all other autoloads to
+# startup_zeshy_autoloads().
+#autoload -U throw catch
+
+# The catch() implementation selectively disables filename globbing for such
+# function by defining an alias of the same name. Since such alias is
+# unavailable on the first call to catch(), define such alias here.
+#alias catch='noglob catch'
+
+#FUXME: Shift to @{always/exception}. There's really no rational reason to have
+#this here. Refactor print_exception_with_status() to manually implement such globbing and
+#resultant handling. Yum!
+#ZESHY_CORE_HELP_ALIASES+='
+#[status: boolean] catch_exception_matching_glob_if_found(string exception_glob)
+#
+#Catch an exception matching the passed glob thrown by the `{...}` block
+#preceding the `always {...}` block presumably calling this function if an
+#exception was thrown matching such glob or return failure otherwise. In the
+#former case, this function ``catches'' such exception by setting string global
+#${CAUGHT} to ${EXCEPTION} (i.e., the string that was thrown), unsetting
+#${EXCEPTION}, and returning success. If no exception was thrown _or_ was but
+#fails to match such glob _or_ this function was _not_ called in an
+#`always {...}` block, failure is returned. See throw_exception() for further
+#details.
+#'
+## Permit globs to be passed unquoted to catch_exception_matching_glob_if_found()
+## by disabling filename globbing for such function.
+#alias    catch_exception_matching_glob_if_found='noglob catch_exception_matching_glob_if_found'
+#function catch_exception_matching_glob_if_found() {
+#    # Validate sanity. Since this function is typically called from within
+#    # exception handlers (i.e., "always {...}" blocks), return failure from such
+#    # handler rather than throwing yet another exception.
+#    (( # == 1 )) || {
+#        print "zeshy: catch_exception_matching_glob_if_found() expected one glob but received:\n${*}" 1>&2
+#        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+#        return 1
+#    }
+#    die_unless_in_always
+#
+#    # If an exception was thrown *AND* such exception matches such glob, return
+#    # success from both the current function and "always {...}" block *AND*
+#    # "catch" such exception as documented above.
+#    if (( ${+EXCEPTION} )) && [[ "${EXCEPTION}" == ${~1} ]] {
+#        TRY_BLOCK_ERROR=0
+#        typeset -g CAUGHT="${EXCEPTION}"
+#        unset EXCEPTION
+#        return 0
+#    }
+#
+#    # Else, return failure.
+#    return 1
+#}
+
+    #FUXME: I have no idea what this does. It doesn't appear to be strictly
+    #necessary, in any case. Disabled for now.
+    #FUXME: I get it. I think throw() is actually trying to induce an error
+    #here. Which is a bit odd, admittedly. This sort-of implies that zsh does
+    #something internally to know that a call to throw() should unwind the
+    #current call stack. Without having actually looked, I have no idea what.
+    #It doesn't particularly matter, I suppose, as return 1 suffices as well.
+    #FUXME: "return 1" does *NOT* suffice. The error this induces appears to
+    #produce exactly the sort of stack-unwinding that exception handling
+    #requires. Interesting... Document, anyway.
+
+    #FUXME: Correct documentation.
+    # Return failure, triggering TRAPZERR() and hence 
+#   return 1
+
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     # Synchronize with rethrow_exception().
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -1490,7 +1768,7 @@ return 0
 #        ZESHY_TRY_LEVEL[${SHLVL}]=$(( ZESHY_TRY_LEVEL[${SHLVL}] - 1 ))
 #
 #        if (( ZESHY_TRY_LEVEL[${SHLVL}] == 0 )) {
-#            die_with_status "${TRY_BLOCK_ERROR}"
+#            print_exception_with_status "${TRY_BLOCK_ERROR}"
 #            print ok
 #        }
 #    }'
@@ -2499,12 +2777,12 @@ return 0
 #   return $(( ${exit_status} + 128 + ${signal_number} ))
 
     # Die with the prior return code.
-#   die_with_status ${exit_status}
+#   print_exception_with_status ${exit_status}
 
-# void die_with_status(int exit_status = 1)
+# void print_exception_with_status(int exit_status = 1)
 #
 # Exit the currently executed script or function with the passed return code.
-#die_with_status() {
+#print_exception_with_status() {
 #   for ((i = 1; i <= ${#funcstack}; i++)) { print "${i}: ${funcstack[${i}]}" }
 #   if is_interactive; then
 #   then print 'throwing exception'; throw ZeshyException
@@ -2539,7 +2817,7 @@ return 0
     # command. This effectively enables "set -e" (i.e., the ERR_EXIT option,
     # terminating the current shell on SIGZERR signals).
 #   eval 'throw ZeshyException'; return ${exit_status}
-#   die_with_status ${exit_status}
+#   print_exception_with_status ${exit_status}
 
 # * Uhm; how did I never see this? zsh supports loop syntax resembling:
 #   for d (../**/*) {
