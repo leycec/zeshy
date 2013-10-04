@@ -1,0 +1,308 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'/---'
+Handle *exception printers* (i.e., functions printing exceptions typically
+consisting of error messages, exit statuses, and call stacks specific to such
+exceptions).
+/---
+
+# ....................{ GETTERS                            }....................
+declare_function_with_stdin <<'/---'
+integer get_terminal_width_for_exceptions(void)
+
+Get the maximum number of characters on each line of exception messages
+available for textual content (i.e., excluding non-textual border characters),
+specific to the current terminal and user-configurable styles for such messages.
+See get_string_titled_width_body_with_style_prefix() for further details.
+/---
+function get_terminal_width_for_exceptions() {
+    get_string_titled_width_body_with_style_prefix 'print_exception.'
+}
+
+# ....................{ PRINTERS                           }....................
+#FIXME: Ugh. The current implementation is atrociously terrible. It should:
+#
+#* Leverage ${ZESHY_STYLE_TO_TEXT}.
+#* Leverage ${ZESHY_STYLE_TO_COLOR} styles that *ACTUALLY* exist.
+#* Be *MUCH* better integrated into the printed exception message. Ideally,
+#  shouldn't messages just resemble:
+#
+#  /----------------- rsync_safely ----------------------\
+#  | mount_disk() failed with exit status 1:             |
+#  | Expected one device filename and one mount dirname. |
+#  \-----------------------------------------------------/
+#
+#  # Then, print the current call stack here!
+#FIXME: Right. All of this was pretty much extreme overkill. Define a new
+#parcel @{message/exception} with function print_exception_with_status()
+#accepting a string message and integer status and printing:
+#
+#* Such message and status in a single box, as above. We'll probably need a call resembling:
+#   print_string_titled_with_style_prefix\
+#       "$(get_call_stack_root_basename)" "${*}" 1>&2
+#* 
+#FIXME: The whole "$(get_call_stack_root_basename)" jazz isn't quite right. Such
+#text should be semantically embellished with a new getter appropriate to output
+#-- say, get_call_stack_root_basename() -- as follows:
+#
+#* If get_call_stack_root_basename() is a file, such basename should be double-
+#  quoted. For aesthetics, we really want to use the UTF-8-encoded “ and ”
+#  characters. To do so, add new entries "text.quote_double_left" and
+#  "text.quote_double_left" to ${ZESHY_STYLE_TO_TEXT_UTF8}. ('K: done!)
+#* If get_call_stack_root_basename() is a function, such basename should be
+#  suffixed by "()".
+#
+#Come to think, such functionality is probably the *EXACT* same as that already
+#performed by output_call_stack(), yes? In such case, extract such functionality
+#into a new function -- how about, say, output_runnable_name_with_style_prefix()?
+#Such function should accept a runnable name and optional style prefix and adorn
+#such name with both context-dependent text *AND* colors. Such function should be
+#defined under @{15-function}, somewhere, to render it accessible to
+#output_call_stack(). Note that, when we call it here, such function should
+#probably be called *WITHOUT* a style prefix; ideally, we want such function to
+#*NOT* adorn such runnable name with colors here, since we do that ourselves
+#already.
+
+#FIXME: Correct documentation.
+declare_function_with_stdin <<'/---'
+[stderr: string] print_exception(void)
+
+Print the passed strings (defaulting to the empty string) as an error entitled
+under the basename of the runnable at the call stack root (i.e., as returned by
+get_call_stack_root_basename()). See print_message() for further details.
+
+Print a description of the passed non-zero exit status to standard error. This
+function is intended to be called only by print_exception_with_status(), whose
+implementation guarantees state assumed by this function (e.g., a call stack
+containing at least three callers).
+
+Print a trace of the call stack for the currently thrown exception to standard
+output. See output_call_stack_with_lists() for further details.
+/---
+function print_exception() {
+    # Validate sanity.
+    die_if_args
+    die_unless_exception
+    string exception_message exception_title
+    integer frame_index_handler_last
+
+
+    #FIXME: Prefix with such exception's status.
+    #FIXME: If such exception is empty, change the status message accordingly.
+    exception_message="${EXCEPTION}"
+
+    #FIXME: Only suffix "()" if such root is a function.
+    # See get_call_stack_root_basename() for further details.
+    exception_title="$(get_call_stack_root_basename)() Exception"
+
+    # Print such exception message and status.
+    print_string_titled "${exception_message}" "${exception_title}" 1>&2
+
+    # If list global ${ZESHY_EXCEPTION_FUNCSTACK} still exists, ...
+    if { is_list ZESHY_EXCEPTION_FUNCSTACK } {
+        # Index of the last runnable in such exception's call stack matching an
+        # exception handler or 0 if no such runnable exists.
+        frame_index_handler_last="${ZESHY_EXCEPTION_FUNCSTACK[(I)(TRAPZERR|die(|_*)|throw_exception)]}"
+    }
+
+    #FIXME: Actually, this is terrible. For too many fragile assumptions that
+    #just don't pan out in reality. The simplest fix is to simply search the
+    #call stack from the caller of this function up the call stack until finding
+    #a caller *NOT* matching the following glob:
+    #
+    #    ('TRAPZERR'|'die'('_'*|))
+    #
+    #Such caller is basically guaranteed to be as close to the desired runnable
+    #name as we can get, and should suffice for 99% of cases. It's also rather
+    #efficient to do, given list index flags. I'm dead certain we perform a
+    #similar search on the call stack elsewhere, as well. Grep us up!
+
+    # Get the caller's caller's name (i.e., the name of the runnable running the
+    # runnable calling this function). Assuming this function to have been
+    # called by print_exception_with_status() as is typically the case, the current
+    # call stack contains at least three and typically four stack frames:
+    #
+    # * ${funcstack[1]}, this function.
+    # * ${funcstack[2]}, the print_exception_with_status() function.
+    # * ${funcstack[3]}, the caller. This is typically either the
+    #   intermediate zeshy-specific TRAPZERR() or die() functions.
+    # * ${funcstack[4]}, the caller's caller. Assuming ${funcstack[3]} to be
+    #   either TRAPZERR() or die(), this is the actual "caller."
+    #
+    # If this is the case, the fourth stack frame identifies the desired caller.
+    if (( ${#funcstack} >= 4 )) {
+        caller_caller_name="${funcstack[4]}"
+    # Else, the call stack contains three or fewer stack frames. While
+    # unexpected, this is certainly permissible (e.g., to avoid recursively
+    # throwing exceptions from exception handlers). Arbitrarily select the last
+    # such frame to identify the desired caller.
+    } else {
+        caller_caller_name="${funcstack[-1]}"
+    }
+
+    #FIXME: Style names are no longer quite right (e.g., "print_exception.colon").
+    #Define new "print_exception_status."-prefixed styles specific to this
+    #function.
+    #FIXME: Clearly, only output "()" if such caller is a function rather than
+    #script. It would be foolish to duplicate the similar functionality of
+    #output_call_stack() already doing so; hence, abstract such functionality
+    #into a new function print_runnable_name() to be called both here and in
+    #output_call_stack(). Nice!
+
+    # Print such status. Avoid redirecting to standard error, as the caller
+    # (typically print_exception_with_status()) is assumed to already do so.
+    output_string "${ZESHY_STYLE_TO_COLOR[print_exception.caller]-}${caller_caller_name}${ZESHY_STYLE_TO_COLOR[print_exception.colon]-}() ${ZESHY_STYLE_TO_COLOR[print_exception.message]-}failed with exit status ${exit_status}"
+
+    output_call_stack_with_funcstack_and_funcfiletrace\
+        ZESHY_EXCEPTION_FUNCSTACK\
+        ZESHY_EXCEPTION_FUNCFILETRACE\
+        ZESHY_EXCEPTION_FUNCSOURCETRACE
+}
+
+#FIXME: In lieu of unit tests...
+#function erro() {
+#    print_exception "I'm in control of the infinite mind, and I control infinite power. When? Every black minute. And self-control is something I've learned."
+#}
+
+# --------------------( WASTELANDS                         )--------------------
+#    start_stdout
+#    stop_stdout
+#}
+
+#, differing from print_exception() styles in only the
+        # substyle ".footing.corner_left".
+
+#declare_function_with_stdin <<'/---'
+#[stderr: string] print_exception_status(integer exit_status)
+#
+#Print a description of the passed non-zero exit status to standard error. This
+#function is intended to be called only by print_exception_with_status(), whose
+#implementation guarantees state assumed by this function (e.g., a call stack
+#containing at least three callers).
+#/---
+#function print_exception_status() {
+#    # Validate passed arguments.
+#    die_unless_arg 'expected one exit status'
+#    string exit_status="${1}" caller_caller_name
+#    die_unless_integer_nonnegative "${exit_status}"
+#
+#    #FUXME: Actually, this is terrible. For too many fragile assumptions that
+#    #just don't pan out in reality. The simplest fix is to simply search the
+#    #call stack from the caller of this function up the call stack until finding
+#    #a caller *NOT* matching the following glob:
+#    #
+#    #    ('TRAPZERR'|'die'('_'*|))
+#    #
+#    #Such caller is basically guaranteed to be as close to the desired runnable
+#    #name as we can get, and should suffice for 99% of cases. It's also rather
+#    #efficient to do, given list index flags. I'm dead certain we perform a
+#    #similar search on the call stack elsewhere, as well. Grep us up!
+#
+#    # Get the caller's caller's name (i.e., the name of the runnable running the
+#    # runnable calling this function). Assuming this function to have been
+#    # called by print_exception_with_status() as is typically the case, the current
+#    # call stack contains at least three and typically four stack frames:
+#    #
+#    # * ${funcstack[1]}, this function.
+#    # * ${funcstack[2]}, the print_exception_with_status() function.
+#    # * ${funcstack[3]}, the caller. This is typically either the
+#    #   intermediate zeshy-specific TRAPZERR() or die() functions.
+#    # * ${funcstack[4]}, the caller's caller. Assuming ${funcstack[3]} to be
+#    #   either TRAPZERR() or die(), this is the actual "caller."
+#    #
+#    # If this is the case, the fourth stack frame identifies the desired caller.
+#    if (( ${#funcstack} >= 4 )) {
+#        caller_caller_name="${funcstack[4]}"
+#    # Else, the call stack contains three or fewer stack frames. While
+#    # unexpected, this is certainly permissible (e.g., to avoid recursively
+#    # throwing exceptions from exception handlers). Arbitrarily select the last
+#    # such frame to identify the desired caller.
+#    } else {
+#        caller_caller_name="${funcstack[-1]}"
+#    }
+#
+#    #FUXME: Style names are no longer quite right (e.g., "print_exception.colon").
+#    #Define new "print_exception_status."-prefixed styles specific to this
+#    #function.
+#    #FUXME: Clearly, only output "()" if such caller is a function rather than
+#    #script. It would be foolish to duplicate the similar functionality of
+#    #output_call_stack() already doing so; hence, abstract such functionality
+#    #into a new function print_runnable_name() to be called both here and in
+#    #output_call_stack(). Nice!
+#
+#    # Print such status. Avoid redirecting to standard error, as the caller
+#    # (typically print_exception_with_status()) is assumed to already do so.
+#    start_stdout
+#    output_string "${ZESHY_STYLE_TO_COLOR[print_exception.caller]-}${caller_caller_name}${ZESHY_STYLE_TO_COLOR[print_exception.colon]-}() ${ZESHY_STYLE_TO_COLOR[print_exception.message]-}failed with exit status ${exit_status}"
+#    stop_stdout
+#}
+
+#available to the textual content of each line of
+#exception messages on the current terminal under user-configurable styles
+#specific to such messages. See get_string_titled_width_body_with_style_prefix()
+#for further details.
+
+#Get the maximum number of characters in the body of each line of output (i.e.,
+#excluding width of visual borders on such lines) wrapped to the current terminal
+#under the user-configurable styles prefixed by the passed prefix.
+
+#Since such messages are often
+#embedded within a visual box, this number is often slightly less than that
+#returned by get_terminal_width().
+#Print the passed strings (defaulting to the empty string) suffixed by a newline
+#and decorated by user-configured colors to standard error as an error message.
+#See print_message() for further details.
+
+#   print_string "${ZESHY_STYLE_TO_COLOR[print_exception.caller]-}$(get_call_stack_root_basename)${ZESHY_STYLE_TO_COLOR[print_exception.colon]-}: ${ZESHY_STYLE_TO_COLOR[print_exception.message]-}${*}" 1>&2
+
+#FUXME: The current overly simplistic get_print_message_prefix()-based approach
+#should be jettisoned in favor of a Unicode box-drawing based approach: e.g.,
+#
+#/------------------------------[ zsh_gone_bad() ]-----------------------------\
+#| An error has been thrown. It is a horrible error, but others are probably   |
+#| worse.                                                                      |
+#\-----------------------------------------------------------------------------/
+#
+#What's particularly nice about such an approach is that it inherently delimits
+#prior from subsequent output. Indeed, we needn't even prefix such output with
+#delimiting whitespace anymore, which is particularly nice.
+
+    # Size of the current call stack, including the call to this function.
+    # Avoid calling get_call_stack_size(), which tends to behave erratically
+    # when called from within an exception handler.
+#   integer call_stack_size=${#funcstack}
+
+#   if (( call_stack_size >= 4 )) {
+#       if is "${funcstack[3]}" == ('TRAPZERR'|'die') si {
+#           caller_caller_name="${funcstack[4]}"
+#       } else {
+#           #FUXME: Doesn't this also constitute an error condition?
+#           print "caller caller name: ${funcstack[3]}\ncaller caller caller name: ${funcstack[4]}"
+#           caller_caller_name="${funcstack[3]}"
+#       }
+#   #FUXME: Doesn't this also constitute an error condition?
+#   } elif (( call_stack_size == 3 )) {
+#       caller_caller_name="${funcstack[3]}"
+#   } elif (( call_stack_size == 2 )) {
+#       die "print_exception_status() called by ${funcstack[2]}() rather than print_exception_with_status()"
+#   } else {  # elif (( call_stack_size == 1 )) {
+#       print "call stack size: ${#funcstack}; ${call_stack_size}\nfuncstack[2]: ${funcstack[2]}"
+#       die "print_exception_status() not callable directly from the CLI"
+#   }
+
+#; call_stack_size="$(get_call_stack_size)"
+#declare_function_with_stdin <<'/---'
+#string print_warning_sans_newline_suffix(
+#    string message1 = "", string message2, ...)
+#
+#Print the passed strings (defaulting to the empty string) suffixed by no newline
+#and decorated by user-configured colors to standard error as a warning message.
+#See print_warning() for further details.
+#/---
+#function print_warning_sans_newline_suffix() {
+#    print_string_sans_newline_suffix "$(print_warning "${@}" 2>&1)" 1>&2
+#}
+
