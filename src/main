@@ -316,12 +316,11 @@ zmodload zsh/parameter
 
 # ....................{ EXCEPTIONS ~ throw                 }....................
 function TRAPZERR() {
-    # Save the exit status of the prior command prior to overwriting this status
-    # by handling such error.
+    # Exit status of the prior command inducing the current error signal.
     integer exit_status="${?}"
 #   print -r -- "TRAPZERR() triggered with ${exit_status}"
 
-    # Convert such error into an exception. Since zsh only passes this function
+    # Convert such error into an exception. Since zsh only passes this handler
     # an exit status, do *NOT* bother fabricating an error message. Subsequent
     # exception handling should do so already.
     store_exception_with_status '' "${exit_status}"
@@ -338,12 +337,10 @@ function TRAPZERR() {
     return ${exit_status}
 }
 
-# To comply with existing zsh code, preserve the original names of such globals
-# rather than declaring zeshy-specific alternatives (e.g.,
+# To comply with existing zsh code, preserve the original exception global
+# rather than declaring a zeshy-specific alternative (e.g.,
 # ${ZESHY_EXCEPTION_MESSAGE}).
 function die throw_exception() {
-    # Copy such exception and related metadata to globals.
-    #
     # Get the exit status to be associated with such exception from the current
     # runtime environment rather than expecting such status to be explicitly
     # passed. Specifically, get the exit status of the prior command --
@@ -371,10 +368,47 @@ function die throw_exception() {
     #     0
     #     >>> true; true | false || exit_status  # ...but this doesn't.
     #     0
+    integer exception_status="${pipestatus[-1]}"
+
+    # If this function is recursively calling itself, halt such recursion by
+    # printing such exception without calling additional functionality and
+    # immediately returning. Specifically, unless the last instance of this
+    # function in the current call stack is the first element of such stack
+    # (signifying the current call), this function threw an exception. Avoid
+    # another such exception and thus infinite recursion by returning.
+    #
+    # If ${funcstack} is undefined, default such index to 1, ensuring such
+    # conditional fails. An appropriate exception will be thrown below.
+    #
+    # Technically, this function *COULD* have simply been called by a valid
+    # script named "throw_exception". While unlikely, it remains marginally
+    # likelier than Schroedinger's Cat. Guard against such inanity by *ONLY*
+    # enabling such condition if the runnable at such index is *NOT* a script.
+    # See is_call_stack_index_script() for further details.
+    if (( ${funcstack[(I)throw_exception]-1} != 1 )) &&
+       [[ "${funcsourcetrace[${funcstack[(I)throw_exception]}]-}" != *':0' ]] {
+        # Print an exception message.
+        print
+        print "zeshy: throw_exception() threw exception: ${*}"
+        print "zeshy: throw_exception() failed with exit status ${exception_status}"
+        print "current call stack:"
+
+        # Print an exception stack trace.
+        local function_name
+        for   function_name ("${funcstack[@]}") {
+            print "  \\_ ${function_name}()"
+        }
+
+        # Unwind the current call stack and shell.
+        readonly THROW=
+        THROW= 2>/dev/null
+    }
+
+    # If such function is defined, globalize such exception.
     if { typeset -f store_exception_with_status &>/dev/null } {
-        store_exception_with_status "${*}" "${pipestatus[-1]}"
-    # Else, such function is undefined. Print an error. Since the end of this
-    # function already throws an exception, do *NOT* bother reporting failure.
+        store_exception_with_status "${*}" "${exception_status}"
+    # Else, print an error. Since the end of this function already throws an
+    # exception, do *NOT* report failure and hence induce infinite recursion.
     } else {
         print 'zeshy: store_exception_with_status() undefined' 1>&2
     }
@@ -399,8 +433,7 @@ function die throw_exception() {
         # If such function is defined, call such function.
         if { typeset -f print_exception_unhandled &>/dev/null } {
             print_exception_unhandled
-        # Else, such function is undefined. Print an error. Since the end of this
-        # function already throws an exception, do *NOT* bother reporting failure.
+        # Else, print an error.
         } else {
             print 'zeshy: print_exception_unhandled() undefined' 1>&2
         }
@@ -432,9 +465,9 @@ function store_exception_with_status() {
 
     # If any canonical call stack list is undefined or not a list, fail.
     { (( ${+funcstack} + ${+funcfiletrace} + ${+funcsourcetrace} == 3 )) &&
-      [[ "${(tP)funcstack}" == 'array-'* ]] &&
-      [[ "${(tP)funcfiletrace}" == 'array-'* ]] &&
-      [[ "${(tP)funcsourcetrace}" == 'array-'* ]] } || {
+      [[ "${(t)funcstack}" == 'array-'* ]] &&
+      [[ "${(t)funcfiletrace}" == 'array-'* ]] &&
+      [[ "${(t)funcsourcetrace}" == 'array-'* ]] } || {
         print "zeshy: \${funcstack\}, \${funcfiletrace\}, and/or \${funcsourcetrace\} undefined for exception: ${EXCEPTION-}" 1>&2
         return 0
     }
@@ -561,46 +594,33 @@ function clear_exception() {
 }
 
 function print_exception_unhandled() {
-    #FIXME: This requires a *MAJOR* simplification. For one, this function is
-    #no longer passed anything and hence should reference globals. For another,
-    #we really want to reduce the series of printer calls below to a single
-    #printer function. It's time to just do it.
-    #FIXME: Actually, two printer calls: 
-
     # Redirect all output printed below to standard error. Yes, a single
     # suffixing "} 1>&2" actually suffices. You rock, zsh! (Sometimes.)
     {
-        # If the current call stack contains this function at any position other
-        # than the first (corresponding to the current call), this function
-        # transitively threw an exception. Blithely continuing on is likely to
-        # transitively throw another such exception, resulting in infinite
-        # recursion. To halt such recursion before it obliterates existence,
-        # print an error and return immediately on detecting such recursion. To
-        # do so efficiently, search from the end (i.e., root) of such stack; if
-        # the first matching caller is not the first, a witch! As below, return
-        # success to avoid triggering TRAPZERR and hence another exception.
-        if (( ${funcstack[(I)print_exception_unhandled]} != 1 )) {
-            # Print a synopsis of such exception.
+        # If this function is recursively calling itself, halt such recursion by
+        # printing such exception without calling additional functionality and
+        # returning immediately. See throw_exception() for further details.
+        if (( ${funcstack[(I)print_exception_unhandled]-1} != 1 )) &&
+           [[ "${funcsourcetrace[${funcstack[(I)print_exception_unhandled]}]-}" != *':0' ]] {
             print
-            print "zeshy: exception handler threw exception: ${EXCEPTION-}"
-            print "zeshy: exception handler failed with exit status ${TRY_BLOCK_ERROR-1}"
-            print "zeshy: current call stack:"
+            print "zeshy: print_exception_unhandled() threw exception: ${EXCEPTION-}"
+            print "zeshy: print_exception_unhandled() failed with exit status ${TRY_BLOCK_ERROR-1}"
+            print "current call stack:"
 
-            # Print a "mini" stack trace.
             local function_name
             for   function_name ("${funcstack[@]}") {
                 print "  \\_ ${function_name}()"
             }
 
-            # Return failure.
-            return 1
+            # Report success to avoid triggering TRAPZERR and further recursion.
+            return 0
         }
 
         # Validate sanity.
         (( # == 0 )) || die 'Expected no arguments.'
 
         # If ${funcstack} is undefined or not a list, throw an exception.
-        (( ${+funcstack} )) && [[ "${(tP)funcstack}" == 'array-'* ]] ||
+        (( ${+funcstack} )) && [[ "${(t)funcstack}" == 'array-'* ]] ||
             die "\${funcstack\} undefined for exception: ${EXCEPTION-}"
 
         # If called directly from the command line *OR* no exception is
@@ -611,8 +631,8 @@ function print_exception_unhandled() {
         if { typeset -f print_exception &>/dev/null } {
             print_exception
         # Else, print such exception manually. If an exception is thrown
-        # sufficiently early in zeshy startup, print_exception() will *NOT* be
-        # defined yet. This does *NOT* constitute an error.
+        # sufficiently early in zeshy startup, print_exception() will *NOT* have
+        # been defined yet.
         } else {
             print -r "zeshy: ${EXCEPTION}"
             print -r "zeshy: failed with exit status ${ZESHY_EXCEPTION_STATUS-1}"
@@ -643,167 +663,7 @@ function print_exception_unhandled() {
                 }
             }
         }
-
-        #FIXME: O.K.; so, fold the current print_error_status() function into a
-        #new print_exception() function and excise print_error_status(). For
-        #simplicity, in fact, rename all existing "print_error" functionality to
-        #"print_exception". (If we like, we can later differentiate a new
-        #print_error() function from such functionality.)
-
-        # If such message exists, print such message.
-#        if (( # )) {
-#            # If print_exception() is defined, call such function.
-#            if { typeset -f print_exception &>/dev/null } {
-#                print_exception "${@}"
-#            # Else, print such message with a one-liner.
-#            } else {
-#                print "zeshy: ${EXCEPTION}"
-#                print "zeshy: failed with exit status ${ZESHY_EXCEPTION_STATUS-1}"
-#            }
-#        }
-
-        # Print a description of the passed non-zero exit status.
-        # If print_exception_message() is defined, call such function.
-#        if { typeset -f print_error_status &>/dev/null } {
-#            print_error_status "${exit_status}"
-#        # Else, print such message with a one-liner.
-#        } else {
-#            print
-#            print "zeshy: failed with exit status ${exit_status}"
-#        }
-#       print "printed exit status"
-
-        # If either the current user's zeshy configuration requests printing
-        # stack traces on exceptions *OR* zeshy is currently being debugged,
-        # print traces.
-#        if (( ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK-0} +\
-#              ${ZESHY_IS_DEBUG-0} )) {
-##           print "printing call stack"
-#            # If output_exception_call_stack() is defined, call such function.
-#            if { typeset -f output_exception_call_stack &>/dev/null } {
-##               print "calling output_call_stack()"
-#                output_exception_call_stack
-#            # Else, print such stack with an implementation distilled from
-#            # output_exception_call_stack(). See such function for further
-#            # details.
-#            } else {
-#                local frame_prefix='    \\_' filename caller_name
-#                integer funcstack_size=${#funcstack} i caller_line
-##               print "printing stack frame"
-#
-#                for (( i = 1; i <= funcstack_size; i++ )) {
-#                    caller_name="${funcstack[${i}]}"
-#                    caller_line="${funcfiletrace[${i}]##*:}"
-#                       filename="${funcfiletrace[${i}]%:*}"
-#
-#                    if { typeset -f -- "${caller_name}" &>/dev/null } {
-#                        caller_name+='()'
-#                    }
-#                    print -r --\
-#                        "${frame_prefix} ${caller_name} { ${filename}: ${caller_line} }"
-#
-#                    frame_prefix=" ${frame_prefix}"
-#                }
-#            }
-#        }
-    } always {
-        # If prior exception handling threw an exception, catch such exception
-        # to prevent uncaught exceptions from recursively triggering TRAPZERR().
-        # Since aliases and functions typically throw exceptions *AND* cannot be
-        # guaranteed to exist (e.g., due to intentional or unintentional
-        # deletion), avoid expanding aliases or calling functions below.
-        # Specifically, print and delete such exception and return success from
-        # this "always {...}" block. See
-        # catch_exception_matching_glob_if_found() for further details.
-        if (( ${+EXCEPTION} )) {
-            print "zeshy: exception handler threw exception \"${EXCEPTION}\""
-            unset EXCEPTION
-            TRY_BLOCK_ERROR=0
-        # Else if the last command of prior exception handling failed with
-        # nonzero exit status, print such failure and again return success.
-        } elif (( ${TRY_BLOCK_ERROR-0} > 0 )) {
-            print "zeshy: exception handler failed with exit status ${TRY_BLOCK_ERROR}"
-            TRY_BLOCK_ERROR=0
-        }
     } 1>&2
-
-    # Return success to avoid triggering TRAPZERR and hence another exception.
-    return 0
-}
-
-#FIXME: die() should arguably be refactored into an alias expanding to simply
-#throw_exception(). In any case, throw_exception() should suffice for all
-#top-level use now. Refactor all top-level parcels to simply call
-#throw_exception() instead and shift die() to, say, @{00-declare/00-pcre}.
-
-ZESHY_CORE_HELP_ALIASES+='
-string die(string error_message1 = "", ...)
-
-Throw an exception with the passed error message (defaulting to the empty
-string). If such exception remains uncaught (i.e., _not_ handled by an
-`always :{...}:` block on the current call stack), such message and related
-metadata will be printed to standard error and failure returned from such stack.
-
-== Exception Metadata ==
-
-Such metadata includes the following:
-
-* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK} is enabled, a stack
-  trace of the current call path. See output_call_stack() for further details.
-* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_DOCUMENTATION} is enabled,
-  documentation for the function or script throwing such exception. See
-  print_exception_thrower_documentation() for further details.
-* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_SOURCE} is enabled, the
-  source code of the function or script throwing such exception. See
-  print_exception_thrower_implementation() for further details.
-'
-function die() {
-    # Exit status of the prior command. zsh defines "pipestatus" to be a global
-    # list with elements the return values of each subcommand of the prior pipe
-    # command or of the prior command if not a pipe command. Conversely, zsh
-    # defines "?" to be a global integer with the return value of the prior
-    # command. Since the former subsumes the latter *AND* the latter fails to
-    # provide the return value of the prior command when a subcommand of a pipe
-    # command, we defer to the former. For example, consider:
-    #
-    #     # Define helper functions.
-    #     >>> pipe_status() { print ${pipestatus[-1]} }
-    #     >>> exit_status() { print $? }
-    #
-    #     # Show "pipestatus" to return the required values.
-    #     >>> true; pipe_status  # this works...
-    #     0
-    #     >>> true; true | false || pipe_status  # ...and so does this.
-    #     1
-    #
-    #     # Show "?" to *NOT* return the required values.
-    #     >>> true; exit_status  # this works...
-    #     0
-    #     >>> true; true | false || exit_status  # ...but this doesn't.
-    #     0
-    integer exit_status=${pipestatus[-1]}
-
-    # If the prior command succeeded, coerce such exit status into an error.
-    if (( ${exit_status} == 0 )) {
-        exit_status=1
-    }
-
-    # Handle such exception.
-    print_exception_with_status "${@}" "${exit_status}"
-
-    #FIXME: Suffix the exception name by the name of the function directly
-    #responsible for throwing this exception. See curse_exception_status()
-    #for simple logic getting this function name.
-
-    # If throw_function() is still defined, unwind the current call stack,
-    # returning the current user to an interactive prompt if the current shell
-    # is interactive or exiting such shell otherwise.
-    if { typeset -f throw_exception &>/dev/null } {
-        throw_exception ZeshyException
-    # Else, something awful. Print a bleak warning.
-    } else {
-        print 'zeshy: throw_exception() undefined (e.g., due to exception handler throwing exception)' 1>&2
-    }
 
     # Return success to avoid triggering TRAPZERR and hence another exception.
     return 0
@@ -882,7 +742,7 @@ local -a arg_shell_options
 #function could be implemented to log to a passed file, instead.)
 #FIXME: Hmm; yes, the "zprof" approach appears superior. Its output rocks, as
 #expected. Mimics "gprof", so there you go. It's a bit wieldy to use, requiring
-#unload of the module to disable profiling, but... no problems, given a
+#an unload of the module to disable profiling, but... no problems, given a
 #run_profiled() helper.
 
 # Parse passed options *BEFORE* operating on any Zeshy files, as the former
@@ -1416,7 +1276,7 @@ if [[ -n "${*}" ]] {
     # /home/leycec/zsh/zeshy/src/main() failed with exit status 1
     #  "~/tmp/tmp.zeshy" { /home/leycec/zsh/zeshy/src/main: 1398 }
     #   "/home/leycec/zsh/zeshy/src/main" { /usr/local/bin/zeshy: 206 }
-    source -- "${@}" or
+    source -- "${@}" ||
         die "Script \"${*}\" failed with exit status ${status}."
 }
 
@@ -1427,8 +1287,206 @@ if [[ -n "${*}" ]] {
 return 0
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: This requires a *MAJOR* simplification. For one, this function is
+    #no longer passed anything and hence should reference globals. For another,
+    #we really want to reduce the series of printer calls below to a single
+    #printer function. It's time to just do it.
+    #FUXME: Actually, two printer calls: 
+
+        #FUXME: O.K.; so, fold the current print_error_status() function into a
+        #new print_exception() function and excise print_error_status(). For
+        #simplicity, in fact, rename all existing "print_error" functionality to
+        #"print_exception". (If we like, we can later differentiate a new
+        #print_error() function from such functionality.)
+
+        # If such message exists, print such message.
+#        if (( # )) {
+#            # If print_exception() is defined, call such function.
+#            if { typeset -f print_exception &>/dev/null } {
+#                print_exception "${@}"
+#            # Else, print such message with a one-liner.
+#            } else {
+#                print "zeshy: ${EXCEPTION}"
+#                print "zeshy: failed with exit status ${ZESHY_EXCEPTION_STATUS-1}"
+#            }
+#        }
+
+        # Print a description of the passed non-zero exit status.
+        # If print_exception_message() is defined, call such function.
+#        if { typeset -f print_error_status &>/dev/null } {
+#            print_error_status "${exit_status}"
+#        # Else, print such message with a one-liner.
+#        } else {
+#            print
+#            print "zeshy: failed with exit status ${exit_status}"
+#        }
+#       print "printed exit status"
+
+        # If either the current user's zeshy configuration requests printing
+        # stack traces on exceptions *OR* zeshy is currently being debugged,
+        # print traces.
+#        if (( ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK-0} +\
+#              ${ZESHY_IS_DEBUG-0} )) {
+##           print "printing call stack"
+#            # If output_exception_call_stack() is defined, call such function.
+#            if { typeset -f output_exception_call_stack &>/dev/null } {
+##               print "calling output_call_stack()"
+#                output_exception_call_stack
+#            # Else, print such stack with an implementation distilled from
+#            # output_exception_call_stack(). See such function for further
+#            # details.
+#            } else {
+#                local frame_prefix='    \\_' filename caller_name
+#                integer funcstack_size=${#funcstack} i caller_line
+##               print "printing stack frame"
+#
+#                for (( i = 1; i <= funcstack_size; i++ )) {
+#                    caller_name="${funcstack[${i}]}"
+#                    caller_line="${funcfiletrace[${i}]##*:}"
+#                       filename="${funcfiletrace[${i}]%:*}"
+#
+#                    if { typeset -f -- "${caller_name}" &>/dev/null } {
+#                        caller_name+='()'
+#                    }
+#                    print -r --\
+#                        "${frame_prefix} ${caller_name} { ${filename}: ${caller_line} }"
+#
+#                    frame_prefix=" ${frame_prefix}"
+#                }
+#            }
+#        }
+#    } always {
+#        # If prior exception handling threw an exception, catch such exception
+#        # to prevent uncaught exceptions from recursively triggering TRAPZERR().
+#        # Since aliases and functions typically throw exceptions *AND* cannot be
+#        # guaranteed to exist (e.g., due to intentional or unintentional
+#        # deletion), avoid expanding aliases or calling functions below.
+#        # Specifically, print and delete such exception and return success from
+#        # this "always {...}" block. See
+#        # catch_exception_matching_glob_if_found() for further details.
+#        if (( ${+EXCEPTION} )) {
+#            print "zeshy: exception handler threw exception \"${EXCEPTION}\""
+#            unset EXCEPTION
+#            TRY_BLOCK_ERROR=0
+#        # Else if the last command of prior exception handling failed with
+#        # nonzero exit status, print such failure and again return success.
+#        } elif (( ${TRY_BLOCK_ERROR-0} > 0 )) {
+#            print "zeshy: exception handler failed with exit status ${TRY_BLOCK_ERROR}"
+#            TRY_BLOCK_ERROR=0
+#        }
+
+#FUXME: die() should arguably be refactored into an alias expanding to simply
+#throw_exception(). In any case, throw_exception() should suffice for all
+#top-level use now. Refactor all top-level parcels to simply call
+#throw_exception() instead and shift die() to, say, @{00-declare/00-pcre}.
+
+#ZESHY_CORE_HELP_ALIASES+='
+#string die(string error_message1 = "", ...)
+#
+#Throw an exception with the passed error message (defaulting to the empty
+#string). If such exception remains uncaught (i.e., _not_ handled by an
+#`always :{...}:` block on the current call stack), such message and related
+#metadata will be printed to standard error and failure returned from such stack.
+#
+#== Exception Metadata ==
+#
+#Such metadata includes the following:
+#
+#* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK} is enabled, a stack
+#  trace of the current call path. See output_call_stack() for further details.
+#* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_DOCUMENTATION} is enabled,
+#  documentation for the function or script throwing such exception. See
+#  print_exception_thrower_documentation() for further details.
+#* If boolean ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_SOURCE} is enabled, the
+#  source code of the function or script throwing such exception. See
+#  print_exception_thrower_implementation() for further details.
+#'
+#function die() {
+#    # Exit status of the prior command. zsh defines "pipestatus" to be a global
+#    # list with elements the return values of each subcommand of the prior pipe
+#    # command or of the prior command if not a pipe command. Conversely, zsh
+#    # defines "?" to be a global integer with the return value of the prior
+#    # command. Since the former subsumes the latter *AND* the latter fails to
+#    # provide the return value of the prior command when a subcommand of a pipe
+#    # command, we defer to the former. For example, consider:
+#    #
+#    #     # Define helper functions.
+#    #     >>> pipe_status() { print ${pipestatus[-1]} }
+#    #     >>> exit_status() { print $? }
+#    #
+#    #     # Show "pipestatus" to return the required values.
+#    #     >>> true; pipe_status  # this works...
+#    #     0
+#    #     >>> true; true | false || pipe_status  # ...and so does this.
+#    #     1
+#    #
+#    #     # Show "?" to *NOT* return the required values.
+#    #     >>> true; exit_status  # this works...
+#    #     0
+#    #     >>> true; true | false || exit_status  # ...but this doesn't.
+#    #     0
+#    integer exit_status=${pipestatus[-1]}
+#
+#    # If the prior command succeeded, coerce such exit status into an error.
+#    if (( ${exit_status} == 0 )) {
+#        exit_status=1
+#    }
+#
+#    # Handle such exception.
+#    print_exception_with_status "${@}" "${exit_status}"
+#
+#    #FIXME: Suffix the exception name by the name of the function directly
+#    #responsible for throwing this exception. See curse_exception_status()
+#    #for simple logic getting this function name.
+#
+#    # If throw_function() is still defined, unwind the current call stack,
+#    # returning the current user to an interactive prompt if the current shell
+#    # is interactive or exiting such shell otherwise.
+#    if { typeset -f throw_exception &>/dev/null } {
+#        throw_exception ZeshyException
+#    # Else, something awful. Print a bleak warning.
+#    } else {
+#        print 'zeshy: throw_exception() undefined (e.g., due to exception handler throwing exception)' 1>&2
+#    }
+#
+#    # Return success to avoid triggering TRAPZERR and hence another exception.
+#    return 0
+#}
+
+# This does *NOT* constitute an error.
+    # Save the exit status of the prior command prior to overwriting this status
+    # by handling such error.
+
+    #FUXME: Technically, naming an otherwise valid zeshy script
+    #"throw_exception" would *COMPLETELY* screw up zeshy operation. (Ditto for
+    #"print_exception_unhandled" below.) This is fairly easy, if noxiously
+    #obnoxious, to guard against. Just do it!
+
+    # Since
+    # continuing on is likely to throw another exception, inducing
+    # infinite recursion.
+    #
+    # To detect such condition
+    # efficiently, search from the end (i.e., root) of the current call stack
+    # for the first runnable with the same name as this is *NOT* the first, a
+    # witch! (i.e., if any element of such stack other
+    # than the first is such function)
+
+        # If the current call stack contains this function at any position other
+        # than the first (corresponding to the current call), this function
+        # transitively threw an exception. Blithely continuing on is likely to
+        # transitively throw another such exception, resulting in infinite
+        # recursion. To halt such recursion before it obliterates existence,
+        # print an error and return immediately on detecting such recursion. To
+        # do so efficiently, search from the end (i.e., root) of such stack; if
+        # the first matching caller is not the first, a witch! As below, return
+        # success to avoid triggering TRAPZERR and hence another exception.
+        #
+        # If ${funcstack} is undefined, default such index to 1, ensuring such
+        # conditional fails. An appropriate exception will be thrown below.
         # If the call stack for such uncaught exception is still defined *AND*
         # nonempty, incorporate such stack into such message.
+
 #        if (( ${+ZESHY_EXCEPTION_FUNCSTACK} && ${#ZESHY_EXCEPTION_FUNCSTACK} )) {
 #            # If the exit status for such uncaught exception is still defined,
 #            # incorporate such status into such message.
