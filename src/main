@@ -30,17 +30,17 @@
 #     failed.  In the latter case the standard handling is applied: `command not found' is
 #     printed  to  standard error and the shell exits with status 127."
 
-#FIXME: When "zsh" is upgraded while Zeshy is running, things go downhill pretty
-#quickly until such Zeshy sessions are restarted. For example, if no exception
+#FIXME: When "zsh" is upgraded while zeshy is running, things go downhill pretty
+#quickly until such zeshy sessions are restarted. For example, if no exception
 #has yet been thrown and hence functions throw() and catch() not autoloaded,
 #then the next fatal error will trigger unhelpful zsh errors resembling
 #"zsh: throw: command not found". It'd be quite nice to detect such upgrade and:
 #
-#* For each running interactive Zeshy shell, implicitly restart such shell on
+#* For each running interactive zeshy shell, implicitly restart such shell on
 #  the next prompt display (i.e., after completing the current command).
-#* For each running non-interactive Zeshy shell, well... there's probably not
+#* For each running non-interactive zeshy shell, well... there's probably not
 #  much we can efficiently do. Hopefully, such shell completes quickly!
-#FIXME: It'd be nice to profile Zeshy a bit to see what's consuming the most
+#FIXME: It'd be nice to profile zeshy a bit to see what's consuming the most
 #time. (I suspect the single "autoload -w" statement loading the digest, but
 #one never knows, really.) Perhaps add a new "--profile-zeshy-startup" option.
 #FIXME: It'd be *GREAT* to optimize release builds by stripping all comments
@@ -418,8 +418,8 @@ function die throw_exception() {
     # If this function is recursively calling itself, halt such recursion by
     # printing such exception without calling additional functionality and
     # immediately returning. See TRAPZERR() for further details.
-    if (( ${funcstack[(I)throw_exception]-1} != 1 )) &&
-       [[ "${funcsourcetrace[${funcstack[(I)throw_exception]}]-}" != *':0' ]] {
+    if (( ${funcstack[(I)(die|throw_exception)]-1} != 1 )) &&
+       [[ "${funcsourcetrace[${funcstack[(I)(die|throw_exception)]}]-}" != *':0' ]] {
         # Print an exception message.
         print
         print "zeshy: throw_exception() threw exception: ${*}"
@@ -437,14 +437,10 @@ function die throw_exception() {
         THROW= 2>/dev/null
     }
 
-    # If such function is defined, globalize such exception.
-    if { typeset -f store_exception_with_status &>/dev/null } {
-        store_exception_with_status "${*}" "${exception_status}"
-    # Else, print an error. Since the end of this function already throws an
-    # exception, do *NOT* report failure and hence induce infinite recursion.
-    } else {
-        print 'zeshy: store_exception_with_status() undefined in throw_exception()' 1>&2
-    }
+    # Persist such exception and associated metadata to global variables.
+    typeset -f store_exception_with_status &>/dev/null ||
+        die 'store_exception_with_status() undefined in throw_exception()'
+    store_exception_with_status "${*}" "${exception_status}"
 
     # By default, zsh coerces integer global ${TRY_BLOCK_ERROR} to -1. On entry,
     # "always :{...}:" blocks set such integer to the exit status of the last
@@ -474,11 +470,12 @@ function store_exception_with_status() {
     # Validate sanity. Since throw_exception() calls this function, avoid
     # calling such function; in the event of an error, simply print a message to
     # standard error and report success. Do *NOT* report failure. Since this
-    # function is typically called by throw_exception(), itself called by
-    # TRAPZERR(), reporting failure here could induce undesired recursion.
-    # Instead, let throw_exception() continue throwing its exception.
+    # function is called by both throw_exception() and TRAPZERR(), reporting
+    # failure here could induce infinite recursion. Rather, permit whichever of
+    # throw_exception() or TRAPZERR() called this function to continue throwing
+    # their exception.
     (( # == 2 )) || {
-        print "zeshy: store_exception_with_status() expected one exception message and one exit status." 1>&2
+        print "zeshy: store_exception_with_status() expected one exception message and one exit status" 1>&2
         return 0
     }
     local exception_message="${1}" exit_status="${2}"
@@ -545,17 +542,16 @@ function store_exception_with_status() {
 
     # If this function was *NOT* called from within a "try {...} always :{...}:"
     # block, the exception that TRAPZERR() or throw_exception() subsequently
-    # throw will induce zsh to silently unwind the call stack for the current
+    # throws will induce zsh to silently unwind the call stack for the current
     # shell without printing such exception. To avoid that, print such exception
     # here *BEFORE* throwing such exception.
     if (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
-        # If such function is defined, call such function.
-        if { typeset -f print_exception_unhandled &>/dev/null } {
-            print_exception_unhandled
-        # Else, print an error.
-        } else {
+        typeset -f print_exception_unhandled &>/dev/null || {
             print 'zeshy: print_exception_unhandled() undefined in store_exception_with_status()' 1>&2
+            return 0
         }
+
+        print_exception_unhandled
     }
 }
 
@@ -568,25 +564,32 @@ function store_exception_with_status() {
 # "}--", doing so inflates the implementation of all runnables expanding such
 # alias -- in some cases, unreadably so. 
 function print_exception_if_unhandled() {
+    # If an error occurs in this function, throw an exception rather than merely
+    # printing a message and setting ${TRY_BLOCK_ERROR} to 1. While doing so
+    # does mimic the low-level action of an exception by unwinding the current
+    # call stack, it fails to mimic the most significant high-level action of an
+    # exception: printing the stack trace!
+
     # If not called from within an "always :{...}:" block, throw an exception.
     # See die_unless_in_always() for further details.
     if (( ${TRY_BLOCK_ERROR--1} < 0 )) {
-        print "zeshy: print_exception_if_unhandled() not called within an \"always :{...}:\" block" 1>&2
-        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+        die "Not in an \"always :\{...\}:\" block (or \$\{TRY_BLOCK_ERROR\} ${TRY_BLOCK_ERROR--1} not in [0, 255] and hence an invalid exit status)."
     # Else if list global ${ZESHY_TRY_LEVEL} is not defined or has no element
     # corresponding to the current shell or such element is non-positive, throw
     # an exception. Assuming the current "always :{...}:" block was preceded by
     # a sane "try {...}" block, such element should always be positive. See
     # try() for further details.
     } elif (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
-        if (( ${+ZESHY_TRY_LEVEL[${SHLVL}]} == 0 )) {
-            print "zeshy: \${ZESHY_TRY_LEVEL[${SHLVL}]\} undefined" 1>&2
-        } else {
-            print "zeshy: \"always :{...}:\" block preceded by no \"try {...}\" block" 1>&2
-            ZESHY_TRY_LEVEL[${SHLVL}]=0
-        }
+        # Coerce such element to its default value to ensure proper operation
+        # hereafter. See try() for further details.
+        typeset -ag ZESHY_TRY_LEVEL; ZESHY_TRY_LEVEL[${SHLVL}]=0
 
-        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+        # Throw an appropriate exception.
+        if (( ${+ZESHY_TRY_LEVEL[${SHLVL}]} )) {
+            die "\${ZESHY_TRY_LEVEL[${SHLVL}]\} ${ZESHY_TRY_LEVEL[${SHLVL}]} <= 0 (e.g., due to no preceding \"try\")."
+        } else {
+            die "\${ZESHY_TRY_LEVEL[${SHLVL}]\} undefined (e.g., due to no preceding \"try\")."
+        }
     # Else, the current context is sane.
     } else {
         # Decrement the shell-specific try level incremented by the prior "try
@@ -600,14 +603,10 @@ function print_exception_if_unhandled() {
         # See catch_exception_matching_glob_if_found() for further details.
         if (( ${+EXCEPTION} && ZESHY_TRY_LEVEL[${SHLVL}] == 0 )) {
             # If either such function is undefined, throw an exception.
-            typeset -f print_exception_unhandled &>/dev/null || {
-                print 'zeshy: print_exception_unhandled() undefined' 1>&2
-                (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
-            }
-            typeset -f clear_exception &>/dev/null || {
-                print 'zeshy: clear_exception() undefined' 1>&2
-                (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
-            }
+            typeset -f print_exception_unhandled &>/dev/null ||
+                die 'print_exception_unhandled() undefined.'
+            typeset -f clear_exception &>/dev/null ||
+                die 'clear_exception() undefined.'
 
             print_exception_unhandled
             clear_exception
@@ -1303,6 +1302,52 @@ if [[ -n "${*}" ]] {
 return 0
 
 # --------------------( WASTELANDS                         )--------------------
+    # If such function is *NOT* defined, print an error. Since the tail of this
+    # function already throws an exception, do *NOT* return failure (which would
+    # trigger TRAPZERR() and hence
+    # induce infinite recursion.
+
+#    if (( ${TRY_BLOCK_ERROR--1} < 0 )) {
+#        print "zeshy: print_exception_if_unhandled() not called within an \"always :{...}:\" block" 1>&2
+#        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+#    # Else if list global ${ZESHY_TRY_LEVEL} is not defined or has no element
+#    # corresponding to the current shell or such element is non-positive, throw
+#    # an exception. Assuming the current "always :{...}:" block was preceded by
+#    # a sane "try {...}" block, such element should always be positive. See
+#    # try() for further details.
+#    } elif (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
+#        # 
+#        ZESHY_TRY_LEVEL[${SHLVL}]=0
+#
+#        if (( ${+ZESHY_TRY_LEVEL[${SHLVL}]} )) {
+#            print "zeshy: \${ZESHY_TRY_LEVEL[${SHLVL}]\} ${ZESHY_TRY_LEVEL[${SHLVL}]} <= 0 in print_exception_if_unhandled() (e.g., due to no preceding \"try\")" 1>&2
+#        } else {
+#            print "zeshy: \${ZESHY_TRY_LEVEL[${SHLVL}]\} undefined in print_exception_if_unhandled() (e.g., due to no preceding \"try\")" 1>&2
+#        }
+#
+#        (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+#    # Else, the current context is sane.
+#    } else {
+#        # Decrement the shell-specific try level incremented by the prior "try
+#        # {...}" block. See try() for further details.
+#        ZESHY_TRY_LEVEL[${SHLVL}]=$(( ZESHY_TRY_LEVEL[${SHLVL}] - 1 ))
+#
+#        # If an exception was thrown and the current "always :{...}:" block is
+#        # the topmost such block, catch such exception. Unlike
+#        # catch_exception_matching_glob_if_found(), retain the current exit
+#        # status (i.e., ${TRY_BLOCK_ERROR}) to report such status to the shell.
+#        # See catch_exception_matching_glob_if_found() for further details.
+#        if (( ${+EXCEPTION} && ZESHY_TRY_LEVEL[${SHLVL}] == 0 )) {
+#            # If either such function is undefined, throw an exception.
+#            typeset -f print_exception_unhandled &>/dev/null || {
+#                print 'zeshy: print_exception_unhandled() undefined' 1>&2
+#                (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+#            }
+#            typeset -f clear_exception &>/dev/null || {
+#                print 'zeshy: clear_exception() undefined' 1>&2
+#                (( ${TRY_BLOCK_ERROR-0} )) || TRY_BLOCK_ERROR=1
+#            }
+
         #FUXME: Fairly certain this is now obsolete by the TRAPZERR() and
         #throw_exception() recursion detectors.
 
