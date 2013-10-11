@@ -437,10 +437,13 @@ function die throw_exception() {
         THROW= 2>/dev/null
     }
 
-    # Persist such exception and associated metadata to global variables.
-    typeset -f store_exception_with_status &>/dev/null ||
-        die 'store_exception_with_status() undefined in throw_exception()'
-    store_exception_with_status "${*}" "${exception_status}"
+    # If such function is defined, globalize such exception.
+    if { typeset -f store_exception_with_status &>/dev/null } {
+        store_exception_with_status "${*}" "${exception_status}"
+    # Else, print an error. Since the end of this function already throws an
+    } else {
+        print 'store_exception_with_status() undefined in throw_exception()' 1>&2
+    }
 
     # By default, zsh coerces integer global ${TRY_BLOCK_ERROR} to -1. On entry,
     # "always :{...}:" blocks set such integer to the exit status of the last
@@ -546,12 +549,14 @@ function store_exception_with_status() {
     # shell without printing such exception. To avoid that, print such exception
     # here *BEFORE* throwing such exception.
     if (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
-        typeset -f print_exception_unhandled &>/dev/null || {
+        # If such function is defined, print such exception.
+        if { typeset -f print_exception_unhandled &>/dev/null } {
+            print_exception_unhandled
+        # Else, print a nonfatal warning.
+        } else {
             print 'zeshy: print_exception_unhandled() undefined in store_exception_with_status()' 1>&2
             return 0
         }
-
-        print_exception_unhandled
     }
 }
 
@@ -572,14 +577,15 @@ function print_exception_if_unhandled() {
 
     # If not called from within an "always :{...}:" block, throw an exception.
     # See die_unless_in_always() for further details.
-    if (( ${TRY_BLOCK_ERROR--1} < 0 )) {
-        die "Not in an \"always :\{...\}:\" block (or \$\{TRY_BLOCK_ERROR\} ${TRY_BLOCK_ERROR--1} not in [0, 255] and hence an invalid exit status)."
+    (( ${TRY_BLOCK_ERROR--1} >= 0 )) || die\
+        "Not in an \"always :\{...\}:\" block (or \$\{TRY_BLOCK_ERROR\} ${TRY_BLOCK_ERROR--1} not in [0, 255] and hence an invalid exit status)."
+
     # Else if list global ${ZESHY_TRY_LEVEL} is not defined or has no element
     # corresponding to the current shell or such element is non-positive, throw
     # an exception. Assuming the current "always :{...}:" block was preceded by
     # a sane "try {...}" block, such element should always be positive. See
     # try() for further details.
-    } elif (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
+    (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} > 0 )) || {
         # Coerce such element to its default value to ensure proper operation
         # hereafter. See try() for further details.
         typeset -ag ZESHY_TRY_LEVEL; ZESHY_TRY_LEVEL[${SHLVL}]=0
@@ -590,41 +596,30 @@ function print_exception_if_unhandled() {
         } else {
             die "\${ZESHY_TRY_LEVEL[${SHLVL}]\} undefined (e.g., due to no preceding \"try\")."
         }
-    # Else, the current context is sane.
-    } else {
-        # Decrement the shell-specific try level incremented by the prior "try
-        # {...}" block. See try() for further details.
-        ZESHY_TRY_LEVEL[${SHLVL}]=$(( ZESHY_TRY_LEVEL[${SHLVL}] - 1 ))
-
-        # If an exception was thrown and the current "always :{...}:" block is
-        # the topmost such block, catch such exception. Unlike
-        # catch_exception_matching_glob_if_found(), retain the current exit
-        # status (i.e., ${TRY_BLOCK_ERROR}) to report such status to the shell.
-        # See catch_exception_matching_glob_if_found() for further details.
-        if (( ${+EXCEPTION} && ZESHY_TRY_LEVEL[${SHLVL}] == 0 )) {
-            # If either such function is undefined, throw an exception.
-            typeset -f print_exception_unhandled &>/dev/null ||
-                die 'print_exception_unhandled() undefined.'
-            typeset -f clear_exception &>/dev/null ||
-                die 'clear_exception() undefined.'
-
-            print_exception_unhandled
-            clear_exception
-        }
     }
-}
 
-function clear_exception() {
-    # Validate sanity.
-    (( # == 0 )) || die 'Expected no arguments.'
+    # Else, the current context is sane.
+    #
+    # Decrement the shell-specific try level incremented by the prior "try
+    # {...}" block. See try() for further details.
+    ZESHY_TRY_LEVEL[${SHLVL}]=$(( ZESHY_TRY_LEVEL[${SHLVL}] - 1 ))
 
-    # Unset all globals set by store_exception_with_status().
-    unset\
-        EXCEPTION\
-        ZESHY_EXCEPTION_STATUS\
-        ZESHY_EXCEPTION_FUNCSTACK\
-        ZESHY_EXCEPTION_FUNCFILETRACE\
-        ZESHY_EXCEPTION_FUNCSOURCETRACE
+    # If an exception was caught, clear the canonical string global storing the
+    # error message for such exception. (This ensures calls by subsequent
+    # "always {...}" blocks to is_exception_caught() report failure.)
+    unset CAUGHT
+
+    # If an exception was thrown and the current "always :{...}:" block is
+    # the topmost such block, catch such exception. Unlike
+    # catch_exception_matching_glob_if_found(), retain the current exit
+    # status (i.e., ${TRY_BLOCK_ERROR}) to report such status to the shell.
+    # See catch_exception_matching_glob_if_found() for further details.
+    if (( ${+EXCEPTION} && ZESHY_TRY_LEVEL[${SHLVL}] == 0 )) {
+        # Print such exception and associated metadata.
+        typeset -f print_exception_unhandled &>/dev/null ||
+            die 'print_exception_unhandled() undefined.'
+        print_exception_unhandled
+    }
 }
 
 function print_exception_unhandled() {
@@ -652,10 +647,10 @@ function print_exception_unhandled() {
             print -r "zeshy: ${EXCEPTION}"
             print -r "zeshy: failed with exit status ${ZESHY_EXCEPTION_STATUS-1}"
 
-            # If either the current user's zeshy configuration requests printing
-            # stack traces on exceptions *OR* zeshy is currently being debugged,
-            # print traces. Print such stack with an implementation distilled from
-            # output_exception_call_stack(). See such function for further details.
+            # If the current zeshy configuration instructs stack traces to be
+            # printed with exceptions *OR* zeshy is currently being debugged,
+            # print such trace. See output_call_stack_lists_with_style_prefix()
+            # for related logic.
             if (( ${ZESHY_ERROR_HANDLER_IS_PRINTING_CALL_STACK-0} +\
                   ${ZESHY_IS_DEBUG-0} )) {
                 local   caller_name filename frame_prefix='    \\_'
@@ -679,6 +674,15 @@ function print_exception_unhandled() {
             }
         }
     } 1>&2
+
+    # Catch such exception by unsetting all globals previously set by
+    # store_exception_with_status(). See catch_exception() for further details.
+    unset\
+        EXCEPTION\
+        ZESHY_EXCEPTION_STATUS\
+        ZESHY_EXCEPTION_FUNCSTACK\
+        ZESHY_EXCEPTION_FUNCFILETRACE\
+        ZESHY_EXCEPTION_FUNCSOURCETRACE
 
     # Return success to avoid triggering TRAPZERR() and hence another exception.
     return 0
@@ -1302,6 +1306,29 @@ if [[ -n "${*}" ]] {
 return 0
 
 # --------------------( WASTELANDS                         )--------------------
+            # Clear such exception and associated metadata.
+#            typeset -f clear_exception &>/dev/null ||
+#                die 'clear_exception() undefined.'
+#            clear_exception
+
+        #FUXME: Silly. Fold such functionality into print_exception_unhandled()
+        #and shift clear_exception() elsewhere.
+
+        # If such function is defined, clear such exception.
+#        if { typeset -f clear_exception &>/dev/null } {
+#            clear_exception
+#        # Else, print a nonfatal warning.
+#        } else {
+#            print 'zeshy: clear_exception() undefined in store_exception_with_status()' 1>&2
+#            return 0
+#        }
+
+            # If either the current user's zeshy configuration requests printing
+            # stack traces on exceptions *OR* zeshy is currently being debugged,
+            # print traces. Print such stack with an implementation distilled from
+            # output_call_stack_lists_with_style_prefix(). See such function for
+            # further details.
+
     # If such function is *NOT* defined, print an error. Since the tail of this
     # function already throws an exception, do *NOT* return failure (which would
     # trigger TRAPZERR() and hence
