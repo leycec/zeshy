@@ -8,25 +8,6 @@ Handle *line wrapping* (i.e., soft wrapping strings to the width of the current
 terminal by inserting newlines into such strings at appropriate break points).
 /---
 
-#FIXME: I believe that wrapping is currently failing for long contiguous strings
-#lacking internal whitespace, suggesting a regression in
-#get_pcre_wrapping_at_line_length(). Investigate as time permits.
-#FIXME: A thought experiment succinctly identified the issue: ANSI escape
-#sequences embedded in strings. We need to account for such sequences when
-#wrapping strings, principally in the following two places:
-#
-#* get_pcre_wrapping_at_line_length(). The returned PCRE must ignore such
-#  sequences. To do so, replace every instance of "." with
-#  "(?:${ZESHY_ANSI_PCRE})?.", where ${ZESHY_ANSI_PCRE} is a newly defined
-#  string global defined in @{ansi} based on corresponding glob patterns.
-#* output_string_wrapped_with_style_prefix(). Such function currently calculates
-#  the length of the current line manually. We'll probably need to replace that
-#  with a process substitution calling
-#  get_string_length_printable_sans_ansi_colors() -- which should be renamed to
-#  get_string_length_printable_sans_ansi(), incidentally.
-#
-#Theoretically, that should do it. *shrug*
-
 # ....................{ GLOBALS                            }....................
 declare_global_with_stdin integer ZESHY_STRING_WRAP_PCRE_INDEX_SPLIT=1 <<'/---'
 1-based index in list ${match} of the next text substring to be wrapped by a
@@ -109,7 +90,7 @@ be implemented as a PCRE. For further details, see the corresponding
 https://en.wikipedia.org/wiki/Word_wrap[Wikipedia article].
 /---
 function get_pcre_wrapping_at_line_length() {
-    # Validate passed arguments.
+    # Validate sanity.
     die_unless_arg 'Expected one integer.'
     string line_length="${1}" pcre_wrapping
     die_unless_integer_positive "${line_length}"
@@ -161,8 +142,17 @@ function get_pcre_wrapping_at_line_length() {
     # an ignorable newline. Since the caller typically suffixes such substring
     # by a newline already, such newline should simply be ignored if present.
     } else {
+        # Such length minus one, typically to account for suffixing hyphens.
         integer line_length_minus_one=$(( line_length - 1 ))
-        return_string '\G(?|\n()()|(.{1,'${line_length}'})(?:\n|\h+\n?|\Z)()|(.{1,'${line_length_minus_one}'}-)\n?()|()(.{1,'${line_length_minus_one}'})\n?)'
+
+        # PCRE matching any character preceded by zero or more ignorable ANSI
+        # escape sequences. Such sequences should typically be ignored when
+        # wrapping text, implying this PCRE should always be used in place of
+        # simpler "." expressions in the PCRE below.
+        string character='(?:(?:'${ZESHY_ANSI_PCRE}')*.)'
+
+        # Get such PCRE.
+        return_string '\G(?|\n()()|('${character}'{1,'${line_length}'})(?:\n|\h+\n?|\Z)()|('${character}'{1,'${line_length_minus_one}'}-)\n?()|()('${character}'{1,'${line_length_minus_one}'})\n?)'
 #       output_string "pcre wrapping at line length ${line_length}/$(get_terminal_width):${ZESHY_ASCII_NEWLINE}${pcre_wrapping}" 1>&2
     }
 }
@@ -274,14 +264,26 @@ function get_string_wrapped_width_with_style_prefix() {
 }
 
 # ....................{ OUTPUTTERS                         }....................
+#FIXME: Actually call such function.
 declare_function_with_stdin <<'/---'
-string output_string_wrapped_with_style_prefix(
-    string text, string style_prefix = "$(get_caller).")
+string output_string_wrapped(string text1, ...)
 
-Wrap the passed string to the width of the current terminal, styled under the
-user-configurable styles prefixed by the passed prefix (defaulting to the dot-
-suffixed name of the caller). See get_pcre_wrapping_at_line_length() for further
-details on such line wrapping.
+Wrap the passed string to the width of the current terminal, using user-
+configurable styles prefixed by the dot-suffixed caller's name (i.e.,
+`$(get_caller).`) See output_string_wrapped_with_style_prefix() for further
+details.
+/---
+function print_string_titled() {
+    die_unless_args_2 'Expected one or more strings.'
+    output_string_wrapped_with_style_prefix "${@}" "$(get_caller)."
+}
+
+declare_function_with_stdin <<'/---'
+string output_string_wrapped_with_style_prefix(string text, string style_prefix)
+
+Wrap the passed string to the width of the current terminal, using 
+user-configurable styles prefixed by the passed prefix. See
+get_pcre_wrapping_at_line_length() for further details.
 
 == Styles ==
 
@@ -305,11 +307,12 @@ literals to be output), including:
   space.
 /---
 function output_string_wrapped_with_style_prefix() {
-    # Validate passed arguments.
-    die_unless_args_1_to_2 'Expected one string and optional style prefix.'
+    # Validate sanity.
+    die_unless_args_2 'Expected one string and one style prefix.'
     string\
         text="${1}"\
-        style_prefix text_line\
+        style_prefix="${2}"\
+        text_line\
         border_left_first\
         border_right_first\
         border_left_continued\
@@ -325,6 +328,7 @@ function output_string_wrapped_with_style_prefix() {
         terminal_width\
         text_line_first_length\
         text_line_continued_length\
+        text_line_length\
         text_line_length_minimum\
         border_left_first_length\
         border_right_first_length\
@@ -333,9 +337,6 @@ function output_string_wrapped_with_style_prefix() {
         joiner_right_length\
         padder_right_length
     boolean is_text_line_first
-
-    # String with which to prefix subsequently expanded styles.
-    style_prefix="${2-$(get_caller).}"
 
     # Width in characters of the current terminal.
     terminal_width="$(get_terminal_width)"
@@ -372,7 +373,9 @@ function output_string_wrapped_with_style_prefix() {
     joiner_right_length="${(m)#joiner_right}"
     padder_right_length="${(m)#padder_right}"
 
-    # Colors for such substrings to be printed below, with similar defaults.
+    # Colors for such substrings to be printed below with similar defaults. Such
+    # colors are expanded several times, encouraging their storage into local
+    # variables here.
     text_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}text]-}"
      border_left_first_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_left]-}"
     border_right_first_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_right]-}"
@@ -420,23 +423,31 @@ function output_string_wrapped_with_style_prefix() {
     # True only if the current substring to be printed is the first.
     is_text_line_first="${ZESHY_BOOLEAN_TRUE}"
 
+    #FIXME: If ${padder_right} contains the flag delimiter (here, "^"), the
+    #call to output_string() in iteration below will fail with error. To correct
+    #this, we should probably devolve such implementation to the general-purpose
+    #solution for repeating strings. See repeat_string().
+
     # For each text substring to be printed as each line, print:
     #
     # * Such left border.
     # * Such substring.
     # * Sufficient spaces to render the subsequently printed right border
     #   flush with the right edge of the current terminal. For efficiency,
-    #   inline such implementation. See get_string_length_printable() and
-    #   repeat_string() for further details.
+    #   inline such implementation. See repeat_string() for further details.
     # * Such right border.
     # * A newline.
     for_string_wrapped_at_line_length\
         "${text}" "${text_line_length_minimum}" text_line '\
+        # Length of the current line excluding ANSI escape sequences. See
+        # get_string_length_printable_sans_ansi() for further details.
+        text_line_length="${(m)#${text_line//${~ZESHY_ANSI_GLOB}}}"
+
         if (( is_text_line_first )) {
             is_text_line_first='${ZESHY_BOOLEAN_FALSE}'
-            output_string "${border_left_first}${text_line}${joiner_right}${(l:$(( text_line_first_length - ${(m)#text_line} ))::'${padder_right}':):-}${border_right_first}"
+            output_string "${border_left_first}${text_line}${joiner_right}${(l^$(( text_line_first_length - text_line_length ))^^'${padder_right}'^):-}${border_right_first}"
         } else {
-            output_string "${border_left_continued}${text_line}${joiner_right}${(l:$(( text_line_continued_length - ${(m)#text_line} ))::'${padder_right}':):-}${border_right_continued}"
+            output_string "${border_left_continued}${text_line}${joiner_right}${(l^$(( text_line_continued_length - text_line_length ))^^'${padder_right}'^):-}${border_right_continued}"
         }'
 #           output_string "padder_right_count: $(( text_line_first_length - ${(m)#text_line} ))"
 #       'output_string "text line length: ${(m)#text_line}/${text_line_length}"
@@ -481,7 +492,7 @@ the illusion. The others believe it enough that they are willing to starve.
 ==========================================
 /---
 function for_string_wrapped_at_line_length() {
-    # Validate passed arguments.
+    # Validate sanity.
     die_unless_args_3_to_4\
         'Expected one string, one integer, optional line name, and one command.'
     string\
@@ -526,6 +537,25 @@ function for_string_wrapped_at_line_length() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: I believe that wrapping is currently failing for long contiguous strings
+#lacking internal whitespace, suggesting a regression in
+#get_pcre_wrapping_at_line_length(). Investigate as time permits.
+#FUXME: A thought experiment succinctly identified the issue: ANSI escape
+#sequences embedded in strings. We need to account for such sequences when
+#wrapping strings, principally in the following two places:
+#
+#* get_pcre_wrapping_at_line_length(). The returned PCRE must ignore such
+#  sequences. To do so, replace every instance of "." with
+#  "(?:${ZESHY_ANSI_PCRE})?.", where ${ZESHY_ANSI_PCRE} is a newly defined
+#  string global defined in @{ansi} based on corresponding glob patterns.
+#* output_string_wrapped_with_style_prefix(). Such function currently calculates
+#  the length of the current line manually. We'll probably need to replace that
+#  with a process substitution calling
+#  get_string_length_printable_sans_ansi() -- which should be renamed to
+#  get_string_length_printable_sans_ansi(), incidentally.
+#
+#Theoretically, that should do it. *shrug*
+
     # To accept arbitrary strings (e.g., possibly containing zsh or zeshy code),
     # avoid character classes "\w" and "\W" matching only spoken language words.
 
@@ -692,7 +722,7 @@ function for_string_wrapped_at_line_length() {
 #==========================================
 #/---
 #function print_string_wrapped_with_line_prefix() {
-#    # Validate passed arguments.
+#    # Validate sanity.
 #    die_unless_args_2 'expected one string and one line prefix'
 #    string text="${1}" line_prefix="${2}"
 #
@@ -700,9 +730,9 @@ function for_string_wrapped_at_line_length() {
 #    # latter lengths exclude non-printable characters, including ANSI escapes.
 #    integer terminal_width text_length line_prefix_length
 #    terminal_width="$(get_terminal_width)"
-#    text_length="$(get_string_length_printable_sans_ansi_colors "${text}")"
+#    text_length="$(get_string_length_printable_sans_ansi "${text}")"
 #    line_prefix_length="$(\
-#        get_string_length_printable_sans_ansi_colors "${prefix}")"
+#        get_string_length_printable_sans_ansi "${prefix}")"
 #
 #    # Maximum length of each text substring to be printed on each output line.
 #    integer line_length; line_length=$(( terminal_width - prefix_length ))
