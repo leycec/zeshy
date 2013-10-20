@@ -23,49 +23,6 @@ function get_exception_message_width() {
 }
 
 # ....................{ PRINTERS                           }....................
-#FIXME: Ugh. The current implementation is atrociously terrible. It should:
-#
-#* Leverage ${ZESHY_STYLE_TO_TEXT}.
-#* Leverage ${ZESHY_STYLE_TO_COLOR} styles that *ACTUALLY* exist.
-#* Be *MUCH* better integrated into the printed exception message. Ideally,
-#  shouldn't messages just resemble:
-#
-#  /----------------- rsync_safely ----------------------\
-#  | mount_disk() failed with exit status 1:             |
-#  | Expected one device filename and one mount dirname. |
-#  \-----------------------------------------------------/
-#
-#  # Then, print the current call stack here!
-#FIXME: Right. All of this was pretty much extreme overkill. Define a new
-#parcel @{message/exception} with function print_exception_with_status()
-#accepting a string message and integer status and printing:
-#
-#* Such message and status in a single box, as above. We'll probably need a call resembling:
-#   print_string_titled_with_style_prefix\
-#       "$(output_call_stack_root_with_style_prefix)" "${*}" 1>&2
-#* 
-#FIXME: The whole "$(output_call_stack_root_with_style_prefix)" jazz isn't quite right. Such
-#text should be semantically embellished with a new getter appropriate to output
-#-- say, output_call_stack_root_with_style_prefix() -- as follows:
-#
-#* If output_call_stack_root_with_style_prefix() is a file, such basename should be double-
-#  quoted. For aesthetics, we really want to use the UTF-8-encoded “ and ”
-#  characters. To do so, add new entries "text.quote_double_left" and
-#  "text.quote_double_left" to ${ZESHY_STYLE_TO_TEXT_UTF8}. ('K: done!)
-#* If output_call_stack_root_with_style_prefix() is a function, such basename should be
-#  suffixed by "()".
-#
-#Come to think, such functionality is probably the *EXACT* same as that already
-#performed by output_call_stack(), yes? In such case, extract such functionality
-#into a new function -- how about, say, output_runnable_name_with_style_prefix()?
-#Such function should accept a runnable name and optional style prefix and adorn
-#such name with both context-dependent text *AND* colors. Such function should be
-#defined under @{15-function}, somewhere, to render it accessible to
-#output_call_stack(). Note that, when we call it here, such function should
-#probably be called *WITHOUT* a style prefix; ideally, we want such function to
-#*NOT* adorn such runnable name with colors here, since we do that ourselves
-#already.
-
 #FIXME: Correct documentation.
 declare_function_with_stdin <<'/---'
 [stderr: string] print_exception(void)
@@ -85,60 +42,83 @@ output. See output_call_stack_with_lists() for further details.
 function print_exception() {
     # Validate sanity.
     die_if_args
-    string exception_message exception_title runnable_name
-    integer runnable_index frame_index_handler_last
+    string\
+        failure_name\
+        failure_text\
+        failure_status\
+        failure_status_suffix\
+        exception_message\
+        exception_title\
+        style_prefix_status='print_exception.failure.'
+    integer failure_index
 
-    # If any global expanded below is undefined, throw an exception. See
-    # is_exception() for further details.
-    (( ${+EXCEPTION} +\
-       ${+ZESHY_EXCEPTION_STATUS} +\
-       ${+ZESHY_EXCEPTION_FUNCSTACK} +\
-       ${+ZESHY_EXCEPTION_FUNCFILETRACE} +\
-       ${+ZESHY_EXCEPTION_FUNCSOURCETRACE} == 5 )) or
-        die '${EXCEPTION}, ${ZESHY_EXCEPTION_STATUS}, ${ZESHY_EXCEPTION_FUNCSTACK}, ${ZESHY_EXCEPTION_FUNCFILETRACE}, and/or ${ZESHY_EXCEPTION_FUNCSOURCETRACE} undefined.'
+    # If any global previously set by store_exception_with_status() has since
+    # been unset or changed to an unexpected type, throw an exception. See
+    # is_string(), is_integer(), and is_list() for further details.
+    is "${(t)EXCEPTION-}" == 'scalar'* si or die\
+         "\${EXCEPTION} undefined or not a scalar variable."
+    is "${(t)ZESHY_EXCEPTION_STATUS-}" == 'integer'* si or die\
+         "\${ZESHY_EXCEPTION_STATUS} undefined or not an integer variable."
+    is "${(t)ZESHY_EXCEPTION_FUNCSTACK-}" == 'array'* si or die\
+         "\${ZESHY_EXCEPTION_FUNCSTACK} undefined or not a list."
+    is "${(t)ZESHY_EXCEPTION_FUNCFILETRACE-}" == 'array'* si or die\
+         "\${ZESHY_EXCEPTION_FUNCFILETRACE} undefined or not a list."
+    is "${(t)ZESHY_EXCEPTION_FUNCSOURCETRACE-}" == 'array'* si or die\
+         "\${ZESHY_EXCEPTION_FUNCSOURCETRACE} undefined or not a list."
 
-    # If any function called below is undefined, throw an exception. For
-    # resilience, minimize the set of such functions.
-    typeset -f output_call_stack_lists_index_with_style_prefix &>/dev/null or
-        die   'output_call_stack_lists_index_with_style_prefix() undefined.'
-    typeset -f output_call_stack_lists &>/dev/null or
-        die   'output_call_stack_lists() undefined.'
+    # If such exception's call stack is empty, throw an exception.
+    (( ${#ZESHY_EXCEPTION_FUNCSTACK} )) or die\
+        "Exception call stack \${ZESHY_EXCEPTION_FUNCSTACK} empty."
 
     # Find the index of the runnable directly responsible for such exception
-    # (i.e., of the the runnable directly calling the die*() or
-    # throw_exception*() function that threw such exception). See
-    # output_call_stack_index_lists_and_style_prefix() for similar logic.
-    integer  runnable_index=1
-    while (( runnable_index <= ${#funcstack} )) and
-        is "${funcstack[${runnable_index}]}" ==\
-            ('TRAPZERR'|'throw_exception'|'die'(|'_'*)) si {
-        runnable_index+=1
+    # (i.e., either running the command returning unhandled nonzero exit status
+    # or calling the die*() or throw_exception*() function throwing such
+    # exception). See output_call_stack_lists_with_style_prefix() for further
+    # details and related logic.
+    failure_index=1
+    while (( failure_index <= ${#ZESHY_EXCEPTION_FUNCSTACK} )) and
+        is "${ZESHY_EXCEPTION_FUNCSTACK[${failure_index}]}" ==\
+            ('TRAPZERR'|'die'(|'_'*)|'throw_exception') si {
+        failure_index+=1
     }
 
-    # Stylize such name.
-    runnable_name="$(\
-        output_call_stack_lists_index_with_style_prefix\
+    # If such index exceeds the last valid index, arbitrarily revert such index
+    # to the first valid index.
+    if (( failure_index > ${#ZESHY_EXCEPTION_FUNCSTACK} )) {
+        failure_index=1
+    }
+
+    # Name of the runnable directly responsible for such exception.
+    set_string_to_call_stack_lists_index_with_style_prefix\
+        failure_name\
         ZESHY_EXCEPTION_FUNCSTACK\
         ZESHY_EXCEPTION_FUNCSOURCETRACE\
-        ${runnable_index}\
-        'print_exception.failure.runnable.')"
+        ${failure_index}\
+        "${style_prefix_status}runnable."
+
+    # Substrings to be printed below.
+    failure_text="${ZESHY_STYLE_TO_COLOR[${style_prefix_status}text]-} failed with exit status "
+    failure_status="${ZESHY_STYLE_TO_COLOR[${style_prefix_status}status]-}${ZESHY_EXCEPTION_STATUS}"
+    failure_status_suffix="${ZESHY_STYLE_TO_COLOR[${style_prefix_status}status_suffix]-}${ZESHY_STYLE_TO_TEXT[${style_prefix_status}status_suffix]-:.}"
 
     # Exception message, prefixed by a synopsis of such exception's exit status.
-    exception_message="${runnable_name}${ZESHY_STYLE_TO_COLOR[print_exception.failure.text]-} failed with exit status ${ZESHY_STYLE_TO_COLOR[print_exception.failure.status]-}${ZESHY_EXCEPTION_STATUS}"
+    exception_message="${runnable_name}${failure_text}${failure_status}${failure_status_suffix}"
 
-    # If such exception was thrown with a nonempty string, suffix such message
-    # with a sane delimiter followed by such string.
+    # If such exception was thrown with a nonempty message, prefix such synopsis
+    # with a sane delimiter followed by such message.
     if is -n "${EXCEPTION}" si {
-        exception_message+="${ZESHY_STYLE_TO_COLOR[print_exception.failure.suffix_nonempty]-}${ZESHY_STYLE_TO_TEXT[print_exception.failure.suffix_nonempty]-:$'\n'}${ZESHY_STYLE_TO_COLOR[print_exception.content.text]-}${EXCEPTION}"
-    # Else, such message is empty. Suffix such message with a sane delimiter.
-    } else {
-        exception_message+="${ZESHY_STYLE_TO_COLOR[print_exception.failure.suffix_empty]-}${ZESHY_STYLE_TO_TEXT[print_exception.failure.suffix_empty]-.}"
+        #FIXME: Print a footing constrained to such width. We'll need a new
+        #function, I'm afraid. *sigh*
+        #FIXME: O.K.; we've implemented it. Just uncomment the following line:
+#       output_string_centered_to_width_with_style_prefix\
+#           ''
+#           "$(get_exception_message_width)"\
+#           "${style_prefix_status}footing."
+        exception_message+=$'\n'"${ZESHY_STYLE_TO_COLOR[print_exception.content.text]-}${EXCEPTION}"
     }
 
-    # Exception title. See output_call_stack_root_with_style_prefix() for
-    # further details.
-    exception_title="$(\
-        output_call_stack_lists_title\
+    # Exception title.
+    exception_title="$(output_call_stack_lists_title\
         ZESHY_EXCEPTION_FUNCSTACK\
         ZESHY_EXCEPTION_FUNCSOURCETRACE) Exception"
 
@@ -160,7 +140,109 @@ function print_exception() {
     } to_stderr
 }
 
+#FIXME: In lieu of unit tests...
+function yolm() {
+    function yolmyolmyolmyolmyolmyolm() {
+        die '"I put in 35 years..."
+"It ain''t right..."
+"I don''t know what to do..."
+They never pay the slaves enough so they can get free, just enough so they can stay alive and come back to work.'
+    }
+    yolmyolmyolmyolmyolmyolm
+}
+
 # --------------------( WASTELANDS                         )--------------------
+#┋«————————————————————————————————————————————————————————————————————————————————————————————» ┋
+#
+#┎┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈• yolm() Exception •┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┒
+#┋yolmyolmyolmyolmyolmyolm() failed with exit status 1.                                          ┋
+#┋┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈ ┋
+#┋"I put in 35 years..."                                                                         ┋
+#┋    "It ain't right..."                                                                        ┋
+#┋    "I don't know what to do..."                                                               ┋
+#┋        They never pay the slaves enough so they can get free, enough so they can stay alive   ┋
+#┋and come back to work.                                                                         ┋
+#┠┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┚
+    # Else, such message is empty. Suffix such synopsis with a sane delimiter.
+#    } else {
+#        exception_message+="${ZESHY_STYLE_TO_COLOR[${style_prefix_status}suffix_empty]-}${ZESHY_STYLE_TO_TEXT[${style_prefix_status}suffix_empty]-.}"
+#    }
+
+# See output_call_stack_root_with_style_prefix() for
+    # further details.
+#    runnable_name="$(\
+#        output_call_stack_lists_index_with_style_prefix\
+#        ZESHY_EXCEPTION_FUNCSTACK\
+#        ZESHY_EXCEPTION_FUNCSOURCETRACE\
+#        ${runnable_index}\
+#        'print_exception.failure.runnable.')"
+
+    # If any global expanded below is undefined, throw an exception. See
+    # is_exception() for further details.
+#    (( ${+EXCEPTION} +\
+#       ${+ZESHY_EXCEPTION_STATUS} +\
+#       ${+ZESHY_EXCEPTION_FUNCSTACK} +\
+#       ${+ZESHY_EXCEPTION_FUNCFILETRACE} +\
+#       ${+ZESHY_EXCEPTION_FUNCSOURCETRACE} == 5 )) or
+#        die '${EXCEPTION}, ${ZESHY_EXCEPTION_STATUS}, ${ZESHY_EXCEPTION_FUNCSTACK}, ${ZESHY_EXCEPTION_FUNCFILETRACE}, and/or ${ZESHY_EXCEPTION_FUNCSOURCETRACE} undefined.'
+
+    # If such exception's call stack is undefined or not a list, fail. See is_list() for
+    # further details. Since other functions called below (e.g.,
+    # set_string_to_call_stack_lists_index_with_style_prefix()) validate the
+#    is "${(tP)funcstack_name__ocsl-}~~~${(tP)funcfiletrace_name__ocsl-}~~~${(tP)funcsourcetrace_name__ocsl-}" ==\
+#       'array'*'~~~array'*'~~~array'* si or die\
+#        "\${${funcstack_name__ocsl}\}, \${${funcfiletrace_name__ocsl}\}, and/or \${${funcsourcetrace_name__ocsl}\} undefined or not lists."
+
+    # If any function called below is undefined, throw an exception. For
+    # resilience, minimize the set of such functions.
+#    { typeset -f\
+#        output_call_stack_lists_index_with_style_prefix\
+#        output_call_stack_lists } silent or die\
+#       'output_call_stack_lists_index_with_style_prefix() and/or output_call_stack_lists() undefined.'
+
+#FUXME: Ugh. The current implementation is atrociously terrible. It should:
+#
+#* Leverage ${ZESHY_STYLE_TO_TEXT}.
+#* Leverage ${ZESHY_STYLE_TO_COLOR} styles that *ACTUALLY* exist.
+#* Be *MUCH* better integrated into the printed exception message. Ideally,
+#  shouldn't messages just resemble:
+#
+#  /----------------- rsync_safely ----------------------\
+#  | mount_disk() failed with exit status 1:             |
+#  | Expected one device filename and one mount dirname. |
+#  \-----------------------------------------------------/
+#
+#  # Then, print the current call stack here!
+#FUXME: Right. All of this was pretty much extreme overkill. Define a new
+#parcel @{message/exception} with function print_exception_with_status()
+#accepting a string message and integer status and printing:
+#
+#* Such message and status in a single box, as above. We'll probably need a call resembling:
+#   print_string_titled_with_style_prefix\
+#       "$(output_call_stack_root_with_style_prefix)" "${*}" 1>&2
+#* 
+#FUXME: The whole "$(output_call_stack_root_with_style_prefix)" jazz isn't quite right. Such
+#text should be semantically embellished with a new getter appropriate to output
+#-- say, output_call_stack_root_with_style_prefix() -- as follows:
+#
+#* If output_call_stack_root_with_style_prefix() is a file, such basename should be double-
+#  quoted. For aesthetics, we really want to use the UTF-8-encoded “ and ”
+#  characters. To do so, add new entries "text.quote_double_left" and
+#  "text.quote_double_left" to ${ZESHY_STYLE_TO_TEXT_UTF8}. ('K: done!)
+#* If output_call_stack_root_with_style_prefix() is a function, such basename should be
+#  suffixed by "()".
+#
+#Come to think, such functionality is probably the *EXACT* same as that already
+#performed by output_call_stack(), yes? In such case, extract such functionality
+#into a new function -- how about, say, output_runnable_name_with_style_prefix()?
+#Such function should accept a runnable name and optional style prefix and adorn
+#such name with both context-dependent text *AND* colors. Such function should be
+#defined under @{15-function}, somewhere, to render it accessible to
+#output_call_stack(). Note that, when we call it here, such function should
+#probably be called *WITHOUT* a style prefix; ideally, we want such function to
+#*NOT* adorn such runnable name with colors here, since we do that ourselves
+#already.
+
     # If list global ${ZESHY_EXCEPTION_FUNCSTACK} still exists, ...
 #    if { is_list ZESHY_EXCEPTION_FUNCSTACK } {
 #        # Index of the last runnable in such exception's call stack matching an
