@@ -3,8 +3,12 @@
 # Copyright 2007-2013 by Cecil Curry.
 # See "COPYING" for additional details.
 
-declare_parcel_as_script_with_stdin <<'______________<heredoc?>______________'
-Handle *printer functions* (i.e., functions printing strings).
+declare_parcel_as_script_with_stdin <<'/---'
+Handle *printer functions* (i.e., high-level functions printing strings).
+Namely, maintain globals tracking the current state of standard output and
+error, including modification times of the device files associated with such
+file descriptors after the most recent call to a printer function writing such
+file descriptors (e.g., print_string()).
 
 == Nomenclature ==
 
@@ -46,31 +50,281 @@ Hence, while printer functions handle repetitive and often error-prone
 contextual tasks on behalf of the caller, getter and outputter functions do
 _not_. Likewise, while printer and outputter functions are rarely called from
 command substitutions, getter functions are _always_.
-______________<heredoc?>______________
-
-# ....................{ OUTPUTTERS                         }....................
-#FIXME: I remain unconvinced of the general utility of this function. Honestly,
-#we'd be better off excising it entirely. It's uselessly general. (Do we still
-#call this anywhere? We certainly shouldn't.)
-declare_function_with_stdin <<'/---'
-string output_line_horizontal(void)
-
-Print a *hard rule* (i.e., horizontal line) to standard output.
 /---
-function output_line_horizontal() {
+
+#FIXME: Wild. O.K.; I think I've tracked down a bit of why start_stdout() no
+#longer works as intended: "stat" caching, probably induced by a recent kernel
+#upgrade changing internal behavior. We need to find a way of circumventing
+#this.
+#FIXME: O.K.; I've discovered that zstat() appears to be performing caching
+#independent of kernel behavior, which we can't seem to get around. That said,
+#the following command (admittedly GNU-specific, but beggers can't particularly
+#be choosers) appears to circumvent both this issue *AND* the nanoseconds issue:
+#
+#    >>> command stat --format='%y' /dev/fd/1
+#    2013-09-21 04:12:10.531266625 -0400
+#    >>> command stat --format='%y' /dev/fd/1
+#    2013-09-21 04:12:10.875260409 -0400
+#    >>> command stat --format='%Y~~~%y' /dev/fd/1
+#    1379751717~~~2013-09-21 04:21:57.688637663 -0400
+#
+#A few things to note:
+#
+#* You *MUST* reference "/dev/fd/1" directly rather than its symbolic link
+#  "/dev/stdout", for the simple reason that "stat" doesn't follow such links by
+#  default. Of course, you can obviate this by passing "-L" to "stat" -- but,
+#  then, why not just avoid the symbolic link altogether? Do so, I should think.
+#* This is GNU-specific. Even under non-GNU systems, however, I'm discouraged by
+#  the over-caching that zstat() performs. We should probably *ALWAYS* defer to
+#  the system "stat" command to avoid such entanglements.
+#* Naturally, we'll need to parse such output apart. Happily, we already do so.
+#* I'm *STRONGLY* concerned that get_path_mtime() will not behave sanely when
+#  run from a piped subshell (which could also be a contributing factor in none
+#  of this quite working right). This is easily circumventable by defining a new
+#  set_float_to_path_mtime() function and redefining both get_path_mtime() and
+#  set_float_to_stdout_mtime() to call such function -- which actually
+#  simplifies matters, quite a bit. (Unsure why I didn't just define such
+#  function from the beginning, really!)
+#
+#Reimplement get_path_mtime() and cohorts, then.
+#FIXME: Hah! get_path_mtime() is *ALREADY* implemented in this manner, it would
+#appear. Clearly, though, we need to *STRONGLY* document why zstat() isn't an
+#option, even ignoring the nanoseconds issue. And we still need to define
+#set_float_to_path_mtime(), so there's plenty to keep us busy with. :)
+
+#FIXME: On attempting to track down our spurious start_stdout() issue, I noted
+#the following output:
+#
+#    [rhosfa leycec}~/zsh/zeshy/src/gr 'or true'
+#    stdout_path:             /dev/pts/6; stdout_mtime:             1379124448.1266725063
+#    ZESHY_STDOUT_PRIOR_PATH: /dev/pts/6; ZESHY_STDOUT_PRIOR_MTIME: 1379124440.1266725063
+#    ...
+#    [rhosfa leycec}~/zsh/zeshy/src/gr 'or true'
+#    stdout_path:             /dev/pts/6; stdout_mtime:             1379125120.1266725063
+#    ZESHY_STDOUT_PRIOR_PATH: /dev/pts/6; ZESHY_STDOUT_PRIOR_MTIME: 1379124448.1266725063
+#
+#Note the two mtimes differ by 8 seconds but have the same exact nanoseconds.
+#Clearly, get_path_mtime() has a subtle bug (or three). 
+#
+#Interesting! While get_path_mtime() *DEFINITELY* has a bug relating to
+#nanoseconds (...in that they never change, which isn't very useful), the main
+#issue obviously lies elsewhere. zeshy should be resetting
+#${ZESHY_STDOUT_PRIOR_MTIME} to the current... Ah, right. So, as we may recall,
+#"gr" is an alias expanding to a function redirecting its output to... Ah,
+#nevermind. Since run_code_paged() should be running grep_path_recursive() in
+#the current shell, I really don't see why this is failing. Clearly,
+#${ZESHY_STDOUT_PRIOR_MTIME} is *NOT* being reset. To debug this, we should
+#probably start appending to a log file on every call to stop_stdout().
+
+# ....................{ GLOBALS                            }....................
+#FIXME: Rename to ${ZESHY_STATE_STDOUT_PRIOR_MTIME} and likewise below.
+declare_global_with_stdin float ZESHY_STDOUT_PRIOR_MTIME <<'/---'
+Modification time of the device file associated with standard output for the
+current shell at the time of the most recent call to update_stdout_state() or 0
+if such function has yet to be called.
+/---
+
+declare_global_with_stdin float ZESHY_STDERR_PRIOR_MTIME <<'/---'
+Modification time of the device file associated with standard error for the
+current shell at the time of the most recent call to update_stdout_state() or 0
+if such function has yet to be called.
+/---
+
+declare_global_with_stdin string ZESHY_STDOUT_PRIOR_PATH <<'/---'
+Canonicalized absolute path of the device file associated with standard output
+for the current shell at the time of the most recent call to
+update_stdout_state() or the empty string if such function has yet to be called.
+/---
+
+declare_global_with_stdin string ZESHY_STDERR_PRIOR_PATH <<'/---'
+Canonicalized absolute path of the device file associated with standard error
+for the current shell at the time of the most recent call to
+update_stderr_state() or the empty string if such function has yet to be called.
+/---
+
+# ....................{ UPDATERS                           }....................
+#FIXME: Rename to update_state_stdout() and likewise below.
+declare_function_with_stdin <<'/---'
+void update_stdout_state(void)
+
+Update globals recording the state of standard output after the most recent call
+to a printer function (e.g., print_string()), where ``state'' implies the
+modification time of the device file associated with standard output at the time
+of such call. Such state assists subsequent calls to start_stdout() in
+deciding whether prior and subsequent output should be delimited by a newline.
+/---
+# Since standard output and error are typically both muxed to the same terminal,
+# testing the modification time of the device file associated with standard
+# output implicitly tests the same for standard error. Hence, testing only the
+# latter suffices to ensure that prior and subsequent output are properly
+# delimited -- even if such output was to standard error rather than output.
+function update_stdout_state() {
+    die_if_args
+    set_float_to_stdout_mtime ZESHY_STDOUT_PRIOR_MTIME
+    set_string_to_stdout_path ZESHY_STDOUT_PRIOR_PATH
+}
+
+declare_function_with_stdin <<'/---'
+void update_stderr_state(void)
+
+Update globals recording the state of standard error after the most recent call
+to a printer function (e.g., print_string()). See update_stdout_state() for
+further details.
+/---
+function update_stderr_state() {
+    die_if_args
+    set_float_to_stderr_mtime ZESHY_STDERR_PRIOR_MTIME
+    set_string_to_stderr_path ZESHY_STDERR_PRIOR_PATH
+}
+
+# ....................{ RESETTERS                          }....................
+declare_function_with_stdin <<'/---'
+void reset_stdout_state(void)
+
+Reset tracking for standard output to its default state. Specifically, reset
+color attributes for the current terminal to such terminal's defaults _and_
+nullify tracking globals for standard output. See stop_stdout() for further
+details.
+/---
+function reset_stdout_state() {
     # Validate sanity.
     die_if_args
-    string rule
 
-    # Print such rule.
-    rule="$(repeat_string\
-         "${ZESHY_STYLE_TO_TEXT[output_line_horizontal.border]-}"\
-        $(get_terminal_width))"
-    output_string\
-        "${ZESHY_STYLE_TO_COLOR[output_line_horizontal.border]-}${rule}${ZESHY_STYLE_TO_COLOR[color.reset]-}"
+    # Reset terminal attributes.
+    reset_terminal_color
+
+    # Reset tracking globals.
+    ZESHY_STDOUT_PRIOR_MTIME=0
+    ZESHY_STDOUT_PRIOR_PATH=''
+}
+
+# ....................{ STARTERS                           }....................
+#FIXME: Rename to start_stdout_state(). Hmm; perhaps not. How about
+#initiate_stdout_state()? Excellent! Fits with nomenclature below.
+#FIXME: Update documentation.
+
+declare_function_with_stdin <<'/---'
+string start_stdout(void)
+
+Prepare for subsequent printing to standard output. Specifically, reset color
+attributes for the current terminal to such terminal's defaults _and_ print
+whitespace separating subsequent from prior shell output to standard output if
+all of the following conditions hold:
+
+** The current shell previously called at least one `zeshy`-specific printer
+   function (e.g., print_string(), print_message_heading()), a prerequisite of the
+   condition below.
+** The current function was _not_ called directly from the command line (i.e.,
+   was called by another function), a prerequisite of the condition below.
+** The function calling the current function differs from the most recently
+   called printer function. If such functions are the same, their output should
+   usually be conjoined rather than separated by whitespace; if such functions
+   differ, however, separating their output with whitespace usually improves
+   readability and aesthetics.
+* _Or_:
+** The current modification time of standard output (in seconds since the Unix
+   epoch) differs from the previous such time recorded by the most recently
+   called printer function, implying that another runnable run at least one
+   second before the current call but after the most recently called printer
+   function has printed to standard output without calling
+   update_stdout_tracking() to update such time. In theory, all runnables
+   should update such time after printing to standard output; in practice, the
+   ``regulatory burden'' imposed by such a rule guarantees its unlikelihood.
+   While this condition fails to detect runnables run in the same second as the
+   current call which printed to standard output without updating such time, it
+   does reliably detect older such runnables. This condition is a convenience
+   fallback and should _not_ be counted upon.
+/---
+function start_stdout() {
+    # Validate sanity.
+    die_if_args
+    string stdout_path
+    float stdout_mtime
+#   output_call_stack
+
+    # Time at which the current shell last printed to standard output. Get such
+    # time *BEFORE* resetting terminal attributes, as the former examines device
+    # files touched by the latter.
+    set_float_to_stdout_mtime stdout_mtime
+
+    # Canonicalized absolute path of the standard output device file. While we
+    # could get such path at any time, do so here for simplicity.
+    set_string_to_stdout_path stdout_path
+
+    # Reset terminal attributes.
+    reset_terminal_color
+#   output_string_to_stderr "stdout_path: ${stdout_path}; stdout_mtime: ${stdout_mtime}${ZESHY_ASCII_NEWLINE}ZESHY_STDOUT_PRIOR_PATH: ${ZESHY_STDOUT_PRIOR_PATH}; ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}"
+
+    # If the global tracking standard output is sane (i.e., is set, nonzero, and
+    # more recent than the time at which the current shell was started), get and
+    # test the time at which such shell last printed to standard output against
+    # such global. If the two differ *AND* the canonicalized absolute path of
+    # standard output has not changed, print a delimiting newline.
+    if is "${stdout_path}" == "${ZESHY_STDOUT_PRIOR_PATH-}" si and
+        (( ${ZESHY_STDOUT_PRIOR_MTIME-0} >= ${ZESHY_TIME_START-1} &&\
+           stdout_mtime > ${ZESHY_STDOUT_PRIOR_MTIME-0} )) {
+#       output_string_to_stderr "stdout_path: ${stdout_path}; stdout_mtime: ${stdout_mtime}${ZESHY_ASCII_NEWLINE}ZESHY_STDOUT_PRIOR_PATH: ${ZESHY_STDOUT_PRIOR_PATH}; ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}"
+        output_newline
+    }
+}
+
+# ....................{ STOPPERS                           }....................
+#FIXME: Rename to finalize_stdout_state().
+declare_function_with_stdin <<'/---'
+void stop_stdout(void)
+
+Cleanup after prior printing to standard output. Specifically, Reset global
+tracking state for `zeshy` printer functions _and_ color attributes for the
+current terminal to such terminal's defaults. See reset_terminal_color() and
+update_stdout_state() for further details.
+/---
+function stop_stdout() {
+    # Validate sanity.
+    #
+    # When debugging, note that it's not genuinely possible to safely print
+    # ${ZESHY_STDOUT_PRIOR_MTIME}. Why? Because merely printing such float
+    # changes the return value of get_stdout_mtime(), guaranteeing the next call
+    # to start_stdout() to erroneously print whitespace. (Ugh.)
+    die_if_args
+
+    # Reset terminal attributes *BEFORE* updating output state, as the former
+    # touches device files tested by the latter.
+    reset_terminal_color
+
+    # Record the modification times of standard output and error.
+    update_stdout_state
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#declare_parcel_as_script_with_stdin <<'/---'
+#Handle *output tracking* of globals recording the state of standard output and
+#error after the most recent call to a printer function (e.g., print_string()),
+#where ``state'' typically means the modification time of the device files
+#associated with standard output and error at the time of such call.
+#/---
+
+# ....................{ OUTPUTTERS                         }....................
+#FUXME: I remain unconvinced of the general utility of this function. Honestly,
+#we'd be better off excising it entirely. It's uselessly general. (Do we still
+#call this anywhere? We certainly shouldn't.)
+#declare_function_with_stdin <<'/---'
+#string output_line_horizontal(void)
+#
+#Print a *hard rule* (i.e., horizontal line) to standard output.
+#/---
+#function output_line_horizontal() {
+#    # Validate sanity.
+#    die_if_args
+#    string rule
+#
+#    # Print such rule.
+#    rule="$(repeat_string\
+#         "${ZESHY_STYLE_TO_TEXT[output_line_horizontal.border]-}"\
+#        $(get_terminal_width))"
+#    output_string\
+#        "${ZESHY_STYLE_TO_COLOR[output_line_horizontal.border]-}${rule}${ZESHY_STYLE_TO_COLOR[color.reset]-}"
+#}
+
 # ....................{ PRINTERS                           }....................
 #FUXME: Actually, this is nonsense. By the above definition, *ALL* printers
 #should page output. But that would render this function nonsensical. Honestly,
