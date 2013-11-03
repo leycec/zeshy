@@ -14,15 +14,23 @@ Handle global declarers.
 #been declared... which I believe we currently don't check!
 #FIXME: Waaait! No. See @{10-function}.
 
-# Global map from global names to the help strings documenting such globals. See
+# Map from global names to the help strings documenting such globals. See
 # ${ZESHY_FUNCTION_NAME_TO_HELP} for further details.
 typeset -Ag ZESHY_GLOBAL_NAME_TO_HELP
 
-# Global glob matching zsh variable names. Dismantled, this is:
+# Glob matching zsh variable names. Dismantled, this is:
 #
 # * "[a-zA-Z_]", matching the first character of a valid zsh variable name.
 # * "[a-zA-Z0-9_]#", matching all remaining characters of such name.
-typeset -g ZESHY_VARIABLE_NAME_GLOB='[a-zA-Z_][a-zA-Z0-9_]#'
+typeset -gx ZESHY_VARIABLE_NAME_GLOB='[a-zA-Z_][a-zA-Z0-9_]#'
+
+# Glob matching zsh variable names preceding the value to initialize such names
+# to in "zeshy"-specific global declarations. Dismantled, this is:
+#
+# * '(#b)((...)#)', capturing all such names to ${match[1]}. 
+# * '(#B)(...=)', matching but *NOT* capturing each such "="-suffixed name.
+# * '(*)', capturing such value to ${match[2]}.
+typeset -gx ZESHY_DECLARATION_GLOBAL_NAMES_AND_VALUE_GLOB='(#b)((#B)('${ZESHY_VARIABLE_NAME_GLOB}'=)#)(*)'
 
 # ....................{ DECLARERS                          }....................
 #FIXME: We need to support a disjunctive prototypes. Consider this function,
@@ -189,7 +197,12 @@ function declare_global() {
         # Prepend such help string with such variable declaration.
         help__dg="${global_type__dg} ${global_names_string__dg}"$'\n\n'"${help__dg}"
 
-        # If such variable names string matches "="-delimited variable
+        # If such variable names string matches a single variable name, set the
+        # list of such names to such name.
+        if [[ "${global_names_string__dg}" ==\
+               ${~ZESHY_VARIABLE_NAME_GLOB} ]] {
+            global_names__dg=( "${global_names_string__dg}" )
+        # Else if such variable names string matches "="-delimited variable
         # assignment syntax, split such string on the final "=" into one
         # substring of one or more variable names and one variable value.
         #
@@ -197,8 +210,8 @@ function declare_global() {
         # "=", attempting to split such names on "=" via parameter expansion
         # flag "(s)" does *NOT* suffice. Instead, match such names iteratively
         # with predefined PCREs.
-        if [[ "${global_names_string__dg}" =~\
-              "${ZESHY_DECLARATION_PCRE_GLOBAL_NAMES}" ]] {
+        } elif [[ "${global_names_string__dg}" ==\
+                   ${~ZESHY_DECLARATION_GLOBAL_NAMES_AND_VALUE_GLOB} ]] {
             # Such variable names string reduced to only such names.
             global_names_string__dg="${match[1]}"
 
@@ -207,7 +220,7 @@ function declare_global() {
 
             # Prepare to match such names from such string. See
             # for_string_matches_pcre() for further details.
-            pcre_compile -- "${ZESHY_DECLARATION_PCRE_GLOBAL_NAME}"
+            pcre_compile -- "${ZESHY_DECLARATION_GLOBAL_NAME_PCRE}"
             pcre_study
 
             # Append each such name to such list.
@@ -215,13 +228,8 @@ function declare_global() {
             while {
                 pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${global_names_string__dg}"
             } {
-                global_names__sltrpn+="${match[1]}"
+                global_names__dg+="${match[1]}"
             }
-        # Else if such variable names string matches a single variable name,
-        # set the list of such names to such name.
-        } elif [[ "${global_names_string__dg}" ==\
-            ${~ZESHY_VARIABLE_NAME_GLOB} ]] {
-            global_names__sltrpn=( "${global_names_string__dg}" )
         # Else, such variable names string is invalid. Throw an exception.
         } else {
             die "Global declaration \"${global_type__dg} ${global_names_string__dg}\" invalid."
@@ -230,9 +238,9 @@ function declare_global() {
     # from the variable declaration prefixing such string.
     } else {
         #FIXME: Generalize to support variable name synonyms, as with aliases
-        #and functions.
-        #FIXME: This could probably be generalized to support "="-delimited
-        #assignment, but I have doubts as to whether that'd be widely useful.
+        #and functions. Don't bother trying to wrestle support for "="-delimited
+        #assignment into such syntax, however. Not worth it; clearly, if the
+        #caller wants to assign a global, they should use the existing syntax.
 
         # Match the variable type and name from such declaration or throw an
         # exception if such match fails. Dismantled, this is:
@@ -329,11 +337,28 @@ function declare_global_with_stdin() {
 # Avoid declaring documentation maps (e.g., ${ZESHY_GLOBAL_NAME_TO_HELP}); a
 # precompilation hook subsequently undefines such maps to conserve memory.
 
-declare_global_with_stdin <<'/---'
-string ZESHY_VARIABLE_NAME_GLOB
-
+declare_global_with_stdin string ZESHY_VARIABLE_NAME_GLOB <<'/---'
 Glob matching syntactically valid `zsh` variable names.
 /---
+
+declare_global_with_stdin string\
+    ZESHY_DECLARATION_GLOBAL_NAMES_AND_VALUE_GLOB <<'/---'
+Glob matching syntactically valid `=`-delimited global declarations initializing
+one or more global names to one value. On a successful match, such glob captures
+the following groups from such declarations:
+
+* `${match[1]}`, providing all `=`-suffixed global names in such declaration.
+* `${match[2]}`, providing the value such globals should be initialized to.
+/---
+
+# Glob matching all "="-suffixed zsh variable names preceding the value
+# initializing such names to in "="-delimited global definitions. Dismantled,
+# this is:
+#
+# * '(#b)((...)#)', capturing all such names to ${match[1]}. 
+# * '(#B)(...=)', matching but *NOT* capturing each such "="-suffixed name.
+# * '(*)', capturing such value to ${match[2]}.
+typeset -gx ZESHY_DECLARATION_GLOBAL_NAMES_GLOB='(#b)((#B)('${ZESHY_VARIABLE_NAME_GLOB}'=)#)(*)'
 
 () {
     # Parent directory of the current script.
@@ -436,6 +461,14 @@ value). See ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST() for further details.
 }
 
 # --------------------( WASTELANDS                         )--------------------
+        #FUXME: This could probably be generalized to support "="-delimited
+        #assignment, but I have doubts as to whether that'd be widely useful.
+#Specifically, such glob captures 
+#
+#all `=`-suffixed global names preceding the
+#value such globals will be initialized to in `=`-delimited global declarations
+#into the following groups:
+
         #FUXME: Improper. As with aliases and functions, we instead want to
         #define a 
         # Declare such global initialized to such value. Note that such value
