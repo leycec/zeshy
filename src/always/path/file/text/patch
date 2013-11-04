@@ -3,9 +3,9 @@
 # Copyright 2007-2013 by Cecil Curry.
 # See "COPYING" for additional details.
 
-declare_parcel_as_script_with_stdin <<'-/-'
+declare_parcel_as_script_with_stdin <<'/---'
 Handle text file patching.
--/-
+/---
 
 #FIXME: Add support for compressed patch files, both on input (apply_) and output
 #(make_). For the latter, we'll need a new function "is_archive_file" in
@@ -15,9 +15,8 @@ Handle text file patching.
 #(hopefully) have a common prefix (say, "x-compressed"). Check this.
 
 # ....................{ MAKERS                             }....................
-#FIXME: Silly nomenclature. Rename to make_patch_from_path_to_path().
 declare_function_with_stdin <<'/---'
-string make_file_text_patch(
+void make_patch_from_path_to_path:(
     string patch_filename = "${old_pathname}.patch",
     string old_pathname,
     string new_pathname)
@@ -32,19 +31,21 @@ Assuming default ${ZESHY_OPTIONS_DIFF}, such differences will be in
 https://en.wikipedia.org/wiki/Diff#Unified_format[*unified `diff` format*], the
 canonical patch file format for most open-source software projects.
 /---
-function make_file_text_patch() {
+function make_patch_from_path_to_path: {
     # Validate sanity.
-    if { is_zsh_cli_function } {
+    if { is_context_cli_function } {
         die_unless_args_2_to_3\
-            'Expected optional patch pathname, one old pathname, and one new pathname.'
+            'Expected optional patch filename, one old pathname, and one new pathname.'
 
-        # If no patch pathname was passed, default such pathname to such old
+        # If no patch filename was passed, default such pathname to such old
         # pathname (excluding any suffixing "/" if such path was a directory).
         is_args_3 or prepend_arg "$(remove_string_suffix "${1}" '/').patch"
     } else {
         die_unless_args_3\
-            'Expected one patch pathname, one old pathname, and one new pathname.'
+            'Expected one patch filename, one old pathname, and one new pathname.'
     }
+
+    # Localize such arguments.
     string\
         patch_filename="${1}"\
         pathname_old="${2}"\
@@ -78,9 +79,7 @@ function make_file_text_patch() {
     #FIXME: Add a new interactive alias expanding to
     #make_file_text_patch_with_options().
 
-    # Default the passed patch to the passed old path excluding suffixing "/",
-    # removing such patch if already found.
-    patch_filename="${3-$(remove_string_suffix "${pathname_old}" '/').patch}"
+    # Remove such patch if already found.
 #   print_message "removing \"${patch_filename}\"..."
     remove_file_if_found "${patch_filename}"
 
@@ -120,38 +119,103 @@ function make_file_text_patch() {
 }
 
 # ....................{ PATCHERS                           }....................
-#FIXME: Silly nomenclature. Rename to apply_patch_to_dir().
 #FIXME: Function implementation is GNU-specific. Correct with the usual
 #${ZESHY_OPTIONS_PATCH_IF_DRY_RUN} approach.
 
 declare_function_with_stdin <<'/---'
-string apply_file_text_patch(
-    string patch_filename,
-    string target_dirname = "$(get_dir)",
-    integer patch_level = "")
+string apply_patch_to_dir:(
+    string patch_filename, string target_dirname = "$(get_dir)")
 
 Apply the passed patch file to the appropriate file(s) in the passed directory
 (defaulting to the current directory, if called directly from the command line)
-under the passed 0-based patch level (defaulting to the empty string and hence
-the first patch level in `[0, 5]` to successfully apply). If such patch writes
-to either an absolute path (e.g., `/sbin/init`) or parent-relative path (e.g.,
-`../../../init/sh`), an exception is thrown.
+with the first patch level in `[0, 5]` to successfully apply. See
+apply_patch_to_dir_with_level:() for further details.
 /---
-function apply_file_patch() {
+function apply_patch_to_dir: {
     # Validate sanity.
-    die_unless_args_1_to_3\
-        'Axpected one patch filename, optional target dirname, and optional patch level.'
+    if { is_context_cli_function } {
+        die_unless_args_1_to_2\
+            'Expected one patch filename and optional target dirname.'
+
+        # If no patch pathname was passed, default such pathname to such old
+        # pathname (excluding any suffixing "/" if such path was a directory).
+        is_args_2 or append_arg "$(get_dir)"
+    } else {
+        die_unless_args_2\
+            'Expected one patch filename and one target dirname.'
+    }
+
+    # Localize such arguments.
+    string patch_filename="${1}" target_dirname="${2}"
+    die_unless_file "${patch_filename}"
+    die_unless_dir "${target_dirname}"
+
+    # Patch such file.
+    store_dir "${target_dirname}"
+    try {
+        # Iteratively search for a successful patch level by attempting each in
+        # ascending order as dry runs.
+        integer patch_level=0  patch_level_max=5
+        for ((; patch_level <= patch_level_max; patch_level++)) {
+            print_message_item\
+                "Attempting patch level ${patch_level} on \"${patch_filename}\"..."
+#               run_code_with_options "patch -p${patch_level} --dry-run --force"\
+            if { run_code_with_options\
+                "command patch -p${patch_level} --dry-run --force --quiet"\
+                ZESHY_OPTIONS_PATCH "< ${(q)patch_filename}" } {
+                break
+            }
+        }
+
+        # If no patch level succeeded, rerun the first dry run, thus forcing
+        # "patch" to print a helpful error message before returning non-zero
+        # exit status and hence inducing a fatal exception.
+        if (( patch_level > patch_level_max )) {
+            run_code_with_options\
+                "command patch -p0 --dry-run --force"\
+                ZESHY_OPTIONS_PATCH "< ${(q)patch_filename}"
+        }
+    } always :{
+        restore_dir
+    }:
+
+    # Apply such patch with the current (presumably successful) patch level.
+    apply_patch_to_dir_with_level:\
+        "${patch_filename}" "${target_dirname}" "${patch_level}"
+}
+
+declare_function_with_stdin <<'/---'
+string apply_patch_to_dir_with_level:(
+    string patch_filename,
+    string target_dirname,
+    integer patch_level)
+
+Apply the passed patch file to the appropriate file(s) in the passed directory
+with the passed 0-based patch level in `[0, 5]`. If such patch insecurely
+attempts to modify either an absolute path (e.g., `/sbin/init`) or parent-
+relative path (e.g., `../../../init/sh`) _and_:
+
+* If the current shell is interactive, the current user is required to confirm
+  such modification.
+* Else, an exception is thrown.
+/---
+function apply_patch_to_dir_with_level: {
+    # Validate sanity.
+    die_unless_args_3\
+        'Expected one patch filename, one target dirname, and one patch level.'
     string\
         patch_filename="${1}"\
-        target_path_dirname="${2:-$(get_dir)}"\
-        patch_level="${3:-}"
+        target_dirname="${2}"\
+        patch_level="${3}"
     die_unless_file "${patch_filename}"
-    die_unless_dir "${target_path_dirname}"
+    die_unless_dir "${target_dirname}"
+    die_unless_integer "${patch_level}"\
+        "Patch level \"${patch_level}\" invalid (i.e., not in [0, 5])."
 
-    # Forbid absolute and parent-relative filenames in the patch file.
+    # Forbid absolute and parent-relative filenames in such patch.
     if { is_file_text_matches_pcre_multiline "${patch_filename}"\
         '^(\*\*\*|\+\+\+|\/---\-)\s+(/|(.*/)?\.\./)' } {
-        string error_message="\"${patch_filename}\" dangerously patches an absolute or parent-relative path."
+        string error_message="\"${patch_filename}\" insecurely patches an absolute or parent-relative path."
 
         # If interactive, require the user confirm such risky behavior.
         if { is_shell_interactive } {
@@ -165,45 +229,23 @@ function apply_file_patch() {
     }
 
     # Patch such file.
-    store_dir "${target_path_dirname}"
-    {
-        # If no patch level was passed, iteractively search for a successful
-        # patch level by attempting each in ascending order (as dry runs).
-        if { is_string_empty "${patch_level}" } {
-            integer patch_level=0  patch_level_max=5
-            for ((; patch_level <= patch_level_max; patch_level++)) {
-                print_message_item\
-                    "Attempting patch level ${patch_level} on \"${patch_filename}\"..."
-#               run_code_with_options "patch -p${patch_level} --dry-run --force"\
-                run_code_with_options\
-                    "command patch -p${patch_level} --dry-run --force --quiet"\
-                    'ZESHY_OPTIONS_PATCH' "< '${patch_filename}'"\
-                    and break or ignore_failure
-            }
-
-            # If no patch level succeeded, rerun the first dry run, thus forcing
-            # "patch" to print a helpful error message before returning non-zero
-            # exit status and hence inducing a fatal exception.
-            if (( patch_level > patch_level_max )) {
-                run_code_with_options "command patch -p0 --dry-run --force"\
-                    'ZESHY_OPTIONS_PATCH' "< '${patch_filename}'"
-            }
-        }
-
-        # Apply the current (presumably successful) patch level.
-        die_unless_integer "${patch_level}"\
-            "Patch level \"${patch_level}\" invalid."
+    store_dir "${target_dirname}"
+    try {
+        # Apply such patch.
         print_message_item\
-            "Applying \"${patch_filename}\" to \"${target_path_dirname}\" under patch level ${patch_level}..."
+            "Applying \"${patch_filename}\" to \"${target_dirname}\" under patch level ${patch_level}..."
         run_code_with_options\
-            "command patch -p${patch_level}" 'ZESHY_OPTIONS_PATCH'\
+            "command patch -p${patch_level}" ZESHY_OPTIONS_PATCH\
             "< ${(q)patch_filename}"
-    } always {
+    } always :{
         restore_dir
-    }
+    }:
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Default the passed patch to the passed old path excluding suffixing "/",
+#   patch_filename="${3-$(remove_string_suffix "${pathname_old}" '/').patch}"
+
     #FUXME: "cat"-ing such diff doesn't strike me as particularly desirable.
     #After all, this function is *NOT* a printer function. How hard is it to
     #simply vim or cat the output patch file, anyway? For generality, cease
