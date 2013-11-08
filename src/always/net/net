@@ -29,36 +29,39 @@ Handle core networking functionality.
 
 # ....................{ GETTERS ~ hostname                 }....................
 declare_function_with_stdin <<'/---'
-string get_hostname(void)
+string get_host(void)
 
 Get the current system's *hostname* (i.e., subdomain name assigned such system).
 Since such hostname is _not_ necessarily fully qualified (e.g., `ryleh` rather
-than `ryleh.cthulhu.com`), consider calling get_hostname_fully_qualified()
+than `ryleh.cthulhu.com`), consider calling get_host_fully_qualified()
 instead.
 /---
-function get_hostname() {
+function get_host() {
     die_if_args
     output_string "${HOST}"
 }
 
 declare_function_with_stdin <<'/---'
-string get_hostname_fully_qualified(void)
+string get_host_fully_qualified(void)
 
-Get the current system's *Fully Qualified Domain Name* (FQDN), a dot-delimited
-string typically equal to `$(get_hostname).$(get_domain_name)`.
+Get the current system's *Fully Qualified Domain Name* (i.e., FQDN, a dot-
+delimited string usually identical to `$(get_host).$(get_domain:)`).
 /---
-function get_hostname_fully_qualified() {
+function get_host_fully_qualified() {
     die_if_args
     command hostname --fqdn
 }
 
 # ....................{ GETTERS ~ domain name              }....................
 declare_function_with_stdin <<'/---'
-string get_domain_name(void)
+string get_domain:(void)
 
 Get the current system's domain name.
 /---
-function get_domain_name() {
+function get_domain:() {
+    #FIXME: If such command doesn't exist, fallback to parsing the domain name
+    #from the current hostname. Or perhaps zsh provides a domain name variable?
+
     # Call "dnsdomainname" rather than "domainname". Curiously, the latter
     # gets the current NIS rather than DNS domain name. Since DNS (largely)
     # obsoletes NIS on modern systems, this is an unfortunate decision.
@@ -68,92 +71,164 @@ function get_domain_name() {
 
 # ....................{ SETTERS                            }....................
 declare_function_with_stdin <<'/---'
-string set_hostname(string hostname)
+string set_host:(string hostname)
 
 Set the hostname of the current system to the passed string.
 /---
-function set_hostname() {
+function set_host:() {
     die_unless_arg 'Expected one string.'
     command hostname -- "${1}"
 }
 
 # ....................{ CONVERTERS                         }....................
-#FIXME: Rename to convert_ip_to_domain_name:() and likewise below.
-#FIXME: Again, extract is_pathable() tests *OUTSIDE* such functions.
 declare_function_with_stdin <<'/---'
-string convert_ip_address_to_domain_name(string ip_address)
+string convert_ip_to_domain:(string ip_address)
 
-Get the domain name responsible for hosting the passed IP address via reverse
-lookup against PTR records on name servers selected by the current system.
+Get the domain name hosted by the passed IP address. Specifically, perform
+reverse lookup with PTR records for such IP address published by the global
+domain name servers for the current system.
 /---
-function convert_ip_address_to_domain_name() {
-    # Validate sanity.
-    die_unless_args 'Expected one IP address.'
-    string ip_address="${1}"
+# If "dig" is installed, prefer such command.
+if { is_pathable dig } {
+    function convert_ip_to_domain:() {
+        # Validate sanity.
+        die_unless_args 'Expected one IP address.'
+        string ip="${1}" domain
+        die_unless_ip "${ip}"
 
-    #FIXME: Implement "nslookup" support.
+        # Since "dig" prints the empty string if no PTR record maps the passed
+        # IP address, detecting such error state requires capturing output.
+        domain="$(command dig +short -x -- "${ip}")"
+        die_unless_string_nonempty "${domain}"\
+            "IP ${ip} not found or associated with no authoritative PTR record."
+        output_string "${domain}"
+    }
+# Else if "host" is installed, fallback to such command.
+} elif { is_pathable host } {
+    function convert_ip_to_domain:() {
+        # Validate sanity.
+        die_unless_args 'Expected one IP address.'
+        string ip="${1}"
+        die_unless_ip "${ip}"
 
-    # Reverse lookup, preferring "dig" to "host" to "nslookup".
-    if { is_pathable dig } {
-        # "dig" outputs the empty string if no PTR record maps the passed IP
-        # address. Testing such condition requires capturing "dig" output.
-        string domain_name
-        domain_name="$(command dig +short -x -- "${ip_address}")"
-        die_unless_string_nonempty "${domain_name}"\
-            "IP ${ip_address} not found or maps to no authoritative PTR record."
-        output_string "${domain_name}"
-    } elif { is_pathable host } {
-        # "host" outputs strings describing the PTR record as follows:
+        # "host" describes PTR record as follows:
         #
         #     >>> host 182.28.18.27
         #     27.18.28.182.in-addr.arpa domain name pointer e.transcendental.com.
         #
-        # Hence, use the fifth field excluding the trailing period.
-        output_string "$(remove_string_suffix\
-            "$(get_string_word "$(command host -- "${ip_address}")" 5)" '.')"
-    } else {
-        die 'Neither "host" or "dig" installed.'
+        # Hence, return the fifth field excluding trailing period.
+        remove_string_suffix\
+            "$(get_string_word "$(command host -- "${ip}")" 5)" '.'
+    }
+# Else if "nslookup" is installed, fallback to such command. Since "nslookup" is
+# principally designed for interactive use, parsing noninteractive output from
+# such command is cumbersome and unreliable at best.
+} elif { is_pathable nslookup } {
+    function convert_ip_to_domain:() {
+        # Validate sanity.
+        die_unless_args 'Expected one IP address.'
+        string ip="${1}"
+        die_unless_ip "${ip}"
+
+        #FIXME: Actually implement
+        #get_string_first_matching_pcre_multiline_group:!
+
+        # "nslookup" describes PTR records as follows:
+        #
+        #     >>> nslookup 8.8.8.8
+        #     Server:		216.168.96.251
+        #     Address:	216.168.96.251#53
+        #
+        #     Non-authoritative answer:
+        #     8.8.8.8.in-addr.arpa	name = google-public-dns-a.google.com.
+        #
+        #     Authoritative answers can be found from:
+        #     8.in-addr.arpa	nameserver = ns2.level3.net.
+        #     8.in-addr.arpa	nameserver = ns1.level3.net.
+        #     ns1.level3.net	internet address = 209.244.0.1
+        #     ns2.level3.net	internet address = 209.244.0.2
+        #
+        # The desired domain name follows the first "name = " in such output,
+        # excluding the suffixing ".".
+        get_string_first_matching_pcre_multiline_group:\
+            "$(command nslookup "${ip}")" '^.*?name = (.*)\.$'
     }
 }
 
+#FIXME: Implement an "nslookup" fallback as well.
 declare_function_with_stdin <<'/---'
-string convert_domain_name_to_ip_address(string domain_name)
+string convert_domain_to_ip:(string domain_name)
 
-Get the IP address serving the passed domain name via forward lookup against A
-records on name servers handling such domain name.
+Get the IP address hosting the passed domain name. Specifically, perform forward
+lookup with A records for such domain name published by the authoritative domain
+name servers for such domain.
 /---
-function convert_domain_name_to_ip_address() {
-    # Validate sanity.
-    die_unless_args 'Expected one domain name.'
-    string domain_name="${1}"
+# If "dig" is installed, prefer such command.
+if { is_pathable dig } {
+    function convert_domain_to_ip:() {
+        # Validate sanity.
+        die_unless_args 'Expected one domain name.'
+        string domain="${1}" ip
 
-    #FIXME: Implement "nslookup" support.
-
-    # Reverse lookup, preferring "dig" to "host" to "nslookup".
-    if { is_pathable dig } {
         # "dig" outputs the empty string if no A record maps the passed domain
         # name. Testing such condition requires capturing "dig" output.
-        string ip_address
-        ip_address="$(command dig +short -- "${domain_name}")"
-        die_unless_string_nonempty "${ip_address}"\
-            "Domain \"${domain_name}\" not found or maps to no authoritative A record."
-        output_string "${ip_address}"
-    } elif { is_pathable host } {
-        # "host" outputs strings describing the PTR record as follows:
+        ip="$(command dig +short -- "${domain}")"
+        die_unless_string_nonempty "${ip}"\
+            "Domain \"${domain}\" not found or associated with no authoritative A record."
+        output_string "${ip}"
+    }
+# Else if "host" is installed, fallback to such command.
+} elif { is_pathable host } {
+    function convert_domain_to_ip:() {
+        # Validate sanity.
+        die_unless_args 'Expected one domain name.'
+        string domain="${1}" ip
+
+        # "host" describes A records as follows:
         #
         #     >>> host -t a e.transcendental.com
         #     e.transcendental.com has address 182.28.18.27
         #
-        # Hence, use the fourth field.
-        output_string\
-            "$(get_string_word "$(command host -- "${domain_name}")" 4)"
-    # Else, throw an exception.
-    } else {
-        die 'Neither "host" or "dig" installed.'
+        # Hence, return the fourth field as is.
+        get_string_word "$(command host -- "${domain}")" 4
     }
-}
+# Else if "nslookup" is installed, fallback to such command. See above.
+} elif { is_pathable nslookup } {
+    function convert_domain_to_ip:() {
+        # Validate sanity.
+        die_unless_args 'Expected one domain name.'
+        string domain="${1}" ip
+
+        #FIXME: Actually implement
+        #get_string_first_matching_pcre_multiline_group:!
+
+        # "nslookup" describes A records as follows:
+        #
+        #     >>> nslookup google-public-dns-a.google.com
+        #     Server:		216.168.96.251
+        #     Address:	216.168.96.251#53
+        #     
+        #     Non-authoritative answer:
+        #     Name:	google-public-dns-a.google.com
+        #     Address: 8.8.8.8
+        #
+        # The desired IP address follows the first "Server:" in such output,
+        # excluding intermediate whitespace.
+        get_string_first_matching_pcre_multiline_group:\
+            "$(command nslookup "${domain}")" '^Server:\s++(.++)$'
+    }
 
 # --------------------( WASTELANDS                         )--------------------
+        # Reverse lookup, preferring "dig" to "host" to "nslookup".
+        # "dig" outputs the empty string if no PTR record maps the passed IP
+        # address. Testing such condition requires capturing "dig" output.
+
+#    } else {
+#        die 'Neither "host" or "dig" installed.'
+#    }
+#FUXME: Rename to convert_ip_to_domain_name:() and likewise below.
+#FUXME: Again, extract is_pathable() tests *OUTSIDE* such functions.
+
     # If "ip" is pathable, query such command.
 #    if { is_pathable ip } {
 #        return_string ${"$(LC_ALL=C command ip addr show dev --\
