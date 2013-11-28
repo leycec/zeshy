@@ -5,7 +5,106 @@
 
 declare_parcel_as_script_with_stdin <<'/---'
 Handle `vim`, the popular CLI editor.
+
+== Vim Servers ==
+
+Most functionality defined by this parcel interfaces with Vim via *Vim servers*
+(i.e., Vim processes assigned process-specific names referenceable externally
+for executing remote commands in such processes). Since Vim implements server
+connectivity via X11 messages, Vim servers are available only under X11.
+
+Vim guarantees a one-to-one correspondence between Vim processes and servers.
+Vim prevents Vim server names from being concurrently shared between multiple
+Vim processes by silently uniquifying Vim server names currently running in other
+Vim processes, suffixing such names by a 1-based integer (e.g., running
+`vim --servername A; vim --servername A` reserves server `A` for the first such
+Vim process and server `A1` for the second).
+
+To print the current Vim server name from within Vim, run:
+
+.Vim server name()
+==========================================
+[source,vim]
+------------------------------------------
+:ec v:servername
+------------------------------------------
+==========================================
 /---
+
+# ....................{ EXCEPTIONS                         }....................
+declare_function_with_stdin <<'/---'
+void die_unless_vim_server:(
+    string server_name,
+    string error_message =
+        "No Vim process running server \"${server_name}\".")
+
+Throw an exception with the passed message unless Vim server currently running in
+another process on the same system. See is_vim_server:() for further details.
+/---
+function die_unless_vim_server:() {
+    die_unless_args_1_to_2\
+        'Expected one server name and optional error message.'
+    string server_name="${1}"
+    is_vim_server: "${server_name}" or die\
+        "${2-No Vim process running server \"${server_name}\".}"
+}
+
+# ....................{ EXCEPTIONS                         }....................
+declare_function_with_stdin <<'/---'
+[status: boolean] is_vim_server:(string server_name)
+
+Report success if one Vim process is running a Vim server with the passed name.
+/---
+function is_vim_server:() {
+    die_unless_arg 'Expected one server name.'
+    is_string_line "$(command vim --serverlist)" "${1}"
+}
+
+# ....................{ CHANGERS                           }....................
+declare_function_with_stdin <<'/---'
+void change_vim_dir:(string dirname = "$(get_dir)")
+
+Change the current directory in the default Vim server currently running in
+another process on the same system (i.e., a Vim server with name
+${ZESHY_VIM_SERVER_NAME_DEFAULT}) to the passed directory (defaulting to the
+current directory, if called directly from the command line).
+/---
+function change_vim_dir:() {
+    #FIXME: Non-ideal. Ideally, the server name should be dynamically parsed
+    #from the command-line with which the most recent Vim process in the current
+    #shell was invoked. Since we only expect one Vim process per shell, such
+    #Vim server should correspond *MUCH* more closely to what the user expects.
+    ignore_context_function_call
+    change_vim_server_dir: "${ZESHY_VIM_SERVER_NAME_DEFAULT}" "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+void change_vim_server_dir:(
+    string server_name,
+    string dirname = "$(get_dir)")
+
+Change the current directory in the passed Vim server currently running in
+another process on the same system to the passed directory (defaulting to the
+current directory, if called directly from the command line). If such server is
+_not_ currently running, an exception is thrown.
+/---
+function change_vim_server_dir:() {
+    # Validate sanity.
+    if { is_context_cli_function } {
+        die_unless_args_1_to_2 'Expected one server name and optional dirname.'
+        is_args_2 or append_arg "$(get_dir)"
+    } else {
+        die_unless_args_2 'Expected one server name and one dirname.'
+    }
+    string server_name="${1}" dirname="${2}"
+    die_unless_vim_server: "${server_name}"
+    die_unless_dir "${dirname}"
+
+    # Set such directory.
+    command vim\
+        --servername "${server_name}"\
+        --remote-send ':cd "'${dirname}'"<CR>'
+}
 
 # ....................{ VIMMERS                            }....................
 declare_function_with_stdin <<'/---'
@@ -13,12 +112,25 @@ declare_function_with_stdin <<'/---'
     string vim_option1?, ...,
     string pathname1?, ...)
 
-Pass the passed paths to `vim` with both the passed and currently configured
-`vim`-specific options (e.g., ${ZESHY_OPTIONS_VIM}).
+Edit the passed paths with `vim` under both the passed and currently configured
+`vim`-specific options (e.g., ${ZESHY_OPTIONS_VIM}). If a Vim server name was
+_not_ explicitly passed and a default has been configured for such name (i.e.,
+if option `--servername` was _not_ passed and string global
+${ZESHY_VIM_SERVER_NAME_DEFAULT} is nonempty), this function implicitly enables
+the Vim server with such name for this editing session (i.e., passing option
+`--servername ${ZESHY_VIM_SERVER_NAME_DEFAULT}` to `vim`).
 /---
 function vim_path_with_options:() {
-    run_code_with_options_configured 'command vim'\
-        'ZESHY_OPTIONS_VIM ZESHY_OPTIONS_VIM_UNDER_SERVER_NOT' "${(q)@}"
+    # If a default is set for such server name, run Vim under such server.
+    if { is_string_nonempty "${ZESHY_VIM_SERVER_NAME_DEFAULT}" and
+         not is_arg_equals: '--servername' } {
+        vim_path_under_server_with_options:\
+            "${@}" "${ZESHY_VIM_SERVER_NAME_DEFAULT}"
+    # Else, run Vim under no such server.
+    } else {
+        run_code_with_options_configured 'command vim' 'ZESHY_OPTIONS_VIM'\
+            "${(q)@}"
+    }
 }
 
 declare_function_with_stdin <<'/---'
@@ -28,8 +140,9 @@ declare_function_with_stdin <<'/---'
         string pathname1?, ...,
         string server_name)
 
-Pass the passed paths to `vim` with both the passed and currently configured
-`vim`-specific options (e.g., ${ZESHY_OPTIONS_VIM}).
+Edit the passed paths with `vim` under both the passed and currently configured
+`vim`-specific options (e.g., ${ZESHY_OPTIONS_VIM}), enabling a Vim server with
+the passed name in this editing session.
 /---
 function vim_path_under_server_with_options:() {
     # Validate sanity.
@@ -39,10 +152,49 @@ function vim_path_under_server_with_options:() {
     pop_arg
 
     # Vim such paths.
-    run_code_with_options_configured\
-        'command vim' 'ZESHY_OPTIONS_VIM' --servername "${server_name}" "${(q)@}"
+    run_code_with_options_configured 'command vim' 'ZESHY_OPTIONS_VIM'\
+        --servername "${server_name}" "${(q)@}"
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: If such server is already running
+#    if { is_vim_server: "${server_name}" } {
+#        print_
+#    }
+
+# . is currently
+# Vim assigns each Vim server name to at most one Vim process, preventing
+# such names from being concurrently shared between multiple Vim processes.  (e.g.,
+# running `vim --servername vim` twice assigns the first Vim process server `vim`
+# the first Vim process server `vim`
+# second assigns the .
+# 
+# _never_ be assigned to more than one Vim process at
+# a time,
+# servers are unique to , there exists exactly one such process.
+# Vim guarantees  server names are 
+# another process on the same system
+# It’s good to note that if two Vims are started with the servername “FOO”, the second one would actually be named “FOO1”.
+
+# declare_global_with_stdin list ZESHY_OPTIONS_VIM_UNDER_SERVER <<'/---'
+# `vim` options when explicitly passed a Vim server name.
+# /---
+# ZESHY_OPTIONS_VIM_UNDER_SERVER=(
+# )
+# 
+# declare_global_with_stdin list ZESHY_OPTIONS_VIM_UNDER_SERVER_NOT <<'/---'
+# `vim` options when _not_ explicitly passed a Vim server name.
+# /---
+# ZESHY_OPTIONS_VIM_UNDER_SERVER_NOT=(
+#     # When *NOT* passed an explicit Vim server name, implicitly enable Vim
+#     # server with the following default server name. Since numerous plugins
+#     # require Vim server to be enabled *AND* since Vim server can only be
+#     # enabled from the command line, this is usually a useful default.
+#     --servername vim
+# 
+#     # Set the current directory for such Vim server to the current directory.
+#     --remote-send ":cd `pwd`<CR>"
+# )
+
 #    die_unless_args\
 #        'Expected optional "vim" options and optional pathnames.'
