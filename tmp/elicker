@@ -60,7 +60,7 @@ local\
     filename_trg_html="${@[-1]}"\
     filename_trg_html_old\
     dirname_trg
-print 'pwd: '${PWD}'\n$$r: '${dirname_src}'\n$$i: '${filename_src_lyx}'\n$$o: '${filename_trg_html}
+#print 'pwd: '${PWD}'\n$$r: '${dirname_src}'\n$$i: '${filename_src_lyx}'\n$$o: '${filename_trg_html}
 
 # Pop such filenames from the argument list, leaving only eLyXer options.
 argv[-3,-1]=()
@@ -140,19 +140,23 @@ print "Post-processing \"${filename_trg_html}\"..."
 # Copy such temporary target file to the target file LyX expects.
 cp "${filename_trg_html_old}" "${filename_trg_html}"
 
-# Change MathJax's math color from default grey (bad MathJax!) to black (good).
-#
-# For safety, performing such change requires matching multiple lines. While
-# either "awk" or "sed" could be employed to do so, both behave awkwardly across
-# multiple lines. Instead, leverage the text file expansion facilities of
-# zsh module "zsh/mapfile" along with the multiline-matching PCRE facilities of
-# zsh module "zsh/pcre" to do so. Since "zsh/mapfile" is a rather unsafe module
-# to leave loaded, load such module only for the duration of such change.
-#
-# It should be noted that XMLStarlet is the ideal means of modifying XML. Due to
-# laziness and a distate for additional dependencies, we go the hard way.
+# Load zsh module "zsh/mapfile", providing both read and write access to text
+# file contents by map global ${mapfile}, only for the exact duration of such
+# access. Since unsetting map entries permanently, silently deletes the
+# corresponding files, such module is inherently unsafe and should only be
+# loaded as long as required.
 zmodload zsh/mapfile
 {
+    # Change MathJax's math color from default grey (bad!) to black (good).
+    #
+    # For safety, performing such change requires matching multiple lines. While
+    # either "awk" or "sed" could be employed to do so, both behave awkwardly
+    # across multiple lines. Instead, leverage the the multiline-matching
+    # PCRE facilities of zsh module "zsh/pcre" to do so. It should be noted that
+    # XMLStarlet is a preferable means of modifying XML. Due to laziness and a
+    # distate for additional dependencies, however, we take the hard way.
+    print "Renaming default MathJax math color..."
+
     # Regex matching lines loading MathJax's JavaScript library from the output
     # HTML file to ${match[1]}. Note that the dot matches all characters
     # excluding newlines, here.
@@ -167,11 +171,95 @@ zmodload zsh/mapfile
 <style>
     .MathJax_Preview { color: black !important }
 </style>${mapfile[${filename_trg_html}][MEND+1,-1]}"
+
+    #FIXME: If this is *STILL* too slow, resort to in-place "sed". *shrug*
+
+    # Remove all forward references to index and glossary entries from the body
+    # of such document. While LaTeX hides such references by default, eLyXer
+    # displays such references as Unicode down arrows. Since readers rarely care
+    # whether and where the index or glossary references the current sentence,
+    # hiding such references tends to produce significantly more readable and
+    # navigable text.  Moreover, since titles can contain such references *AND*
+    # since such references can be concatenated together, displaying such
+    # references as arrows tends to produce unaesthetic output.
+    #
+    # Specifically, globally replace all "<a>...</a>" tags resembling:
+    #
+    # * <a class="IndexReference" name="entry-Fruit-patterns-Watermelon-spiral-0" href="#index-Fruit-patterns-Watermelon-spiral">↓</a>
+    # * <a class="NomenclatureEntry" name="noment-vitalism" href="#nom-vitalism">↓</a>
+    print "Removing empty forward references..."
+
+    # Original text of such file. For efficiency, iteration below modifies
+    # such text "in-place."
+    local text_old="${mapfile[${filename_trg_html}]}"
+
+    # Replaced text of such file.
+    local text_new
+
+    # While there exist substrings matching such PCRE in such text, dynamically
+    # replace such substrings with their replacement. Since each such
+    # replacement guaranteeably replaces such match, the implementation below
+    # need *NOT* store the byte offset of the current match to string global
+    # ${ZPCRE_OP} (unlike most PCRE match iterations). Such implementation
+    # strongly resembles that of for_string_text_matching_pcre:() but differs enough to
+    # warrant separation here. See such function for further details.
+    #
+    # For efficiency, avoid performing brute-force matching ala
+    # 'while is "${text_old__rltmpbt}" =~ "${pcre__rltmpbt}" si {...}'. Such
+    # approach does suffice to implement the desired iteration but could
+    # conceivably recompile such PCRE on each iteration (depending on zsh
+    # internals) and in any case is unlikely to optimize such compilation by
+    # internally calling pcre_study().
+    pcre_compile -- '<a[^>]++>↓</a>'
+    pcre_study
+
+    # Unfortunately, pcre_match() fails to set global integers ${MBEGIN} and
+    # ${MEND} to the character indices of the start and end of the matched
+    # substring. Fortunately, it sets global string ${ZPCRE_OP} to the " "-
+    # delimited *BYTE* indices of the start and end of such substring.
+    # Unfortunately, multibyte strings (e.g., UTF8-encoded) are indexed with
+    # character rather than byte indices under default zsh option "multibyte".
+    # Fortunately, such option can be locally disabled to force zsh to index all
+    # strings (multibyte or not) with byte rather than character indices.
+    unsetopt multibyte
+
+    while { pcre_match -b -- "${text_old}" } {
+        # If such substring is empty, throw an exception. This avoids infinite
+        # loops on perverse PCREs matching only zero-width assertions or the
+        # empty string.
+        (( ${#MATCH} )) || die 'PCRE erroneously matched the empty string.'
+
+        # Append the replaced text by the portion of the original text preceding
+        # such match.
+        text_new+="${text_old[1,${ZPCRE_OP[(w)1]}]}"
+
+        # Reduce the original text to the portion following such match.
+        text_old="${text_old[${ZPCRE_OP[(w)2]},-1]}"
+
+        setopt multibyte
+        text_old="${text_old[2,-1]}"
+        unsetopt multibyte
+    }
+
+    # Set such scalar to such replaced text followed by all remaining original
+    # text. To avoid extraneous string copies, inline such implementation.
+    mapfile[${filename_trg_html}]="${text_new}${text_old}"
+
+    # Reenable default character indexing.
+    setopt multibyte
+# For safety, unload "zsh/mapfile" even in the event of exceptions.
 } always {
     zmodload -ui zsh/mapfile
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#   mapfile[${filename_trg_html}]="${mapfile[${filename_trg_html}]//\<a[^>]#\>↓\</a\>}"
+    # across multiple lines. Instead, leverage the text file expansion
+    # facilities of zsh module "zsh/mapfile" along with the multiline-matching
+    # PCRE facilities of zsh module "zsh/pcre" to do so. Since "zsh/mapfile" is
+    # a rather unsafe module to leave loaded, load such module only for the
+    # duration of such change.
+
     # Regex matching the loading of MathJax's JavaScript library from the output
     # HTML file to ${match[1]} and the remainder of such file to ${match[2]}.
 #   local pcre='(.*?src=".*?MathJax.js[^"]++">\n</script>)(.*)'
