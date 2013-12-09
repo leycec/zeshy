@@ -116,20 +116,76 @@ command substitutions, getter functions are _always_.
 #${ZESHY_STDOUT_PRIOR_MTIME} is *NOT* being reset. To debug this, we should
 #probably start appending to a log file on every call to stop_stdout().
 
+#FIXME: This *STILL* doesn't behave terribly reliably on copious output. The
+#best example is probably:
+#
+#    >>> eqe virtual/ssh
+#
+#This prints numerous headings, some of which are (seemingly randomly) preceded
+#by separating whitespace and others of which are not. The culprit is almost
+#certainly line buffering in either character-special devices (namely, terminal
+#drivers) or underlying commands (e.g., "equery"). I'm not entirely convinced a
+#sane solution exists, I'm afraid. I'd hate to jettison this, but it *SIMPLY
+#DOESN'T WORK.* That said, it could be worth at least examining the solutions
+#documented at the following URL for disabling line buffering, of which the most
+#promising is the "stdbuf" command provided by recent versions of "coreutils":
+#
+#    http://mywiki.wooledge.org/BashFAQ/009
+#
+#Interestingly, the exact same problem persists even after eliminating all
+#instances of "| page_stdin" from the function that eqe() calls. So it's not the
+#fault of merely redirecting stdout to a pipe. It *MUST* be buffering! Right?
+#
+#If buffering is at fault and "stdbuf" does rectify the issue, we'll need to
+#contemplate how to actually globally apply "stdbuf" to all commands printing
+#output. While we'll have to do so manually (namely, be replacing all instances
+#of "command ${command_name}" with "command stdbuf ${command_name}" or better
+#yet expansion of some new alias such run_command_unbuffered:() conditionally
+#expanding to "command stdbuf -oL" only if "stdbuf" is pathable and "command"
+#otherwise), grepping for '\bcommand \b' should yield a helpful starting place.
+#*shrug*
+#FIXME: Interesting. Buffering probably isn't at fault. Globally replacing
+#"command equery" with "command stdbuf -oL equery" had utterly no effect on the
+#prior issue, suggesting we're dealing with a zeshy-specific bug here, as
+#suggested way above. The issue is probably that it's infeasible to reliably
+#obtain the nanosecond-portion of file mtime, even with the tricks that
+#get_path_mtime() employs -- in which case this has all really been for naught.
+
+#FIXME: O.K.; extensive testing conclusively demonstrates the case. Just run the
+#following command repeatedly:
+#
+#    >>> sync; get_path_mtime /dev/pts/9
+#
+#The output clearly shows standard output's mtime to be updated exactly 8
+#seconds to the nanosecond, which is clearly the reason for the nanoseconds
+#never changing for standard output's mtime. So, no bug: just an unfortunate
+#implementation detail.
+#
+#I'm afraid this means that standard output's mtime is useless for real-world
+#use, suggesting we'll need to revert to the prior implementation. (Sucks; I
+#know.)
+#
+#We'll still want to test whether or not standard output's path has changed, as
+#that's reliably infortative. ${ZESHY_STDOUT_PRIOR_MTIME}, however, should be
+#ripped out in favor of the name of the most recent printer function to have
+#been called. Searching up the callstack for such name was quite involved, as I
+#recall. (Ye unbidden Gods, but why did I strip this out without properly
+#checking whether or not it would work? Bad assumptions, I'm afraid.)
+
 # ....................{ GLOBALS                            }....................
-#FIXME: Rename to ${ZESHY_STATE_STDOUT_PRIOR_MTIME} and likewise below.
-declare_global_with_stdin float ZESHY_STDOUT_PRIOR_MTIME <<'/---'
-Modification time of the device file associated with standard output for the
-current shell at the time of the most recent call to update_stdout_state() or 0
-if such function has yet to be called.
-/---
+# declare_global_with_stdin float ZESHY_STDOUT_PRIOR_MTIME <<'/---'
+# Modification time of the device file associated with standard output for the
+# current shell at the time of the most recent call to update_stdout_state() or 0
+# if such function has yet to be called.
+# /---
+# 
+# declare_global_with_stdin float ZESHY_STDERR_PRIOR_MTIME <<'/---'
+# Modification time of the device file associated with standard error for the
+# current shell at the time of the most recent call to update_stdout_state() or 0
+# if such function has yet to be called.
+# /---
 
-declare_global_with_stdin float ZESHY_STDERR_PRIOR_MTIME <<'/---'
-Modification time of the device file associated with standard error for the
-current shell at the time of the most recent call to update_stdout_state() or 0
-if such function has yet to be called.
-/---
-
+#FIXME: Rename to ${ZESHY_STATE_STDOUT_PRIOR_PATH} and likewise below.
 declare_global_with_stdin string ZESHY_STDOUT_PRIOR_PATH <<'/---'
 Canonicalized absolute path of the device file associated with standard output
 for the current shell at the time of the most recent call to
@@ -143,7 +199,6 @@ update_stderr_state() or the empty string if such function has yet to be called.
 /---
 
 # ....................{ UPDATERS                           }....................
-#FIXME: Rename to update_state_stdout() and likewise below.
 declare_function_with_stdin <<'/---'
 void update_stdout_state(void)
 
@@ -160,8 +215,8 @@ deciding whether prior and subsequent output should be delimited by a newline.
 # delimited -- even if such output was to standard error rather than output.
 function update_stdout_state() {
     die_if_args
-    set_float_to_stdout_mtime ZESHY_STDOUT_PRIOR_MTIME
-    set_string_to_stdout_path ZESHY_STDOUT_PRIOR_PATH
+    # set_float_to_stdout_mtime ZESHY_STDOUT_PRIOR_MTIME
+    set_string_to_stdout_filename: ZESHY_STDOUT_PRIOR_PATH
 }
 
 declare_function_with_stdin <<'/---'
@@ -173,8 +228,8 @@ further details.
 /---
 function update_stderr_state() {
     die_if_args
-    set_float_to_stderr_mtime ZESHY_STDERR_PRIOR_MTIME
-    set_string_to_stderr_path ZESHY_STDERR_PRIOR_PATH
+    # set_float_to_stderr_mtime ZESHY_STDERR_PRIOR_MTIME
+    set_string_to_stderr_filename: ZESHY_STDERR_PRIOR_PATH
 }
 
 # ....................{ RESETTERS                          }....................
@@ -194,7 +249,7 @@ function reset_stdout_state() {
     reset_terminal_color
 
     # Reset tracking globals.
-    ZESHY_STDOUT_PRIOR_MTIME=0
+    # ZESHY_STDOUT_PRIOR_MTIME=0
     ZESHY_STDOUT_PRIOR_PATH=''
 }
 
@@ -242,27 +297,29 @@ function start_stdout() {
     float stdout_mtime
 #   output_call_stack
 
+    #FIXME: No point, I'm afraid. So far above.
     # Time at which the current shell last printed to standard output. Get such
     # time *BEFORE* resetting terminal attributes, as the former examines device
     # files touched by the latter.
-    set_float_to_stdout_mtime stdout_mtime
+    # set_float_to_stdout_mtime stdout_mtime
 
     # Canonicalized absolute path of the standard output device file. While we
     # could get such path at any time, do so here for simplicity.
-    set_string_to_stdout_path stdout_path
+    set_string_to_stdout_filename: stdout_path
 
     # Reset terminal attributes.
     reset_terminal_color
-#   output_string_to_stderr "stdout_path: ${stdout_path}; stdout_mtime: ${stdout_mtime}${ZESHY_ASCII_NEWLINE}ZESHY_STDOUT_PRIOR_PATH: ${ZESHY_STDOUT_PRIOR_PATH}; ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}"
+    # output_string_to_stderr "stdout_path: ${stdout_path}; stdout_mtime: ${stdout_mtime}${ZESHY_ASCII_NEWLINE}ZESHY_STDOUT_PRIOR_PATH: ${ZESHY_STDOUT_PRIOR_PATH}; ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}"
 
-    # If the global tracking standard output is sane (i.e., is set, nonzero, and
-    # more recent than the time at which the current shell was started), get and
-    # test the time at which such shell last printed to standard output against
-    # such global. If the two differ *AND* the canonicalized absolute path of
-    # standard output has not changed, print a delimiting newline.
-    if is "${stdout_path}" == "${ZESHY_STDOUT_PRIOR_PATH-}" si and
-        (( ${ZESHY_STDOUT_PRIOR_MTIME-0} >= ${ZESHY_TIME_START-1} &&\
-           stdout_mtime > ${ZESHY_STDOUT_PRIOR_MTIME-0} )) {
+    # If the global that tracks standard output is sane (i.e., is set, nonzero,
+    # and more recent than the time at which the current shell was started), get
+    # and test the time at which such shell last printed to standard output
+    # against such global. If the two differ *AND* the canonicalized absolute
+    # path of standard output has not changed, print a delimiting newline.
+    if is "${stdout_path}" == "${ZESHY_STDOUT_PRIOR_PATH-}" si {
+    # if is "${stdout_path}" == "${ZESHY_STDOUT_PRIOR_PATH-}" si and
+        # (( ${ZESHY_STDOUT_PRIOR_MTIME-0} >= ${ZESHY_TIME_START-1} &&\
+        #    stdout_mtime > ${ZESHY_STDOUT_PRIOR_MTIME-0} )) {
 #       output_string_to_stderr "stdout_path: ${stdout_path}; stdout_mtime: ${stdout_mtime}${ZESHY_ASCII_NEWLINE}ZESHY_STDOUT_PRIOR_PATH: ${ZESHY_STDOUT_PRIOR_PATH}; ZESHY_STDOUT_PRIOR_MTIME: ${ZESHY_STDOUT_PRIOR_MTIME}"
         output_newline
     }
@@ -295,7 +352,41 @@ function stop_stdout() {
     update_stdout_state
 }
 
+#FIXME: In lieu of unit tests...
+# function olii() {
+#     print_message_heading 'yummy'
+#     output_string 'here we are'
+#     print_message_heading 'tummy'
+#     output_string 'there we go'
+# 
+#     print_message_item 'yum'
+#     print_message_item 'ows'
+# }
+
 # --------------------( WASTELANDS                         )--------------------
+    # string stdout_path
+    # float  stdout_mtime
+    # integer i
+    # for ((  i=1; i <= 6; i++ )) {
+    #     # set_float_to_stdout_mtime stdout_mtime
+    #     # set_string_to_stdout_filename: stdout_path
+    #     # print "[cur] stdout mtime: ${stdout_mtime}\nstdout path: ${stdout_path}"
+
+    #     set_string_to_stdout_filename: stdout_path
+    #     output_string "stdout filename: ${stdout_path}"
+    #     command stat\
+    #         --dereference\
+    #         --printf "%y~~~%Y"\
+    #         -- "${stdout_path}"
+    #     output_newline
+    # }
+
+    # set_float_to_stdout_mtime stdout_mtime
+    # set_string_to_stdout_filename: stdout_path
+    # print "[cur] stdout mtime: ${stdout_mtime}\nstdout path: ${stdout_path}"
+
+    # grep_path_recursive "${HOME}/zsh/zeshy/src" 'or true'
+    # grep_path_recursive "${HOME}/zsh/zeshy/src" 'or true'
 #declare_parcel_as_script_with_stdin <<'/---'
 #Handle *output tracking* of globals recording the state of standard output and
 #error after the most recent call to a printer function (e.g., print_string()),
