@@ -9,31 +9,195 @@ more otherwise unsafe `zsh` modules while dynamically evaluating the passed
 strings as commands).
 /---
 
+#FIXME: I have... an idea. It's fairly clear that this sort of
+#"run_code_with_mapfile: '...'" style of code declaration is clumsy,
+#difficult to read, and excessively error-prone. But I believe such
+#clumsiness can be obviated away entirely -- and not merely for
+#run_code_with_mapfile:() but for all similar functions. Ideally, we should
+#be able to call run_code_with_mapfile: like so:
+#
+#    :run_code_with_mapfile :{
+#        output_string "${mapfile[/etc/passwd]}"
+#    :}
+#
+#So how do we achieve such functionality, example? Well, it should be fairly
+#simple. O.K., O.K.; it's not simple at all! But it *IS* decently clever and
+#overly complex, and that certainly counts for something.
+#
+#We want the prior code to dynamically expand inplace to:
+#
+#    ::unload_module_mapfile
+#    :try {
+#        output_string "${mapfile[/etc/passwd]}"
+#    :} always {
+#        ::unload_module_mapfile
+#    :}
+#
+#Can we actually achieve this? The answer, perhaps surprisingly, is yes.
+#First, note the following behavior:
+#
+#    >>> alias tamp='alias simp="print ok"'
+#    >>> function libo() {
+#    ...    tamp
+#    ...    simp
+#    ... }
+#    >>> libo
+#    ok
+#
+#Pretty intense, eh? Alias tamp() expands to an alias definition of alias simp()
+#at the point at which function libo() is called, ensuring the expansion of
+#alias simp() succeeds. Since this works, we extend this concept to dynamically
+#define alias ":}".
+#
+#Note that we no longer need ":{", since such brace should *ALWAYS* be prefixed
+#by another zeshy-specific alias. (This reduces both verbosity and complexity,
+#an essential here.) Then consider the following first draft:
+#
+#    alias :try='...
+#        alias :}="} always {
+#           alias :}=''print_exception_if_unhandled
+#    }''"
+#    '
+#    alias :run_code_with_mapfile='
+#       alias :}=":} always {
+#           ::unload_module_mapfile
+#       :}"
+#       ::load_module_mapfile
+#       :try {
+#    '
+#
+#Hence, this:
+#
+#    :run_code_with_mapfile :{
+#        output_string "${mapfile[/etc/passwd]}"
+#    :}
+#
+#...iteratively expands to this:
+#
+#    alias :}=":} always {
+#        ::unload_module_mapfile
+#    :}"
+#    ::load_module_mapfile
+#    :try {
+#        output_string "${mapfile[/etc/passwd]}"
+#    :} always {
+#        ::unload_module_mapfile
+#    :}
+#
+#...iteratively expands to this:
+#
+#    ::unload_module_mapfile
+#    ...
+#    alias :}="} always {
+#        alias :}='print_exception_if_unhandled
+#    }'"
+#    {
+#        output_string "${mapfile[/etc/passwd]}"
+#    } always { always {
+#        alias :}='print_exception_if_unhandled
+#    }'
+#        ::unload_module_mapfile
+#        print_exception_if_unhandled
+#    }}
+#
+#Fairly dark voodoo. In particular, note the redundant "always { always {". That
+#probably won't work (not to mention being fairly inefficient), so just do:
+#
+#    alias :try='
+#        alias :}="} always {
+#           alias :}=''print_exception_if_unhandled
+#    }''"
+#        typeset -ag ZESHY_TRY_LEVEL; ZESHY_TRY_LEVEL[${SHLVL}]=$(( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} + 1 ))
+#    '
+#    alias catch=''
+#    alias :run_code_with_mapfile='
+#       alias :}=":} catch {
+#           ::unload_module_mapfile
+#       :}"
+#       ::load_module_mapfile
+#       :try'
+#
+#Given this, the new style of exception handling is as follows:
+#
+#    :try {
+#        ...
+#    :} catch {
+#        ...
+#    :}
+#
+#This has the extreme benefit of proper IDE syntax highlighting as well as
+#greater readability for those already familiar with exception handling under
+#conventional programming languages.
+#
+#Of course, the whole point of zeshy *IS* dark zsh voodoo. This is right in line
+#with that mandate... I'm *FAIRLY* sure the above will work, but it's all a
+#matter of whether or not zeshy dynamically expands such aliases as expected.
+#
+#Note that we'll need to remove our existing definitions of ":{" and "}:". After
+#renaming the latter to ":{", we should continue to *DOCUMENT* such alias but
+#leave it otherwise undefined. (Easy to do, happily.)
+#FIXME: Oh, wait. That doesn't quite work, as :try() defines :}(), overwriting
+#the prior definition of :}() for :run_code_with_mapfile(). So...
+#
+#Oh, bother. This probably won't work. If the code to be evaluated by
+#:run_code_with_mapfile() calls, say, :run_code_under_dir(), then the latter's
+#definition of :}() will obviously overwrite the former's. Well, it was a
+#valiant effort! Simply a wee too much dynamism, I'm afraid. Be a shame to
+#jettison *ALL* of this, however. Hmm... Right. I don't see a choice but the
+#following:
+#
+#    alias :load_module_mapfile_start='::load_module_mapfile
+#    :try'
+#    alias :load_module_mapfile_stop='always :{
+#        ::unload_module_mapfile
+#    :}'
+#
+#Called like this:
+#
+#      :load_module_mapfile_start {
+#        output_string "${mapfile[/etc/passwd]}"
+#    } :load_module_mapfile_stop
+#
+#No change to existing aliases :try(), :{(), or :}(), then. It's certainly not
+#perfect, but it beats the *HECK* out of the existing approach. In the immortal
+#words of the mustachioed plumber: "Let's a-go!" Excise the existing
+#run_code_with_mapfile:() function in favor of the above.
+#FIXME: Incidentally, as the prior examples demonstrate, rename "}:" to ":}"
+#to ensure conformance with zeshy namespace prefix ":".
+
 #FIXME: Add examples.
 
 # ....................{ RUNNERS                            }....................
+#FIXME: Excise this and hence this parcel. Replace all such calls with
+#equivalent expansions of :load_module_mapfile_start() and
+#:load_module_mapfile_stop(), as above.
+
 declare_function_with_stdin <<'/---'
-[stdout: string, stderr: string, status: integer] run_code_with_mapfile:(
-   string code1, ...)
+[stdout: str, stderr: str, status: int] run_code_with_mapfile:(str code1, ...)
 
 Run the passed code with temporary access to map global ${mapfile} exported by
 `zsh` module `mapfile`. While this function _is_ moderately safer than cruder
-alternatives (e.g., zmodload(), load_module_mapfile()), the possibility of
+alternatives (e.g., zmodload(), :load_module_mapfile()), the possibility of
 permanent filesystem derangement remains -- rendering this function inherently
-unsafe at best. See load_module_mapfile() for further details on the plausible
+unsafe at best. See :load_module_mapfile() for further details on the plausible
 risks of such global and module.
 /---
 function run_code_with_mapfile:() {
     die_unless_args 'Expected one or more shell words.'
-    load_module_mapfile
+    :load_module_mapfile
     try {
         run_code "${@}"
     } always :{
-        unload_module_mapfile
+        :unload_module_mapfile
     }:
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#    alias :always='always {
+#        alias :}="...
+#        }}"
+#    '
+
 # a pall spectre.
 # for the
 #duration of such execution.
