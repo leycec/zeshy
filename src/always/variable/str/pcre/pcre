@@ -15,6 +15,256 @@ contain `\`-prefixed expressions treated by `zsh` as character escapes
 implicitly deleting each such `\`.
 /---
 
+#FIXME: We've finally uncovered the Dark Magestic Art of *BOTH* passing aliases
+#multiple arguments *AND* "passing" aliases code to be dynamically evaluated.
+#The solution to the latter leverages the solution to the former, so we start
+#there. Consider the current alias undefine_variable_for():
+#
+#    alias undefine_variable_for='{
+#        # Validate sanity.
+#        list args__uvf; set_list_to_stdin_words args__uvf
+#        (( ${#args__uvf} >= 1 )) or die "Expected one or more variable names."
+#
+#        # For safety, destructively coerce such variables to writable local strings.
+#        # When passed read-only variables, this prevents zsh from failing on the
+#        # subsequent call to unset() with "zsh: ${variable_name} read-only".
+#        typeset +r -- "${args__uvf[@]}"
+#
+#        # Unset such variables.
+#        unset -- "${args__uvf[@]}"
+#    } <<<'
+#
+#This is replaceable with the following normal alias undefine_variables()
+#internally defining a temporary global alias, arbitrarily shadowing "--" in
+#this case:
+#
+#    alias ":undefine_variables--"='
+#       :alias_global "--"="
+#           :undefine_alias \"--\"
+#           typeset +r -- \"${variable_names__uv[@]}\"
+#           unset -- \"${variable_names__uv[@]}\""
+#       :list variable_names__uv
+#       :set_list_to_args_1_or_more variable_names__uv'
+#
+#Ridiculously simple as well as fairly clever, eh? A propitious combination.
+#Such alias must be called like so:
+#
+#    :undefine_variables-- this_one and_this_one and_this_last_one --
+#
+#Due to the additional burden on the caller, such alias names should probably be
+#suffixed by "--" to explicitly inform the caller of such calling conventions.
+#Alternately, and this is probably the better solution, we could temporarily
+#shadow "{" to expand to the empty string and "}" to expand to the prior
+#definition of "--", called like so:
+#
+#    :undefine_variables_in_block { this_one and_this_one and_this_last_one }
+#
+#That's certainly more intuitive.
+#
+#An issue does arise with all of this, however. If an exception is called by the
+#arguments passed to such alias, the subsequent alias reverting such temporary
+#shadowing will never be expanded, effectively rendering such shadowing
+#*PERMANENT* -- which is *REALLY, REALLY HORRIBLE*. Since we *REALLY, REALLY*
+#crave the freedom that such aliases afford, however, this must simply be worked
+#around. And, obviously, it can.
+#
+#Simply have our homespun exception handler forcefully undefine all aliases
+#shadowing "{" and "}". Fortunately, it's not hard to test this: e.g.,
+#
+#    # This should trigger the edge case noted above.
+#    :undefine_variables_in_block { $(false) }
+#
+#All such aliases *MUST* explicitly state in their documentation's "Caveats"
+#section that alias arguments *MUST* on penalty of terrible things happening
+#delimit such arguments with "{" and "}". Failing to do so will cause "{" and
+#"}" to be shadowed until the next thrown exception. Since shadowing "{" and
+#"}" in this way is likely to provoke an exception in short order, this isn't
+#quite as terrible as it could be. But it's still terrible.
+#
+#If the burden of shadowing "{" and "}" simply becomes too much (or zsh
+#prohibits us from shadowing such strings), there are certainly safer
+#alternatives we could try -- namely, similar parens pairs. Neither "[" and "]"
+#or "(" and ")" are used *AT ALL* in the zeshy codebase, suggesting that
+#terribly things probably won't happen when the user fails to embed arguments in
+#such delimiters. How about:
+#
+#    :undefine_variables_in_parens ( this_one and_this_one and_this_last_one )
+#
+#Oh, wait. "(" and ")" are obviously used extensively for nonscalar definitions.
+#Right, then. That leaves us with:
+#
+#    :undefine_variables_bracketed [ this_one and_this_one and_this_last_one ]
+#
+#Should be the safest, I imagine. Right. Let's go with this one! "[" and "]"
+#weren't doing anything for us, anyway, given their obsoletion in zsh by the
+#similar pair "[[" and "]]".
+#
+#Ah! Right. Since subshells inherit aliases, we absolutely *CANNOT* shadow a
+#critical delimiter. Consider the following:
+#
+#    # And... we've now broken the world.
+#    :undefine_variables_in_block { $(if true { print oh } else { print no }) }
+#
+#"[" and "]" it is, then. :)
+
+#FIXME: Which returns us to a solution for the second matter above, of "passing"
+#aliases code to be dynamically evaluated. Note that the following example uses
+#delimiters "[" and "]" for the exact same reasons as the prior solution. "{"
+#and "}" are simply out of the question, due to command substitutions. Then:
+#
+#    :for_string_text_matching_pcre_bracketed "test string" "\s++(str)" [
+#        :output_string "${match[1]}"
+#    ]
+#
+#Great. I've confirmed Vim syntax highlights such code as expected, which
+#(unsurprisingly) is a principal concern, although it probably shouldn't be! In
+#any event, how does one define such alias? Simple, given the prior solution:
+#
+#    alias :for_string_text_matching_pcre_bracketed='
+#       :alias_global "["="
+#           :undefine_alias \"[\""
+#           :str\
+#               text__fstmpb="${args__fstmpbb[1]}"\
+#               pcre__fstmpb="${args__fstmpbb[2]}"\
+#               code__fstmpb="${args__fstmpbb[3]}"
+#           :die_unless_str_nonempty pcre__fstmpb 'Expected non-empty PCRE.'
+#           :str  MATCH
+#           :list match
+#           pcre_compile -- "${pcre__fstmpb}"
+#           pcre_study
+#           string ZPCRE_OP='0 0'
+#           while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text__fstmpb}" } {"
+#       :alias_global "]"="}
+#           :undefine_alias \"]\""
+#       :list args__fstmpbb
+#       :set_list_to_args_3 args__fstmpbb'
+#
+#It's almost ludicrously brilliant in its circularity. And I'm 100% confident it
+#will work as advertised. We did it! I can hardly believe, and doubt terribly
+#many others will ever see the worth in it. But... there it is. Awesome.
+#FIXME: There's only one catch, and it relates to an issue we've noted elsewhere
+#with such sorts of solutions. There's no real reason that the bracketed code
+#can't expand another such alias. But the above definition implicitly prohibits
+#such expansion, as that would overwrite the prior definition of "]". Ah, but,
+#so long as we just alias "]" to "}" as we do above, this isn't an issue. But,
+#it *WILL* probably be an issue with other such iterators, some of which will
+#need to expand code *AFTER* the caller-provided block of code. And doing that
+#reliably requires some... finesse. Which means that assuming "]" still expands
+#to "}" is inherently unsafe, since other aliases will need to expand it
+#differently.
+#
+#Hmm; honestly, the only safe means of doing so is somewhat clumsy, requiring
+#alias-specific initiators and terminators. We'd call such aliases like so:
+#
+#    :for_string_text_matching_pcre_bracketed_start "test string" "\s++(str)" [
+#        :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_bracketed_stop
+#
+#Of course, at this point, readability has all but died. How about:
+#
+#    :for_string_text_matching_pcre_init "test string" "\s++(str)"
+#    :for_string_text_matching_pcre_start
+#    :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Right. It's either that, or:
+#
+#    :for_string_text_matching_pcre_start "test string" "\s++(str)" --
+#    :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Right. While terser, the latter form is inherently dangerous when operating on
+#arbitrary user-provided strings. While the user *COULD* conceivably pass...
+#Hm. Right. We no longer need to have such delimiter terminate such line,
+#implying that the following should suffice:
+#
+#    :for_string_text_matching_pcre_start "test string" "\s++(str)"
+#    :
+#    :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Sweet, no? I mean, *SURE*, it is a bit awkward. But it's reliable, moderately
+#terse, and immanently usuable. I'm unconvinced we can do better. Still,
+#contemplate her a bit more before we commit this to repository memory. Ah;
+#wait. ":" has critical import in zsh, as used widely throughout the zeshy
+#codebase, ensuring conflicts with command substitutions in alias arguments. So,
+#how about:
+#
+#    :for_string_text_matching_pcre_start "test string" "\s++(str)"
+#    ::
+#
+#    :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#It's either that or use "." (which also works). Right. Go with "::". As the
+#prior example demonstrates, "::" produces a reasonably aesthetic result that
+#*SHOULD* be readily memorable. That said, the nomenclature needs to explicitly
+#specify double colons to be required. Hm; "_with_double_colon" and similar is
+#overly cumbersome. How about just:
+#
+#    :for_string_text_matching_pcre_start:: "test string" "\s++(str)"
+#    ::
+#
+#    :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#The "::" suffixing such alias name should suffice to inform the user that
+#something's up. Assuming the user actually then reads the alias documentation
+#or is sufficiently aware of zeshy to recall what a suffixing "::" means, this
+#should be reasonably readable. I mean, sure... it's a bit obtuse. But I'm not
+#convinced we can do better. Right. We *REALLY* don't want to prefix such alias
+#name by "::", as that implies such alias to be a private alias as well as
+#requiring the corresponding "_stop" alias to also be prefixed by "::" for
+#orthogonality.
+#
+#O.K.; I'm satisfied. The prior example *IS IT*. Full stop. Let's do this! Oh,
+#right. We'd might as well truncate that to:
+#
+#    :for_string_text_matching_pcre_start::{ "test string" "\s++(str)" ::}
+#    :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Ugh. Alternative delimiters "[" and "]" *AND* "(" and ")" cannot be used
+#without explicit escaping in function and alias names, rendering such
+#delimiters useless for our purposes. We'd prefer to use the briefer ":{" and
+#":}" here, but for (obvious reasons) such delimiters are already occupied.
+#However, I'd argue that the prior sort of aliases will be more common than
+#"} always {...}" blocks... Hmm; perhaps not. Right. "always" blocks *ARE* more
+#core to the language. Grumble; grumble.
+#
+#Oh; right. Why not a *DIFFERENT* prefix other than ":", here? If the closing
+#delimiter were anything *BUT* a temporary expedient, adopting a different
+#prefix would (of course) be a poor idea. But as it is, such alias is unlikely
+#to conflict with terribly much; how about:
+#
+#   #:for_string_text_matching_pcre_start%{ "test string" "\s++(str)" }%
+#   #:for_string_text_matching_pcre_start={ "test string" "\s++(str)" }=
+#   #:for_string_text_matching_pcre_start-{ "test string" "\s++(str)" }-
+#    :for_string_text_matching_pcre_start~{ "test string" "\s++(str)" }~
+#    :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Yes, zsh prohibits or using anything suffixed by "}". So, "}-" or similar will
+#have to do. "}=" appears to be out as well, coughing up similar parse errors.
+#"}~" and "}-" are demonstrably the more aesthetic. Given that "}:" requires
+#holding shift for all such characters, "}~" is the sound, orthogonal choice.
+#It's also somewhat more aesthetic, *ESPECIALLY* for use with the corresponding
+#prefix "~{".
+
+#FIXME: O.K.; there we have it. After great deliberation, aliases accepting
+#multiple arguments should be called with the following conventions:
+#
+#    :for_string_text_matching_pcre_start~{ "test string" "\s++(str)" }~
+#
+#And aliases accepting multiple arguments *AND* code to be dynamically evaluated
+#called with the following conventions:
+#
+#    :for_string_text_matching_pcre_start~{ "test string" "\s++(str)" }~
+#    :output_string "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#I'm content. And that's all she wrote.
+
 # ....................{ GLOBALS                            }....................
 #FIXME: Actually use such globals in place of their magic strings everywhere.
 
@@ -74,7 +324,7 @@ function is_string_contains_characters_pcre() {
 }
 
 # ....................{ GETTERS ~ count                    }....................
-#FIXME: Rename to get_string_text_count_matching_pcre().
+#FIXME: Rename to :get_string_text_count_matching_pcre().
 declare_function_with_stdin <<'/---'
 integer get_string_pcre_match_count(string text, string pcre)
 
@@ -101,7 +351,7 @@ function get_string_pcre_match_count() {
 
 # ....................{ ITERATORS                          }....................
 declare_function_with_stdin <<'/---'
-string for_string_text_matching_pcre:(
+[stdout: str, stderr: str] for_string_text_matching_pcre:(
     string text,
     string pcre,
     string code)
@@ -244,6 +494,8 @@ function for_string_text_matching_pcre:() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#I'm afraid the three-alias variant above
+#remains the sanest choice.
 #    string text_name = "text",
 #    string pcre,
 #    string code)
