@@ -3,15 +3,16 @@
 # Copyright 2007-2013 by Cecil Curry.
 # See "COPYING" for additional details.
 
-declare_parcel_as_script_with_stdin <<'---'
+declare_parcel_as_script_with_stdin <<'/---'
 Handle *processes* (i.e., currently running commands).
----
+/---
 
 # ....................{ EXCEPTIONS                         }....................
+#FIXME: Rename to :die_unless_process() and likewise below.
 declare_function_with_stdin <<'/---'
 void die_unless_command_running(
     string command_name,
-    string error_message = "Command \"${command_name}\" not running.")
+    string error_message = "No process running command \"${command_name}\".")
 
 Throw an exception with the passed message unless the passed command is
 currently running under some user.
@@ -19,9 +20,9 @@ currently running under some user.
 function die_unless_command_running() {
     die_unless_args_1_to_2\
         'Expected one command name and optional error message.'
-    string command_name="${1}"
-    is_command_running "${command_name}" or
-        die "${2:-Command \"${command_name}\" not running.}"
+    :string command_name="${1}"
+    :is_process "${command_name}" or
+        die "${2-No process running command \"${command_name}\".}"
 }
 
 declare_function_with_stdin <<'/---'
@@ -29,7 +30,7 @@ void die_unless_command_running_as_user(
     string command_name,
     string username,
     string error_message =
-        "Command \"${command_name}\" not running under user \"${username}\".")
+        "No process running command \"${command_name}\" under user ${username}.")
 
 Throw an exception with the passed message unless the passed command is running
 under the passed user.
@@ -37,36 +38,131 @@ under the passed user.
 function die_unless_command_running_as_user() {
     die_unless_args_2_to_3\
         'Expected one command name, one username, and optional error message.'
-    string command_name="${1}" username="${2}"
-    is_command_running_as_user "${username}" "${command_name}" or
-        die "${3:-Command \"${command_name}\" not running under user \"${username}\".}"
+    :string command_name="${1}" username="${2}"
+    :is_process_under_user "${username}" "${command_name}" or
+        die "${3-No process running command \"${command_name}\" under user ${username}.}"
 }
 
 # ....................{ TESTERS                            }....................
 declare_function_with_stdin <<'/---'
-[status: boolean] is_command_running(string command_name)
+[status: bool] :is_process(string command_name)
 
-Return success if the passed command is currently running under some user.
+Report success if there exists at least one process running the passed command
+under _any_ user.
 /---
-function is_command_running() {
+function :is_process() {
     die_unless_arg 'Expected one command name.'
-    run_code_silent get_pids_running_command_if_found "${@}"
+    :string process_pids
+    { :set_list_to_process_pids_if_found process_pids "${1}" } silent:
 }
 
+#FIXME: Ugh. Reimplement this in terms of a new setter, as above.
 declare_function_with_stdin <<'/---'
-[status: boolean] is_command_running_as_user(
-    string command_name, string username)
+[status: bool] :is_process_under_user(string command_name, string username)
 
-Return success if the passed command is running under the passed user.
+Report success if there exists at least one process running the passed command
+under the passed user.
 /---
-function is_command_running_as_user() {
+function :is_process_under_user() {
     die_unless_args_2 'Expected one command name and one username.'
-    run_code_silent get_pids_running_command_under_user_if_found "${@}"
+    { get_pids_running_command_under_user_if_found "${@}" } silent:
+}
+
+# ....................{ SETTERS                            }....................
+declare_function_with_stdin <<'/---'
+[status: bool] :set_list_to_process_pids_if_found(
+    string list_name, string command_name)
+
+Set the passed list (ideally, list set) to the PIDs of all processes currently
+running the passed command (in arbitrary order) if at least one such process
+exists or report failure otherwise.
+/---
+# If "pidof" is pathable, prefer such command for terseness and efficacy.
+if { is_pathable pidof } {
+    function :set_list_to_process_pids_if_found() {
+        # Validate sanity.
+        die_unless_args_2 'Expected one list name and one command name.'
+        :string\
+            list_name__sltppif="${1}"\
+            command_name__sltppif="${2}"\
+            process_pids__sltppif
+
+        # Get a space-delimited string of such PIDs if at least one such process
+        # exists or report failure otherwise.
+        process_pids__sltppif="$(command pidof -- "${command_name__sltppif}")"\
+            or report_failure
+
+        # Set such list to such PIDs.
+        set_list_to_string_words\
+            "${list_name__sltppif}" "${process_pids__sltppif}"
+    }
+# Else if "pgrep" is pathable, prefer such command.
+} elif { is_pathable pgrep } {
+    function :set_list_to_process_pids_if_found() {
+        # Validate sanity.
+        die_unless_args_2 'Expected one list name and one command name.'
+        :string\
+            list_name__sltppif="${1}"\
+            command_name__sltppif="${2}"\
+            process_pids__sltppif
+
+        # Get a newline-delimited string of such PIDs if at least one such
+        # process exists or report failure otherwise. Call "pgrep" according to
+        # whether the absolute path or only basename of such command was passed.
+        if { is_path_absolute "${command_name__sltppif}" } {
+            process_pids__sltppif="$(command pgrep --exact --full --\
+                "${command_name__sltppif}")" or report_failure
+        } else {
+            process_pids__sltppif="$(command pgrep --exact --\
+                "${command_name__sltppif}")" or report_failure
+        }
+
+        # Set such list to such PIDs.
+        set_list_to_string_lines\
+            "${list_name__sltppif}" "${process_pids__sltppif}"
+    }
+# Else, fallback to parsing "ps" output. As such parsing is inevitably fragile,
+# this implementation is hardly ideal. Nonetheless, "ps" is effectively
+# guaranteed to exist by virtue of its use on all modern Unix derivatives.
+} else {
+    function :set_list_to_process_pids_if_found() {
+        #FIXME: If such command name is prefixed by a hyphen, this probably
+        #fails silently unexpectedly horribly. *shrug*
+
+        # Validate sanity.
+        die_unless_args_2 'Expected one list name and one command name.'
+        :string\
+            list_name__sltppif="${1}"\
+            command_name__sltppif="${2}"\
+            process_pids__sltppif
+
+        # Reduce such command to its basename if passed as a path. Option "-C"
+        # passed to "ps" below fails silently if passed a path.
+        :remove_path_dirname command_name__sltppif
+
+        # Get a newline-delimited string of such PIDs if at least one such
+        # process exists or report failure otherwise. Dismantled, this is:
+        #
+        # * "-o 'pid='", outputting a newline-delimited string list of all such
+        #   PIDs sans prefixing header.
+        # * "-C", matching only processes running such command basename.
+        process_pids__sltppif="$(command\
+            ps -o 'pid=' -C "${command_name__sltppif}")" or report_failure
+
+        # Set such list to such PIDs.
+        set_list_to_string_lines\
+            "${list_name__sltppif}" "${process_pids__sltppif}"
+    }
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# function :is_process() {
+#     die_unless_arg 'Expected one command name.'
+#     { get_pids_running_command_if_found "${@}" } silent:
+# }
+
 #FUXME: Convert to a function. No viable reason to define this as an alias.
-#FUXME: Contemplate renaming nomenclature from is_command_running() to
+#FUXME: Contemplate renaming nomenclature from :is_process() to
 #is_job_running_command(), which better coincides with the current
 #get_pid_running_command() nomenclature. Or perhaps not; a bit hard to say.
 #While slightly longer, 
