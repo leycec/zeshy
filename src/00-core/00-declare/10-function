@@ -1,0 +1,2887 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'/---'
+Handle function declarers and definers.
+/---
+
+#FIXME: I'm beginning to question the wisdom of maintaining separate
+#"_with_stdin" versions. Since AsciiDoc syntax *FUNDAMENTALLY* conflicts with
+#single- and double-quoted string syntax, I see little point in continuing to
+#maintain such versions. The work involved has been a headache from the start.
+#It also renders the codebase less readable than it should be. Ideally,
+#everything should resemble:
+#
+#    declare_function <<'/---'
+#    ...
+#    /---
+#
+#Rather than:
+#
+#    declare_function_with_stdin <<'/---'
+#    ...
+#    /---
+#
+#To synopsize:
+#
+#* Change declare_function() to require documentation passed as stdin. (Indeed,
+#  such documentation should be optional for aliases and globals but *NOT*
+#  functions; in the former case, the alias or global to be declared can be
+#  specified entirely in separate arguments. Since this is *NOT* the case for
+#  functions, require stdin.)
+#* Inline the run_runnable_with_stdin() implementation in each such function,
+#  for both simplicity and efficiency. (It's not terribly complex, really.)
+#* Replace all existing calls to declare_function_with_stdin() with
+#  declare_function().
+#FIXME: This largely obsoletes the run_runnable_with_stdin() function, which,
+#due to its usefulness, should be shifted into "runnable/command/command" (or a
+#similar parcel nearby).
+
+#FIXME: It'd be great to add an additional runnable attribute -- this time,
+#applicable to both aliases and functions. You may have noted extreme repetition
+#in declaring hooks: e.g.,
+#
+#  :run_hook_on_zeshy_precompile precompile_zeshy_terminal_colors
+#
+#  declare_function_with_stdin <<'/---'
+#  void precompile_zeshy_terminal_colors(void)
+#
+#  Define terminal color globals to be compiled into zeshy's user digest file.
+#  /---
+#  function precompile_zeshy_terminal_colors() { ... }
+#
+#To reduce such redundancy, support a new attribute "hooks: ...", where "..." is
+#either the name of a single hook function or a list of such names. This reduces
+#the above example to simply:
+#
+#  declare_function_with_stdin <<'/---'
+#  <hooks: on_zeshy_precompile> void precompile_zeshy_terminal_colors(void)
+#
+#  Define terminal color globals to be compiled into zeshy's user digest file.
+#  /---
+#  function precompile_zeshy_terminal_colors() { ... }
+#
+#If such function also needed to be run on, say, zeshy startup, this could be
+#expanded to:
+#
+#  declare_function_with_stdin <<'/---'
+#  <hooks: (on_zeshy_precompile, on_zeshy_startup)>
+#       void precompile_zeshy_terminal_colors(void)
+#
+#  Define terminal color globals to be compiled into zeshy's user digest file.
+#  /---
+#  function precompile_zeshy_terminal_colors() { ... }
+#
+#Alias and function prototype parsing should then parse such list (e.g., by
+#"borrowing" the similar parsing we've already implemented for argument lists)
+#and for each such string, prefix such string with "run_hook_on_", throw an
+#exception if the result is not an existing function, and otherwise run such
+#function with all such alias and function names.
+
+#FIXME: Rename the ${ZESHY_HELP_GLOBALS}, etc. globals to
+#${ZESHY_CORE_HELP_GLOBALS}, etc. Such globals, *DISTINCT* from the above, now
+#apply *ONLY* to top-level components (e.g., src/{main,compile,...}). For
+#efficiency (and simplicity), retain the current approach of simply appending to
+#such lists. Then during zeshy precompilation (as implemented by
+#"always/zsh/help/precompile"), simply iterate over each such list and for each
+#help string simply call declare_global(), etc. Ultra-simple and efficient.
+#After doing so, all documentation resides in the
+#${ZESHY_FUNCTION_NAME_TO_HELP}, etc. globals as desired.
+#FIXME: Remove all reference to {prepend,append,set}_args_with_stdin() from the
+#Zeshy codebase, excluding set_args_with_stdin() where called from herestring-
+#style aliases. In all other cases, such calls are highly dangerous and should
+#be eliminated.
+#FIXME: Wait. I believe we *MIGHT* be able to resuscitate such function *IF* we
+#can augment them as follows (...no idea if this works, but it seems worth a
+#try):
+#
+#* If standard input is an open pipe *AND* if list global ${pipestatus} is of
+#  size larger than one, then doesn't that definitively suggest the current
+#  function is directly piped standard input? Naturally, we should extensively
+#  test this in vanilla zsh before running around like a mad badger attempting
+#  to implement this in Zeshy. Ah; perhaps not. For example, for the first
+#  function called in such a pipe, wouldn't ${pipestatus} be the empty list?
+
+#FIXME: Naturally, AsciiDoc will be an only optional dependency for users
+#attempting to build the documentation. If not installed, we'll just display
+#function documentation as is when a user runs "help function". If installed,
+#we'll probably want to pipe function documentation dynamically through either
+#the ASCII or man page exporters. (Sweeeeeet, no?)
+
+#FIXME: Matching function prototypes is feasible with one or possibly more PCREs
+#but *NOT* globs, due to the need to match arbitrarily many function names and
+#argument specifiers. This is essential, since:
+#
+#* If AsciiDoc is installed, function prototypes should be dynamically marked up
+#  with AsciiDoc-specific notation, which I believe even supports colors.
+#* Else, function prototypes should be styled with conventional color styles.
+#FIXME: Source code highlighting is simple. Just write:
+#
+#    [source,bash]
+#    ----
+#    INSERT CODE HERE
+#    ----
+#
+#Sadly, neither Pygments or other less popular alternatives support zsh yet.
+#Hence, "bash" suffices. Then, we want to selectively prefer "pygments" where
+#available. To do so, we'll need to output the following at the very top of each
+#AsciiDoc document we send to "asciidoc":
+#
+#    8<---------------
+#    = Title
+#    :source-highlighter: pygments
+#
+#This is an AsciiDoc header instructing "asciidoc" to prefer the "pygments"
+#backend for the [source] filter. For further details, see:
+#    https://groups.google.com/forum/?fromgroups=#!topic/asciidoc/ReIM4z-zi9I
+#FIXME: Avoid repetition. In particular, replace "[source,bash]" with simply
+#"[source]" everywhere by setting the default "language" in the AsciiDoc
+#document header, like so:
+#
+#    :language: bash
+#
+#The same style can be extended to set default table attributes as follows:
+#
+#    :grid:  none
+#    :frame: topbot
+
+#FIXME: Documentation functions should continue working after Zeshy startup. To
+#make this work, we'll need to redefine them in a precompile_zeshy_() function
+#to ensure that the digest file contains the redefinition. Honestly, I'm not
+#entirely convinced we want to serialize such documentation to disk; of course,
+#we *DO*. But that invokes a few not-so-subtle issues. For now, just retain
+#documentation in memory until it becomes a demonstrable problem.
+#FIXME: After having performed a great deal of online research, "gzip" appears
+#to be the canonical go-to for small text file compression.
+#FIXME: Hmmmm. No. Scratch that. We really need a filesystem-based approach.
+#O.K.; so, here's the idea:
+#
+#* Shift the definitions of set_alias_documentation(), etc. to this component,
+#  replacing all current calls to such functions with hard-coded additions to
+#  such map globals. *DO IT.* Trust me. This is needed to ensure that such
+#  functions are compiled into Zeshy's digest file.
+#* *DON'T* redefine declare_alias(), declare_function(), or declare_global().
+#  Instead redefine set_alias_documentation(), etc. to write to disk rather to
+#  such map globals in the precompile_zeshy_*() function defined below, thus
+#  ensuring the redefinition of such functions is compiled into Zeshy's digest.
+#
+#Bam. Nice one, eh?
+
+#FIXME: It'd be great to support specification of whether a function or alias
+#argument is actually mandatory or optional in variadic lists. For example, in
+#the following function prototype, all arguments except the first menu name are
+#actually optional -- but we have no way of indicating that at the moment:
+#
+#    string show_info_menu_with_options(
+#        string info_option1, string info_option2, ...,
+#        string menu_name1, string menu_name2, ...)
+#
+#I propose a simple suffix "?" on all optional variadic arguments: e.g.,
+#
+#    string show_info_menu_with_options(
+#        string info_option1?, string info_option2?, ...,
+#        string menu_name1, string menu_name2?, ...)
+#
+#Fairly simple *AND* legible, yes?
+
+# See @{global} for help strings for all globals defined below. Likewise, see
+# the end of this parcel for help strings for all functions defined below.
+
+# ....................{ GLOBALS                            }....................
+#FIXME: Don't neglect to delete such map immediately after use in
+#precompilation!
+#FIXME: Actually, when we replace such map entirely with equivalent dynamically
+#synthesized functions, this (clearly) ceases to become an issue. Make it so.
+
+#FIXME: I'm unsure if I've documented it anywhere... so, it had might as well be
+#here. The nomenclature for synthesized help function names should be:
+#
+#* For aliases, "::zeshy:help:alias:${alias_name}".
+#* For functions, "::zeshy:help:function:${function_name}".
+#* For globals, "::zeshy:help:global:${global_name}".
+#
+#Simple. Note that in the case of normal ":"-suffixed aliases and functions,
+#the corresponding help function names will also be suffixed by ":" -- which is,
+#of course, perfect. Lookin good, eh?
+
+# Map each function name to the help string documenting such function.
+typeset -Ag ZESHY_FUNCTION_NAME_TO_HELP
+
+#FIXME: This map can probably go away too. I'm unconvinced that recording alias,
+#function, and global synonyms is genuinely worth the effort. After all, when we
+#migrate to a function- rather than map-based help system, we *CAN* and probably
+#should just define equivalent functions for all such synonyms and then entirely
+#forget about the fact that they were synonyms in the first place. (This
+#obviously applies to alias and global synonyms, as well.) Doing is both simpler
+#and more efficient, since these three maps need no longer be compiled into or
+#loaded from the digest file.
+#FIXME: The only legitimate use of this map was checking whether or not such
+#function had been previously declared. But that will *STILL* be easy to check
+#when we migrate to a function-based help system, since in that case we simply
+#test for the existence of such help function, in which case we know whether
+#such function had been previously declared or not. Since such test is both
+#simple and efficient, there truly exists no compelling reason at all to keep
+#these maps around. Excise! Excise!
+
+# Map each function name to the first name declared for such function.
+typeset -Agx ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST
+
+# ....................{ EXCEPTIONS                         }....................
+#FIXME: Rename to ::die_for_declaration_type_with_help:.
+
+# See below for function documentation.
+function die_for_declarator_type_with_help() {
+    # Validate passed arguments.
+    (( # == 2 )) || die 'Expected one type string and one help string.'
+#   print -r -- "arg count: ${#}; args: ${*}"
+    local type="${1}" help="${2}"
+
+    # Function prototype prefixing such help string.
+    local help_prototype
+
+    # If such string contains a blank line (i.e., "\n\n"), crudely match the
+    # substring preceding such line as the function prototype.
+    if     [[ "${help}" == (#b)([^$'\n']##)$'\n\n'* ]] {
+        help_prototype="${match[1]}"
+    # Else if such string contains a newline (i.e., "\n"), crudely match the
+    # substring preceding such newline as the function prototype.
+    } elif [[ "${help}" == (#b)([^$'\n']##)$'\n'* ]] {
+        help_prototype="${match[1]}"
+    # Else, abandon all hope.
+    } else {
+        help_prototype="${help}"
+    }
+
+    # Throw an exception suffixed by such prototype.
+    die "${(C)type} documentation invalid (see \"print_help declare_${type}\"):
+${help_prototype}"
+}
+
+# ....................{ DECLARERS                          }....................
+# See below for function documentation.
+function declare_function() {
+    # Validate passed arguments.
+    (( # == 1 )) || die 'Expected one help string.'
+    local help__df="${1}" function_name__df
+    local -a function_names__df help_match__df
+
+    # Unless such string matches the function help PCRE, throw an exception.
+    [[ "${help__df}" =~\
+       "${ZESHY_HELP_PCRE_FUNCTION_PROTOTYPE_ATTRIBUTES_AND_NAMES}" ]] ||
+        die_for_declarator_type_with_help 'function' "${help__df}"
+#   for ((match_index=1; match_index <= ${#match}; ++match_index)) {
+#       print "match ${match_index}: ${match[${match_index}]}"
+#   }
+
+    # List of substrings captured by the prior match. The PCRE-based iteration
+    # performed by set_lists_to_runnable_prototype_name_or_names:() below
+    # overwrites ${match}, necessitating we preserve it here.
+    help_match__df=( "${match[@]}" )
+
+    # List of function names declared by such prototype.
+    set_list_and_map_to_runnable_prototype_name_or_names:\
+        function_names__df\
+        ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST\
+        "${help_match__df[2]-}"\
+        "${help_match__df[3]-}"
+
+    # If such function has attributes, match such attributes.
+    if [[ -n "${help_match__df[1]}" ]] {
+        # List of function attributes split from such string. Split on commas
+        # after truncating:
+        #
+        # * Optional whitespace surrounding commas (e.g., from " , " to ",").
+        # * Optional trailing commas and/or whitespace.
+        local -a attributes__df; attributes__df=(
+            "${(s:,:)${help_match__df[1]//[[:space:]]#,[[:space:]]#/,}%%[[:space:]]#,#[[:space:]]#}"
+        )
+#       for ((match_index=1; match_index <= ${#attrs}; ++match_index)) {
+#           print "attr ${match_index}: ${attrs[${match_index}]}"
+#       }
+
+        # If such attributes include "globbable," disable filename globbing for
+        # all arguments passed to such function names. See is_list_contains()
+        # for further details.
+        if (( ${attributes__df[(i)globbable]} <= ${#attributes__df} )) {
+            #FIXME: For efficiency, this and the following loop should be
+            #centralized into a single loop. This will become increasingly vital
+            #as the number of such loops in this function inevitably
+            #proliferates.
+            for function_name__df ("${function_names__df[@]}") {
+                # For safety (in the event of function names containing alias-
+                # reserved characters), call define_alias() rather than manually
+                # defining such alias.
+                define_alias\
+                    "${function_name__df}" "noglob ${(q)function_name__df}"
+            }
+        }
+    }
+
+    # Map the first function name to such help string. Note the choice of
+    # mapping function name synonyms to the first function name in
+    # set_list_and_map_to_runnable_prototype_name_or_names:, as well; this is
+    # *NOT* a coincidence, as could be inferred.
+    ZESHY_FUNCTION_NAME_TO_HELP[${function_names__df[1]}]="${help__df}"
+
+    # Add all such functions to the current parcel.
+    for function_name__df ("${function_names__df[@]}") {
+        add_parcel_function "${ZESHY_PARCEL_NAME}" "${function_name__df}"
+    }
+}
+
+# See below for function documentation.
+function declare_function_with_stdin() {
+    run_runnable_with_stdin declare_function
+}
+
+#FIXME: Rename to ::set_list_and_map_to_prototype_name_or_names:. This funtion
+#*WILL* be generalized to support parsing of global name synonyms, as well.
+#FIXME: Actually call such function above *AND* in declare_alias().
+#FIXME: Actually document such function.
+
+# See below for function documentation.
+function set_list_and_map_to_runnable_prototype_name_or_names: {
+    # Validate passed arguments.
+    (( # == 4 )) || die\
+        'Expected one list name, one map name, one matched singular string, and one matched plural string.'
+    local\
+        list_name__sltrpn="${1}"\
+        map_name__sltrpn="${2}"\
+        runnable_name__sltrpn="${3}"\
+        runnable_names__sltrpn="${4}"
+
+    # If any such variable is undefined or not of the expected type, throw an
+    # exception. See is_list() for further details.
+    [[ "${(tP)list_name__sltrpn-}" == 'array'* ]] || die\
+        "\${${list_name__sltrpn}} undefined or not a list."
+    [[ "${(tP)map_name__sltrpn-}" == 'association'* ]] || die\
+        "\${${map_name__sltrpn}} undefined or not a map."
+
+    # If such runnable only has one name...
+    if [[ -n "${runnable_name__sltrpn}" ]] {
+        eval '
+        # If such runnable is already declared, print a warning. See
+        # is_map_key() for further details.
+        if (( ${+'${map_name__sltrpn}'[${runnable_name__sltrpn}]} )) {
+            print "zeshy: ${runnable_name__sltrpn}() in @{${ZESHY_PARCEL_NAME}} already declared" 1>&2
+        }
+
+        # Set such list to such name.
+        '${list_name__sltrpn}'=( "${runnable_name__sltrpn}" )
+
+        # Add the identity mapping to such map.
+        '${map_name__sltrpn}'[${runnable_name__sltrpn}]="${runnable_name__sltrpn}"'
+    # Else, such runnable has multiple names. Since single- and double-quoted
+    # runnable names may contain commas, such names cannot be split on commas as
+    # with runnable attributes elsewhere. Rather, iteratively match such names
+    # with a PCRE.
+    } else {
+        # Prepare to match such names. See for_string_text_matching_pcre:() for further
+        # details.
+        pcre_compile -- "${ZESHY_HELP_PCRE_RUNNABLE_PROTOTYPE_NAME}"
+        pcre_study
+
+        # Match such names.
+        local ZPCRE_OP='0 0'
+        eval 'while {
+            pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${runnable_names__sltrpn}"
+        } {
+            # For convenience, store the currently matched name.
+            runnable_name__sltrpn="${match[1]}"
+
+            # If such runnable is already declared, print a warning as above.
+            if (( ${+'${map_name__sltrpn}'[${runnable_name__sltrpn}]} )) {
+                print "zeshy: ${runnable_name__sltrpn}() in @{${ZESHY_PARCEL_NAME}} already declared" 1>&2
+            }
+
+            # Append such name to such list.
+            '${list_name__sltrpn}'+="${runnable_name__sltrpn}"
+
+            # Map such name to the first such name for such runnable.
+            '${map_name__sltrpn}'[${runnable_name__sltrpn}]="${'${list_name__sltrpn}'[1]}"
+        }'
+    }
+}
+
+# ....................{ DEFINERS                           }....................
+#FIXME: Arguably complex enough to warrant shifting to a new parcel
+#@{20-function/define}.
+#FIXME: Right. We *HAVE* to do so anyway, to ensure access to coprocess
+#functionality. See below. For now, the following two functions remain *BROKEN*.
+
+declare_function_with_stdin <<'/---'
+void define_function(string function_name, string function_body)
+
+Define the passed function to run the passed *function body* (i.e., such
+function's implementation excluding `function ${function_name} () {` prefix and
+`}` suffix). If such function has already been declared, throw an exception.
+
+Unlike aliases, functions with names containing shell-reserved characters may be
+readily defined by double-quoting such names. Hence, this function is largely
+useful only for defining functions dynamically: e.g.,
+
+.define_function()
+==========================================
+[source]
+------------------------------------------
+>>> define_function "moral = choice" 'print_string\
+...    "With the myth of the State out of the way, the real mutuality and
+...     reciprocity of society and individual became clear. Sacrifice might be
+...     demanded of the individual, but never compromise: for though only the
+...     society could give security and stability, only the individual, the
+...     person, had the power of moral choice—the power of change, the essential
+...     function of life. The Odonian society was conceived as a permanent
+...     revolution, and revolution begins in the thinking mind."
+>>> get_string_line $("moral = choice") 1
+With the myth of the State out of the way, the real mutuality and
+------------------------------------------
+==========================================
+/---
+function define_function() {
+    # Validate sanity.
+    (( # == 2 )) || die 'Expected one function name and one function body.'
+    local function_name__df="${1}"
+
+    # If such function already exists, throw an exception. See is_function()
+    # for further details.
+    if { typeset -f -- "${function_name__df}" &>/dev/null } {
+        die "function ${function_name__df}() already exists:"$'\n'"$(which -- "${function_name__df}")"
+    }
+
+    # Declare such function.
+    redefine_function "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+void redefine_function(string function_name, string function_body)
+
+(Re)define the passed function to run the passed function body, regardless of
+whether such function has been previously defined. See define_function() for
+further details: e.g.,
+
+.redefine_function()
+==========================================
+[source]
+------------------------------------------
+>>> redefine_function "The Age of Decreasing Numbers" 'print_string\
+...    "Civilization is a subset of nature even if we're not aware of it, and
+...     the dark side of our recent increase was a decrease in topsoil and
+...     forests and fossil fuels and the Earth's capacity to absorb industrial
+...     waste without catastrophic change. Now these things have decreased so
+...     far that our habit of increase can no longer feed itself."'
+>>> get_string_line $("The Age of Decreasing Numbers") 1
+Civilization is a subset of nature even if we're not aware of it, and
+>>> redefine_function "The Age of Decreasing Numbers" 'print_string\
+...    "With the housing crash, the falling dollar, and the decline in middle
+...     class income, we're already tasting the coming age of numbers getting
+...     smaller. Next: the stock market, easy credit, the GNP, energy
+...     production, energy consumption, and human population."
+>>> get_string_line $("The Age of Decreasing Numbers") 1
+With the housing crash, the falling dollar, and the decline in middle
+------------------------------------------
+==========================================
+/---
+function redefine_function() {
+    # Validate sanity.
+    (( # == 2 )) || die 'Expected one function name and one function body.'
+    local function_name__rf="${1}" function_body__rf="${2}"
+    [[ -n "${function_name__rf}" ]] || die 'Expected nonempty function name.'
+#   is_zeshy_debug_and print "zeshy: defining ${function_name__rf}()..."
+
+    # Function to be defined. For obscure error handling reasons, the eval()
+    # call below is repeated twice. While localizing the function definition as
+    # a variable is hardly essential, it does streamline such calls below.
+    local function__rf="function \"\${function_name__rf}\" () {
+    ${function_body__rf}
+}"
+
+    # All standard output and error printed by the latter of the two eval()
+    # calls below.
+    local function_error__rf
+
+    # Temporarily enable shell option "EVAL_LINENO". If such eval() call fails
+    # with a syntax error, enabling this option ensures the line number zsh
+    # embeds in the error will be relative to such function body rather than to
+    # the current function (i.e., redefine_error()). See
+    # enable_shell_option_local() for further details.
+    setopt -- local_options eval_lineno
+
+    #FIXME: Uhm; this still shouldn't work. Declaring such function in any pipe
+    #subcommand other than the last does so only in the corresponding subshell.
+    #Instead, we'll need to use the coprocess approach. Unfortunately, we're
+    #getting into a bit of a chicken-and-egg issue here. We *DEFINITELY* don't
+    #want to inline our coprocess implementation here; it's simply too delicate.
+    #Instead, we'll need to leave this function *UNDEFINED* until after defining
+    #such coprocess functionality -- which, I believe, is all segregated to
+    #@{15-alias}. That being the case, this function should be shifted to
+    #@{20-function} and reimplemented in terms of coprocesses.
+
+    # Declare such function. To prevent errors if such function name contains
+    # double quotes, avoid directly interpolating such function name.
+    #
+    # If such function body is syntactically invalid, zsh prints a nonfatal
+    # warning to standard error and returns successfully; else, neither standard
+    # output or error are printed to. Deciding whether an error occurred thus
+    # requires capturing standard output and error to a string local and testing
+    # whether such local is nonempty or not. Since capturing such output with a
+    # conventional command substitution declares such function only in a
+    # subshell rather than the current shell (e.g.,
+    # function_error="$(eval "function ..." 2>&1)"), capture such output with a
+    # pipe in the current shell instead.
+    #
+    # Ideally, that would simply suffice: pipe such output into the necessary
+    # read() command and test the result. Naturally, it doesn't. While it
+    # remains unclear why eval() behaves in this manner, one thing is clear: if
+    # eval() succeeds in defining such function *AND* is piped into *ANYTHING*,
+    # eval() silently fails and undefines such function. While this is fairly
+    # crazy, the solution is fairly simple: only pipe eval() output if a prior
+    # eval() call passed the same arguments returns non-zero exit status. This
+    # is the most obscure code in any language I've ever had the shame to admit
+    # having contributed. It's hard to be proud of something like this.
+    eval "${function__rf}" || {
+        # Dismantled, this is:
+        #
+        # * "|&", piping both standard output and error from such eval() call.
+        # * "IFS='' read -r -d ''", capturing all piped standard output and
+        #   error to ${function_error}.
+        eval "${function__rf}" |& IFS='' read -r -d '' function_error__rf
+    }
+#    print -r -- "function \"${function_name__rf}\" () {
+#    ${function_body__rf}
+#}"
+
+    # If such function body is syntactically invalid, throw an exception.
+    # Technically, shifting this conditional into the prior block would slightly
+    # improve efficiency -- while indenting this conditional two tabs to the
+    # right and hence rendering it unreadable. (You decide.)
+    if [[ -n "${function_error__rf}" ]] {
+#       print "error: ${function_error__rf}"
+        # If such error message is in canonical zsh format (e.g.,
+        # "(eval):244: parse error near `()'"), convert such message
+        # to human-readable form. In particular, append the actual line of code
+        # in such function body inducing such error. Dismantled, this is:
+        #
+        # * "(#b)", enabling match group capturing.
+        # * "(<->##)", matching such line as one or more digits into
+        #   ${match[1]}. See is_integer() for further details.
+        # * "(*)", matching the actual error message into ${match[2]}.
+        if [[ "${function_error__rf}" == (#b)'(eval):'(<->##)': '(*) ]] {
+            # Parse error emitted by zsh, stripped of trailing whitespace.
+            local parse_error__rf="${match[2]%%[[:space:]]#}"
+
+            # Line number of such error. Such number is relative to the
+            # function definition rather than function body and hence is one
+            # larger than it should be. Amend this.
+            integer line_number__rf=$(( match[1] - 1 ))
+
+            # Line number of the second lines preceding and succeeding such
+            # error, for textual context.
+            integer line_number_start__rf=$(( line_number__rf - 2 ))
+            integer line_number_end__rf=$((   line_number__rf + 2 ))
+
+            # List of function body lines, split on newline. See
+            # set_list_to_string_lines() for further details.
+            local -a function_body_lines__rf
+            function_body_lines__rf=( ${(f)function_body__rf} )
+
+            # Constrain such numbers to [1, ${max_line_number}], where
+            # ${max_line_number} is the number of lines in such function body.
+            if (( line_number_start__rf < 1 )) {
+                  line_number_start__rf=1
+            }
+            if (( line_number_end__rf > ${#function_body_lines__rf} )) {
+                  line_number_end__rf=${#function_body_lines__rf}
+            }
+
+            # String of relative function body lines, numbered for convenience.
+            local function_body_context__rf
+
+            #FIXME: Hardly an ideal implementation. Ideally, we should implement
+            #a function leveraging color styles printing such textual context
+            #with decent aesthetics. To do so, we'll need test here whether such
+            #function exists; if it does, call it, passing such call
+            #"${function_body__rf}" and the desired function line; else, defer
+            #to the default implementation below. (Actually, don't we have an
+            #existing function for numbering arbitrary code lines? I recall such
+            #function requiring a bit of touch-up, as well...)
+
+            # Append each such line prefixed by its line number to such string.
+            integer i__rf
+            for ((  i__rf=${line_number_start__rf};
+                    i__rf <= ${line_number_end__rf};
+                    i__rf++ )) {
+                function_body_context__rf+=$'\n'"[${i__rf}]  ${function_body_lines__rf[${i__rf}]}"
+            }
+
+            # Set such error message.
+            function_error__rf="${parse_error__rf} on line ${line_number__rf} of ${function_name__rf}():"$'\n'"${function_body_context__rf}"
+        }
+
+        # Throw such exception.
+        die "${function_error__rf}"
+    }
+
+    # If such function was *NOT* successfully defined *AND* no errors or
+    # warnings were printed, throw an exception. While this should never happen,
+    # of course, it occasionally does (much to our horrified chagrin).
+    #
+    # This is purely a precaution to avoid silent regressions.
+    typeset -f -- "${function_name__rf}" &>/dev/null ||
+        die "${function_name__rf}() could not be defined with body:"$'\n'"${function_body__rf}"
+}
+
+#FIXME: In lieu of unit tests...
+#() {
+#    # This should fail with a parse error.
+#    define_function yu '()'
+#}
+
+# ....................{ DOCUMENTERS                        }....................
+# Document functions previously defined by this parcel.
+
+declare_function_with_stdin <<'/---'
+void declare_function(string documentation)
+
+Declare the function named by the function prototype prefixing the passed help
+string to be contained by the current parcel and documented by such string.
+Function documentation consists of:
+
+. A *function prototype* in `zeshy`-specific C-like syntax, consisting of zero or
+  more function attributes, one or more function return types, one or more
+  function names, and zero or more function arguments (e.g.,
+  `<globbable> boolean <ruth, benedict>(integer siphon, character funnel)`, a
+  function with one attribute `globbable`, one return type `boolean`, two names
+  `ruth` and `benedict`, and two arguments `siphon` and `funnel`).
+. A *function description* in http://asciidoc.org[AsciiDoc] syntax augmented
+  with `zeshy`-specific markup for cross-referencing other `zeshy` documentation
+  (e.g., `Everyone _believes_ that the *man* +atop+ the box _owns_ the fish()`).
+
+== Function Documentation Grammar ==
+
+For completeness, we specify such syntax as a
+http://en.wikipedia.org/wiki/Parsing_expression_grammar[Parser Expression Grammar (PEG)]:
+
+[[declare_function.peg]]
+.Function Documentation Grammar
+[cols=">strong,^,<"]
+|===============================================================================
+| FunctDocumentation    | <- | FunctPrototype Whitespace+ AsciiDoc
+| http://asciidoc.org[AsciiDoc] | <- | (XReference \| AnyCharacter)*
+| XReference            | <- | WordStart XReferObject WordEnd
+| XReferObject          | <- | XReferAliasOrFunct \|
+                               XReferAlias \|
+                               XReferFunct \|
+                               XReferGlobal
+| XReferAliasOrFunct    | <- | AlphanumericString ``()''
+| XReferAlias           | <- | ``alias:''    XReferAliasOrFunct
+| XReferFunct           | <- | ``function:'' XReferAliasOrFunct
+| XReferGlobal          | <- | ``${'' AlphanumericString ``}''
+| FunctPrototype        | <- | Whitespace* FunctAttrs
+                               Whitespace* ReturnTypes
+                               Whitespace+ FunctNames
+                               Whitespace* FunctArgs
+| FunctAttrs            | <- | ``{'' Whitespace*
+                               (FunctAttr ListComma)*
+                                FunctAttr ListCommaOptional
+                               Whitespace* ``}''
+| FunctAttr             | <- | ``globbable''
+| ReturnTypes           | <- | Type \| ReturnChannels
+| Type                  | <- | AlphanumericString
+| ReturnChannels        | <- | ``['' Whitespace*
+                               (ReturnChannel ListComma)*
+                                ReturnChannel ListCommaOptional
+                               Whitespace* ``]''
+| ReturnChannel         | <- | ReturnChannelName Whitespace* ``:'' Whitespace*
+                               Type
+| ReturnChannelName     | <- | ``stdout'' \| ``stderr'' \| ``status''
+| FunctNames            | <- | FunctName | FunctNameList
+| FunctName             | <- | AlphanumericString \|
+                               SingleQuotedString \|
+                               DoubleQuotedString
+| FunctNameList         | <- | ``<'' Whitespace*
+                               (FunctName ListCommaOrWhitespace)*
+                                FunctName ListCommaOrWhitespaceOptional
+                               Whitespace* ``>''
+| FunctArgs             | <- | FunctArgList \| FunctArgChannels
+| FunctArgChannels      | <- | ``['' Whitespace*
+                               (FunctArgChannel ListComma)*
+                                FunctArgChannel ListCommaOptional
+                               Whitespace ``]''
+| FunctArgChannel       | <- | FunctArgChannelName Whitespace* ``:'' Whitespace*
+                               (FunctArg \| FunctArgList)
+| FunctArgChannelName   | <- | ``args'' \| ``stdin''
+| FunctArgList          | <- | ``('' Whitespace*
+                               (FunctArgsEmpty \| FunctArgsNonEmpty)
+                               Whitespace* ``)''
+| FunctArgsEmpty        | <- | FunctArgEmpty?
+| FunctArgsNonEmpty     | <- | (FunctArgNonEmpty ListComma)*
+                                FunctArgNonEmpty ListCommaOptional
+| FunctArg              | <- | FunctArgEmpty \| FunctArgNonEmpty
+| FunctArgEmpty         | <- | ``void''
+| FunctArgNonEmpty      | <- | Type  Whitespace+ FunctArgName (Whitespace*
+                               ``='' Whitespace* FunctArgDefaultValue)?
+| FunctArgName          | <- | AlphanumericString
+| FunctArgDefaultValue  | <- | ZshValue
+| ListComma             | <- |  Whitespace* ``,'' Whitespace*
+| ListCommaOptional     | <- | (Whitespace* ``,'')?
+| ListCommaOrWhitespace | <- | ListComma \| Whitespace+
+| ListCommaOrWhitespaceOptional | <- | ListCommaOptional
+| ZshValue              | <- | Integer \| Float \|
+                               SingleQuotedString \| DoubleQuotedString
+| Integer               | <- | ``-''? Digit+
+| Float                 | <- | ``-''? Digit+ ``.'' Digit+
+| SingleQuotedString    | <- | ``\''' (``\'\''' \| !``\''' AnyCharacter)* ``\'''
+| DoubleQuotedString    | <- | ``"''  (``\\"''  \| !``"''  AnyCharacter)* ``"''
+| AlphanumericString    | <- | (!(Whitespace \| Punctuation) AnyCharacter)*
+| Whitespace            | <- | `` '' \| ``\\t'' \| ``\\n''
+| Punctuation           | <- | ``('' \| ``)'' \| ``['' \| ``]'' \| ``{'' \| ``}'' \|
+                               ``,'' \| ``='' \| ``:'' \| ``"'' \| ``\'''
+| Digit                 | <- | ``0'' \| ``1'' \| ``2'' \| ``3'' \| ``4'' \| ``5'' \|
+                               ``6'' \| ``7'' \| ``8'' \| ``9''
+| AnyCharacter          | <- | Whitespace \| Punctuation \| Digit \| ``a'' \| ...
+|===============================================================================
+
+== Function Description ==
+
+Function descriptions follow http://asciidoc.org[AsciiDoc] syntax, augmented
+with `zeshy`-specific syntax for alias, function, and global cross-references.
+See declare_parcel() for further details.
+
+== Function Prototypes ==
+
+Function prototypes follow a C-like syntax supporting zsh features not commonly
+found in conventional high-level languages: function name synonyms and return
+and argument channels. Since zsh does _not_ currently support function
+prototypes, we cannot coerce zsh to respect or enforce such prototypes at
+runtime. `zeshy` can, however, convert such prototypes to syntax-highlighted,
+contextually-linked specifications in end-consumer documentation.
+
+=== Context-sensitivity ===
+
+In conventional high-level languages, a function is typified by its *signature*:
+the set of function name(s), return type(s), and argument type(s) uniquely
+identifying that function. Each signature is statically predefined at function
+declaration time and either not subject to subsequent change or changeable only
+by redeclaring its function.
+
+In zsh, a function is typified only by the set of its names. Since this is
+hardly a signature in the conventional sense, zsh functions have arguably no
+function signature and certainly no statically predefined set of return type(s)
+and/or argument type(s). Rather, these types are the implicit result of dynamic
+implementation details possibly depending on local, global, or external state --
+which is to say, effectively anything you'd like.
+
+For example, it's possible (though a pretty bad idea) to define a function
+accepting at least one string argument and conditionally changing both return
+and argument types in context-dependent relation to such argument as follows:
+
+* If such argument is "hexadecimal -> decimal", accept a second string in
+  base 16 hexadecimal format and return the equivalent base 10 integer.
+* If such argument is "string1, ... -> list", accept one or more additional
+  strings and return the concatenation of such strings as a string convertible
+  without error into a list of such strings by the caller.
+* If such argument is "stdin == 'clear' ? string -> void : void -> string", test
+  whether such function was piped standard input equal to string "clear". If so,
+  accept a second string signifying the name of a list to be cleared; otherwise,
+  accept no additional strings and return a string of random bytes.
+
+This rabbit hole goes deep. Since supporting such conditionality is infeasible
+(and arguably undesirable), [underline]#this function naively assumes all function
+signatures to be statically predefined at function declaration time#. For
+signatures for which this is not the case (as in the above example), consider
+documenting only the most commonly called signature in the function prototype.
+
+=== Function Attributes ===
+
+Functions may be annotated with a list of `zeshy`-specific function attributes.
+Declaring a `{`- and `}`-bracketed list of one or more `,`-delimited attribute
+names annotates such function with such attributes, which this function parses
+and dynamically enables. The following attributes are currently supported:
+
+==== globbable =====
+
+`globbable`, signifying this function's arguments to _not_ be subject to
+conventional filename globbing and hence to be passed to such function as is. By
+default, all function arguments _are_ subject to such globbing, preventing glob
+expressions from being passed as function arguments unless explicitly quoted or
+escaped. Enabling this attribute on a function disables such behavior for all
+arguments callers pass such function: e.g.,
+
+.Globbable Function
+==========================================
+[source]
+------------------------------------------
+>>> declare_function '
+... <globbable> [status: boolean] is_string_matcheses(string text, string glob)
+...
+... A function that may be passed unquoted glob expressions.
+... '
+>>> function is_string_matcheses() { is ${1} == ${~2} si }
+>>> is_string_matcheses satoshi_nakamoto *n[aeou]k[aeou]* and print metzdowd
+metzdowd
+------------------------------------------
+==========================================
+
+Internally, this attribute is implemented by defining a new alias of the same
+name expanding to such function prefixed by `noglob` (e.g.,
+`alias ${function_name}="noglob ${function_name}"`).
+
+=== Return Types ===
+
+`zsh` return types are more intricate than those of normal high-level languages.
+All functions return three *channels* (i.e., ``streams'' of orthogonal output):
+
+. A string of standard output.
+. A string of standard error.
+. A byte of exit status.
+
+==== Single Return Type ====
+
+Since most functions only output to standard output and throw exceptions rather
+than return non-zero exit status on failure, shorthand notation suffices for
+such functions. Declaring a single return type as in conventional high-level
+languages (e.g., `integer hikikomori(string otaku)`) signifies such function to
+always return a string of standard output convertible without error to such
+type, an empty string of standard error, and zero exit status (i.e., success).
+
+===== Non-Scalar Return Types =====
+
+`zeshy` provides aliases for both returning and receiving returned lists and maps,
+suggesting `list` and `map` are acceptable return types from either standard
+output or error. Since returning such types incurs a significant performance
+penalty, consider only returning such types for sufficiently small lists and
+maps (noting that ``small'' has yet to be rigorously defined).
+
+==== Mapped Return Types ====
+
+Some functions output to standard error and/or return non-zero exit status,
+necessitating a longhand notation mapping each of the three possible return
+channels (standard output, standard input, and exit status) to the return type
+such function returns on such channel. Specifically, declaring a `[`- and `]`-
+bracketed map of one to three `,`-delimited, `:`-separated key-value pairs
+mapping return channel to return type (e.g.,
+`[stdout: float, stderr: string, status: integer] nhk(string kyokai)`)
+signifies such function to return standard output and error strings and exit
+status convertible without error to such types.
+
+At least one such key-value pair must be declared. The value declares the
+return type that channel returns (e.g., `string`). The key identifies the
+channel itself via one of three case-insensitive strings:
+
+* `stdout`, the standard output channel. Returns any conventional type or
+  `void`, a pseudo-type signifying such function to return no standard output.
+  Defaults to `void` if unspecified.
+* `stderr`, the standard error return channel. Returns any conventional type or
+  `void`, a pseudo-type signifying such function to return no standard error.
+  Defaults to `void` if unspecified.
+* `status`, the exit status return channel. Returns only the following
+  numerical return types (defaulting to `true` if unspecified):
+  ** `true`, a pseudo-type signifying such function to always succeed (ignoring
+     exceptions). While `true` and `false` are values rather than genuine types,
+     mere technicalities are merely that.
+  ** `false`, a pseudo-type signifying such function to always fail. Since `zeshy`
+     implicitly throws exceptions on failure, such type is generally unhelpful.
+  ** `boolean`, signifying such function to return exit status 0 on success or 1
+     on failure. Most such functions are `is_`-prefixed *testers* returning only
+     `[status: boolean]` and hence no standard output or error (e.g.,
+     `[status: boolean] is_dir_too_terrible_to_behold(string dirname)`).
+  ** `integer`, signifying a function returning more than merely exit statuses 0
+     and 1 (e.g., `grep`, returning 0 on match, 1 on no match, and 2 on error).
+
+Return types thus default to map `[stdout: void, stderr: void, status: true]`.
+For example, the following prototypes all equivalently define a function
+accepting no arguments, returning a string convertible without error to a float
+from standard output and no standard error, and always succeeding:
+
+.Mapped Return Types
+==========================================
+* `float ukigumo(void)`.
+* `[stdout: float] ukigumo(void)`.
+* `[stdout: float, stderr: void] ukigumo(void)`.
+* `[stdout: float, status: true] ukigumo(void)`.
+* `[stdout: float, stderr: void, status: true] ukigumo(void)`.
+==========================================
+
+=== Function Names ===
+
+zsh function names are more intricate than those of normal high-level languages.
+All functions have one or more names, declared at function declaration time by
+listing such names delimited by whitespace. Sadly, documentation requires re-
+listing such names delimited by commas and bracketed by `<` and `>`. While such
+repetition is regrettable, zsh's lack of prototyping support affords us no
+alternatives: e.g.,
+
+.Function Name Synonyms
+==========================================
+[source]
+------------------------------------------
+>>> declare_function '
+... void name, synonym, pseudonym, anonym(void)
+...
+... A function callable as either name(), synonym(), pseudonym(), or anonym().
+... '
+>>> function name synonym pseudonym anonym() { print 'nom de plume' }
+>>> name
+nom de plume
+>>> pseudonym
+nom de plume
+------------------------------------------
+==========================================
+
+=== Function Arguments ===
+
+As expected, zsh function arguments are more intricate than those of normal
+high-level languages. All functions accept two *channels* (i.e., ``streams'' of
+orthogonal input):
+
+. A passed argument list.
+. A string of standard input.
+
+[[declare_function.argument_list]]
+==== Single Function Argument List ====
+
+Since most functions only accept passed argument lists rather than standard
+input, shorthand notation suffices for such functions. Declaring a single `(`-
+and `)`-bracketed argument type list of one or more `,`-delimited argument
+declarations consisting of a whitespace-delimited type and name followed by
+optional `=` and default value in typical zsh syntax as in normal high-level
+languages (e.g., `void the(string ultimate, integer question = 42)`) signifies
+such function to accept only such arguments with no standard input.
+
+===== Function Argument Names =====
+
+Argument names should contain no whitespace or punctuation, much like real zsh
+variable names. While argument names need not correspond to the actual variable
+name (if any) the function implementation copies such argument into, this is
+generally considered good form.
+
+===== Function Argument Types =====
+
+Argument types are any single scalar types (e.g., `boolean`, `integer`), thus
+excluding `void`, `list`, and `map`. Since argument lists are lists, consider
+passing read-only lists as arguments and lists to be modified as the names of
+such lists. While maps can be packed into argument lists, consider always
+passing maps as the names of such maps. When passing the name rather than value
+of variables, consider mangling *ALL* variable names declared in the function
+implementation in a function-specific manner to avoid accidentally overriding
+externally with internally declared variables. `zeshy` heuristically mangles by
+appending `__` followed by the first letter of each word in the function name,
+which suffices for most purposes. For readability, avoid mangling documented
+argument names. For example:
+
+.Function Argument Mangling
+==========================================
+[source]
+------------------------------------------
+declare_function '
+void set_list_to_raspberry_hybrids(string list_name, string flavor)
+
+Set the passed list to all known raspberry hybrids of the passed flavor.
+'
+function set_list_to_raspberry_hybrids() {
+    # Validate passed arguments.
+    die_unless_args_2 'expected one list name and one raspberry flavor'
+    string list_name__sltrh="${1}" flavor__sltrh="${@[-1]}"
+    die_unless_list "${list_name__sltrh}"
+
+    # Set such list.
+    if { is_string_equals "${flavor}" acidic }
+        eval "${list_name__sltrh}=( loganberry )"
+    } else {
+        eval "${list_name__sltrh}=( tayberry )"
+    }
+}
+------------------------------------------
+==========================================
+
+===== Function Argument Default Values =====
+
+Default argument values are any valid right-hand side of a scalar assignment,
+including double-quoted strings nesting arbitrarily deep process substitutions
+(e.g., `(string dirname = "$(is_superuser and "/o" or "$(get_dir)")")`). For
+safety, `zeshy` _never_ evaluates such values, which may thus contain executable
+code known to have dangerous side-effects. (Naturally, this is a poor idea.)
+
+===== Empty Function Argument List =====
+
+Functions accepting no arguments may declare an argument list of either:
+
+* `()' as in shell languages.
+* `(void)` as in C-like languages.
+
+===== Variadic Function Function Argument List =====
+
+Functions accepting arbitrarily many arguments of the same type (referred to as
+``variadic functions'' elsewhere) should declare only the first such argument
+including optional default value followed by `, ...`. When a default value is
+declared, any number of such arguments may be passed; then if a caller passes no
+such arguments, the function defaults to a single argument of the default value.
+When no default value is declared, at least one such argument must be passed.
+Such arguments may be preceded and followed by other arguments. For example:
+
+.Variadic Function
+==========================================
+[source]
+------------------------------------------
+declare_function '
+void uhoh(integer mtime, string dirname1 = "/", ..., boolean is_recursive)
+
+A function accepting an integer, zero or more dirnames defaulting to "/" if
+no such strings are passed, and a boolean -- usually doing something rather
+dangerous.
+'
+function uhoh() {
+    # Validate passed arguments.
+    die_unless_args_2_or_more\
+        'expected one integer, optional dirnames, and one boolean'
+    string mtime="${1}" is_recursive="${@[-1]}"
+    die_unless_integer "${mtime}"
+    die_unless_boolean "${is_recursive}"
+
+    # Remove such integer and boolean from the argument list. All remaining
+    # arguments, if any, are dirnames.
+    shift_arg
+    pop_arg
+
+    # If no arguments remain, default to "/".
+    is_args or set_args "/"
+
+    # Do something rather dangerous.
+    print "Mu-haha! [${mtime}]"
+    if is_boolean_true "${is_recursive}"
+    then ls -R -- "${@}"
+    else ls    -- "${@}"
+    fi
+}
+------------------------------------------
+==========================================
+
+==== Mapped Function Argument List ====
+
+Some functions also accept standard input, necessitating a longhand notation
+mapping each of the two possible argument channels (passed argument list and
+standard input) to the argument type list such function accepts on such channel.
+Specifically, declaring a `[`- and `]`-bracketed map of one to two `,`-
+delimited key-value `:`-separated pairs mapping argument channel to argument
+type list signifies such function to accept passed argument strings and a string
+of standard input convertible without error to such types (e.g.,
+`void taake[args: (string hordaland1, ...), stdin: string vi]`).
+
+At least one such key-value pair must be declared. Each key is any of the
+following case-insensitive strings:
+
+* `args`, the *passed arguments* argument channel.
+* `stdin`, the *standard input* argument channel.
+
+Each value identifies the arguments such channel accepts in either:
+
+* _Shorthand notation_, a
+  <<declare_function.argument_list,single argument declaration>> consisting of
+  either:
+** A whitespace-delimited type and name followed by optional `=` and default
+   value in typical zsh syntax, signifying such function to accept only that
+   argument on such channel (e.g.,
+   `void chomsky[args: boolean the_purpose, stdin: integer of_education]`).
+** `void`, a pseudo-type signifying such function to accept _no_ arguments on
+   such channel.
+* _Longhand notation_, a `(`- and `)`-bracketed list of one or more `,`-
+  delimited <<declare_function.argument_list,argument declarations>>,
+  signifying such function to accept all such arguments on that channel (e.g.,
+  `void kropotkin[args: (integer mutual1, ...), stdin: (integer aid1, ...)]`).
+
+Argument list types thus default to map `[args: void, stdin: void]`. For
+example, the following prototypes all equivalently define a function
+accepting a string convertible without error to a character on the passed
+argument list and no standard input, and always succeeding:
+
+.Mapped Return Types
+==========================================
+* `void kurosawa(character red_beard)`.
+* `void kurosawa[args: character red_beard]`.
+* `void kurosawa[args: (character red_beard)]`.
+* `void kurosawa[args: (character red_beard), stdin: void]`.
+==========================================
+/---
+
+declare_function_with_stdin <<'/---'
+void declare_function_with_stdin[stdin: string documentation]
+
+Set the documentation for the function named by the function prototype prefixing
+standard input to such input. This function is the standard input-specific
+analogue to declare_function(), which accepts a string argument rather than
+standard input. Function documentation adheres to http://asciidoc.org[AsciiDoc]
+syntax conflicting with both single- and double-quoted zsh string syntax and
+hence cannot reliably be passed as a string argument. Such conflicts include:
+
+* AsciiDoc-specific paired single quote, conflicting with zsh-specific single-
+  quoted string escapes (e.g., '``The Bastion''', a double-quoted string in
+  AsciiDoc that zsh reduces to "``The Bastion'").
+* AsciiDoc-specific paired backticks, conflicting with zsh-specific double-
+  quoted string process substitution (e.g., "`the' `stranger'", a pair of
+  single-quoted strings in AsciiDoc that zsh attempts to substitute with the
+  output of running the external command "the' ").
+
+By accepting standard input in lieu of string arguments, this function allows
+documentation containing such conflicts to be defined by here-documents: e.g.,
+
+.Here-documented Function
+==========================================
+[source]
+------------------------------------------
+declare_function_with_stdin <<'________________<heredoc!>________________'
+void armok(string god, character of, boolean blood)
+
+``Losing'' is `fun`.
+________________<heredoc!>________________
+''
+------------------------------------------
+==========================================
+
+See declare_function() for further details.
+/---
+
+declare_function_with_stdin <<'/---'
+void die_for_declarator_type_with_help(string namespace, string documentation)
+
+Throw an exception describing a failure to declare a `zsh` object of the passed
+namespace (i.e., `alias`, `global`, `function`) documented by the passed help
+string. This utility function is intended to be called by only declare_alias(),
+declare_global(), and declare_function().
+/---
+
+declare_function_with_stdin <<'/---'
+void set_list_and_map_to_runnable_prototype_name_or_names:(
+    string list_name,
+    string map_name,
+    string matched_runnable_name,
+    string matched_runnable_names)
+
+Set the passed list to all runnable names in the passed string of single or
+multiple runnable names, presumably matched from the prototype of an alias or
+function help string. For each such runnable name, add a new key-value pair to
+the passed map mapping such name to the first such name in such string. This
+function is a helper parser intended to be called _only_ by runnable declarators
+(e.g., declare_alias(), declare_function()).
+/---
+
+# ....................{ DOCUMENTERS ~ parcel               }....................
+# Document functions previously defined by @{*-parcel} under such parcel, rather
+# than the current parcel.
+
+#FIXME: This isn't right, of course. We're declaring such functions under the
+#current parcel, currently. See @{25-global} for a simple technique for
+#implementing this.
+
+declare_function_with_stdin <<'/---'
+void die_if_parcel(
+    string parcel_name,
+    string error_message = "parcel \"${parcel_name}\" already declared")
+
+Throw an exception with the passed message if such parcel exists.
+/---
+
+declare_function_with_stdin <<'/---'
+void die_unless_parcel(
+    string parcel_name,
+    string error_message = "parcel \"${parcel_name}\" undeclared")
+
+Throw an exception with the passed message unless such parcel exists.
+/---
+
+declare_function_with_stdin <<'/---'
+[status: boolean] is_parcel(string parcel_name)
+
+Return success if such parcel exists.
+/---
+
+declare_function_with_stdin <<'/---'
+void set_parcel(string parcel_name)
+
+Set the current parcel to the previously declared parcel with the passed
+(possibly nonextant) absolute path. See declare_parcel() for further details.
+/---
+
+declare_function_with_stdin <<'/---'
+void set_parcel_as_script(string script_name)
+
+Set the current parcel to the previously declared parcel with the passed path
+referring to an existing `zeshy` script. Unless such path refers to an existing
+`zeshy` script associated with a previously declared parcel, an exception is
+thrown. For simplicity, such path may be absolute or relative and contain
+symbolic link components. See convert_path_to_parcel() for further details.
+/---
+
+declare_function_with_stdin <<'/---'
+string convert_path_to_parcel(string pathname)
+
+Convert the passed existing absolute or relative path to the parcel name
+corresponding to such path. If such path does _not_ exist, an exception is
+thrown. Relative paths will be converted to absolute paths. Symbolic link path
+components will be replaced with their transitive targets. If such path begins
+with an overlay directory, such system-specific directory will be replaced with
+a system-agnostic parcel scheme as discussed below (e.g., from
+`/usr/share/zeshy/always/zsh/zsh` to `zeshy://always/zsh/zsh`).
+
+All `zeshy` scripts reside in one of the following `zeshy` overlays:
+
+* ${ZESHY_OVERLAY_DIR}, the system-wide overlay of official scripts.
+* ${ZESHY_USER_OVERLAY_DIR}, the user-specific overlay of third-party scripts.
+* ${ZESHY_USER_CONFIG_DIR}, the user-specific overlay of user-specific
+  configuration scripts.
+
+In either case, the overlay directories prefixing script paths are system-
+specific. For portability, this function replaces such prefixes with the
+following system-agnostic schemes:
+
+* `zeshy://`, for paths prefixed by ${ZESHY_OVERLAY_DIR}.
+* `zeshy.user://`, for paths prefixed by ${ZESHY_USER_OVERLAY_DIR}.
+* `zeshy.user.config://`, for paths prefixed by ${ZESHY_USER_CONFIG_DIR}.
+
+For example:
+
+.convert_path_to_parcel()
+==========================================
+[source]
+------------------------------------------
+>>> change_dir "${ZESHY_OVERLAY_DIR}"
+>>> convert_path_to_parcel "is_pathable/mutt"
+zeshy://is_pathable/mutt
+>>> convert_path_to_parcel "${ZESHY_OVERLAY_DIR}/is_pathable/mutt"
+zeshy://is_pathable/mutt
+>>> convert_path_to_parcel "${ZESHY_USER_OVERLAY_DIR}/is_pathable/awesome"
+zeshy.user://is_pathable/awesome
+------------------------------------------
+==========================================
+/---
+
+declare_function_with_stdin <<'/---'
+void add_parcel_alias(string parcel_name, string alias_name)
+
+Add the passed alias to the passed parcel. Since parcels are `zeshy`-specific
+abstractions, this only notes such parcel to ``contain'' such alias for
+documentation and lookup purposes.
+/---
+
+declare_function_with_stdin <<'/---'
+void add_parcel_function(string parcel_name, string function_name)
+
+Add the passed function to the passed parcel. See add_parcel_alias() for further
+details.
+/---
+
+declare_function_with_stdin <<'/---'
+void add_parcel_global(string parcel_name, string global_name)
+
+Add the passed global to the passed parcel. See add_parcel_alias() for further
+details.
+/---
+
+declare_function_with_stdin <<'/---'
+void declare_parcel(string parcel_name, string documentation)
+
+Declare a new *parcel* (i.e., `zeshy`-specific abstraction packaging
+aliases, globals, and functions declared by some `zeshy` script or scripts),
+uniquely identified with the passed <<parcel.name,absolute path>> and documented
+with the passed <<parcel.help,help string>>.
+
+While most high-level languages provide native support for declaring package-
+like abstractions (e.g., `perl` packages, `python` modules, `ruby` gems), `zsh`
+does not. Even if `zsh` did, however, `zeshy`\'s compilation into unstructured
+digest files would likely render such packaging moot.
+
+== Motivation ==
+
+Parcels implement a useful (if limited) pure-`zsh` facsimile of the typical
+package motif, aggregating logically related `zsh` objects into abstract units.
+Under most high-level languages, such units form a language-specific topology
+of reusable components and readable documentation. Under `zsh`, only the latter
+applies. Since digest files offer no internal structure (and hence no reusable
+components), *parcels currently only serve to structure `zeshy` documentation.*
+
+And that's it. At such time as `zsh` adds native support for declaring package-
+like abstractions, however, this could conceivably change.
+
+[[parcel.name]]
+== Parcel Names ==
+
+Parcel names are arbitrary strings containing no null characters, typically
+formatted as URIs prefixed by one of the following two schemes:
+
+* `zeshy://`, for parcels declared by official `zeshy` scripts residing in
+  the system-wide `zeshy` overlay.
+* `zeshy.user://`, for parcels declared by thirdy-party `zeshy` scripts residing
+  in the system-wide `zeshy` overlay.
+
+Since parcels are only abstractions, such URIs need _not_ refer to existing
+filesystem paths. Under the typical
+<<parcel.relations.1to1,one-to-one relationship>> between parcels and scripts,
+however, this is the case. See convert_path_to_parcel() for further details.
+
+[[parcel.help]]
+== Parcel Documentation ==
+
+Parcel documentation adheres to http://asciidoc.org[AsciiDoc] syntax, augmented
+with `zeshy`-specific syntax for cross-referencing other `zeshy` documentation.
+Since single- and double-quoted `zsh` string syntax conflicts with such syntax,
+consider passing such documentation to declare_parcel_with_stdin() as a here-
+document on standard input instead.
+
+=== Cross-reference Syntax ===
+
+Cross-referencing other `zeshy` aliases, functions, globals, and parcels
+requires simple `zeshy`-specific syntax, typically in a human-readable manner
+inspired by the corresponding `zsh` syntax.
+
+==== Globals ====
+
+To cross-reference a global, simply delimit such global's name by `${` and `}`
+(e.g., `${ZESHY_FUNCTION_NAME_TO_DOCUMENTATION}`).
+
+==== Aliases or Functions ====
+
+To cross-reference an alias or function, simply suffix the name of such alias or
+function by `()` (e.g., `die_with_your_boots_on()`). If both an alias and
+function exist with such name, the alias rather than function will be cross-
+referenced (in keeping with `zsh` precedent).
+
+==== Function Disambiguation ====
+
+To cross-reference a function for which there exists an alias of the same name,
+simply delimit such function's name by `function://` and `()`
+(e.g., `function://die_with_your_boots_on()`).
+
+==== Parcels ====
+
+To cross-reference a parcel, delimit by `@{` and `}` either:
+
+* Such parcel's name (e.g., `@{zeshy://always/zsh/zsh}`). Since parcel names
+  form unique identifiers, this has the advantage of disambiguity but the
+  disadvantage of subsequently failing should the script declaring such parcel
+  be moved (e.g., from `/usr/share/zeshy/always/zsh/zsh` to
+  `/usr/share/zeshy/always/lang/zsh/zsh`).
+* Any suffix of such parcel's name following but _not_ including a directory
+  separator `/` (e.g., `@{always/zsh/zsh}`, `@{zsh/zsh}`, or `@{zsh}`). This
+  induces a depth-first search for the first parcel name suffixed by `/`
+  followed by such suffix of:
++
+--
+. All `zeshy` overlays in the following order (thus giving official parcels
+  precedent over third-party parcels):
+.. `zeshy://`, the system-wide overlay of official parcels.
+.. `zeshy.user://`, the user-specific overlay of third-party parcels.
+. All subdirectories of each such overlay in lexicographic order.
+
+This has the disadvantage of ambiguity but the advantage (especially with
+shorter suffixes) of preserving a cross-reference should the script declaring
+such parcel be moved. Note that creating a new script residing in a
+lexicographically ``earlier'' path declaring a parcel of the same suffix
+rewires existing cross-references to target the new script (e.g., creating
+`/usr/share/zeshy/always/00-declare/zsh/zsh` rewires `@{zsh/zsh}` and `@{zsh}`).
+In some cases, this may be beneficial; in others, however, this is probably not.
+--
+
+For example, all of the following cross-reference parcel
+`zeshy://always/zsh/zsh` (in order of increasing brevity and hence ambiguity):
+
+. `@{zeshy://always/zsh/zsh}`, unambiguously cross-referencing such parcel.
+. `@{always/zsh/zsh}`, cross-referenced by depth-first search under overlay
+  `zeshy://`.
+. `@{zsh/zsh}`, cross-referenced by depth-first search under overlay
+  subdirectory `zeshy://always/`.
+. `@{zsh}`, cross-referenced by depth-first search under overlay subdirectory
+  `zeshy://always/zsh/`.
+
+== Parcel-script Relationships ==
+
+Parcels are non-physical abstractions related to (but _not_ necessarily
+synonymous with) the physical `zeshy` scripts declaring such parcels.
+
+[[parcel.relations.1to1]]
+=== One-to-one Parcel-script Relationships ===
+
+There typically exists a one-to-one relationship between parcels and scripts.
+For each such script, there exists a corresponding parcel whose name is the
+absolute path of such script -- both guaranteeing uniqueness between parcel
+names and establishing a convenient means of associating parcels with scripts.
+With such relationships, a script's absolute path identifies its parcel and a
+parcel's name its script's absolute path.
+
+To implement such relationship, such scripts should call a *parcel declarer*
+(e.g., declare_parcel_as_script(), declare_parcel_script_with_stdin()) before calling any
+other declarers (e.g., declare_alias(), declare_function_with_stdin()).
+
+=== One-to-many Parcel-script Relationships ===
+
+A one-to-many relationship between parcels and scripts, in which one parcel is
+distributed across multiple scripts (hereafter referred to as the *swarm* of
+scripts declaring and defining such parcel), is also feasible. As with aliases,
+functions, and variables, parcels are typically only declared once. Hence, for
+one script in each such swarm, there exists a corresponding parcel whose name
+is the absolute path of such script. All other scripts in such swarm non-
+ambiguously refer to such parcel by such path.
+
+To implement such relationship, the declaring script in such swarm should call
+a parcel declarer before calling any parcel-specific declarers. All other
+scripts in such swarm should call a *parcel setter* (e.g., set_parcel(),
+set_parcel_script()) before calling any parcel-specific declarers.
+
+=== Many-to-one Parcel-script Relationships ===
+
+A many-to-one relationship between parcels and scripts, in which multiple
+parcels (hereafter referred to as the *passel* of parcels being declared and
+defined) are centralized into one script, is also feasible. For each such
+script, there exist multiple corresponding parcels. To guarantee uniqueness
+between parcel names, only one such parcel name may be the absolute path of
+such script. All other parcel names in such passel must be arbitrary (probably
+nonextant) absolute paths (e.g., by appending arbitrary integers to the path of
+such script).
+
+To implement such relationship, such script should be internally subdivided into
+such parcels, calling a parcel declarer for each such parcel before calling all
+declarers specific to such parcel.
+
+=== Many-to-many Parcel-script Relationships ===
+
+Lastly, a many-to-many relationship between parcels and scripts, in which
+multiple parcels are distributed across multiple scripts, is also feasible.
+Since such relationships blend one-to-many and many-to-one relationships, see
+prior sections for further details. (Given the subtle complexities of such
+relationships, many-to-many parcel-script relationships are rather uncommon.)
+
+=== Parcel-script Relationships in zeshy ===
+
+Since one-to-one relationships tend to conform more closely to user expectations
+than one-to-many, many-to-one, or many-to-many relationships, all scripts in the
+`zeshy` codebase declare and define exactly one parcel.
+/---
+
+declare_function_with_stdin <<'/---'
+void declare_parcel_with_stdin[
+    args: string parcel_name, stdin: string documentation]
+
+Declare a new parcel, uniquely identified with the passed absolute path and
+documented with standard input (e.g., as a here-document). See declare_parcel()
+for further details.
+/---
+
+declare_function_with_stdin <<'/---'
+void declare_parcel_as_script(
+    string script_name = "${ZESHY_SCRIPT_NAME}",
+    string documentation)
+
+Declare a new parcel, uniquely identified with the passed `zeshy` script
+(defaulting to the currently sourced script, if compiling `zeshy`\'s user digest
+file) and documented with the passed help string. See declare_parcel() for
+further details.
+/---
+
+declare_function_with_stdin <<'/---'
+void declare_parcel_as_script_with_stdin[
+    args:  string script_name = "${ZESHY_SCRIPT_NAME}",
+    stdin: string documentation]
+
+Declare a new parcel, uniquely identified with the passed `zeshy` script
+(defaulting to the currently sourced script, if compiling `zeshy`\'s user digest
+file) and documented with standard input (e.g., as a here-document). See
+declare_parcel() for further details.
+/---
+
+declare_function_with_stdin <<'/---'
+void run_runnable_with_stdin[
+    args: (string runnable_name, string argument1, string argument2, ...),
+    stdin: string input]
+
+Run the passed *runnable* (i.e., alias, function, command), passing such
+function first all passed arguments in the passed order and finally all standard
+input to this function as a single argument. For safety, this function closes
+such input immediately after running such runnable: e.g.,
+
+.run_runnable_with_stdin()
+==========================================
+[source]
+------------------------------------------
+>>> string on_commodities=\
+...     "In proportion as the bourgeoisie, i.e., capital, is developed, in the
+...      same proportion is the proletariat, the modern working class, developed
+...      — a class of labourers, who live only so long as they find work, and
+...      who find work only so long as their labour increases capital. These
+...      labourers, who must sell themselves piecemeal, are a commodity, like
+...      every other article of commerce, and are consequently exposed to all
+...      the vicissitudes of competition, to all the fluctuations of the market."
+>>> output_string "${on_commodities}" | run_runnable_with_stdin head -2 -
+In proportion as the bourgeoisie, i.e., capital, is developed, in the
+same proportion is the proletariat, the modern working class, developed
+------------------------------------------
+==========================================
+/---
+
+# --------------------( WASTELANDS                         )--------------------
+    #FUXME: Abstract retrieval of runnable names to a helper function for reuse
+    #under aliases.
+
+#FUXME: Rename to ${ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST}. Now that we're
+#eliminating ${ZESHY_FUNCTION_NAME_TO_HELP}, such map had might as well include
+#all declared function names.
+
+# Map all names (including the first) for functions with multiple names to the
+# first names declared for such functions.
+# See ${ZESHY_PARCEL_NAME_TO_HELP} for further details.
+
+#    # List of function names matched from such string.
+#    local -a function_names__df
+#
+#    # Current function name iterated in such list.
+#    local function_name__df
+#
+#    # If such function only has one name, match such name.
+#    function_name__df="${help_match__df[2]-}"
+#    if [[ -n "${function_name__df}" ]] {
+#        function_names__df=( "${function_name__df}" )
+#
+#        # If such function has already been declared, print a warning.
+#        if (( ${+ZESHY_FUNCTION_NAME_TO_HELP[${function_name__df}]} )) {
+#            print "zeshy: function ${function_name__df}() in parcel @{${ZESHY_PARCEL_NAME}} already declared" 1>&2
+#        }
+#    # Else, such function has multiple names. Since single- and double-quoted
+#    # function names may contain commas, such names cannot be split on commas as
+#    # with function attributes above. Rather, match such names with iteration.
+#    } else {
+#        # Prepare to match such names.
+#        pcre_compile -- "${ZESHY_HELP_PCRE_RUNNABLE_PROTOTYPE_NAME}"
+#        pcre_study
+#
+#        # Match such names, recording each to be a synonym of the first such
+#        # name matched above. See for_string_text_matching_pcre:() for further details.
+#        local ZPCRE_OP='0 0'
+#        while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${help_match__df[3]}" } {
+#            function_name__df="${match[1]}"
+#            function_names__df+="${function_name__df}"
+#            ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST[${function_name__df}]="${function_names__df[1]}"
+#
+#            # If such function has already been declared, print a warning.
+#            if (( ${+ZESHY_FUNCTION_NAME_TO_HELP[${function_name__df}]} )) {
+#                print "zeshy: function ${function_name__df}() in parcel @{${ZESHY_PARCEL_NAME}} already declared" 1>&2
+#            }
+#        }
+#    }
+
+#   for ((match_index=1; match_index <= ${#names}; ++match_index)) {
+#       print "name ${match_index}: ${names[${match_index}]}"
+#   }
+
+#`zsh` already provides intuitive syntax for defining functions (even those
+#with names containing shell-reserved characters), this function is largely
+#useful only for defining functions dynamically: e.g.,
+
+        # * "read -t 0", reading standard input only if such input is nonempty.
+        #   See is_stdin_readable_sans_blocking() for further details.
+#   }" |& { read -t 0 && IFS='' read -r -d '' function_error__rf }
+#    eval "function \"\${function_name__rf}\" () {
+#    ${function_body__rf}
+#}" || {
+    # Technically, shifting this conditional into the prior block would slightly
+    # improve efficiency -- while also r
+#requires 
+#The syntax for cross-referencing another `zeshy` entity depends on the type of
+#such entity, typically in a human-readable manner corresponding to underlying
+#`zsh` syntax.
+#; such parcel names are the absolute path of the existing `zeshy` script
+#declaring such parcel.
+#
+#paths (i.e., prefixed and internally delimited by
+#the directory separator '/' and ). Since parcels
+#are only abstractions, such paths need _not_ exist. Assuming the customary
+#<<parcel.relations.1to1,one-to-one relationship>> between parcels and scripts,
+#however, each parcel name is customarily the absolute path of the existing shell
+#script declaring such parcel.
+
+# See declare_function_with_stdin() for further details.
+# instead rather than single- or double-
+#quoted string function arguments 
+
+#Parcel help strings are *pure-AsciiDoc*. Unlike alias, global, and function help
+#strings, parcel help strings support no `zeshy`-specific prefixing declarations
+#or prototypes. After all, given the abstract nature of parcels, what _exactly_
+#would be declared or prototyped?
+#FUXME: Add declare_component() and declare_component_with_stdin() functions.
+#It bears considering how we'll actually associate components with aliases,
+#functions, and globals, considering that zsh does not support nested data
+#structures. I suppose we'll need to pack everything into a map. How about
+#${ZESHY_COMPONENT_NAME_TO_ALIAS_NAME} (and so forth for globals and functions),
+#with structure resembling:
+#
+#  ZESHY_COMPONENT_NAME_TO_FUNCTION_NAME=(
+#      'declare' 'declare_alias:declare_function:declare_global'
+#  )
+#
+#Hence, values are ":"-delimited function names. For globals, this clearly
+#suffices, as global names are sufficiently constrained. For aliases and
+#functions, however, we'll need to support double-quoted strings. Just double-
+#quoted, to make things *MOSTLY* simple. The only complexity there is
+#remembering to quote-protect embedded '"' characters in alias and function
+#names.
+#FUXME: Wait. Component names *MUST* also include internal structure --
+#subdirectories (i.e., parent components), in this case. The above should be:
+#
+#  ZESHY_COMPONENT_NAME_TO_FUNCTION_NAME=(
+#      'always/00-startup/00-declare/declare'
+#          'declare_alias:declare_function:declare_global'
+#  )
+#
+#The reason why, of course, is that component names are only unique within such
+#subdirectories.
+#FUXME: Actually, avoid double-quoting strings containing colons. The far
+#simpler solution is to prefix colons in alias and function names with "\". Such
+#list is then splittable with a slightly more efficient PCRE matching colon
+#separators with negative lookahead: e.g., "(?!\\):". Since there's no character
+#alias and function names *CANNOT* contain, it's doubtful there's a more
+#efficient approach. (Actually, I suppose we could try to find a UTF-8 character
+#in the range 127 to 255 guaranteed... ah; forget it. Way too much bit hackery.)
+#In any case, "(?!\\):" should certainly be efficient enough for *MOST* cases.
+#FUXME: To minimize the number of characters that need to be escaped, why don't
+#we just use null instead of colon? That then raises the obvious question: why
+#don't we just stipulate that zeshy-specific alias and function names *CANNOT*
+#contain nulls? To be fair, though, this single use probably doesn't warrant
+#prohibiting nulls entirely. Just use a PCRE resembling "(?!\\)\0". (Yes, I've
+#checked the PCRE documentation: a lone "\0" does indeed refer to binary zero.)
+#Bam!
+
+#FUXME: On calling declare_component(), we'll need to set a global caching the
+#current component name (complete with subdirectories) -- say,
+#${ZESHY_COMPONENT_NAME_CURRENT}. There's no need to persist such global after
+#sourcing all zeshy components, so we should probably undefine it after that.
+
+#FUXME: The above globals raise the obvious question: should we keep them in
+#memory or serialize them to disk? For the most, I strongly suspect they're
+#sufficiently small to impose no burden in memory. If this ever changes, we
+#simply offload them to disk with a KVS-based implementation. Simple, no?
+
+#* `zsh` global, prefix such name with `${` and suffix such name with `}` (e.g.,
+#  `${ZESHY_FUNCTION_NAME_TO_DOCUMENTATION}`).
+#* `zsh` alias or function, suffix such alias or function name with `()` (e.g.,
+#  `declare_function()`). If both an alias _and_ function share such name, the
+#  cross-reference refers only to the alias (in keeping with zsh behavior). For
+#  genericity, this is generally preferable to the next two disambiguations.
+#* `zsh` alias unambiguously (if a function of the same name also exists), prefix
+#  such name with `alias:` and suffix such name with `()` (e.g., `alias:die()`).
+#* `zsh` function unambiguously (if an alias of the same name also exists),
+#  prefix such name with `function:` and suffix such name with `()` (e.g.,
+#  `function:die()`).
+
+#Cross-referencing by ambiguous suffix rather than unambiguous name induces a
+#depth-first search for the first parcel name with such suffix of:
+#
+#. All `zeshy` overlays in the following order (thus giving official parcels
+#  precedent over third-party parcels):
+#.. `zeshy://`, the system-wide overlay of official parcels.
+#.. `zeshy.user://`, the user-specific overlay of third-party parcels.
+#. All overlay subdirectories in lexicographic order.
+#
+#of all overlays and subdirectories thereof for
+#  the first parcel suffixed by a directory separator `/` followed by such
+#  suffix, as discussed below. 
+#
+#starting with the system-wide `zeshy`
+#overlay and all subdirectories of such overlays in lexicographic order for the
+#first parcel name suffixed by the specified string.
+#
+#For convenience, parcels may also be cross-referenced by implicitly performing a
+#depth-first search of all `zeshy` overlays starting with the system-wide `zeshy`
+#overlay and all subdirectories of such overlays in lexicographic order for the
+#first parcel name suffixed by the specified string.
+#
+#To cross-reference a parcel by implicitly searching all overlays for the
+#first matching parcel, delimit such parcel's name (truncated as above) by `@{`
+#and `}` (e.g., `@{/if_pathable/cataclysm}`). Omitting an explicit overlay label
+#thus prompts `zeshy` to iteratively search every overlay for such parcel in the
+#following order:
+#
+#. `zeshy`, thus giving highest precedent to core parcels bundled by default with
+#  `zeshy`.
+#. `party`.
+#
+#  of all `zeshy` overlays beginning at the system-
+#  wide overlay `zeshy://` and proceeding to the user-specific overlay `zeshy.user://`)
+#  then the system-wide `zeshy`
+#
+#overlay and all subdirectories of such overlays in lexicographic order for the
+#first parcel name suffixed by the specified string.
+#
+#See convert_path_to_parcel() for further details on parcel names.
+#
+#For convenience, parcels may be cross-referenced either by explicitly declaring
+#such parcel's name or implicitly searching all overlays for the
+#first matching parcel. In either case, parcel names should omit the absolute
+#path of the overlay containing such parcel (e.g., for the parcel declared by the
+#script with absolute path `/usr/share/zeshy/always/variable/type`, reference
+#such parcel as `/always/variable/type` rather than the full absolute path).
+#
+#===== By Explicit Declaration =====
+#
+#To cross-reference a parcel by explicitly declaring the overlay containing such
+#parcel, delimit such parcel's name (truncated as above) by either:
+#
+#To cross-reference a documented parcel, delimit such parcel's name by `@{` and
+#`}`. Assuming such parcel to have been declared by declare_parcel_as_script()
+#(as is always the case for all official `zeshy` parcels), the name of such
+#parcel is the absolute path of the corresponding `zeshy` script with the overlay
+#directory name prefixing such path replaced with `zeshy://` for official scripts
+#and `zeshy.user://` for third-party scripts (e.g.,
+#`@{zeshy://always/zeshy/zeshy}` cross-refences the parcel declared by script
+#`/usr/share/zeshy/always/zeshy/zeshy`).
+#
+#To obtain the parcel name for any script, simply pass the path of such script to
+#convert_path_to_parcel(); the output is the corresponding parcel name.
+#
+#===== By Implicit Searching =====
+#
+#For convenience, parcels may also be cross-referenced by implicitly performing a
+#depth-first search of all `zeshy` overlays starting with the system-wide `zeshy`
+#overlay and all subdirectories of such overlays in lexicographic order for the
+#first parcel name suffixed by the specified string.
+#
+#To cross-reference a parcel by implicitly searching all overlays for the
+#first matching parcel, delimit such parcel's name (truncated as above) by `@{`
+#and `}` (e.g., `@{/if_pathable/cataclysm}`). Omitting an explicit overlay label
+#thus prompts `zeshy` to iteratively search every overlay for such parcel in the
+#following order:
+#
+#. `zeshy`, thus giving highest precedent to core parcels bundled by default with
+#  `zeshy`.
+#. `party`.
+#
+#
+##=== Cross-referencing Parcels ===
+##
+##Due to the context-dependent nature of parcel names, cross-referencing parcels
+#entails somewhat more effort than cross-referencing aliases, functions, and
+#globals. While alias, function, and global names are necessarily unique in their
+#respective namespaces and hence unambiguously cross-referenceable, parcel names
+#are unique only in their ``full'' form as system- and user-specific absolute
+#paths -- and hence _not_ unambiguously cross-referenceable cross-system or
+#-user. Which is slightly bad.
+#
+#To rectify this, note that all `zeshy` scripts and hence parcels reside under
+#one of two root *overlays* (i.e., top-level directories
+#
+#* The system-wide overlay (e.g., `/usr/share/zeshy`). Such scripts are bundled
+#  by default with all `zeshy` installations and hence form the portable core of
+#  `zeshy` guaranteed to exist wherever `zeshy` exists.
+#* The user-specific overlay (e.g., `/home/leycec/.zeshy/overlay`). Such scripts
+#  are _not_ bundled by default with `zeshy` and hence constitute non-portable
+#  (if exceptionally neato) third-party addons, extensions, plugins, and so on.
+#
+#Since the absolute paths of such overlays are necessarily system- and user-
+#specific, `zeshy` currently recognizes only the following system- and user-
+#agnostic labels:
+#
+#* `zeshy`, for parcels residing in the system-wide overlay.
+#* `party`, for parcels residing in the user-specific overlay.
+#
+#To rectify this, `zeshy` assigns each *overlay* (i.e., top-level directory
+#containing `zeshy` scripts to be compiled into `zeshy`\'s user digest file) a
+#path-agnostically human-readable label. Since all cross-referencable `zeshy`
+#scripts reside in exactly one overlay (ignoring hard and soft link shenanigans),
+#the replacement of the absolute path of the overlay containing a parcel in such
+#parcel's name with the corresponding label
+#the combination of such a label _and_ the fragment of a parcel's name following
+#the absolute path of the overlay containing such parcel uniquely identifies such
+#parcel cross-system and -user.
+#
+#==== Overlay Labels ====
+#
+#All `zeshy` scripts and hence parcels reside in one of two overlays:
+#
+#* The system-wide overlay (e.g., `/usr/share/zeshy`). Such scripts are bundled
+#  by default with all `zeshy` installations and hence form the portable core of
+#  `zeshy` guaranteed to exist wherever `zeshy` exists.
+#* The user-specific overlay (e.g., `/home/leycec/.zeshy/overlay`). Such scripts
+#  are _not_ bundled by default with `zeshy` and hence constitute non-portable
+#  (if exceptionally neato) third-party addons, extensions, plugins, and so on.
+#
+#Since the absolute paths of such overlays are necessarily system- and user-
+#specific, `zeshy` currently recognizes only the following system- and user-
+#agnostic labels:
+#
+#* `zeshy`, for parcels residing in the system-wide overlay.
+#* `party`, for parcels residing in the user-specific overlay.
+#
+#==== Parcel Cross-reference Syntax ====
+#
+#For convenience, parcels may be cross-referenced either by explicitly declaring
+#the overlay containing such parcel or implicitly searching all overlays for the
+#first matching parcel. In either case, parcel names should omit the absolute
+#path of the overlay containing such parcel (e.g., for the parcel declared by the
+#script with absolute path `/usr/share/zeshy/always/variable/type`, reference
+#such parcel as `/always/variable/type` rather than the full absolute path).
+#
+#===== By Explicit Declaration =====
+#
+#To cross-reference a parcel by explicitly declaring the overlay containing such
+#parcel, delimit such parcel's name (truncated as above) by either:
+#
+#* `@zeshy{` and `}`, for parcels residing in the system-wide overlay (e.g.,
+#  `@zeshy{/always/variable/type}`).
+#* `@party{` and `}`, for parcels residing in the user-specific overlay (e.g.,
+#  `@party{/if_pathable/sushi}`).
+#
+#===== By Implicit Searching =====
+#
+#To cross-reference a parcel by implicitly searching all overlays for the
+#first matching parcel, delimit such parcel's name (truncated as above) by `@{`
+#and `}` (e.g., `@{/if_pathable/cataclysm}`). Omitting an explicit overlay label
+#thus prompts `zeshy` to iteratively search every overlay for such parcel in the
+#following order:
+#
+#. `zeshy`, thus giving highest precedent to core parcels bundled by default with
+#  `zeshy`.
+#. `party`.
+#
+#
+##Set the documentation for the function named by the function prototype prefixing
+#the passed string to such string. 
+#FUXME: As expected, '/---' is a fairly
+#ridiculous heredoc delimiter. I'd like to transition to something either
+#Pythonic or zshish: namely, either: "'''" (i.e., three single quotes) or
+#"```". O.K.; so, "'''" and variants thereof (e.g., "''''") doesn't work, as
+#AsciiDoc already arrogates such string to itself. "```", however, is
+#particularly zshish and *NOT* already arrogated by AsciiDoc. Sadly, however,
+#vim refuses to syntax highlight it. O.K.; bloody hell. It's astonishingly
+#difficult to invent a delimiter satisfying readability, vim parsability, and
+#non-AsciiDoc parsability. How about either '-"-' or '_"_'? Actually, those
+#still require a bit too much typing (and are awkward to type on most
+#keyboards). How about simply "-=-"? Ah, hell. I really like '-"-'! So, there it
+#is. Globally replace heredoc delimiters with '-"-', as above. Hmm; O.K., the
+#typability constraint is rather important. I'd rather not have to rely on vim
+#registers, again. So, perhaps '-=-', yes? It's hardly inspiring, but suffices.
+#Nice, I actually like having "/" in there for vertical emphasis. That leaves us
+#with "/---", which is also free in AsciiDoc. What say you? I like it. It hits all
+#the right boxes: readily typeable (at least on Dvorak and Kinesis), non-
+#conflicting with AsciiDoc, parsed by vim, and moderately zsh-ish. (Moderately.)
+#It even moderately resembles the upper half of a face: e.g.,
+#   /---  /---
+#    o    -
+#...which could have iconography implications later. Say:
+#
+#      /--- /---
+#      z=esh=y
+#
+#      /---
+# zeshy = zsh
+#
+#O.K., they're hardly impressive. Well, to be pondered in any case! Right. Don't
+#bother trying to connect "/---" into an icon. This, however, could prove useful:
+#
+#   z sh
+#   | ||
+#   zeshy
+
+#FUXME: Not terribly fond of the noun "component", to be honest. It's rather
+#lengthy. Conceivable alternatives:
+#
+#* "bundle". Decent, but I rather prefer "parcel".
+#* "container". Non-ideal. Containers are lists and maps.
+#* "capsule". Nice!
+#* "parcel". Nice!
+#* "package". Non-ideal. Packages are a larger-scale abstraction.
+#* "unit". Possibly nice? A bit too terse and ambiguous, perhaps.
+#
+#Right. "parcel" really strikes me as the ideal candidate, at the moment. Shall
+#we run with it?
+#'@' followed by the label of such
+#
+#either:
+#
+##FUXME: Not quite right. Let's use such syntax to incrementally search in the
+##following overlays (in order) for such parcel: `zeshy`, `user`.
+#* `@{` and `}`, for parcels residing in the system-wide `zeshy` overlay and
+#  hence bundled by default with all `zeshy` installations (e.g.,
+#  `/usr/share/zeshy`).
+#
+#* `@${overlay_name}{` and `}`, for parcels residing in the named overlay. For
+#  portability, only the following overlay names are currently recognized:
+#** `zeshy`, if such parcel resides in the system-wide `zeshy` overlay (e.g.,
+#   `/usr/share/zeshy`).
+#** `home`, if such parcel resides in the user-specific `zeshy` overlay (e.g.,
+#   `/home/leycec/.zeshy/overlay`).
+#
+#For example:
+#
+#, a human-readable 
+#different overlay from
+#  the current parcel, where `${overlay_name}` is either:
+#
+#same overlay as the current parcel.
+#
+#While alias, function, and global names are necessarily unique in their
+#respective namespaces and hence unambiguously cross-referenceable, parcel names
+#are unique only in their "full" form as system- and user-specific absolute
+#paths -- and hence _not_ unambiguously cross-referenceable cross-system.
+#Fortunately, rectifying this is simple: 
+#
+#To cross-reference a documented parcel, delimit such parcel's name -- omitting
+#the absolute path of the overlay root containing the parcel -- by `@{` and `}`.
+#
+#Hence,
+#parcel names should 
+#
+#`zeshy` rectifies this by .
+#Consequently, 
+#
+#either:
+#
+#* As an absolute path relative to and hence omitting the system-specific
+#  directory of the overlay root (e.g., `@{/always/variable/type}`, rather than
+#  `@{/usr/share/zeshy/always/variable/type}`). Since 
+##** `path`, to reference such parcel with a system- and user-specific path
+##   despite  (e.g.,
+#   `/home/leycec/.zeshy/overlay`).
+#Declare the passed `zeshy` script (defaulting to the currently sourced script)
+#to be a new parcel, documented with standard input. Consider calling this rather
+#than declare_parcel_as_script(), which requires passing an AsciiDoc-incompatible
+#string argument rather than AsciiDoc-compatible standard input. See
+#declare_function_with_stdin() for further details.
+
+#Since 
+#Calling this function is generally preferable to
+#calling declare_parcel_as_script(), which requires passing an AsciiDoc-incompatible
+#string argument rather than AsciiDoc-compatible standard input. 
+#At the moment, this means: *``parcels structure `zeshy` documentation.''* And
+#that's it. At such time as `zsh` adds native support for declaring package-
+#like abstractions, however, this could conceivably change.
+
+#parcels will (of course) cleanly extended with such support.
+# Thus, the necessity of a
+#`zeshy`-specific abstraction allowing for such compilation.
+#Record the passed parcel (defaulting to the current parcel) as containing the
+#passed function.
+#Add the passed alias to the passed parcel. Since parcels are only abstractions,
+#``add'' in this case only means recording such parcel as containing such alias.
+# share a one-to-one relationship with their owner scripts.
+#Hence, a
+#single script declares such parcel's
+#name is the absolute path of
+#such script. All other scripts in such passel refer to such parcel by such path.
+
+#In this case,
+#such parcel is declared by a single such script but defined
+#one such script declares such parcel and 
+#That is, for the single
+#, there exists a corresponding parcel whose name is the
+#absolute path of such script. 
+
+#In this case, there
+#typically exists 
+
+#However, this is hardly the only possible type of relationship between parcels and scripts.
+#, though _not_
+#necessarily referring to extant files or directories.
+    # Add each such function to the current parcel. For efficiency, inline such
+    # iteration. See add_parcel_alias() for further details.
+#   for function_name__df ("${function_names__df[@]}") {
+#       ZESHY_PARCEL_NAME_TO_FUNCTION_NAMES[${ZESHY_PARCEL_NAME}]+=$'\0'"${2//$'\0'/\\$'\0'}"
+#   }
+
+#Handle *parcel* (i.e., `zeshy`-specific abstractions containing aliases,
+#parcels, and functions) declarers.
+#FUXME: Actually call this in such functions.
+#FUXME: So what should component documentation contain? It's fairly simple, I
+#think: *ALL* component documentation should be AsciiDoc. We could support a
+#prefixing prototype, but I fail to see how that's helpful. The current
+#component name is perfectly inferrable from the current path -- no need to
+#duplicate it unnecessarily. Great!
+#FUXME: Rename to run_function_passed_stdin() or run_runnable_with_stdin().
+#FUXME: A bit discontent with the current structure. Shift this and
+#declare_function_with_stdin() to a new component "00-function". Rename this
+#component to "declare", retaining all existing functions. Shift "define" and
+#"document" here. Last, shift declare_function*() documentation to
+#"00-function". I know, I know. But it's worth it.
+#FUXME: O.K.; the above is essentially correct. What we specifically want,
+#however, are the following three subcomponents with the expected content:
+#"00-function", "alias", and "global". Simple. Elegant. Go-go!
+
+# Component "document" declares and documents all other pertinent globals (e.g.,
+# ${ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST}).
+#FUXME: I submit we should define a syntax for embedding function attributes in
+#function documentation and having declare_function() itself parse and handle
+#such attributes. For the moment, I can only think of one such attribute:
+#"globbable". Define such attribute like so:
+#
+#   <globbable> void happy_go_lucky(void)
+#
+#Dead simple, yes? What's great about this is that it formally associates the
+#attribute with the function's documentation, which we can later highlight
+#accordingly.
+#       # Function prototype prefixing such help string.
+#       string help_prototype
+
+#       # If such string contains a blank line (i.e., "\n\n"), crudely match the
+#       # substring preceding such line as the function prototype.
+#       if     [[ "${help}" == (#b)([^$'\n']##)$'\n\n'* ]] {
+#           help_prototype="${match[1]}"
+#       # Else if such string contains a newline (i.e., "\n"), crudely match the
+#       # substring preceding such newline as the function prototype.
+#       } elif [[ "${help}" == (#b)([^$'\n']##)$'\n'* ]] {
+#           help_prototype="${match[1]}"
+#       # Else, abandon all hope.
+#       } else {
+#           help_prototype="${help}"
+#       }
+
+#       die 'function help string invalid (see "print_help declare_function" for details):
+#'"${help_prototype}"
+
+                #FUXME: If such function name contains spaces or other awkward
+                #characters, this is likely to fail -- probably silently!
+                #Command-line experimentation suggests that creating such an
+                #alias requires *EXTREME* quoting and quote-protection of such
+                #quotes. Since this is fairly odd, it's conceivable it's a bug.
+                #Here's what the horrid syntax looks like:
+                #
+                #  >>> alias \"hm\ mm\"="print ik"
+                #  >>> "hm mm"
+                #  ik
+                #
+                #So, both the prefixing and suffixing '"' as well as internal
+                #whitespace have to be explicitly escaped. Certainly doable;
+                #it's just... annoying! I suspect the "=" character also needs
+                #be escaped. Anything else? *sigh*
+                #FUXME: Given the complexity, we might want to define a function
+                #accepting a desired alias name and expansion as two separate
+                #parameters and defining such alias -- say, define_alias()?
+
+    #FUXME: Leveraging the above regular expressions, parse function name
+    #synonyms and attributes. See above for the algorithm.
+
+    # Store such documentation for subsequent parsing.
+#   ZESHY_HELP_GLOBAL+="${1}"
+
+    #FUXME: This is incorrect, as it fails to declare globals if a local of the
+    #same name exists. See is_variable_global() for a solution.
+    #FUXME: If such global has been declared, we should probably print a
+    #warning to standard error if its declared type differs from the
+    #documentation-declared type. The implementation is a bit tedious,
+    #however, requiring a new map ZESHY_GLOBAL_DECLARATOR_TO_TYPE
+    #dynamically constructed from its converse for performing efficient
+    #lookups. Clearly, not a priority for the moment.
+    # If such global has not yet been declared, do so. See is_variable() for
+    # further details.
+#   [[ -n "${(P)global_name__dg+x}" ]] || {
+
+#FUXME: Restore the ${ZESHY_FUNCTION_NAME_TO_HELP}, etc. globals back to this
+#component. Use such globals rather than ${ZESHY_HELP_GLOBALS}, etc. in
+#function implementations below.
+#FUXME: Consequently, declare_function() should immediately parse the passed
+#help string's function prototype for only the following bits of metadata:
+#
+#* The list of all function attributes.
+#* The list of all function names.
+#
+#Given the latter, set ${ZESHY_FUNCTION_NAME_TO_HELP} with the *FIRST* such
+#function name and set ${ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST} as
+#discussed below from all such function names to the first such function name.
+#
+#Then, given the former, if such attributes contain "globbable", define one
+#"noglob" alias for each function name. Awesomeness!
+#FUXME: Honestly, I don't see why we shouldn't support the same syntax for
+#aliases. Hence, both functions should call an underlying function passed the
+#names of the maps to... Ah, wait. No, no. Aliases don't genuinely support
+#synonyms. We could fake it, I suppose. But I'm unsure whether there's any
+#value in that. For now, confine such parsing to functions.
+
+#FUXME: How should function synonyms be handled? For proper HTML construction,
+#the fact that one function is a synonym of another *REALLY* needs to be
+#embedded in either this data structure or another. How about a map
+#${ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST}? Given the following
+#function declaration:
+#
+#  function func1 func2 func3() { ... }
+#
+#...we would populate such map as follows:
+#
+#  ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST=(
+#      'func1' 'func1'
+#      'func2' 'func1'
+#      'func3' 'func1'
+#  )
+#
+#Hence, given a function name, it's (largely) trivial and reasonably efficient
+#to find all synonyms of such function. We arbitrarily choose the first function
+#name to be the "source" to which all synonyms refer, including such function
+#name itself. Note that functions with no synonyms should *NOT* be defined by
+#such map. We could certainly admit that, but it serves no purpose and
+#(potentially) squanders quite a bit of safe.
+#   print "attrs: ${attrs[@]}"
+#   print "names: ${names[@]}"
+    #FUXME: Right. We don't actually need the list of names, due to our helpful
+    #choice of global data structure. Instead, we only need to record the
+    #*FIRST* function name in a string local.
+
+        # Match the first such name, which by the definition of such PCRE is
+        # guaranteed to exist. See for_string_text_matching_pcre:() for further details.
+#       pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${names_string}"
+#       function_names+="${match[1]}"
+
+        #FUXME: Rather than append to such list, do the following:
+        #
+        #* Set the above string local to the first match.
+        #* For all subsequent matches, map from such match to such string local
+        #  in global ${ZESHY_FUNCTION_NAME_TO_FUNCTION_NAME_FIRST}.
+        #
+        #To do so simply (and efficiently!), do something resembling:
+        #
+        # This should be guaranteed to match and hence always return success.
+#       while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${help_match[3]}" } {
+#           names+="${match[1]}"
+#       }
+
+        # Such names as a raw string. Since iteration overwrites list global
+        # ${match}, copy such string before overwriting it below.
+#       local names_string="${help_match[3]}"
+
+    #FUXME: We'll clearly need to convert a few of the locals below into globals
+    #above. Let's cross that tepid bridge when we trip into it.
+
+        #FUXME: Actually, only print the first line of such documentation. Also, use
+        #a different color for such line; say, regular red or cyan?
+        #FUXME: Actually, print as follows:
+        #
+        #* If such prototype contains a blank line (i.e., "\n\n\n"), print from the
+        #  first line of such prototype up to the next line that comes first of
+        #  either such blank line or 5. (This avoids inevitable problems with
+        #  pathological documentation.)
+        #* Else, print only the first line of such documentation. This is only an
+        #  unlikely edge case, so it needn't be too fancy; pretty much everyone will
+        #  follow zeshy precedent of a blank line, I reckon.
+
+    #string pcre_return_type=${pcre_ident}
+        #string pcre_function_name_list='\{\s*+([^}]*?)(?:'${pcre_comma}')?\}'
+#FUXME: Actually, defer such definition to the same precompilation function
+#iterating and serializing all documentation to disk. The reason? Simplicity,
+#centralizing all function prototype parsing into a single function. Such
+#parsing is rapidly becoming too complex to duplicate between multiple
+#functions.
+#FUXME: Function name synonyms should be implemented as symbolic links in the
+#documentation directory. Consequently, no parsing of function name synonyms is
+#desirable in declare_function() itself. In fact, we can reduce the current
+#temporary maps ZESHY_ALIAS_NAME_TO_DOCUMENTATION and so on to corresponding
+#lists ZESHY_USER_HELP_ALIASES and so on. Just append each passed
+#documentation string as is to the desired list.
+#FUXME: Define a new declare_function_glob() or
+#declare_function_sans_filename_globbing() or
+#declare_function_and_disable_filename_globbing(). Yes, the latter. While
+#verbose, that's not necessarily a bad thing in this case, as such function
+#dramatically alters function parsing. In any case, such function should
+#define a new alias of the same name expanding as follows:
+#
+#    alias ${function_name}="noglob ${function_name}"
+#
+#Test if such alias already exists before doing so, in which case throw an
+#exception or perhaps merely print a warning. (Nah, exception!)
+
+    #FUXME: Actually define set_string_with_stdin(). Simplicity incarnate.
+    # Document such input. See set_string_with_stdin() for further details.
+#Prefer globals
+    # "${match[1]}" and "${match[2]}" to human-readable local variables to
+    # avoid polluting the local shell environment any further. 
+#FUXME: I'm unclear why this needs to be an alias. If we were declaring such
+#variable locally, I could see it, but... yeah; I think I slightly erred in
+#implementing this as an alias. Convert to a function and reap the rewards of
+#simplicity.
+
+# ....................{ SETTERS                            }....................
+#function set_alias_documentation() {
+#    (( # == 1 )) || die 'expected one documentation string'
+#    ZESHY_CORE_HELP_ALIASES+="${1}"
+#}
+
+#function set_function_documentation() {
+#    (( # == 1 )) || die 'expected one documentation string'
+#    ZESHY_HELP_FUNCTION+="${1}"
+#}
+
+#function set_global_documentation() {
+#    (( # == 1 )) || die 'expected one documentation string'
+#    ZESHY_HELP_GLOBAL+="${1}"
+#}
+
+    # If such documentation is prefixed by an alias prototype, match the
+    # relevant alias name from such prototype. While zsh permissively allows
+    # alias name declarations to be quoted and hence contain arbitrary
+    # characters as with functions, such aliases are not runnable: e.g.,
+    #
+    #   >>> alias "o w s"="print 'revolt is dead; long live revolt'"
+    #   >>> o\ w\ s
+    #   zsh: command not found: o w s
+    #
+    # For simplicity, use a similar glob expression as declare_function().
+#   if [[ "${documentation}" ==\
+#       (#b)[[:space:]]#[^[:space:]]##[[:space:]]##([^'<']##)'<'* ]]
+#   then ZESHY_ALIAS_NAME_TO_DOCUMENTATION[${match[1]}]="${documentation}"
+#           print "function name: ${match[1]}"
+    # Else, throw an exception with a portion of such documentation.
+#   else die "help string \"${documentation[1,40]}...\" not prefixed by an alias prototype"
+#   fi
+
+    # If such documentation is prefixed by a function prototype, match the
+    # relevant function name from such prototype. zsh permissively allows
+    # function name declarations to be quoted and hence contain arbitrary
+    # characters, necessitating a more lenient glob expression than liked.
+    # Dismantled, this is:
+    #
+    # * "(#b)", capturing match groups into global list ${match}.
+    # * "[[:space:]]#", matching optional whitespace.
+    # * "[^[:space:]]##", matching the function return type.
+    # * "[[:space:]]##", matching mandatory whitespace.
+    # * "([^'(']##)", matching the function name into ${match[1]}.
+    # * '(', matching the beginning of the function argument list.
+#   if [[ "${documentation__df}" ==\
+#       (#b)[[:space:]]#[^[:space:]]##[[:space:]]##([^'(']##)'('* ]]; then
+        # Attempt to split such function name on " [or] " delimiters.
+#       local    function_name__df="${match[1]}"
+#       local -a function_names__df
+#       function_names__df=( "${(s: [or] :)function_name__df}" )
+
+        # If such function name contains no such delimiters, document as is.
+#       if (( ${#function_names__df} == 1 ))
+#       then ZESHY_FUNCTION_NAME_TO_DOCUMENTATION[${function_name__df}]="${documentation__df}"
+        # Else, such function name contains at least one such delimiter.
+        # Document each split function name with such documentation.
+#       else
+#           for function_name_split ("${function_names__df[@]}") {
+#                   print "function name split: ${function_name_split}"
+#               ZESHY_FUNCTION_NAME_TO_DOCUMENTATION[${function_name_split__df}]="${documentation__df}"
+#           }
+#       fi
+#           print "function name: ${match[1]}"
+    # Else, throw an exception with a portion of such documentation.
+#   else die "help string \"${documentation__df[1,40]}...\" not prefixed by a function prototype"
+#   fi
+#FUXME: declare_function() is arguably a bit more than mere documentation, now.
+#Ditto for declare_global(). Perhaps we should contemplate a nomenclature
+#change -- say, to prototype_function() or declare_function(). Yes, "declare"
+#strikes me as the proper verb here. It applies to globals as well!
+#FUXME: O.K., O.K. Stop the "<>" nonsense with aliases. It's useful for
+#referencing aliases to distinguish them from functions but completely unuseful
+#for prototyping aliases. Alias prototype syntax should be a proper subset of
+#function prototype syntax. (Note this is really the only way to do the PEG, as
+#well; can you imagine duplicating the bloody function PEG for aliases with only
+#ignorable differences?)
+
+#FUXME: Ensure this is performed in, say, "main":
+#
+#    # Undefine lower-level documentators, hereafter replaced by the previously
+#    # defined higher-level documentators. Do so here for code convenience rather
+#    # than necessity.
+#    unfunction\
+#        set_alias_documentation\
+#        set_function_documentation\
+#        set_global_documentation
+# ....................{ DOCUMENTATION                      }....................
+# Map from Zeshy-specific alias name to documentation for such alias.
+#local -A ZESHY_ALIAS_NAME_TO_DOCUMENTATION
+
+# Map from Zeshy-specific function name to documentation for such function.
+#local -A ZESHY_FUNCTION_NAME_TO_DOCUMENTATION
+
+# Map from Zeshy-specific global name to documentation for such global.
+#local -A ZESHY_GLOBAL_NAME_TO_DOCUMENTATION
+
+# Avoid documenting the following three functions, subsequently undefined during
+# Zeshy startup and hence inaccessible to callers.
+
+# void set_alias_documentation(string alias_name, string documentation)
+#
+# Document the passed alias with the passed string.
+#function set_alias_documentation() {
+#    (( # == 2 )) || die 'expected one alias name and one help string'
+#    ZESHY_ALIAS_NAME_TO_DOCUMENTATION[${1}]="${2}"
+#}
+
+# void set_function_documentation(string function_name, string documentation)
+#
+# Document the passed function with the passed string.
+#function set_function_documentation() {
+#    (( # == 2 )) || die 'expected one function name and one help string'
+#    ZESHY_FUNCTION_NAME_TO_DOCUMENTATION[${1}]="${2}"
+#}
+
+# void set_global_documentation(string global_name, string documentation)
+#
+# Document the passed global with the passed string.
+#function set_global_documentation() {
+#    (( # == 2 )) || die 'expected one global name and one help string'
+#    ZESHY_GLOBAL_NAME_TO_DOCUMENTATION[${1}]="${2}"
+#}
+
+    # If such documentation is prefixed by a function prototype, match the
+    # relevant function name from such prototype. zsh permissively allows
+    # function name declarations to be quoted and hence contain arbitrary
+    # characters, necessitating a more lenient glob expression than liked.
+    # Dismantled, this is:
+    #
+    # * "(#b)", capturing match groups into global list ${match}.
+    # * "[[:space:]]#", matching optional whitespace.
+    # * "[^[:space:]]##", matching the function return type.
+    # * "[[:space:]]##", matching mandatory whitespace.
+    # * "([^'(']##)", matching the function name into ${match[1]}.
+    # * '(', matching the beginning of the function argument list.
+#   if [[ "${documentation__df}" ==\
+#       (#b)[[:space:]]#[^[:space:]]##[[:space:]]##([^'(']##)'('* ]]; then
+#       # Attempt to split such function name on " [or] " delimiters.
+#       local    function_name__df="${match[1]}"
+#       local -a function_names__df
+#       function_names__df=( "${(s: [or] :)function_name__df}" )
+
+        # If such function name contains no such delimiters, document as is.
+#       if (( ${#function_names__df} == 1 ))
+#       then ZESHY_FUNCTION_NAME_TO_DOCUMENTATION[${function_name__df}]="${documentation__df}"
+        # Else, such function name contains at least one such delimiter.
+        # Document each split function name with such documentation.
+#       else
+#           for function_name_split ("${function_names__df[@]}") {
+#                   print "function name split: ${function_name_split}"
+#               ZESHY_FUNCTION_NAME_TO_DOCUMENTATION[${function_name_split__df}]="${documentation__df}"
+#           }
+#       fi
+#           print "function name: ${match[1]}"
+    # Else, throw an exception with a portion of such documentation.
+#   else die "help string \"${documentation__df[1,40]}...\" not prefixed by a function prototype"
+#   fi
+
+#names following the `(`- and `)`-bracketed argument list or `[`- and `]`-
+#bracketed argument channel list signifies such function to be annotated by such
+
+#declare_function_with_stdin <<'/---'
+#void declare_function_with_stdin_and_disable_filename_globbing[
+#    stdin: string documentation]
+#
+#Set the documentation for the function named by the function prototype prefixing
+#standard input to such input and disable filename globbing on all arguments
+#callers subsequently pass to such function. While the latter admittedly has
+#little to do with function documentation, bundling the two together simplifies
+#life. See declare_function_with_stdin() and
+#disable_function_filename_globbing() for further details.
+#/---
+
+#FUXME: Actually, no one'll ever call this function. Rename to
+#declare_function_with_stdin_and_disable_function_filename_globbing() and
+#implement accordingly. Yes, this is an obscenely long function name. No, in
+#this particular instance, I don't particularly care. There's no reasonable
+#abbreviation permitting the function name and heredoc declaration to reside on
+#the same line, so such function is called like so:
+#
+#    declare_function_with_stdin_and_disable_function_filename_globbing\
+#        <<'/---'
+#    ...
+#    /---
+#FUXME: Document declare_function_with_stdin() as well. In the documentation,
+#note the reason for needing declare_function_with_stdin() to be the fact that
+#both single- and double-quoted strings interface poorly with AsciiDoc syntax.
+#Specifically, AsciiDoc's frequent use of:
+#
+#* Paired single quotes (e.g., ``the bastion'', an aesthetically double-
+#  quoted string) conflicts with single-quoted escapes in single-quoted strings.
+#* Paired backticks (e.g., `the stranger', a passthrough monospaced string)
+#  conflicts with backtick-style process substitutions in double-quoted strings.
+#
+#Fortunately, zsh supplies a third alternative: here-documents. Since zsh
+#writes here-documents to standard input, this function expects non-empty
+#standard input. See declare_function() for further details.
+
+#While function documentation can be passed as a
+#conventional string argument to declare_function() rather than as standard
+#input to this function, such documentation adheres to 
+#http://asciidoc.org[AsciiDoc] syntax containing syntactic constructs
+#containing characters conflicting with
+#conventional single- or double-quoted zsh strings:
+#
+#* Paired single quotes (e.g., ``the bastion'', an aesthetically double-
+#  quoted string) conflicts with single-quoted escapes in single-quoted strings.
+#* Paired backticks (e.g., `the stranger', a passthrough monospaced string)
+#  conflicts with backtick-style process substitutions in double-quoted strings.
+
+#Set the documentation for the globally exported variable named by the variable
+#declaration prefixing the passed string to such string. Documentation consists
+#of a variable declaration in Zeshy-specific C-like syntax and a variable
+#description in http://asciidoc.org[AsciiDoc].
+#
+#If called when recompiling Zeshy''s user digest file, globally export the global
+#prefixing the passed string with the Zeshy-specific type (e.g., "list", "float")
+#prefixing the passed string *AND* document such global with such string; else,
+#do nothing.
+
+#Set the documentation for the function named by the function prototype prefixing
+#the passed string to such string. Documentation consists of a function prototype
+#in Zeshy-specific C-like syntax and a function description in
+#http://asciidoc.org[AsciiDoc].
+#Function documentation consists of a function prototype and description
+#delimited by mandatory whitespace. A function prototype consists of one or more
+#return types, one or more function names, and zero or more function arguments;
+#a function description consists of arbitrary http://asciidoc.org[AsciiDoc] with
+#additional support for conveniently cross-referencing other Zeshy documentation.
+
+#Alias documentation consists of an alias prototype and description delimited by
+#mandatory whitespace. An alias prototype consists of one or more return types,
+#one alias name, and zero or more arguments; an alias description consists of
+#arbitrary http://asciidoc.org[AsciiDoc] with additional support for conveniently
+#cross-referencing other Zeshy documentation.
+
+#== Alias Prototypes ==
+#
+#Alias prototypes follow a C-like syntax supporting zsh features not commonly
+#found in conventional high-level languages: return and argument channels. Since
+#zsh does _not_ currently support alias prototypes, we cannot coerce zsh to
+#respect or enforce such prototypes at runtime. Zeshy can, however, convert such
+#prototypes to syntax-highlighted, contextually-linked specifications in end-
+#consumer documentation.
+
+#Since zsh expands aliases inline, aliases cannot accept arbitrary arguments not
+#accepted by the command such alias expands to.
+
+#FUXME: Obscenely out-of-date. Significantly expand, noting that the alias
+#documentation PEG is effectively the proper subset of the function
+#documentation PEG excluding function name synonyms and replacing "(" and ")"
+#with "<" and ">".
+#While all function implementations remain free to
+#dynamically redefine their signatures and hence deviate from such static
+#documentation, developers should question the cognitive cost of such functions!
+
+#FUXME: There is one other matter, of course: standard input. And
+#come to think, this is also a concern for function documentation as well.
+#How do we document whether a function accepts standard input and, when it does
+#so, where it places such input in relation to other accepted arguments if any?
+#*UGH*. Super annoying that I neglected to account for stdin. *sigh*
+#FUXME: O.K.; I think I have a working syntax. The idea is simple: zsh
+#extensions to C-like function prototype syntax are "["- and "]"-delimited.
+#Since herestring-driven aliases unpack stdin into customary arguments, we have
+#an stdin argument syntax resembling:
+#
+#[stdout: float] ukigumo[stdin: (string dirname, integer mtime)]
+#
+#What's nice is that, as a function, it would simply be written as:
+#
+#[stdout: float] ukigumo(string dirname, integer mtime)
+#
+#Simple, concise, and consistent. Excellent. The above syntax naturally extends
+#to support standard input being assigned to only one argument, like so:
+#
+#[stdout: float] ukigumo(stdin: string dirname, integer mtime)
+#
+#Ugh. So, that works, but doesn't really coincide with above. How about:
+#
+#[stdout: float] ukigumo(stdin: [string dirname, integer mtime])
+#[stdout: float] ukigumo(stdin: string dirname, integer mtime)
+#
+#Right. That works. It's obviously tempting to reduce every "[" and "]" to a
+#"(" and ")" at this point, but that reduces the resulting prototype to a
+#slightly less readable mish-a-mash ala LISP (*shudder*):
+#
+#(stdout: float) ukigumo(stdin: (string dirname, integer mtime))
+#
+#Hmm. Is that *REALLY* less readable? Frankly, it seems *MORE* readable. Right.
+#O.K.; so, in this instance only, contemplate LISP-ish syntax. I can't believe
+#I'm muttering that, but... well, it is much easier to remember and hence to
+#write, and reads quite well as well. So, there you are!
+#
+#Right. There's just one final thing: input pipes. Quite a few functions only
+#expect piped standard input, not just any ol' standard input. So, we'll need to
+#also support something resembling:
+#
+#(stdout: float) ukigumo(piped stdin: string dirname, integer mtime)
+#(stdout: float) ukigumo(stdin pipe: string dirname, integer mtime)
+#(stdout: float) ukigumo(stdin-pipe: string dirname, integer mtime)
+#(stdout: float) ukigumo(pipe: string dirname, integer mtime)
+#(stdout: float) ukigumo(piped: string dirname, integer mtime)
+#
+#The latter, I should think. "piped" implies "stdin" and more, so prefixing with
+#or otherwise explicitly stating "stdin" is unnecessary. Well! That should do it,
+#no? We'll need to slightly revise both the PEG and examples below, but better
+#now that after we've begun using this syntax everywhere, eh? :}
+#
+#Ah, right: one final thing. The ":" implies mandatory and, in most cases, piped
+#standard input is optional. How about a new "?" suffix for optional input, ala:
+#
+#(stdout: float) ukigumo(piped? string dirname, integer mtime)
+#(stdout: float) ukigumo(stdin: (string dirname, integer mtime))
+#
+#BRILLIANT. Bravo, senior Cecil. Bravo.
+#
+#Note, however, that optional piped input is probably unhelpful and should
+#arguably be eliminated from the Zeshy codebase. Hence, for now, just document
+#the "stdin:"-style syntax.
+#FUXME: O.K.; so, the above syntax isn't *QUITE* right. Since we're *NEVER*
+#passing in standard input as an optional argument, any standard input passed is
+#always as a second "channel" completely outside the scope of passed arguments.
+#Also note that *_from()-style aliases *APPEAR* to the caller to accept a single
+#string rather than standard input, suggesting an additional "string:" channel.
+#Revert to "["-style syntax, for clarity. This suggests the following syntax:
+#
+#    # A function accepting a string *AND* standard input.
+#    [stdout: void] set_string_to_stdin_pipe[
+#       args: string string_name, stdin: string input]
+#
+#    # A function accepting one or more integers on standard input.
+#    [stdout: string] get_stdin_integers[
+#       args: void, stdin: (integer int1, ...)]
+#
+#    # Equivalent to the prior prototype.
+#    [stdout: string] get_stdin_integers[stdin: (integer int1, ...)]
+#
+#    # A herestring-style alias.
+#    [stdout: float] ukigumo[string: (string dirname, integer mtime)]
+#
+#So, the fundamental idea is that "args:" and "stdin:" both default to "void",
+#as for return types. Either or neither may be specified, with predictable
+#consequences in any case. Beautiful, no? (Well, certainly *LOGICAL*!)
+
+#Tester functions returning only boolean exit status and no standard output or
+#error may thus map return types `[status: boolean]` (e.g.,
+#`[status: boolean] is_dir_too_terrible_to_behold(string dirname)`).
+
+#Being unprototyped, zsh function argument order and type is not
+#statically predefined at function declaration time but may conditionally
+#dynamically depend on local, global, and/or external state. For example,
+#While perfectly documenting all possible function argument dynamics is both unfeasible and undesirable,
+#conditionally depend and hence arguably more involved
+#(though not necessarily beneficially) than those of conventional high-level languages.
+
+#Documenting all possible function prototype dynamics is both unfeasible and
+#undesirable. For sanity, function documentation assumes function signatures to
+#be statically predefined at function declaration time as in normal high-level languages. Function implementations remain
+#free to dynamically redefine and hence stray from such documentation as
+#necessary, although this is generally discouraged.
+
+#For brevity, functions may specify a single return type as in conventional
+#high-level languages (e.g., `integer`).
+# Zeshy documents such values in one of two ways:
+#With a single type as in conventional high-level languages (e.g., `integer`),
+#signifying such function to return a string of standard output convertible
+#without error to such type, an empty string of standard error, and zero exit
+#status (i.e., success). Since most functions only write to standard output and
+#throw exceptions rather than return non-zero exit status on error, this
+#shorthand notation simplifies most functions'' documentation.
+
+#| Digit                 | <- | ``0'' | DigitNonZero
+#| DigitNonZero          | <- | ``1'' | ``2'' | ``3'' | ``4'' | ``5'' | ``6'' |
+#                               ``7'' | ``8'' | ``9''
+#| Integer               | <- | ``-''? (``0'' | DigitNonZero Digit*)
+
+#FUXME: I've performed an obscene amount of research on lightweight
+#documentation formats and the winner *HANDS DOWN* is AsciiDoc. The syntax
+#absolutely rocks, is near infinitely extendable with "pluginname:string"-style
+#syntax and third-party plugins, exports beautiful HTML, LaTeX, PDF, man pages,
+#DocBook, and so on. All Git documentation is written in AsciiDoc (which should
+#absolutely tell you something: this is Linus' Git, after all). Markdown and
+#Textile are rather outdated at this point. The only genuine competitor is the
+#official Python documentation language, RestructuredText (reST). I'll admit:
+#reST is powerful. Probably nearly as or even slightly more powerful than
+#AsciiDoc. But in the end, that doesn't really matter... because the syntax is
+#absolute shite. I mean, *LOOK AT THAT SYNTAX*. What the bloody hell were they
+#thinking? They could have simply adopted the de facto e-mail-style markup
+#syntax from which AsciiDoc (and Markdown and Textile and pretty much every
+#other lightweight documentation language) is descended. But *NO*, they had to
+#reinvent the friggin' wheel. And they failed. They thoroughly failed. Thank the
+#Nordic Gods, then, for AsciiDoc.
+
+#[stdout: float] ukigumo(stdin -> [string dirname, integer mtime])
+#(stdout: float) ukigumo(stdin: (string dirname, integer mtime))
+#[stdout: float] ukigumo(stdin: [string dirname, integer mtime])
+#[stdout: float] ukigumo(string dirname, integer mtime) <- stdin
+#[stdout: float] ukigumo[stdin: (string dirname, integer mtime)]
+#[stdout: float] ukigumo(stdin -> string dirname, integer mtime)
+
+#FUXME: set_function_documentation() will need to detect whether passed standard
+#input and, if so, ... Hmm. Actually, we should probably just do so in the high-
+#level functions themselves (e.g., declare_function()). That necessitates
+#pushing such documentation to the end of this file, but... *shrug*. That's
+#fine, and arguably even preferred here (since it centralizes all documentation
+#in one place). Arguably, we should then provide distinct high-level functions
+#entitled declare_function_from_stdin() and so forth. The issue with
+#trying to make a single "smart" declare_function() implicitly detecting open
+#standard input is that such functions will be called from the top-level during
+#Zeshy startup and hence cannot distinguish external from internal standard
+#input. Subvert such confusion with distinct functions only accepting standard
+#input.
+
+#set_alias_documentation declare_global '
+#void declare_global<string documentation>
+#
+#If called when recompiling Zeshy''s user digest file, globally export the global
+#prefixing the passed string with the Zeshy-specific type (e.g., "list", "float")
+#prefixing the passed string *AND* document such global with such string; else,
+#do nothing.
+#'
+#alias declare_global='
+#{
+#    # Localize the passed herestring.
+#    local documentation__dg="$(< /dev/stdin)"
+#...
+#} <<<'
+
+#Document the function named in the function prototype prefixing the passed
+#documentation, which consists of a function prototype in C-like syntax
+#followed by function description in AsciiDoc.
+#
+#whose syntax supports zsh features not commonly found in
+#conventional high-level languages (e.g., function name synonyms, tristate return
+#values). For completeness, we specify such syntax with a Parser Expression
+#Grammar (PEG):
+#
+#Such types should correspond to the actual variable type (if
+#any) the function implementation copies such argument into.
+#
+#values are *NEVER* evaluated by Zeshy and hence may contain executable code that
+#could, whenever evaluated, have dangerous side-effects. 
+#
+#assigning each argument a
+#mandatory name and type and optional default value.
+#
+#While argument names need
+#not correspond to the variable name (if any) the function implementation copies
+#such argument into, argument types and optional default value should, of course.
+#
+#(e.g., "function name synonym pseudonym nom_de_guerre nom_de_plume() { true }",
+#a function callable as either name(), synonym(), pseudonym(), nom_de_guerre(),
+#or nom_de_plume()).
+#
+#by listing all such names in whitespace-
+#delimited fashion (e.g., .
+#at least one name  also arbi:
+#a
+#Most function names as in conventional high-level languages (e.g., "integer"),
+#
+#* "RETURN_TYPE", the Zeshy-specific variable type such function returns.
+#  Technically, all zsh functions "return" three values (in the low-level sense):
+#  a string of standard output, a string of standard error, and an exit status.
+#  Practically, most zsh functions avoid writing to standard error and only .
+#
+#For functions with only one name, call this function as follows:
+#
+#    declare_function ''
+#    RETURN_TYPE FUNCTION_NAME(
+#        ARG_TYPE_1 ARG_NAME_1 {= ARG_DEFAULT_VALUE_1},
+#        ARG_TYPE_2 ARG_NAME_2 {= ARG_DEFAULT_VALUE_2}, ...)
+#
+#    HUMAN_READABLE_DOCUMENTATION
+#    ''
+#    function FUNCTION_NAME() {
+#        FUNCTION_IMPLEMENTATION
+#    }
+#
+#For functions with multiple names, call this function as follows:
+#
+#    declare_function ''
+#    RETURN_TYPE FUNCTION_NAME_1 [or] FUNCTION_NAME_2 [or] ... FUNCTION_NAME_N(
+#        ARG_TYPE_1 ARG_NAME_1 {= ARG_DEFAULT_VALUE_1},
+#        ARG_TYPE_2 ARG_NAME_2 {= ARG_DEFAULT_VALUE_2}, ...)
+#
+#    HUMAN_READABLE_DOCUMENTATION
+#    ''
+#    function FUNCTION_NAME_1 FUNCTION_NAME_2 ... FUNCTION_NAME_N() {
+#        FUNCTION_IMPLEMENTATION
+#    }
+#
+#Capitalized strings above denote the following semantics:
+#
+#* "RETURN_TYPE", the Zeshy-specific variable type such function returns.
+#  Technically, all zsh functions "return" three values (in the low-level sense):
+#  a string of standard output, a string of standard error, and an exit status.
+#  Practically, most zsh functions avoid writing to standard error and only .
+#  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#  FUXME: Rewrite this section after implementing the above additions. It gets a
+#  bit complicated, but... heck, it''ll definitely be worth it.
+#  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#* "FUNCTION_NAME_1", the first name for such function. While most functions have
+#  only one name, zsh permits additional names to be declared in a function
+#  declaration with the above whitespace-delimited syntax.
+#* "FUNCTION_NAME_2", the second name for such function. While most functions have
+#
+#  As in C-like languages, type "void" signifies such function to return no
+#  standard output and/or error.
+#
+#Function prototypes follow the familiar "RETURN_TYPE FUNCTION_NAME 
+#
+#familiar C, C++, C#, Java, python etc. syntax for function prototypes for documentation purposes, which must follow one of the following formats:
+#
+#* 
+#  "RETURN_TYPE FUNCTION_NAME ([or] FUNCTION_NAME_SYNONYM ...)
+#
+#While zsh does not support function prototypes, this function
+#adopts conventional high-level language function prototype syntax for documentation-specific purposes.
+#While Zeshy cannot enforce such prototype at runtime, it can at least convert such prototype into
+#appropriately .
+#the return type, argument types, or argument order of 
+#at runtime, it can convert such prototype into 
+#
+#named by the C-style function prototype of the passed
+#documentation string. Since zsh permits no function prototyping, this function
+#adopts conventional high-level language function prototype syntax for documentation purposes.
+#While Zeshy cannot enforce such prototype at runtime, it can at least convert such prototype into
+#appropriately .
+#the return type, argument types, or argument order of 
+#at runtime, it can convert such prototype into 
+#
+#syntax does *NOT* constitute 
+#While such syntax does *NOT* constitute an enforcable
+#familiar C, C++, C#, Java, python etc. syntax for function prototypes for documentation purposes, which must follow one of the following formats:
+#
+#* 
+#  "RETURN_TYPE FUNCTION_NAME ([or] FUNCTION_NAME_SYNONYM ...)
+#
+#, which must thus be prefixed  with such documentation. 
+#
+#This function is deleted by Zeshy immediately before compiling its user digest
+#file and hence only callable from the global context of Zeshy components.
+
+#FUXME: It'd be great to support a distinction between standard output and
+#error return values in function prototypes. How about something resembling:
+#
+#    # Function returning a string of standard output and no standard error.
+#    [string, void] do_something(void)
+#
+#    # Or perhaps the more verbose:
+#    [stdout: string, stderr: void] do_something(void)
+#
+#    # Actually, we could support both (obviously), which we should do. Ah;
+#    # actually, we should probably just add such "stdout:" and "stderr:"
+#    # labels on printing human-readable documentation to users, yes? Ah;
+#    # perhaps not. It'd certainly be more intelligible to developers browsing
+#    # the code to see "[stdout: string, stderr: void]" versus the former.
+#    # The more verbose version also lends itself well to specifying exit
+#    # status, as below.
+#
+#Since most functions return no standard error, retain support for shorthand:
+#
+#    # Same as above, shorthand.
+#    string do_something(void)
+#
+#While most functions return 0 exit status, some do not. How about this:
+#
+#    # Function returning a string of standard output and no standard error
+#    # and non-zero exit status on failure.
+#    [string, void, boolean] do_something(void)
+#
+#    # Or, again:
+#    [stdout: string, stderr: void, status: boolean] do_something(void)
+#
+#Status may either be "void" (i.e., always returns 0), "boolean" (i.e.,
+#either returns 0 or 1), or "integer" (i.e., returns a variety of statuses.
+#
+#Ah! Another way in which the labels are demonstrably superior: in may cases,
+#we'll want to specify "stdout" and "status" but not "stderr". So, that's just:
+#
+#    [stdout: string, status: boolean] do_something(void)
+#
+#Naturally, order no longer matters. Sweet! I'm thinking we *ABSOLUTELY*
+#shouldn't support the abbreviated "[stdout, void, boolean]" style, yes? Far too
+#much ambiguity and head-scratching.
+#FUXME: The specification below has become sufficiently complex to warrant a BNF.
+#I know, I know. But we'll make it simple and concise, with adequate commenting.
+#There's really no better way.
+
+# ....................{ GLOBALS                            }....................
+#FUXME: This is terrible. Eliminate such global entirely; instead, simply
+#attempt to run a dynamically constructed command
+#${variable_type}_global_export().
+
+#set_global_documentation ZESHY_GLOBAL_TYPE_TO_DECLARATOR '
+#map ZESHY_GLOBAL_TYPE_TO_DECLARATOR
+#
+#Map variable type to the declarator (i.e., command prefix) declaring and
+#exporting globals of such type.
+#'
+#typeset -Agx ZESHY_GLOBAL_TYPE_TO_DECLARATOR
+#ZESHY_GLOBAL_TYPE_TO_DECLARATOR=(
+#    # String types.
+#    string    'export'
+#    boolean   'export'
+#    character 'export'
+
+    # Integer types.
+#    integer         'export -i'
+#    file_descriptor 'export -i'
+#
+    # Float types.
+#    float 'export -F'
+#
+#    # List types.
+#    list     'export -a'
+#    list_set 'export -Ua'
+#
+#    # While "export -a" succeeds (as above), "export -A" fails with error.
+#    # Hence, revert to builtin typeset().
+#    map 'typeset -Agx'
+#)
+
+        # If such global''s type is not a Zeshy-specific type, throw an
+        # exception. See is_map_key() for implementation details.
+#       (( ${+ZESHY_GLOBAL_TYPE_TO_DECLARATOR[${match[1]}]} )) ||
+#           die "\"${match[1]}\" not a zeshy type"
+
+        # Declare such global.
+#       ${(z)ZESHY_GLOBAL_TYPE_TO_DECLARATOR[${match[1]}]} "${match[2]}"
+
+# ....................{ MAIN                               }....................
+#FUXME: Not quite right. We also want to undefine all of the above aliases and
+#functions before Zeshy digest compilation, suggesting we create a new
+#precompilation hook performing all such undefinitions. I can't imagine that
+#order matters, there; so, just add a customary precompilation hook here.
+
+#:run_hook_on_zeshy_precompile precompile_zeshy_documentation_undefine
+
+#declare_function '
+#void precompile_zeshy_documentation_undefine(void)
+#
+#Undefine all documentation-defining runnables (e.g., set_alias_documentation(),
+#declare_global()) *AFTER* sourcing all Zeshy components calling such runnables
+#and hence having defined all available documentation. To  Zeshy caches 
+#The documentation such runnables
+#'
+#function precompile_zeshy_documentation_undefine() {
+#    # Undefine lower-level documentators, hereafter replaced by the previously
+#    # defined higher-level documentators. Do so here for code convenience rather
+#    # than necessity.
+#    unfunction\
+#        set_alias_documentation\
+#        set_function_documentation\
+#        set_global_documentation
+#}
+
+#FUXME: Rename "[or]" to "[or]" everywhere. Avoid simply "or", as that isn't
+#subject to global replacement.
+# For simplicity, this function ignores 
+# such low-level distinctions, accepts
+# (e.g., "boolean", "list", "string"). If 
+#
+#While most functions have only one name, zsh does permit additional names to be
+#declared in function declarations with the above whitespace-delimited syntax.
+#
+#Capitalized strings denote the following semantics:
+#
+#* "RETURN_TYPE", the Zeshy-specific type of variable returned by such function
+#  (e.g., "boolean", "list", "string").
+#* "FUNCTION_NAME_1", the first name for such function. While most functions have
+#  only one name, zsh permits additional names to be declared in a function
+#  declaration with the above whitespace-delimited syntax.
+
+# *BEFORE* compiling Zeshy''s user digest file
+# (i.e., at the top level of Zeshy components and in precompilation hooks).
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    #FUXME: *THIS IS ABSURD*. It's currently working, yes. But there's no
+    #reason to perform such heavy-weight functionality here. Shift *ALL* such
+    #documentation functionality to "always/00-setup/00-document/document".
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Define declare_function() before declare_alias(), which documents itself
+# with the former function.
+# For efficiency when not recompiling Zeshy's user digest file, default such
+# runnables to noop. When recompiling such file, redefine such runnables to
+# actually document the passed object.
+#alias declare_alias=':' declare_function=':' declare_global=':'
+
+# Define aliases subsequently expanded by Zeshy's user configuration files,
+# defined here rather than in "config" to avoid excessive global variables.
+# (Namely, a new global boolean ${ZESHY_USER_DIGEST_FILE_IS_OUTDATED} would be
+# required for tracking such state.)

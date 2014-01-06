@@ -1,0 +1,394 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'/---'
+Handle *terminal color hooks* (i.e., functions run on `zeshy` precompilation and
+startup establishing terminal attributes and color globals).
+/---
+
+# ....................{ PRECOMPILERS                       }....................
+# Initialize all remaining color globals before compiling zeshy's user digest
+# file, ensuring such globals to be compiled into such file and hence *ALWAYS*
+# accessible on zeshy startup. Such hook function expands configuration-specific
+# globals inaccessible until precompilation (e.g., ${ZESHY_STYLE_TO_COLOR_NAMES})
+# and hence cannot be reduced to an anonymous function run immediately here.
+:run_hook_on_zeshy_precompile precompile_zeshy_terminal_color
+
+declare_function_with_stdin <<'/---'
+void precompile_zeshy_terminal_color(void)
+
+Initialize color-specific globals to be compiled into `zeshy`\'s user digest
+file. If the number of colors supported by the current terminal differs from
+such number on subsequent `zeshy` startup, startup_zeshy_terminal_color() will
+necessarily reinitialize globals whose values depend on such colors.
+/---
+function precompile_zeshy_terminal_color() {
+    # Validate sanity.
+    die_if_args
+
+    # Convert human-readable, user-configured color maps into machine-readable,
+    # zeshy-compiled color maps.
+    precompile_zeshy_terminal_color_map\
+        ZESHY_STYLE_TO_COLOR        ZESHY_STYLE_TO_COLOR_NAMES
+    precompile_zeshy_terminal_color_map\
+        ZESHY_STYLE_TO_COLOR_PROMPT ZESHY_STYLE_TO_COLOR_NAMES_PROMPT
+
+    # Delimit prompt-specific color values by "%{" and "%}" to prevent prompt
+    # colors from erroneously contributing to prompt string length.
+    string style color
+    for    style color ("${(kv@)ZESHY_STYLE_TO_COLOR_PROMPT_8}") {
+        ZESHY_STYLE_TO_COLOR_PROMPT_8[${style}]="%{${color}%}"
+    }
+
+    # Initialize color globals *AFTER* initializing the prior maps.
+    set_terminal_color_globals
+}
+
+declare_function_with_stdin <<'/---'
+void precompile_zeshy_terminal_color_map(
+    string target_map_name_prefix, string source_map_name)
+
+Set maps `${target_map_name_prefix}_2` and `${target_map_name_prefix}_8` from
+the passed source map. Specifically, for each key-value pair of such source map:
+
+* Set the value for the same key of `${target_map_name_prefix}_2` to the
+  empty string.
+* Set the value for the same key of `${target_map_name_prefix}_8` to the
+  color-specific ANSI escape sequence specified by such source value, where the
+  latter is a `:`-delimited list of keys of map ${ZESHY_ANSI_SGR_NAME_TO_VALUE}.
+  See ${ZESHY_STYLE_TO_COLOR_NAMES} for further details.
+/---
+function precompile_zeshy_terminal_color_map() {
+    # Validate sanity.
+    die_unless_args_2\
+        'expected one target map name prefix and one source map name'
+    string\
+        map_name_target_prefix="${1}"\
+        map_name_source="${2}"\
+        map_name_target_2\
+        map_name_target_8\
+        ansi_csi\
+        color_name\
+        color_value
+    integer color_name_index
+
+    # Target map names, constructed from such prefix.
+    map_name_target_2="${map_name_target_prefix}_2"
+    map_name_target_8="${map_name_target_prefix}_8"
+    die_unless_maps\
+        "${map_name_target_2}"\
+        "${map_name_target_8}"\
+        "${map_name_source}"
+
+    # List of color names split from the concatenated string of such names
+    # corresponding to the current value of the map iterated below.
+    list color_names
+
+    # Magic string prefixing all ANSI SGR escape sequences, consisting of the
+    # magic string ANSI CSI prefixing all ANSI escape sequences in general
+    # followed by the ANSI SGR value resetting color attributes to defaults.
+    ansi_csi="${ZESHY_ANSI_CSI}${ZESHY_ANSI_SGR_NAME_TO_VALUE[reset]}${ZESHY_ANSI_SUFFIX_NEXT}"
+
+    # Assign each color style its corresponding ANSI color. See
+    # for_map_key_value_pairs() for further details.
+    string style color_names_string color_name
+    for    style color_names_string ("${(kv@P)map_name_source}") {
+        # If such style is empty, throw an exception. Since empty color names
+        # are acceptable (e.g., to suggest the defaults for such style), do
+        # *NOT* throw an exception if such color names string is empty.
+        (( ${#style} )) or die\
+            "${ZESHY_STYLE_TO_COLOR_NAMES} contains an empty style with color \"${color_names_string}\""
+
+        # Force such color names string to lowercase. See lowercase_string() for
+        # further details.
+        color_names_string="${(L)color_names_string}"
+
+        #FIXME: I'm pretty sure everything else in this applies generally to
+        #256 color terminals. But this is *CLEARLY* specific to 8- and 16-color
+        #terminals and hence should be shifted to whatever new place that we
+        #handle their mapping. 256 color terminals support *MUCH* saner
+        #greyscale colors than this ad-hoc nonsense.
+
+        # Foreground greyscale colors are notoriously off, assigning the color
+        # white a greyish rather than white color value and defining no color
+        # grey. To correct this, test whether the current color names contain
+        # such colors and modify such names *BEFORE* splitting such names below.
+        #
+        # If such color names contain a white color in regular typeface (i.e.,
+        # neither bold or weak), replace such color with intense white.
+        if is "${color_names_string}" == *"white"* and
+              "${color_names_string}" != *("bold"|"weak")* si {
+            color_names_string="${color_names_string//white/intense_white}"
+        # Since "grey" is a zeshy-specific pseudo-color, such color values must
+        # be aggregated together from genuine white and black color values.
+        } elif is "${color_names_string}" == *"grey"* si {
+            case  "${color_names_string}" {
+            # If such color is bold, replace such color with non-bold white.
+            *"bold"*) color_names_string="${${color_names_string//grey/white}//bold}";;
+            # If such color is weak, replace such color with non-weak black.
+            *"weak"*) color_names_string="${${color_names_string//grey/black}//weak}";;
+            # Else, replace such color with bold black.
+            *)        color_names_string="${color_names_string//grey/black:bold}";;
+            }
+        }
+
+        # Split such color names on colons. See
+        # set_list_to_string_split_on_string() for further details.
+        color_names=( ${(s~:~)color_names_string} )
+
+        # Initialize the mapping from such style to color value to the ANSI CSI,
+        # a magic string prefixing all ANSI escape sequences.
+        color_value="${ansi_csi}"
+
+        # For each color name split from such string of names...
+        for (( color_name_index=1;
+               color_name_index <= ${#color_names};
+               color_name_index++ )) {
+               color_name="${color_names[${color_name_index}]}"
+
+            # If such color name is empty (e.g., due to programmatically
+            # deleting such name above), continue to the next.
+            (( ${#color_name} )) or continue
+
+            # If such color name is unrecognized, throw an exception.
+            (( ${+ZESHY_ANSI_SGR_NAME_TO_VALUE[${color_name}]} )) or
+                die_unless_map_key ZESHY_ANSI_SGR_NAME_TO_VALUE "${color_name}"
+
+            # Else, append the ANSI SGR value of such color.
+            color_value+="${ZESHY_ANSI_SGR_NAME_TO_VALUE[${color_name}]}"
+
+            # If this is the last such value, terminate such sequence.
+            if (( color_name_index == ${#color_names} )) {
+                color_value+="${ZESHY_ANSI_SUFFIX_LAST}"
+            # Else, delimit such value from subsequent values.
+            } else {
+                color_value+="${ZESHY_ANSI_SUFFIX_NEXT}"
+            }
+#           print "${map_name_target_8}[${style}]+=${color_name}"
+        }
+
+        # Map the polychrome and monochrome colors for such style to such value
+        # and the empty string respectively.
+        eval ${map_name_target_8}'[${style}]="${color_value}"
+            '${map_name_target_2}'[${style}]='
+#       eval 'print "'${map_name_target_8}'[${style}]: ${'${map_name_target_8}'[${style}]}color"'
+    }
+}
+
+# --------------------( WASTELANDS                         )--------------------
+    #FUXME: Rename to define_global_x11_color_name_to_rgb_hexadecimal().
+        #FUXME: O.K.; we have the ${target_index}. Now, we need to concoct an
+        #ANSI OSC (?) sequence displaying the color corresponding to such index.
+
+        #FUXME: Parse such hex value into discrete RGB integer values. Then,
+        #decide what to do. Namely:
+        #
+        #* If all three values are equal, first attempt to map such values to
+        #  256-color greyscale indices (...using a transform I haven't really
+        #  even thought about, though it should be exceedingly simple).
+        #* Else, first attempt to map such values to 256-color color cube
+        #  indices using the transform below.
+        #
+        #Then, determine which mapping most closely maps to such color. After
+        #determining that, set a new entry of a new global map from such color
+        #name to the ANSI sequence displaying such mapped color. *phew*
+        #FUXME: Wait; no. The color cube contains greyscale mappings as well.
+        #Just indiscriminantly map to both in arbitrary order and then compare.
+
+#   float factor; factor=$(( 5.8056465992094 * 10**-8 ))
+#           0.016126817172149*(color_value - 46) +\
+#           0.00895182756535989*exp(0.0247607306726445*(color_value - 46)) +\
+#           0.99104817243464016 ) ))
+
+#'s 24-bit RGB value to the 8-bit colors displayed by
+#FUXME: Actually, Euclidean distance is overkill (and probably wrong as well).
+#The reason? The fact that there only 
+
+#for simplicity, RGB. While we choose RGB for simplicity,
+#this may not be the <<define_globals_color_cube.caveats,ideal choice>>
+#we decide which of the two sets
+#of indices best approximates such color -- then accept that set and ignore the
+#other. 
+# *BEFORE*
+        # mapping such color to the closest index in any dimension of the 6x6x6
+        # color cube, which requires destructively offsetting such color
+#To guarantee such generalization captures all colors
+#with names containing the word `grey` in the X11 color database, we define
+#``sufficiently small'' 
+#
+#In this case,
+#``grey'' 
+#
+#The maximum distance between components at which an RGB color can still be said
+#to be ``grey'' should be chosen on the practical basis of the set of X11 colors.
+#Specifically, such 
+
+#Since color index 0 contains the darkest bin .
+#------------------------------------------
+#>>> list color_value_midpoints; color_value_midpoints=(50, 98, 143, 184, 220)
+#------------------------------------------
+#
+#Given such midpoints, the size of each color bin then becomes:
+#
+#. 50 possible colors map to color index 0.
+#. 48 possible colors map to color index 1.
+#. 45 possible colors map to color index 2.
+#. 41 possible colors map to color index 3.
+#. 36 possible colors map to color index 4.
+#. 30 possible colors map to color index 5.
+#------------------------------------------
+#x	y
+#0	0
+#51	1
+#99	2
+#144	3
+#185	4
+#221	5
+#256	6
+#------------------------------------------
+#[source]
+#------------------------------------------
+#>>> integer color_value color_index
+#>>> color_index=$((\
+#...     0.0196327201550869*color_value +\
+#...     5.8056465992094*(10**-8)*(color_value**3) ))
+#------------------------------------------
+#
+#Such equation enjoys remarkably low error (R^2 = 0.99995461) and complexity
+#(size = 11 in Eureqa parlance). Note the implicit rounding down, as well. This
+#results in mapping each RGB component in the range:
+#
+#. [0, 50] to color index 0, containing 50 colors.
+#. [51, 100] to color index 1, containing 49 colors.
+#. [101, 143] to color index 2, containing 42 colors.
+#. [144, 185] to color index 3, containing 41 colors.
+#. [186, 222] to color index 4, containing 36 colors.
+#. [223, 255] to color index 5, containing 32 colors.
+#
+#   color_index=$((\
+#       0.0196327201550869*color_value +\
+#       5.8056465992094*(10**-8)*(color_value**3) ))
+    # Precompute all mappings from 24-bit RGB color values in [0, 255] to the
+    # corresponding 8-bit RGB . See documentation above
+    # for the derivation of such mapping.
+#   for (( color_value=0; color_value < 255; color_value++ )) {
+#   }
+
+    #FUXME: To determine which mapping is closest, it'd be great to apply a
+    #genuine error function and then simply choose the mapping with minimum
+    #error. I recall the "zsh/mathfunc" module supporting such a function,
+    #fortunately. Examine!
+
+#FUXME: There remain two things to document:
+#
+#* How we quantize to the greyscale ramp. (Honestly, we haven't quite got that
+#  sorted ourselves.)
+#* How we determine whether the color cube or greyscale approximation is closest
+#  to the current color's actual value.
+#
+#As for the former, note that simplistic midpoints for the greyscale ramp are:
+#
+#[source]
+#------------------------------------------
+#>>> list grey_value_midpoints; grey_value_midpoints=(
+#...     13, 23, 33, ..., 213, 223, 233)
+#------------------------------------------
+#
+#This results in mapping each RGB component in the range:
+#
+#. [0, 13] to grey index 0, containing 14 greys.
+#. [14, 23] to grey index 1, containing 10 greys.
+#. [24, 33] to grey index 2, containing 10 greys.
+#. ...
+#. [214, 223] to grey index 21, containing 10 greys.
+#. [224, 233] to grey index 22, containing 10 greys.
+#. [234, 255] to grey index 23, containing 22 greys.
+#
+#Note the uniformity of all bins _except_ the first and latter, containing
+#slightly and substantially more greys than the others. While regrettable,
+#colors sufficiently close to pure black or pure white should already have been
+#successfully mapped to the corresponding indices of the 6x6x6 color cube. Since
+#such mapping should better approximate such colors than the above greyscale
+#mapping, the latter should be silently discarded after comparison with the
+#former. Such disparities in bin sizes should thus have negligible negative
+#impact, when all is said and done.
+#
+#While we could apply the former technique of regression analysis to deriving a
+#similar equation for mapping to greyscale, such ramp's uniformity recommends a
+#simplistic algebraic approach:
+#
+#[source]
+#------------------------------------------
+#>>> integer grey_value grey_index
+#>>> grey_index=$(( (grey_value - 4)/10 ))
+#>>> if (( grey_index > 23 )) { grey_index == 23 }
+#------------------------------------------
+#
+#As <<define_globals_color_cube.waste,previously discussed>>, such ramp is
+#artificially constrained to 24 indices. Color values mapping to nonexistent
+#0-based index 24 (i.e., 1-based index 25) must thus be clamped to the final
+#0-based index 23 (i.e., 1-based index 24) with an `if` conditional. Sadly, this
+#includes all color values in [244, 255]. In any case, the above logic generates
+#the following mapping:
+#
+#.Equation-based Greyscale Mapping
+#[cols=">strong,^,^strong,<emphasis",options="header"]
+#|===============================================================================
+#| grey value | grey index (float) | grey index (integer) | notes
+#|   0        | -0.4               |  0 | after rounding down
+#|   3        | -0.1               |  0 | after rounding down
+#|   4        |  0.0               |  0 | after rounding down
+#|  13        |  0.9               |  0 | after rounding down
+#|  14        |  1.0               |  1 | after rounding down
+#|  23        |  1.9               |  1 | after rounding down
+#|  ...       |  ...               | ...| ...
+#| 224        | 22.0               | 22 | after rounding down
+#| 233        | 22.9               | 22 | after rounding down
+#| 234        | 23.0               | 23 | after rounding down
+#| 243        | 23.9               | 23 | after rounding down
+#| 244        | 24.0               | 23 | after clamping down
+#| 255        | 25.1               | 23 | after clamping down
+
+#'s uniformity recommends a
+#simplistic algebraic approach:
+# Omitting the remaining 16 midpoints for brevity, these are:
+#Simplistic midpoints for the greyscale ramp are:
+#the distance
+#between the two newly converted colors must be measured against the original 24-
+#bit RGB color and the converted color with minimum distance accepted as the
+#closest quantization.
+
+#$(( 16 + (${color_value_red}*6* $cube) + (map_cube($green) * $cube) + map_cube($blue),
+#
+#index = 16 + index_red*36 + index_green*6 + index_blue
+#index_red = index 
+#
+#After we parse the 
+#
+#color_value_red=$(( $color_index_red * 40 + 55 ))
+
+#hypotenuse of a *tetrahedron* (i.e., a three-dimensional triangle) in the traditional Pythogorean Theorem: e.g.,
+#such indices must be converted
+#back to RGB colors and the  of the former or latter
+
+#does _not describe 
+#no 25th index for a theoretical last greyscale value of `#f8f8f8`. Since the
+#prior equation simplistically assumes such value,
+
+#Since 
+#, complete with floating point indices prior to rounding down and integer indices following such rounding
+
+#In practice, since such disparity seems
+#sufficiently small as to be effectively negligible.
+#grey_index(  0) = -0.4 ~= 0
+#grey_index(  3) = -0.1 ~= 0
+#grey_index(  4) =  0.0 ~= 0
+#grey_index( 13) =  0.9 ~= 0
+#grey_index( 14) =  1.0 ~= 1
+#grey_index( 23) =  1.9 ~= 1
+
+#ence, the set of 24 greyscale color values in decimal is:
+#either the canonical 6x6x6 color cube consisting of 216 non-greyscale colors _or_ the
+#greyscale ramp consisting of 24 greyscale colors.. in the -- or.
