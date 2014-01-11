@@ -169,6 +169,236 @@
 #  "--debug", since config auto-copying is independent of whether or not we're
 #  debugging), disable auto-copying. It's simply not beneficial. It obstructs.
 #* Else, enable auto-copying.
+#FIXME: Right. So, the above is all sensible -- particularly the caching of MD5
+#sums for configuration files. However, we can do better. *MUCH* better. To do
+#so, consider a fundamentally different approach. What if, when the user makes
+#custom changes to zeshy configuration files, we could store the exact changes
+#such user just made to a zsh script? If we could do that (which we demonstrate
+#below we can), then we can smoothly automate the upgrade process such that *NO*
+#manual user intervention should be required (unlike, say, Gentoo upgrades), as
+#follows:
+#
+#* On detecting a change to the current version of zeshy and hence a probable
+#  upgrade:
+#  * Check whether the zsh script caching the user's prior changes to
+#    configuration files exists. If not, print a warning and do *NOT* proceed
+#    with the instructions below. (This implies that such script should always
+#    be initialized to a 0-byte file, even when the user has made no changes, to
+#    distinguish between the erroneous case that such file has been erroneously
+#    deleted or moved and the non-erroneous case that no changes have been made.)
+#  * Assuming such script exists, move the user's entire zeshy configuration
+#    directory to "/tmp" (e.g., "mv ~/.zeshy/config /tmp"), thus preserving such
+#    directory while getting it out of the way.
+#  * Copy over all applicable configuration files for the current system from
+#    the newly upgraded zeshy, as usual. (No changes here, clearly.)
+#  * Now for the critical part: source or run the previously cached zsh script,
+#    thus "replaying" all prior custom changes the user made to the old
+#    configuration files to the in-memory copy of such globals.
+#  * Great! But we're only halfway there, yet. We still need to serialize such
+#    changes back to disk -- specifically, to the new configuration files. It's
+#    not particularly difficult to write variables back to disk, of course, but
+#    we'd love to preserve the original documentation in such file, too.
+#    Frankly, the only sane way to do this will be as follows:
+#    * Define a new function "string :output_parcel_declarer(string parcel_name)"
+#      (or perhaps an equivalent setter, to avoid subshell inefficiency)
+#      outputting out a string declaring documentation for the passed parcel.
+#    * Define a similar function "string :output_global_declarer(string parcel_name)".
+#      That's all we should need for configuration files, which should *NEVER*
+#      define new aliases or functions.
+#    * Then, programmatically reconstruct each modified configuration file by
+#      first overwriting such file with (in order): the corresponding parcel
+#      declaration and, for each global previously defined by such file, the
+#      corresponding global declaration followed immediately by the new
+#      definition of such global.
+#
+#Hmmm. The latter is particularly problematic, however; while that *WOULD* work,
+#it would also completely discard beneficial formatting in modified
+#configuration files, which is completely unhelpful.
+#
+#Before we get to reconsidering that, however, how exactly do we even write such
+#script in the first place? First, note that it's trivial to determine which
+#configuration files have been modified by simply comparing the mtime (we only
+#care about changes to file *CONTENT* here and hence don't care about ctime) of
+#each source zeshy configuration file with the mtime of the corresponding target
+#user configuration file. There's probably a number of heuristics with which to
+#optimize such comparison, but by far the simplest would be to simply
+#recursively touch *ALL* target user configuration files (hence changing their
+#mtimes to the current time) when copying *ANY* such file; this ensures that
+#unchanged files *ALL* share the same mtime, which could readily be stored as a
+#global integer to the digest compiled at the same mtime -- say,
+#${ZESHY_USER_CONFIG_DIR_MTIME}. Finding changed configuration files thus
+#reduces to a recursive list assignment resembling:
+#
+#    :int path_mtime
+#    :list filenames_config_changed; filenames_config_changed=(
+#        "${ZESHY_USER_CONFIG_DIR}"/**/*(-.e^'\
+#            :set_int_to_path_mtime path_mtime "${REPLY}";\
+#            (( path_mtime > ZESHY_USER_CONFIG_DIR_MTIME ))\
+#        '^)"
+#    ) or ignore_failure
+#
+#That's it. So, we efficiently find all changed files. What then? Then we need
+#to winnow down exactly what changed within such files: specifically, which
+#globals were changed and how. We'll tackle this in two parts: first, how do we
+#find which globals were changed? This part is quite simple, fortunately, thanks
+#to the fact that *ALL* configuration globals should be declared with
+#:declare_global(). Given the associative mappings between a parcel and all
+#globals formally declared by that parcel, we know exactly which globals such
+#file defines. Great! So here's how we find which changed. For each changed
+#configuration file:
+#
+#* Source the corresponding source configuration file, thus resetting all
+#  globals to their original values.
+#* For each such global, iteratively copy such global to a new global with
+#  similar name (e.g., from ${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN} to
+#  ${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN_old}).
+#* Source the corresponding target configuration file, thus returning all
+#  globals to their changed values.
+#* For each such global, compare the stored old value for such global to the
+#  new value for such global. This trivially reduces to an "is ... == ..."
+#  comparison for scalar globals, of course. For list globals, we *COULD*
+#  attempt to flatten such globals to scalars and then perform a similar
+#  comparison, but I'm unconvinced that would work reliably on edge cases. For
+#  robustness, it'll be necessary to define a new :is_list_equals() function
+#  efficiently comparing two lists as follows:
+#
+#  * If the size of such lists differs, such function can immediately report
+#    failure without needing to check list contents.
+#  * Else, we'll need to check list contents. To do so reliably necessarily
+#    probably requires iteration of some sort. Wait! No, it doesn't. All we need
+#    to do is obtain the asymmetric list difference between the two lists. Since
+#    there exist two directions for such difference, we'll need to perform such
+#    difference twice, resulting in two temporary lists: one from the difference
+#    of such lists in one direction and the other from such difference in the
+#    other direction. Hmm. Alternately, we could also take the *SYMMETRIC* list
+#    intersection between the two lists. If the resulting list is the same size
+#    as either input list, then such lists must necessarily be equal. Right? I
+#    think so, but contemplate this a bit further. (And actually try it out, of
+#    course.)
+#
+#  For map globals, I hope a similar approach as just delineated would suffice
+#  for comparison. In any case, we *CAN* reliably, efficiently compare globals
+#  regardless of type.
+#* For each global that has been changed by the user, we want to produce one or
+#  more lines of zsh code changing the default value for such to the user's
+#  custom value for such global. For example, given a list global defaulting to:
+#
+#    ZESHY_LIST=( a b c d e f )
+#
+#  ...and a user's custom value for such global of:
+#
+#    ZESHY_LIST=( a b c d e g )
+#
+#  ...the required line of code is as follows:
+#
+#    ZESHY_LIST[6]='g'
+#
+#  So, how do we find the minimal lines of code effecting such changes? Simple:
+#
+#  * For scalars, simply forcefully reassign the entire scalar variable to the
+#    new value. (We could split this apart into regular expression-based search
+#    and replace expressions or some such, but... Well, that's crazy talk. Most
+#    scalar configuration globals should be sufficiently short that simply
+#    reassigning their values will suffice.)
+#  * For lists, we'll need to determine *EXACTLY* which list items changed and
+#    then produce a line of code as above reassigning such item. There's
+#    probably no efficient means of implementing this aside from the obvious:
+#    just iterate over all items and compare each with scalar comparisons. Given
+#    that we're ultimately saving the user time by doing so, we reckon they can
+#    afford to wait a bit for such process.
+#  * For maps, identical reasoning holds.
+#
+#Ultimately, we'll have produced a number of lines resembling:
+#
+#    ZESHY_STRING='my new value'
+#    ZESHY_LIST[6]='g'
+#    ZESHY_MAP['my key']='my new value'
+#    ZESHY_MAP['simloo']='gamjee'
+#
+#Now, what if we group such lines according to the global they act upon into
+#small functions outputting such lines: e.g.,
+#
+#    function "::customize_config_file_global:command/my_command:ZESHY_STRING"() {
+#        output_string 'ZESHY_STRING="my new value"'
+#    }
+#    function "::customize_config_file_global:command/my_command:ZESHY_LIST"() {
+#        output_string 'ZESHY_LIST[6]="g"'
+#    }
+#    function "::customize_config_file_global:command/my_command:ZESHY_MAP"() {
+#        output_string '
+#           ZESHY_MAP["my key"]="my new value"
+#           ZESHY_MAP["simloo"]="gamjee"'
+#    }
+#
+#Great! We're nearly there. We simply cache all such functions to a new digest
+#(yup!) -- say "~/.zeshy/digest/config.zwc". We now have stored a recoverable
+#record of all configuration file changes -- including the exact file, global,
+#and code to effect such changes.
+#
+#What's left? We need to actually apply such changes in a meaningful manner,
+#transforming default source zeshy configuration files to custom target user
+#configuration files -- while preserving *ALL* original formatting in such files.
+#Is this even feasible? The answer, of course, is yes: but we'll have to
+#manually parse such files to do it. Fortunately, such files *WILL* adhere to a
+#strict syntax. Ours. As currently defined. That's it. So, how do we effect such
+#changes? For each such global:
+#
+#* First, we need to find the line such file defines such global on. This
+#  *WOULD* be simple, except that we currently define scalar and nonscalar
+#  globals in a slightly different manner, complicating parsing. But it's still
+#  not *TOO* bad. Anyway, it's annoying, but very feasible.
+#* If such global is a:
+#  * Scalar, the prior parsing should probably simply be a direct search-and-
+#    replace operation, replacing the current definition of such scalar with the
+#    string output by the corresponding ::customize_config_file_global*()
+#    function, as above.
+#  * List, we could either append such list's definition with the string output
+#    by the corresponding ::customize_config_file_global*() (easier, but
+#    complicates future edits to such global by the user) *OR* ideally
+#    dynamically construct a search-and-replace operation finding the nth item
+#    of such list and replacing such item with the desired new value. Since the
+#    former approach also requires perfect list parsing and produces a much less
+#    desirable outcome, we should definitely aim for the latter approach. Ah!
+#    Actually, there are three different type of list changes to consider:
+#    * Changes to existing list items, which the above approach handles.
+#    * Deletions of existing list items, recorded like so:
+#      output_string 'ZESHY_LIST[5]=()'
+#      Not terribly hard to handle. Just perform a search-and-replace where the
+#      replacement string is the empty string. Done.
+#    * Additions of new list items. We'll want to distinguish this from the case
+#      of changing list items... Hmm. Right. I hereby suggest a new approach.
+#      Rather than merely outputting code, instead have such functions *CALL*
+#      the desired functions effecting such changes: e.g.,
+#
+#      function "::customize_config_file_global:command/my_command:ZESHY_MAP"() {
+#          :set_config_file_global_map_key_value\
+#              "command/my_command" ZESHY_MAP 'simloo' 'gamjee'
+#          :append_config_file_global_map_key_value\
+#              "command/my_command" ZESHY_MAP 'my key' 'my new value'
+#          :remove_config_file_global_map_key_value\
+#              "command/my_command" ZESHY_MAP 'unwanted key'
+#      }
+#
+#      O.K.; that's pretty sweet.
+#  * Map, pursue an identical approach as for lists.
+#
+#The inevitable question arises: what if attempting to automatically apply a
+#change fails? This *WILL* happen all the time, though hopefully not in the
+#common case. Consider, for example, a user customizing the value of a map key
+#we remove in a subsequent version of zeshy. What's the right thing to do?
+#Simple. Inform the user with a vivid warning on updating zeshy, and allow them
+#to manually reapply such change in some fashion if they so desire. But in
+#*MOST* cases, the above approach should suffice. I can't think of *ANY* other
+#CLI software in existence going to such lengths. Nearly all simply ignore the
+#issue. But it's not really ignorable, here.
+#
+#Naturally, this is all an incredible amount of work. We estimate about a
+#month's worth. That's a huge investment. But it *WOULD* be worth it. And it
+#would work. We're fully confident of that now.
+#
+#That said, we really want to pluck the low-hanging fruit by implementing MD5-
+#based config file updating, first. Way easier and fairly essential to making
+#zeshy updates at least moderately sane.
 
 #FIXME: It's not *IMMEDIATELY* pressing, but there probably exist race
 #conditions in the event two zeshy shells startup at a similar time and the
