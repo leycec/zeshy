@@ -237,15 +237,39 @@
 #        '^)"
 #    ) or ignore_failure
 #
-#That's it. So, we efficiently find all changed files. What then? Then we need
-#to winnow down exactly what changed within such files: specifically, which
-#globals were changed and how. We'll tackle this in two parts: first, how do we
-#find which globals were changed? This part is quite simple, fortunately, thanks
-#to the fact that *ALL* configuration globals should be declared with
+#Ah. Wait. While the above *WOULD* work, it's extreme overkill. We already have
+#all the tools required to find changed configuration files without needing to
+#touch files or maintain new globals. How? Simple: the digest file. Grab the
+#mtime of the current digest file *BEFORE* it's recompiled, then use the above
+#recursive list assignment technique to find all files newer than such mtime.
+#Done. Solved. Simple. Moving on!
+#
+#So, we efficiently find all changed files. What then? Then we need to winnow
+#down exactly what changed within such files: specifically, which globals were
+#changed and how. We'll tackle this in two parts: first, how do we find which
+#globals were changed? This part is quite simple, fortunately, thanks to the
+#fact that *ALL* configuration globals should be declared with
 #:declare_global(). Given the associative mappings between a parcel and all
 #globals formally declared by that parcel, we know exactly which globals such
 #file defines. Great! So here's how we find which changed. For each changed
 #configuration file:
+#
+#=======================
+#Wait. Everything below applies, but it's not quite as efficient as it could be.
+#In particular, we should really:
+#
+#* For each such global, iteratively copy such global to a new global with
+#  similar name (e.g., from ${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN} to
+#  ${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN_new}).
+#* Source the corresponding source configuration file, thus resetting all
+#  globals to their original values.
+#* For each such global, compare the stored new value for such global to the
+#  current original value for such global.
+#
+#Fairly obvious, in hindsight. The approach below has us sourcing *TWO* files,
+#while the approach above only one. *shrug*
+#
+#=======================
 #
 #* Source the corresponding source configuration file, thus resetting all
 #  globals to their original values.
@@ -305,8 +329,42 @@
 #    probably no efficient means of implementing this aside from the obvious:
 #    just iterate over all items and compare each with scalar comparisons. Given
 #    that we're ultimately saving the user time by doing so, we reckon they can
-#    afford to wait a bit for such process.
+#    afford to wait a bit for such process. Of course, this is complicated by
+#    the fact that there exist three sorts of meaningful list operations:
+#    * List additions (of new items).
+#    * List deletions (of existing items).
+#    * List item assignments (of existing items).
+#    That said, while it *WOULD* be nice to detect additions and deletions and
+#    we could theoretically do so, how exactly would one detect the situation of
+#    *BOTH* a list addition and deletion? Indeed, the more changes the user
+#    makes to a given list, the more it becomes clear that simply tracking all
+#    list item assignments that need to made to convert from the source to
+#    target lists not only suffices in the general case but is (arguably) the
+#    optimal solution.
 #  * For maps, identical reasoning holds.
+#
+#======================
+#Actually, we ascertain below that we *REALLY* want to produce customizer
+#functions tracking only scalar assignments and list and map item assignments:
+#e.g.,
+#
+#      function "::customize_config_file_global:command/my_command:ZESHY_MAP"() {
+#          # Need to pass an expected old value here, for safety checking.
+#          :set_config_file_global_map_key_value_old_and_new\
+#              "command/my_command" ZESHY_MAP 'my key' 'expected old value' 'desired new value'
+#
+#          # No need to pass an expected old value here, clearly.
+#          :append_config_file_global_map_key_value\
+#              "command/my_command" ZESHY_MAP 'my new key' 'desired new value'
+#
+#          # No need to pass *ANY* values here, clearly.
+#          :delete_config_file_global_map_key\
+#              "command/my_command" ZESHY_MAP 'my old key'
+#      }
+#
+#It takes us a bit of thought wrangling to arrive at the above conclusion. But,
+#there's the summation of it. Pretty sweet, eh?
+#======================
 #
 #Ultimately, we'll have produced a number of lines resembling:
 #
@@ -316,9 +374,10 @@
 #    ZESHY_MAP['simloo']='gamjee'
 #
 #Now, what if we group such lines according to the global they act upon into
-#small functions outputting such lines: e.g.,
+#small functions outputting such lines (in this example, for configuration file
+#"~/.zeshy/config/command/my_command"): e.g.,
 #
-#    function "::customize_config_file_global:command/my_command:ZESHY_STRING"() {
+#    function "::customize_config_file_global::ZESHY_STRING"() {
 #        output_string 'ZESHY_STRING="my new value"'
 #    }
 #    function "::customize_config_file_global:command/my_command:ZESHY_LIST"() {
@@ -331,7 +390,7 @@
 #    }
 #
 #Great! We're nearly there. We simply cache all such functions to a new digest
-#(yup!) -- say "~/.zeshy/digest/config.zwc". We now have stored a recoverable
+#(yup!) -- say "~/.zeshy/digest/config.zwc". We now have a perfectly recoverable
 #record of all configuration file changes -- including the exact file, global,
 #and code to effect such changes.
 #
@@ -391,6 +450,34 @@
 #*MOST* cases, the above approach should suffice. I can't think of *ANY* other
 #CLI software in existence going to such lengths. Nearly all simply ignore the
 #issue. But it's not really ignorable, here.
+#
+#Actually, it's not necessarily clear that *ANY* changes will fail if we adopt
+#the simplest approach of simply tracking low-level list and map item
+#assignments (easy) rather than higher-level list and map item additions and
+#deletions (*SIGNIFICANTLY* more difficult). In the former case, applying a
+#simple list or map item assignment should *ALWAYS* succeed, suggesting we won't
+#be able to reliably detect when such an assignment should actually fail. Hmmm;
+#I see. Right. To detect failure states, we'll need to revise such customizer
+#functions to store not only the desired new value for list and map items but
+#the expected old value. Such functions should then ensure that such list or map
+#actually contains the expected old value before applying the new value: e.g.,
+#
+#      function "::customize_config_file_global:command/my_command:ZESHY_MAP"() {
+#          :set_config_file_global_map_key_value_old_and_new\
+#              "command/my_command" ZESHY_MAP 'my key' 'expected old value' 'desired new value'
+#      }
+#
+#O.K.; the prior example *IS* great, but we *WILL* need to track additions and
+#deletions, for the obvious reason that deleted keys require no values to be
+#passed while added keys require only the new value to be passed. A single
+#:set_config_file_global_map_key_value_old_and_new() function, while great, does
+#*NOT* suffice to describe map key additions and deletions. (Obvious in
+#hindsight, we suppose.) So, we *WILL* need to detect and handle such
+#situations. No way around, I'm afraid.
+#
+#Again, just emit warnings when expectations are not met rather than throwing
+#fatal exceptions. (Obviously, don't go through with the change; just skip to
+#the next customizer.)
 #
 #Naturally, this is all an incredible amount of work. We estimate about a
 #month's worth. That's a huge investment. But it *WOULD* be worth it. And it
