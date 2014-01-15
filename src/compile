@@ -686,6 +686,196 @@
 #could certainly defining such function in this parcel, doing so would prevent
 #its compilation into the current digest file. *sigh*
 
+#FIXME: We've finally uncovered the optimal means of conditionalizing
+#configuration files based on current OS and window manager. The ultimate
+#solution, while exceedingly clever and orthogonal, will necessitate quite a bit
+#of legwork on our part -- including an implementation of a zsh preprocessor.
+#That's right: a zsh preprocessor, naturally implemented in pure-zsh. Why?
+#Consider what configuration files consist of: intermingled runtime
+#documentation with global variable definitions and occasional code. Given that,
+#there's no reasonable means by which we could produce two or more OS-specific
+#versions of a configuration file. Specifically, how would we keep the
+#documentation preceeding each global in synchronicity? And that documentation
+#*DOES* need to preceed each global.
+#
+#So, we need a different approach. Rather than distribute redundant copies of
+#configuration file documentation into multiple files, we centralize all such
+#documentation into a single file as we currently do. But then how do we
+#efficiently support multiple OSes? After all, we *REALLY* don't want runtime
+#logic in configuration files resembling:
+#
+#    if { :is_os_linux and :is_wm_x11 } {
+#        ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=(
+#            import scrot imlib2_grab 'xwd and xwdtopnm' )
+#    elif { :is_os_darwin } {
+#        ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=( apple_screenshotter )
+#    }
+#
+#Why? Because that's *TERRIBLE*. The end user shouldn't be expected to know
+#exactly what OS and windowing manager they're currently using *OR* to be able
+#to parse the above zeshy code. (Who knows what "darwin" means, anyway?)
+#
+#Instead, when producing target configuration files, we want to perform
+#in-memory filtering of *EVERYTHING* in the corresponding source configuration
+#files that doesn't apply to the current OS and windowing system. Hence, if on
+#X11 under Linux, we only want to produce the following two lines (rather than
+#the complex conditional above):
+#
+#    ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=(
+#        import scrot imlib2_grab 'xwd and xwdtopnm' )
+#
+#How do we reliably achieve this? The answer, of course, is both positively
+#insane and remotely clever: we dynamically transform in-memory each applicable
+#source configuration file into a zsh script consisting principally of calls to
+#:output_string(), where *ONLY* lines in the original source configuration file
+#applicable to the current system are passed to such function. Specifically, for
+#each line of such file:
+#
+#* If such line is prefixed by "#:", strip such prefix. Such lines constitute
+#  actual zsh code to be executed "as is" in the current shell.
+#* Else, force-quote the entire line (e.g., with "(qq)") and prefix such quotes
+#  with ":output_string ". Such lines constitute raw string literal lines to be
+#  output rather than executed as code.
+#
+#This produces a zsh script, which we then run as such (ideally, in the current
+#shell by calling source(), though that's only for efficiency; since we're not
+#running such script for the standard output it produces rather than for any
+#side-effects in the current shell, we could technically run such script under a
+#new zeshy interpreter -- though, again, that's silly). Redirect the standard
+#output of such script to the desired target configuration file, and we're done.
+#
+#Oh-ho-ho. Wait. No need to produce a temporary zsh script file, of course. Just
+#produce a temporary *IN-MEMORY STRING* whose contents are the code to be
+#executed producing the contents of the desired target configuration file; then,
+#just eval() such string and redirect the standard output of such eval() to the
+#desired target configuration file. Done!
+#
+#So. What would such a source configuration file resemble? Consider:
+#
+#
+#    #!/usr/bin/env zsh
+#
+#    declare_parcel_as_script_with_stdin <<'/---'
+#    Configure *command alternatives* (i.e., lists of all possible external commands
+#    providing similar functionality, listed in descending order of preference).
+#    /---
+#
+#    # ....................{ ABBREVIATIONS                      }....................
+#    declare_global_with_stdin list ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN <<'/---'
+#    List of all possible commands which which to implement
+#    :screenshot_screen_to_file(), in descending order of preference.
+#    /---
+#    #: if { :is_os_linux and :is_wm_x11 } {
+#    ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=(
+#        import scrot imlib2_grab 'xwd and xwdtopnm' )
+#    #: elif { :is_os_darwin } {
+#    ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=( apple_screenshotter )
+#    #: }
+#
+#*REGARDLESS* of which OS or windowing manager is currently being run, the
+#*EXACT SAME* in-memory zsh script is always produced from the above source.
+#Indeed, this suggests we could cache such intermediary scripts on-disk
+#somewhere (...though, as ever, that gets into inevitable desynchronization
+#issues). In any case, such in-memory script resembles:
+#
+#    :output_string '#!/usr/bin/env zsh
+#
+#    declare_parcel_as_script_with_stdin <<''/---''
+#    Configure *command alternatives* (i.e., lists of all possible external commands
+#    providing similar functionality, listed in descending order of preference).
+#    /---
+#
+#    # ....................{ ABBREVIATIONS                      }....................
+#    declare_global_with_stdin list ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN <<''/---''
+#    List of all possible commands which which to implement
+#    :screenshot_screen_to_file(), in descending order of preference.
+#    /---'
+#    if { :is_os_linux and :is_wm_x11 } {
+#    :output_string 'ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=(
+#        import scrot imlib2_grab ''xwd and xwdtopnm'' )'
+#    elif { :is_os_darwin } {
+#    :output_string 'ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=( apple_screenshotter )'
+#    }
+#
+#...which, as you'll notice, is valid zsh. When dynamically evaluated under a
+#Linux distro running an X11 windowing manager, the following target
+#configuration file is output as desired:
+#
+#    #!/usr/bin/env zsh
+#
+#    declare_parcel_as_script_with_stdin <<'/---'
+#    Configure *command alternatives* (i.e., lists of all possible external commands
+#    providing similar functionality, listed in descending order of preference).
+#    /---
+#
+#    # ....................{ ABBREVIATIONS                      }....................
+#    declare_global_with_stdin list ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN <<'/---'
+#    List of all possible commands which which to implement
+#    :screenshot_screen_to_file(), in descending order of preference.
+#    /---
+#    ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=(
+#        import scrot imlib2_grab 'xwd and xwdtopnm' )
+#
+#Woh! Vision of C preprocessor macros dance before my eyes. While not terribly
+#fond of macro systems in general (M4, I'm harshly glaring at you), it's
+#difficult to conceive of a more appropriate alternative in this instance. In
+#fact, the above is fairly bloody sweet.
+#FIXME: Of course, the approach described above of manually iterating source
+#configuration file lines is fairly inefficient. Instead, we want to perform
+#global string searching and replacement -- ideally glob-based, but PCRE if
+#necessary. We repeatedly match *EITHER* (e.g., "(...|...)"):
+#
+#* All characters from the current character (starting at the first, of course)
+#  *NOT* prefixed by substring "\n#:" up to but *NOT* including either the next
+#  substring "\n#:" or the string end, captured into match group 1.
+#* All characters from the current character prefixed by substring "\n#:" up to but
+#  *NOT* including either the next substring "\n(?!#:)" (i.e., the next line *NOT*
+#  prefixed by substring "\n#:") or the string end, captured into match group 2.
+#
+#Right. That's looking like PCRE-based iteration, which is fine. Then,
+#conditionally depending on which match group is nonempty, we append such match
+#appropriately transformed onto the in-memory string holding such temporary zsh
+#script. Fairly simple, no?
+
+#FIXME: The current digest file depends on both zeshy-specific state (e.g.,
+#whether or not we're compiling a debug build) and system-specific state (e.g.,
+#the current OS and windowing manager in use). The current configuration tree
+#*NEEDS* to similarly depend on the system- but *NOT* zeshy-specific state. One
+#configuration tree should suffice for all possible zeshy states; however, the
+#same cannot be said of system states. Users should be able to seemlessly move
+#their entire "~/.zeshy" directory between not only different machines running
+#the same OS but between different machines running different OSes. To effect
+#the latter, we'll need to specifically create an intermediary subdirectory
+#directly under "~/.zeshy/config" named after all relevant system state: e.g.,
+#
+#    ~/.zeshy/
+#        config/
+#            current -> linux.gentoo.x11/
+#            linux.gentoo.mir/
+#                00-core/
+#                command/
+#            linux.gentoo.wayland/
+#                00-core/
+#                command/
+#            linux.gentoo.x11/
+#                00-core/
+#                command/
+#            darwin/
+#                00-core/
+#                command/
+#            windows/
+#                00-core/
+#                command/
+#
+#Note the symbolic link "current", linking to configuration tree
+#"linux.gentoo.x11/" in the above example. Such directory is both for user
+#convenience and zeshy use. Indeed, setting such symlink in a reliable manner
+#simplifies our selection of the configuration tree corresponding to the current
+#OS and windowing manager. (That is, assuming we set such symlink reliably, *NO*
+#existing code in this parcel needs to change to accommodate this improvement.)
+#
+#Parcel @{digest} should probably maintain such symlink, yes?
+
 #FIXME: Compilation is currently a bit... fragile. If *ANYTHING* goes wrong
 #during Zeshy codebase sourcing (particularly precompilation, which now performs
 #quite a bit of functionality), the digest file is never created or created
@@ -704,6 +894,18 @@
 #so without importing any heavyweight zsh modules or scripts; should be quite
 #doable, no? I wouldn't be terribly surprised if the exact sequences to be
 #printed are already readily Googleable.
+#FIXME: Indeed, digest compilation is decomposable into two segments:
+#
+#1. Overlay discovery, relatively fast. (Estimated 5% of time spent.)
+#2. Script sourcing, relatively slow. (Estimated 95% of time spent.)
+#
+#Given this, an empty progress bar should be displayed immediately prior to
+#overlay discovery, incremented to approximately 5% of the width of the screen
+#during such discovery, and then incremented to the remaining screen width
+#during such sourcing. Since we know *EXACTLY* how many scripts to be sourced
+#before doing so, the latter is readily accomplished; the former, however, must
+#be merely guestimated at. For example, we might estimate a maximum of 32
+#discovered overlays, and then increment the progress bar accordingly.
 
 # ....................{ MODULES                            }....................
 # Load all zsh modules required by this parcel or parcels this parcel sources.
@@ -984,7 +1186,7 @@ function ::compile_zeshy_overlay() {
     local -a dirnames_suboverlay
     [[ -d "${dirname_overlay}" ]] ||
         die "Overlay \"${dirname_overlay}\" not found or not a directory."
-    :output_line_if_debugging "Searching overlay \"${dirname_overlay}\"."
+    # :output_line_if_debugging "Searching overlay \"${dirname_overlay}\"."
 
     # If such overlay is *NOT* the topmost system-wide overlay, register all
     # files in such directory. The topmost system-wide overlay contains the
@@ -1016,6 +1218,7 @@ function ::compile_zeshy_overlay() {
             compile_suboverlay='::compile_zeshy_suboverlay_simple'
 
         # Compile such suboverlay.
+        :output_line_if_debugging "Searching suboverlay \"${dirname_suboverlay}\"."
         "${compile_suboverlay}" "${dirname_suboverlay}"
     }
 }
@@ -1135,19 +1338,22 @@ function ::compile_zeshy_suboverlay_if_pathable() {
 
 # void ::compile_zeshy_suboverlay_if_distro(string suboverlay_dirname)
 function ::compile_zeshy_suboverlay_if_distro() {
-    # Validate sanity. If such overlay contains no such suboverlay *OR* the
-    # current operating system is unrecognized, return.
+    # Validate sanity.
     (( # == 1 )) || die 'Expected one overlay dirname.'
     local dirname_suboverlay="${1}"
     [[ -d "${dirname_suboverlay}" ]] ||
         die "Suboverlay \"${dirname_suboverlay}\" not found or not a directory."
 
-    # If such suboverlay contains a suboverlay of the same name as the current
-    # operating system, register the latter; else, noop.
-    dirname_suboverlay+="if_distro/${ZESHY_DISTRO_NAME}"
+    # If the current operating system is unrecognized, return silently.
+    [[ -n "${ZESHY_DISTRO_NAME}" ]] || return 0
+
+    # If such overlay has a subdirectory with name such system, register such
+    # subdirectory as a suboverlay.
+    dirname_suboverlay+="/${ZESHY_DISTRO_NAME}"
     if [[ -d "${dirname_suboverlay}" ]] {
         ZESHY_OVERLAY_DIRNAMES+="${dirname_suboverlay}"
     }
+    # print "distro dir: ${dirname_suboverlay}"
 }
 
 # ....................{ PRECOMPILERS                       }....................
