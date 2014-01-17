@@ -1,0 +1,597 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'/---'
+Handle *operating system testers* (i.e., high-level functions testing whether
+the current operating system either is a particular operating system _or_
+belongs to a particular category or lineage of operating systems).
+/---
+
+# Note that canonical string global ${OSTYPE} is set during zsh compilation by
+# autotools script "configure.ac" to the autotools-specific string global
+# $host_os. Unfortunately, there appears to exist no definitive list of all
+# $host_os values, necessitating the ad-hoc approach. Fortunately, reliable
+# third-party sources matching a subset of such values do exist -- including:
+#
+# * "http://git.savannah.gnu.org/gitweb/?p=gnulib.git;a=blob_plain;f=build-aux/config.rpath;hb=HEAD",
+#   a shell script outputting variables setting the shared library runtime
+#   search path in the GNU gnulib library. See also the files
+#   "build-aux/config.library" and "m4/host-os.m4" in such library. Given that
+#   GNU also maintains autotools, this approximates a definitive list.
+# * "https://ftp.samba.org/pub/unpacked/ctdb/lib/replace/libreplace_ld.m4", the
+#   suite of autotools macro definitions for SAMBA's libreplace.
+# * "http://git.savannah.gnu.org/cgit/grub.git/plain/configure.ac", the
+#   autotools configuration for GRUB2.
+#
+# We intentionally exclude operating systems no longer under active development
+# (e.g., SunOS, SGI's IRIX, Hewlett Packard's Tru64 UNIX). Since zeshy requires
+# zsh >= 5.0.0, such systems are unlikely to run zeshy reliably (if at all).
+
+# ....................{ TESTERS                            }....................
+# For efficiency, define OS testers to statically report either success or
+# failure (rather than conditionally performing a test). See below for
+# function documentation.
+#
+# To add support for a new OS, automatically (rather than manually) define a new
+# tester for such OS by:
+#
+# * Adding its zeshy-specific name to local list ${os_names}.
+# * Matching its autotools-specific name and convert such name to its zeshy-
+#   specific name.
+# * Document function ":is_os_${os_name}", where "${os_name}" is its zeshy-
+#   specific name.
+
+() {
+    # List of all zeshy-specific OS names.
+    :list os_names; os_names=(
+        # BSD.
+        dragonfly_bsd freebsd netbsd openbsd
+
+        # GNU.
+        gnu_hurd gnu_kfreebsd gnu_kopensolaris
+
+        # Linux.
+        linux_android linux_gnu
+
+        # Unix System V.
+        aix hpux solaris
+
+        # Other.
+        aros darwin haiku qnx_neutrino windows )
+
+    # zeshy-specific name of the current OS system as one lowercase word.
+    :string os_name
+
+    # True if the current OS is explicitly recognized by zeshy. (Defaults to
+    # true.)
+    :bool is_os_recognized=1
+
+    # True if the current OS is a BSD derivative. (Defaults to false.)
+
+    :bool is_os_bsd=0
+
+    # True if the current OS supports the GNU toolchain. (Defaults to false.)
+    :bool is_os_gnu=0
+
+    # True if the current OS is a Unix System V derivative. (Defaults to false.)
+    :bool is_os_sysv=0
+
+    # Map from autotools- to zeshy-specific OS names. The latter tend to
+    # correspond more to the human-readable OS name than the former (e.g.,
+    # "gnu_hurd" rather than "gnu", a patently unfortunate choice of identifier)
+    # and, arguably more importantly, lack the OS versions frequently suffixing
+    # the latter (e.g., "aix" rather than "aix9").
+    case "${OSTYPE}" {
+    # Map recognized autotools- to zeshy-specific OS names.
+    'aix'*)                os_name='aix'; is_os_sysv=1;;
+    'aros'*)               os_name='aros';;
+    'darwin'*)             os_name='darwin';;
+    'dragonfly'*)          os_name='dragonfly_bsd';    is_os_bsd=1;;
+    'freebsd'*)            os_name='freebsd';          is_os_bsd=1;;
+    'haiku'*)              os_name='haiku';;
+    'hpux'*)               os_name='hpux';             is_os_sysv=1;;
+    'gnu'*)                os_name='gnu_hurd';         is_os_gnu=1;;
+    'kfreebsd'*'-gnu')     os_name='gnu_kfreebsd';     is_os_gnu=1; is_os_bsd=1;;
+    'kopensolaris'*'-gnu') os_name='gnu_kopensolaris'; is_os_gnu=1; is_os_sysv=1;;
+    'linux-android'*)      os_name='linux_android';;
+    'linux-gnu'*)          os_name='linux_gnu';        is_os_gnu=1;;
+    'netbsd'*)             os_name='netbsd';           is_os_bsd=1;;
+    'nto-qnx'*)            os_name='qnx_neutrino';;
+    'openbsd'*)            os_name='openbsd';          is_os_bsd=1;;
+    'solaris'*)            os_name='solaris';          is_os_sysv=1;;
+    ('cygwin'|'mingw')*)   os_name='windows';;
+    # Else, the autotools-specific OS name is unrecognized.
+    *)
+        # Since zeshy is likely to perform poorly under unrecognized OSes, print
+        # a nonfatal warning.
+        { print "zeshy: OS \"${OSTYPE}\" unrecognized" } to_stderr:
+        is_os_recognized=0
+
+        # Convert such name to a lowercase single word, converting all dashes
+        # and contiguous runs of one or more spaces to underscores.
+        os_name="${${(L)OSTYPE// ##/_}//-/_}"
+    }
+
+    # If the current OS was recognized, define the corresponding tester to
+    # always report success.
+    if (( is_os_recognized )) {
+        define_function ":is_os_${os_name}" 'die_if_args; report_success'
+
+        # If such OS is GNU/Linux, also define :is_os_gnu_linux() similarly.
+        if is "${os_name}" == 'linux_gnu' si {
+            define_function :is_os_gnu_linux 'die_if_args; report_success'
+        }
+
+        # Define all other individual OS testers to always report failure. For
+        # efficiency, remove the current OS name from the list of all possible
+        # OS names and iterate such list. See remove_list_items() for further
+        # details.
+        :string os_name_other
+        for     os_name_other ("${os_names[@]:#${os_name}}") {
+            define_function ":is_os_${os_name_other}"\
+                'die_if_args; report_failure'
+        }
+    }
+
+    # If the current OS is a BSD or Unix System V derivative or supports the GNU
+    # toolchain, define the corresponding tester to always report success; else,
+    # define such tester to always report failure.
+    if (( is_os_bsd ))  { define_function :is_os_bsd  'die_if_args; report_success'
+    } else              { define_function :is_os_bsd  'die_if_args; report_failure' }
+    if (( is_os_gnu ))  { define_function :is_os_gnu  'die_if_args; report_success'
+    } else              { define_function :is_os_gnu  'die_if_args; report_failure' }
+    if (( is_os_sysv )) { define_function :is_os_sysv 'die_if_args; report_success'
+    } else              { define_function :is_os_sysv 'die_if_args; report_failure' }
+
+    # If the current OS is a Linux distribution, define the corresponding tester
+    # to always report success; else, define such tester to always report failure.
+    # Since the autotools-specific names for all such OSes are prefixed by
+    # "linux", match such names with a plain glob.
+    if is "${OSTYPE}" == 'linux'* si { define_function :is_os_linux 'die_if_args; report_success'
+    } else                           { define_function :is_os_linux 'die_if_args; report_failure' }
+
+    # Define a setter setting the passed string to the current OS name.
+    define_function :set_string_to_os\
+       '# Validate sanity.
+        die_unless_arg "Expected one string name."
+        :string string_name__ssto="${1}"
+
+        # If such string is undefined or not of the expected type, throw an
+        # exception. See is_variable_string() for further details.
+        [[ "${(tP)string_name__ssto-}" == "scalar"* ]] || die\
+            ''${''${string_name__ssto}''} undefined or not a string.''
+
+        # Set such string. See set_string_to_string() for further details.
+        : "${(P)string_name__ssto::='${os_name}'}"'
+}
+
+# ....................{ TESTERS ~ other                    }....................
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_aros(void)
+
+Report success if the current operating system is an *AROS distribution* (i.e.,
+a distribution of the AROS Research Operating System, an open-source
+implementation of the AmigaOS 3.1 APIs).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_darwin(void)
+
+Report success if the current operating system has an Apple Darwin core. This
+implies such system to provide both the *XNU kernel* (i.e., hybrid kernel
+combining the Mach 3 microkernel and BSD 4.4 kernel subsystems) and well-known
+low-level open-source components (e.g., `launchd`, `mDNSResponder`). While both
+the OS X and iOS platforms leverage Darwin, this does _not_ necessarily imply
+the current system to also provide high-level closed-source components commonly
+associated with either platform (e.g., Carbon, Cocoa).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_haiku(void)
+
+Report success if the current operating system is *Haiku* (i.e., an open-source
+operating system compatible at both the source and binary level with the long-
+defunct BeOS).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_qnx_neutrino(void)
+
+Report success if the current operating system is *QNX Neutrino* (i.e., a Unix-
+like real-time operating system popular in the embedded systems market).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_windows(void)
+
+Report success if the current operating system is Microsoft Windows.
+/---
+
+# ....................{ TESTERS ~ bsd                      }....................
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_bsd(void)
+
+Report success if the current operating system is a *Berkeley Software
+Distribution (BSD) derivative* (i.e., a Unix operating system running a BSD
+kernel but _not_ necessarily the customary BSD toolchain). This includes:
+
+* DragonFly BSD.
+* FreeBSD.
+* GNU/kFreeBSD.
+* NetBSD.
+* OpenBSD.
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_dragonfly_bsd(void)
+
+Report success if the current operating system is DragonFly BSD.
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_freebsd(void)
+
+Report success if the current operating system is FreeBSD. This does _not_
+include GNU/kFreeBSD, which only provides the FreeBSD kernel (rather than both
+the FreeBSD kernel and corresponding userland toolchain).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_netbsd(void)
+
+Report success if the current operating system is NetBSD.
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_openbsd(void)
+
+Report success if the current operating system is OpenBSD.
+/---
+
+# ....................{ TESTERS ~ linux                    }....................
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_linux(void)
+
+Report success if the current operating system is a *Linux distribution* (i.e.,
+a Unix-like operating system running the Linux kernel), including but _not_
+limited to conventional GNU/Linux distributions.
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_linux_android(void)
+
+Report success if the current operating system is *Google Android* (i.e., a
+Linux distribution targetting touchscreen mobile devices).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] {:is_os_linux_gnu, :is_os_gnu_linux}(void)
+
+Report success if the current operating system is a *GNU/Linux distribution*
+(i.e., a Linux distribution providing the GNU toolchain).
+/---
+
+# ....................{ TESTERS ~ gnu                      }....................
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_gnu(void)
+
+Report success if the current operating system supports the *GNU toolchain*
+(i.e., suite of programming tools produced by the GNU Project). This excludes
+operation systems unaffiliated with GNU supporting an optional subset of such
+toolchain (e.g., via MacPorts under Apple Darwin).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_gnu_hurd(void)
+
+Report success if the current operating system is *GNU/Hurd* (i.e., the official
+GNU operating system, running the GNU Mach microkernel).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_gnu_kfreebsd(void)
+
+Report success if the current operating system is *GNU/kFreeBSD* (i.e., a
+FreeBSD variant providing the GNU toolchain).
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_gnu_kopensolaris(void)
+
+Report success if the current operating system is *GNU/kOpenSolaris* (i.e., an
+OpenSolaris variant providing the GNU toolchain).
+/---
+
+# ....................{ TESTERS ~ sysv                     }....................
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_sysv(void)
+
+Report success if the current operating system is a Unix System V derivative.
+This implies such system to have a System V kernel, typically either Release 3
+or 4. Currently, this includes:
+
+* All Solaris variants (e.g., OpenSolaris, Oracle Solaris, illumos).
+* Hewlett Packard's HP-UX.
+* IBM's AIX.
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_aix(void)
+
+Report success if the current operating system is IBM's AIX.
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_hpux(void)
+
+Report success if the current operating system is Hewlett Packard's HP-UX.
+/---
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_os_solaris(void)
+
+Report success if the current operating system is a Solaris variant (e.g.,
+Oracle Solaris, Sun Solaris, OpenSolaris, illumos).
+/---
+
+# ....................{ SETTERS                            }....................
+declare_function_with_stdin <<'/---'
+void :set_string_to_os(string string_name)
+
+Set the passed string to the current OS name.
+/---
+
+# --------------------( WASTELANDS                         )--------------------
+#This implies
+# such system to have a BSD kernel but _not_ necessarily the standard BSD
+# toolchain. 
+# and hence are preferable.
+#FUXME: Define a setter :set_string_to_os() setting such string to ${ZESHY_OS}.
+#Incidentally, if such function is defined dynamically in the above anonymous
+#function, then we can (and should!) reduce ${ZESHY_OS} to a local string of
+#such function. Sensible, no? The fewer globals the better.
+
+#FUXME: Given the likelihood of calling such functions frequently during digest
+#compilation, such functions should be strongly optimized. Fortunately, this is
+#more or less simple: if the current OS is such os, such function should be
+#defined to report success without performing a conditional test; else, be
+#defined to report failure. Simple. So, we'll need something resembling:
+#
+#declare_global_with_stdin string ZESHY_OS <<'/---'
+#Name of the current operating system as exactly one lowercase word.
+#/---
+#
+#() {
+#   :bool is_bsd="${ZESHY_BOOLEAN_FALSE}"
+#
+#   # Map from autotools- to zeshy-specific OS names. The latter tend to
+#   # correspond more to the human-readable OS name than the former (e.g.,
+#   # "gnu_hurd" rather than "gnu") and hence are preferable.
+#   case "${OSTYPE}" {
+#   dragonfly*) ZESHY_OS='dragonfly_bsd'; is_bsd="${ZESHY_BOOLEAN_TRUE}";;
+#   *) ZESHY_OS="${OSTYPE//[[:space:]]##/_}";;
+#   }
+#
+#   if (( is_bsd )) {
+#       define_function :is_os_bsd 'die_if_args; report_success'
+#   }
+#
+#   #FUXME: Define all *OTHER* testers to report failure.
+#   define_function ":is_os_${ZESHY_OS}" 'die_if_args; report_success'
+#}
+#
+#The core idea is that we first convert ${OSTYPE} to ${ZESHY_OS}, then define
+#is_os_${ZESHY_OS}() to report success and all other such testers to report
+#failure. Simple, no?
+
+    #FUXME: Define all *OTHER* testers to report failure. We'll probably need to
+    #perform list or map item deletion or differencing to do so reasonably.
+    #(Ideally the former, yes?)
+
+    # If the current OS is a BSD, define such tester to report success.
+    # if (( is_os_bsd )) {
+    #     define_function :is_os_bsd 'die_if_args; report_success'
+    # # Else, define such tester to report failure.
+    # } else {
+    #     define_function :is_os_bsd 'die_if_args; report_failure'
+    # }
+
+#function :is_os_aros() {
+#    die_if_args
+#    is "${OSTYPE}" == 'aros'* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_darwin(void)
+#
+#Report success if the current operating system has an Apple Darwin core. This
+#implies such system to provide both the *XNU kernel* (i.e., hybrid kernel
+#combining the Mach 3 microkernel and BSD 4.4 kernel subsystems) and well-known
+#low-level open-source components (e.g., `launchd`, `mDNSResponder`). While both
+#the OS X and iOS platforms leverage Darwin, this does _not_ necessarily imply
+#the current system to also provide high-level closed-source components commonly
+#associated with either platform (e.g., Carbon, Cocoa).
+#/---
+#function :is_os_darwin() {
+#    die_if_args
+#    is "${OSTYPE}" == 'darwin'* si
+#}
+#
+## ....................{ TESTERS ~ bsd                      }....................
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_bsd(void)
+#
+#Report success if the current operating system is a BSD derivative. This implies
+#such system to have a BSD kernel but _not_ necessarily the customary BSD
+#toolchain. Currently, this includes:
+#
+#* DragonFly BSD.
+#* FreeBSD.
+#* GNU/kFreeBSD.
+#* NetBSD.
+#* OpenBSD.
+#/---
+#function :is_os_bsd() {
+#    die_if_args
+#    is "${OSTYPE}" == ('dragonfly'|'freebsd'|'netbsd'|'openbsd'|'kfreebsd'*'-gnu')* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_dragonfly_bsd(void)
+#
+#Report success if the current operating system is DragonFly BSD.
+#/---
+#function :is_os_dragonfly_bsd() {
+#    die_if_args
+#    is "${OSTYPE}" == 'dragonfly'* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_freebsd(void)
+#
+#Report success if the current operating system is FreeBSD. This does _not_
+#include GNU/kFreeBSD, which only provides the FreeBSD kernel (rather than both
+#the FreeBSD kernel and corresponding userland toolchain).
+#/---
+#function :is_os_freebsd() {
+#    die_if_args
+#    is "${OSTYPE}" == 'freebsd'* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_netbsd(void)
+#
+#Report success if the current operating system is NetBSD.
+#/---
+#function :is_os_netbsd() {
+#    die_if_args
+#    is "${OSTYPE}" == 'netbsd'* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_openbsd(void)
+#
+#Report success if the current operating system is OpenBSD.
+#/---
+#function :is_os_openbsd() {
+#    die_if_args
+#    is "${OSTYPE}" == 'openbsd'* si
+#}
+#
+## ....................{ TESTERS ~ linux                    }....................
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_linux(void)
+#
+#Report success if the current operating system is a Linux distribution,
+#including but _not_ limited to GNU/Linux distributions.
+#/---
+#function :is_os_linux() {
+#    die_if_args
+#    is "${OSTYPE}" == 'linux'* si
+#}
+#
+## ....................{ TESTERS ~ gnu                      }....................
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_gnu(void)
+#
+#Report success if the current operating system supports the entirety of the *GNU
+#toolchain* (i.e., suite of programming tools produced by the GNU Project). This
+#excludes operation systems not affiliated with GNU but nonetheless supporting a
+#subset of such toolchain (e.g., Apple Darwin).
+#/---
+#function :is_os_gnu() {
+#    die_if_args
+#    is "${OSTYPE}" == ('gnu'*|*'-gnu') si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_gnu_hurd(void)
+#
+#Report success if the current operating system is GNU/Hurd.
+#/---
+#function :is_os_gnu_hurd() {
+#    # Yes, GNU/Hurd's choice of identifier is... unfortunate.
+#    die_if_args
+#    is "${OSTYPE}" == 'gnu'* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_gnu_kfreebsd(void)
+#
+#Report success if the current operating system is GNU/kFreeBSD.
+#/---
+#function :is_os_gnu_kfreebsd() {
+#    die_if_args
+#    is "${OSTYPE}" == 'kfreebsd'*'-gnu' si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] is_os_linux_gnu(void)
+#
+#Report success if the current operating system is GNU/Linux.
+#/---
+#function is_os_linux_gnu() {
+#    die_if_args
+#    is "${OSTYPE}" == 'linux-gnu' si
+#}
+#
+## ....................{ TESTERS ~ sysv                     }....................
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_sysv(void)
+#
+#Report success if the current operating system is a Unix System V derivative.
+#This implies such system to have a System V kernel, typically either Release 3
+#or 4. Currently, this includes:
+#
+#* All Solaris variants (e.g., Oracle Solaris, illumos).
+#* Hewlett Packard's HP-UX.
+#* IBM's AIX.
+#/---
+#function :is_os_sysv() {
+#    die_if_args
+#    is "${OSTYPE}" == ('aix'|'hpux'|'solaris')* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_aix(void)
+#
+#Report success if the current operating system is IBM's AIX.
+#/---
+#function :is_os_aix() {
+#    die_if_args
+#    is "${OSTYPE}" == 'aix'* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_hpux(void)
+#
+#Report success if the current operating system is Hewlett Packard's HP-UX.
+#/---
+#function :is_os_hpux() {
+#    die_if_args
+#    is "${OSTYPE}" == 'hpux'* si
+#}
+#
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_solaris(void)
+#
+#Report success if the current operating system is a Solaris variant (e.g.,
+#Oracle Solaris, Sun Solaris, OpenSolaris, illumos).
+#/---
+#function :is_os_solaris() {
+#    die_if_args
+#    is "${OSTYPE}" == 'solaris'* si
+#}
+#
+## ....................{ TESTERS ~ windows                  }....................
+#declare_function_with_stdin <<'/---'
+#[status: bool] :is_os_windows(void)
+#
+#Report success if the current operating system is Microsoft Windows.
+#/---
+#function :is_os_windows() {
+#    die_if_args
+#    is "${OSTYPE}" == ('cygwin'|'mingw32'|'windows')* si
+#}
