@@ -57,7 +57,170 @@ window managers).
 #such metadata reliably. Perhaps one simply can't? In any case, we should still
 #be able to reliably query every non-BSD OS for such metadata. Make it so,
 #please!
-#FIXME: Woo! After trolling through the *VERY* simple "wmctrl" codebase
+
+# ....................{ TESTERS                            }....................
+#FIXME: In the general case, :set_string_to_window_manager() is a fairly
+#expensive function to call. Hence, defining testers in terms of such function
+#may not necessarily be the best call. What we *REALLY* want to do is have the
+#current digest conditionally depend not only on the current OS but current
+#window manager as well. This would basically require us to push the
+#implementation of :set_string_to_window_manager() into @{src/digest} or
+#thereabouts, which would be a fairly heavy move. So... perhaps not? Right.
+#Unlike desktop environments (e.g., KDE), which *CAN* fairly reliably be
+#detected by testing for the existence of guaranteed environment variables
+#(e.g., ${KDE_SESSION_ID} or some such), window managers really can't be. So, we
+#probably do need to allow the same digest file to be shared between multiple
+#managers. Of course, that would preclude us from ever compiling window manager-
+#specific code into zeshy, which... is *TERRIBLE*! No, really. We *REALLY* want
+#to be able to do that.
+#
+#Which strongly implies we need to push :set_string_to_window_manager() into
+#@{src/digest}. Yes, it's a fairly heavy move. But there's little alternative.
+#Actually, I should note we only need to push a subset of such functionality to
+#@{src/digest}: basically, just the core logic getting the raw window manager
+#name. Don't bother munging it. We just need a unique string for comparison and
+#caching purposes -- *NOT* for creating human-readable function names or output
+#labels. That means we can reduce such logic in @{src/digest} to:
+#
+#* If in X (i.e., if `(( ${+DISPLAY} ))`) and either `xprop` or `wmctrl` is
+#  pathable, run such command to obtain a raw window manager name. Don't bother
+#  lowercasing it or doing *ANYTHING*, really, except returning the raw string.
+#* Else, report the current window manager name to be ${OSTYPE}. (Dead simple.)
+
+# ....................{ SETTERS                            }....................
+#FIXME: The list of Linux window managers is woefully incomplete. Improve!
+declare_function_with_stdin <<'/---'
+void :set_string_to_window_manager(string string_name)
+
+Set the passed string to exactly one lowercase word uniquely identifying the
+*current window manager* (i.e., the component of the current windowing system
+managing windows for the current display of the current display server): e.g.,
+
+.:set_string_to_window_manager()
+==========================================
+[source]
+------------------------------------------
+>>> :string window_manager
+>>> :set_string_to_window_manager window_manager
+>>> output_string "${window_manager}"
+fvwm
+------------------------------------------
+==========================================
+
+== Implementation ==
+
+Under OSes supporting only a single monolithic window manager (e.g., iOS,
+Windows), this function unconditionally sets such string to a constant
+identifying such manager (e.g., `quartz`, `windows`).
+
+Under all other OSes (e.g., BSD and Linux derivatives), this function
+conditionally sets such string to the result of running either reliable window
+management commands if pathable (e.g., `wmctrl`, `xprop`) or unreliable process
+finders otherwise (e.g., `pgrep`).
+
+== Window Managers ==
+
+This function identifies common window managers as follows (in lexicographic
+order grouped by operating system):
+
+.Linux (and Sometimes BSD) Window Managers
+[cols=">strong,^,^,<emphasis",options="header"]
+|===============================================================================
+| Name    | Window Manager | Desktop Environment
+| awesome | awesome        | N/A
+| compiz  | Compiz         | N/A
+| fvwm    | FVWM           | N/A
+| kwin    | KWin           | KDE 4
+| marco   | Marco          | MATE
+| metacity| Metacity       | GNOME 2
+| mutter  | Mutter         | GNOME 3
+| xfwm4   | Xfwm4          | Xfce4
+
+.OS-specific Window Managers
+[cols=">strong,^,^,<emphasis",options="header"]
+|===============================================================================
+| Name    | Window Manager    | Operating System
+| quartz  | Quartz Compositor | OS X
+| windows | Windows           | Windows
+/---
+# If the current OS dictates a stock window manager, define such function to
+# unconditionally set such string to such manager's name.
+if { :is_os_darwin } {
+    function :set_string_to_window_manager() {
+        # See below.
+        die_unless_arg 'Expected one string name.'
+        :string string_name__sstwm="${1}"
+        [[ "${(tP)string_name__sstwm-}" == 'scalar'* ]] || die\
+            '${'${string_name__sstwm}'} undefined or not a string.'
+        : "${(P)string_name__sstwm::=quartz}"
+    }
+} elif { :is_os_windows } {
+    function :set_string_to_window_manager() {
+        die_unless_arg 'Expected one string name.'
+        :string string_name__sstwm="${1}"
+        [[ "${(tP)string_name__sstwm-}" == 'scalar'* ]] || die\
+            '${'${string_name__sstwm}'} undefined or not a string.'
+        : "${(P)string_name__sstwm::=windows}"
+    }
+# Else if the current display server supports the X11 protocol and a command for
+# querying X11 window properties is pathable, define such function to set such
+# string to the output of such command.
+} elif { is_pathable 'xprop' } {
+    function :set_string_to_window_manager() {
+        # Validate sanity.
+        die_unless_arg 'Expected one string name.'
+        :string\
+            string_name__sstwm="${1}" window_id_wm__sstwm wm_name__sstwm
+
+        # If such string is undefined or not of the expected type, throw an
+        # exception. See is_variable_string() for further details.
+        [[ "${(tP)string_name__sstwm-}" == 'scalar'* ]] || die\
+            '${'${string_name__sstwm}'} undefined or not a string.'
+
+        # Get the window ID of the child window of the root window whose window
+        # properties reflect the current window manager rather than such window.
+        # Default "xprop" output is cumbersome to parse: e.g.,
+        #
+        #     _NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x80001a
+        #
+        # Hence, pass options streamlining such output: e.g.,
+        #
+        #     _NET_SUPPORTING_WM_CHECK 0x80001a
+        window_id_wm__sstwm="$(command xprop -root -notype\
+            -f _NET_SUPPORTING_WM_CHECK 32x ' $0' _NET_SUPPORTING_WM_CHECK)"
+
+        # Strip the prefixing property name from such ID.
+        window_id_wm__sstwm="${window_id_wm__sstwm##* }"
+
+        # Get the name of the current window manager from such window. Again,
+        # default "xprop" output is cumbersome to parse: e.g.,
+        #
+        #     _NET_WM_NAME(UTF8_STRING) = "FVWM"
+        #
+        # Hence, pass options streamlining such output: e.g.,
+        #
+        #     _NET_WM_NAME "FVWM"
+        wm_name__sstwm="$(command xprop -id "${window_id_wm__sstwm}" -notype\
+            -f _NET_WM_NAME 8u ' $0' _NET_WM_NAME)"
+
+        # Munge such name. Specifically:
+        #
+        # * Strip the prefixing property name and '"' from such name.
+        # * Strip the suffixing '"' from such name.
+        # * Lowercase such name.
+        wm_name__sstwm="${(L)${wm_name__sstwm##*\"}[1,-2]}"
+
+        # Set such string. See set_string_to_string() for further details.
+        : "${(P)string_name__sstwm::=${wm_name__sstwm}}"
+    }
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#FUXME: O.K.; if we define testers *AFTER* :set_string_to_window_manager(), we
+#can actually define them to statically always report either success or failure,
+#as in other sibling parcels. That would seem to preferable
+
+#FUXME: Woo! After trolling through the *VERY* simple "wmctrl" codebase
 #(basically, a single C file "main.c"), it's clear that we should be able to
 #retrieve such name using standard CLI utilities bundled with X.Org. Take a
 #look at function wm_info() in such codebase, which (in order):
@@ -114,134 +277,27 @@ window managers).
 #operation above. Oh, wait... Since we have *NOTHING* to query the window
 #manager about except its name, that's probably a tad overkill. Just perform
 #both operations in the same :set_string_to_window_manager() function. "Bam!"
-#FIXME: Note there exists a related external command "xwininfo". While the CLI
+#FUXME: Note there exists a related external command "xwininfo". While the CLI
 #interface and output of such command is somewhat more convenient than that of
 #"xprop", "xwininfo" sadly lacks support for retrieval of arbitrary window
 #properties and hence is useless for our purposes.
-#FIXME: While OS X does *NOT* support alternative window managers in the
+#FUXME: While OS X does *NOT* support alternative window managers in the
 #technical sense, it does permit window layout customization within the context
 #of the only available window manager, Quartz Compositor. Curiously, the OS X
 #community has taken to calling such customizations "window managers." They are
 #not. Consequently, our job is quite simple under OS X:
 #:set_string_to_window_manager() should always set such string to "quartz".
 
-# ....................{ TESTERS                            }....................
+        # If such name requires manual conversion, do so.
+        # case "${wm_name__sstwm}" {
+        # metacity) wm_name__sstwm='gnome2';;
+        # mutter)   wm_name__sstwm='gnome3';;
+        # }
 
-# ....................{ SETTERS                            }....................
-#FIXME: The list of Linux window managers is woefully incomplete. Improve!
-declare_function_with_stdin <<'/---'
-void :set_string_to_window_manager(string string_name)
+        # # Else, convert such name from X11- to zeshy-specific nomenclature.
+        # # Specifically, lowercase such name.
+        # wm_name__sstwm="${(L)wm_name__sstwm}"
 
-Set the passed string to exactly one lowercase word uniquely identifying the
-*current window manager* (i.e., the component of the current windowing system
-managing windows for the current display of the current display server): e.g.,
-
-.:set_string_to_window_manager()
-==========================================
-[source]
-------------------------------------------
->>> :string window_manager
->>> :set_string_to_window_manager window_manager
->>> output_string "${window_manager}"
-fvwm
-------------------------------------------
-==========================================
-
-== Implementation ==
-
-Under OSes supporting only a single monolithic window manager (e.g., iOS,
-Windows), this function unconditionally sets such string to a constant
-identifying such manager (e.g., `quartz`, `windows`).
-
-Under all other OSes (e.g., BSD and Linux derivatives), this function
-conditionally sets such string to the result of running either reliable window
-management commands if pathable (e.g., `wmctrl`, `xprop`) or unreliable process
-finders otherwise (e.g., `pgrep`).
-
-== Window Managers ==
-
-This function identifies common window managers as follows (in lexicographic
-order grouped by operating system):
-
-.Linux (and Sometimes BSD) Window Managers
-[cols=">strong,^,^,<emphasis",options="header"]
-|===============================================================================
-| Window Manager | Name
-| awesome        | awesome
-| Compiz         | compiz
-| FVWM           | fvwm
-
-						'2bwm') WM="2bwm";;
-						'awesome') WM="Awesome";;
-						'beryl') WM="Beryl";;
-						'bspwm') WM="bspwm";;
-						'blackbox') WM="Blackbox";;
-						'cinnamon') WM="Muffin";;
-						'compiz') WM="Compiz";;
-						'dminiwm') WM="dminiwm";;
-						'dwm') WM="dwm";;
-						'e16') WM="E16";;
-						'emerald') WM="Emerald";;
-						'enlightenment') WM="E17";;
-						'fluxbox') WM="FluxBox";;
-						'fvwm') WM="FVWM";;
-						'herbstluftwm') WM="herbstluftwm";;
-						'icewm') WM="IceWM";;
-						'kwin') WM="KWin";;
-						'metacity') WM="Metacity";;
-						'monsterwm') WM="monsterwm";;
-						'musca') WM="Musca";;
-						'notion') WM="Notion";;
-						'openbox') WM="OpenBox";;
-						'pekwm') WM="PekWM";;
-						'ratpoison') WM="Ratpoison";;
-						'sawfish') WM="Sawfish";;
-						'scrotwm') WM="ScrotWM";;
-						'spectrwm') WM="SpectrWM";;
-						'stumpwm') WM="StumpWM";;
-						'subtle') WM="subtle";;
-						'wmaker') WM="WindowMaker";;
-						'wmfs') WM="WMFS";;
-						'wmii') WM="wmii";;
-						'xfwm4') WM="Xfwm4";;
-						'i3') WM="i3";;
-						'xmonad') WM="XMonad";;
-
-.OS X Window Managers
-[cols=">strong,^,^,<emphasis",options="header"]
-|===============================================================================
-| Window Manager    | Name
-| Quartz Compositor | quartz
-
-.Windows Window Managers
-[cols=">strong,^,^,<emphasis",options="header"]
-|===============================================================================
-| Window Manager    | Name
-| Windows           | windows
-/---
-function :set_string_to_window_manager() {
-    # Validate sanity.
-    die_unless_arg 'Expected one string name.'
-    :string string_name__sstwm="${1}" window_manager_name
-
-    # If such string is undefined or not of the expected type, throw an
-    # exception. See is_variable_string() for further details.
-    [[ "${(tP)string_name__sstwm-}" == 'scalar'* ]] || die\
-        '${'${string_name__sstwm}'} undefined or not a string.'
-
-    #FIXME: Implement me!
-
-    # If such name requires manual conversion, do so.
-
-    # Else, convert such name from X11- to zeshy-specific nomenclature.
-    # Specifically, lowercase such name.
-    window_manager_name="${(L)window_manager_name}"
-
-    # Set such string. See set_string_to_string() for further details.
-    : "${(P)string_name__ssto::=${window_manager_name}}"
-}
-
-# --------------------( WASTELANDS                         )--------------------
 # to dynamically query the current windowing
 # system for the window manager managing the current display
 # such strings for several
