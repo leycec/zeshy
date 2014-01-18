@@ -1,0 +1,298 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Casually inspect the current system (e.g., operating system, window manager).
+# @{digest} depends on this parcel to determine whether or not the previously
+# compiled digest file applies to the current system.
+
+#FIXME: The current digest file needs to depend on both zeshy-specific state
+#(e.g., whether or not we're compiling a debug build) and system-specific state
+#(e.g., the current OS and windowing manager in use). At the moment, it only
+#depends on the former. The reason we such file needs to depend on both is that
+#users should be able to seemlessly move their entire "~/.zeshy" directory
+#between not only different machines running the same OS but between different
+#machines running different OSes. To effect the latter, we'll need to
+#specifically create an intermediary subdirectory directly under
+#"~/.zeshy/cache/digest" named after all relevant system state: e.g.,
+#
+#    ~/.zeshy/
+#        cache/
+#            digest/
+#                current -> linux.gentoo.x11/
+#                linux.gentoo.mir/
+#                    debug.zwc
+#                    release.zwc
+#                linux.gentoo.wayland/
+#                    debug.zwc
+#                    release.zwc
+#                linux.gentoo.x11/
+#                    debug.zwc
+#                    release.zwc
+#                darwin/
+#                    debug.zwc
+#                    release.zwc
+#                windows/
+#                    debug.zwc
+#                    release.zwc
+#
+#Note the symbolic link "current", linking to configuration tree
+#"linux.gentoo.x11/" in the above example. Such directory is both for user
+#convenience and zeshy use. Indeed, setting such symlink in a reliable manner
+#simplifies our autoloading of the digest file corresponding to the current
+#system state. (That is, assuming we set such symlink reliably, *NO* existing
+#code in this parcel needs to change to accommodate this improvement.)
+#
+#In any case, the symbolic link is quite negligible. For safety, the critical
+#thing is that we implement support for such subdirectories. That's it. Yummy!
+#FIXME: Note, however, this implies that we'll need to shift OS and windowing
+#manager detection logic here (...or possibly in a new top-level parcel sourced
+#by this parcel called, say, @{test}). Unavoidable, really. Since we only need
+#the subset of such logic producing a single flat string describing all relevant
+#system state (e.g., "linux.gentoo.x11"), such logic *HOPEFULLY* won't be
+#grossly cumbersome.
+#
+#Note, however, that such logic *WILL* be reused by @{compile} when deciding
+#which suboverlays of an "if_os" overlay to register. This suggests we probably
+#will need more than simply logic producing such string... but, without actually
+#delving into it, it's presumptuous to say with certainty.
+#FIXME: O.K.; after reasonably deep contemplation, here's the low-level plan for
+#implementing the above:
+#
+#* Create new top-level parcel @{inspect}, dynamically inspecting the current
+#  system and setting persistent string globals describing the results of such
+#  inspection. Given the variety of all possible operating systems, display
+#  servers, window managers, and so forth to be inspected, such parcel is
+#  expected to eventually grow to considerable size and hence be inappropriate
+#  for inclusion in this parcel.
+#* @{inspect} should declare and define at least the following string globals:
+#  * ${ZESHY_WINDOW_MANAGER_NAME}, the raw low-level name of the current window
+#    manager.  Basically, this is the capitalized string reported by "xprop"
+#    (with the delimiting double quotes necessarily stripped, of course). Since
+#    window managers are necessarily tied to particular display servers, the
+#    window manager name implies a unique display server (e.g., if
+#    "${ZESHY_WINDOW_MANAGER_NAME} == FVWM", then the display server is X).
+#    Hence, we needn't formalize the names of either the current display server
+#    *OR* deskop environment. (Which is nice, as the latter in particular can be
+#    fairly expensive.)
+#  * ${ZESHY_SYSTEM_ID}, set as
+#    ZESHY_SYSTEM_ID="${OSTYPE}.${ZESHY_WINDOW_MANAGER_NAME}" (e.g.,
+#    "linux-gnu.FVWM"). This is *THE* critical string, used as the basename of
+#    the subdirectory under both "~/.zeshy/cache/digest" and "~/.zeshy/config"
+#    to write and read from.  Naturally, such basename should contain no
+#    whitespace, punctuation aside from "_", "-", and ".", or UTF8 characters.
+#  And that's it, for now.
+#* This implies we should rename:
+#  * ${ZESHY_USER_DIGEST_DIR} to ${ZESHY_USER_DIGEST_ROOT_DIRNAME}.
+#  * ${ZESHY_USER_CONFIG_DIR} to ${ZESHY_USER_CONFIG_ROOT_DIRNAME}.
+#  Then set:
+#  * ZESHY_USER_DIGEST_DIR="${ZESHY_USER_DIGEST_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}".
+#  * ZESHY_USER_CONFIG_DIR="${ZESHY_USER_CONFIG_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}".
+#* Shift the window manager detection code currently embodied in
+#  :set_string_to_window_manager() to @{inspect}. Thereafter,
+#  :set_string_to_window_manager() should be dynamically defined to always
+#  statically return ${ZESHY_WINDOW_MANAGER_NAME}.
+#* Do *NOT* shift the OS detection code currently embodied in
+#  @{*-core/*-test/*-os} here. Instead, simply use the low-level raw string
+#  ${OSTYPE} as is without modification in @{inspect}.
+#* Have this parcel unconditionally source @{inspect}.
+#FIXME: [NOTE: None of the above applies, actually. See the next FIXME comment.]
+#
+#Great. So, that inspects the system and establishes the requisite globals. What
+#then? Well, then we have to actually compare the previously cached version of
+#${ZESHY_SYSTEM_ID} to the current version, implying we need to cache such
+#global. When? Where? Simple: existing function ::precompile_zeshy_cache() in
+#@{compile} *ALREADY* writes list global ${ZESHY_DIGEST_DEPENDENCY_PATHS} to
+#zsh script "${ZESHY_USER_DIGEST_DEPENDENCIES_FILE}". In fact, that's the *ONLY*
+#global that's currently written there. But it certainly needn't be. Modify such
+#function to *ALSO* write ${ZESHY_SYSTEM_ID} to such file. (Dead simple, given
+#that such function does so by calling write_file_with_variable().)
+#
+#is_zeshy_digest_outdated() then sources such file and hence defines all such
+#globals. Arguably, ::precompile_zeshy_cache() should save at least
+#${ZESHY_SYSTEM_ID} under a different name to permit comparison with the
+#current value of ${ZESHY_SYSTEM_ID} established by @{inspect} -- say, as
+#${ZESHY_SYSTEM_ID_OLD}. (Since such global is a string, it's both trivial and
+#efficient to locally copy such string to a temporary new global
+#${ZESHY_SYSTEM_ID_OLD} defined and then subsequently unset within
+#::precompile_zeshy_cache().) Great! So, *AFTER* sourcing
+#"${ZESHY_USER_DIGEST_DEPENDENCIES_FILE}" but *BEFORE* examining any path
+#mtimes, is_zeshy_digest_outdated() performs the following comparison:
+#
+#  [[ "${ZESHY_SYSTEM_ID}" == "${ZESHY_SYSTEM_ID_OLD}" ]] || return 0
+#FIXME: Oh, wait. We don't even *NEED* to perform such comparison, since it's
+#implicit in the fact that ${ZESHY_USER_DIGEST_DIR} and hence
+#${ZESHY_USER_DIGEST_FILE} now depends on ${ZESHY_SYSTEM_ID}. This, in turn,
+#means we don't even need to perform any of the above writing of
+#${ZESHY_SYSTEM_ID} into ${ZESHY_USER_DIGEST_DEPENDENCIES_FILE}. Dead simple!
+#FIXME: Note that, since neither Mir or Wayland currently appear to provide
+#command-line interfaces to query for the current window manager,
+#${ZESHY_WINDOW_MANAGER_NAME} should simply be set to either "Mir" or
+#"Wayland" under such display servers. Indeed, under Wayland, the display
+#server *IS* the window manager. What we refer to as "window managers" under
+#X11 will be *MUCH* more tightly bound to Wayland itself. Indeed, under Weston
+#(the reference implementation of Weston), window managers appear to be loaded
+#as dynamically shared libraries on Weston startup and hence referred to as
+#"shell plugins". Specifically:
+#
+#"Weston has shell plugins. A shell plugin is basically a window manager,
+# implementing all the window management policy and protocol. It is a plugin,
+# because it has to be part of the server.  The desktop-shell plugin is a window
+# manager for desktops. There is also a tablet-shell plugin, but it would need
+# more love. The desktop-shell plugin is accompanied with the desktop-shell
+# client, which in a separate process is resposible for GUI elements, like
+# backgrounds and panels. The Wayland protocol extension specific to
+# desktop-shell is wl_shell.  The name is misleading nowadays, since it is not
+# really part of the core protocol. Any client will use wl_shell for window
+# management related requests."
+#
+#This is all a bit annoying, as it implies that under non-Weston Wayland
+#implementations, window managers will probably be implemented in a completely
+#non-orthogonal, different manner, and there exists no uniform API -- accessible
+#at the CLI or not -- for querying the name of "the thing currently managing
+#windows." Silly. But there it is. Of course, it'll be a year or two before
+#Wayland is even robust enough for general-purpose use. In the meantime, we just
+#set ${ZESHY_WINDOW_MANAGER_NAME} to simple strings without attempting querying.
+#
+#There already exist a few such shell plugins: i3way (inspired by tiling window
+#manager i3), Orbital, and so on. The interesting thing is that zeshy probably
+#doesn't *NEED* to care about shell plugins. Weston should theoretically
+#eventually provide a uniform C API and hence command-line interface for
+#performing generic operations universally applicable to *EVERY* shell plugin
+#(e.g., setting the background image).
+#
+#Right. Then, under Weston, the interesting thing to see will be how the KDE
+#and GNOME desktop environments are implemented -- perhaps as one or more
+#plugins? Though, that seems a bit ridiculous, given the heavy and fiercely
+#independent nature of both. In any case, at the moment, *WHO CARES.* :{}
+
+# ....................{ GLOBALS                            }....................
+typeset -g ZESHY_SYSTEM_ID ZESHY_DISPLAY_SERVER_NAME ZESHY_WINDOW_MANAGER_NAME
+
+# ....................{ SETTERS                            }....................
+#FIXME: Insufficient, although certainly close enough for now. In particular,
+#the current distribution should be appended to ${OSTYPE} to also handle
+#migration of zeshy between different distributions of the same OS.
+
+# void :set_digest_system_globals(void)
+function :set_digest_system_globals() {
+    # If the current OS is Apple iOS, set such globals statically. See
+    # @{*-core/*-test/*-os} for further details.
+    if [[ "${OSTYPE}" == 'darwin'* ]] {
+        # If the current display server (Quartz Compositor) supports the X11
+        # protocol, XQuartz must be running. See :is_display_server_x() for
+        # further details.
+        if (( ${+DISPLAY} )) {
+            ZESHY_DISPLAY_SERVER_NAME='XQuartz'
+            ZESHY_WINDOW_MANAGER_NAME='XQuartz'
+        # Else, only Quartz Compositor is running.
+        } else {
+            ZESHY_DISPLAY_SERVER_NAME='Quartz'
+            ZESHY_WINDOW_MANAGER_NAME='Quartz'
+        }
+    # Else if the current OS is Microsoft Windows, set such globals statically.
+    } elif [[ "${OSTYPE}" == ('cygwin'|'mingw')* ]] {
+        # If the current display server supports the X11 protocol, either XMing
+        # or Cygwin X is probably running. For brevity, assume the former.
+        if (( ${+DISPLAY} )) {
+            ZESHY_DISPLAY_SERVER_NAME='XMing'
+            ZESHY_WINDOW_MANAGER_NAME='XMing'
+        # Else, only Windows itself is running.
+        } else {
+            ZESHY_DISPLAY_SERVER_NAME='Windows'
+            ZESHY_WINDOW_MANAGER_NAME='Windows'
+        }
+    # Else if the current display server is Wayland, set such globals
+    # statically. See :is_display_server_wayland() for further details.
+    } elif (( ${+WAYLAND_DISPLAY} )) {
+        # If such server supports the X11 protocol, XWayland must be running.
+        if (( ${+DISPLAY} )) {
+            ZESHY_DISPLAY_SERVER_NAME='XWayland'
+            ZESHY_WINDOW_MANAGER_NAME='XWayland'
+        # Else, only Wayland itself is running.
+        } else {
+            ZESHY_DISPLAY_SERVER_NAME='Wayland'
+            ZESHY_WINDOW_MANAGER_NAME='Wayland'
+        }
+    # Else if the current display server is Mir, set such globals statically.
+    # See :is_display_server_mir() for further details.
+    } elif (( ${+MIR_SOCKET} )) {
+        # If such server supports the X11 protocol, XMir must be running.
+        if (( ${+DISPLAY} )) {
+            ZESHY_DISPLAY_SERVER_NAME='XMir'
+            ZESHY_WINDOW_MANAGER_NAME='XMir'
+        # Else, only Mir itself is running.
+        } else {
+            ZESHY_DISPLAY_SERVER_NAME='Mir'
+            ZESHY_WINDOW_MANAGER_NAME='Mir'
+        }
+    # Else if the current display server supports the X11 protocol, set such
+    # globals dynamically by querying the appropriate X11 property of the root
+    # window (i.e., the desktop). This is fairly computationally complex, but
+    # there's little we can do about that.
+    #
+    } elif (( ${+DISPLAY} )) {
+        ZESHY_DISPLAY_SERVER_NAME='X'
+
+        # If "wmctrl" is installed, prefer such command. See is_pathable() for
+        # further details.
+        if (( ${+commands[wmctrl]} )) {
+            #FIXME: Implement me!
+        # Else if "xprop" is installed, fallback to such command.
+        } elif (( ${+commands[xprop]} )) {
+            # Get the window ID of the child window of the root window whose window
+            # properties reflect the current window manager rather than such window.
+            # Default "xprop" output is cumbersome to parse: e.g.,
+            #
+            #     _NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x80001a
+            #
+            # Hence, pass options streamlining such output: e.g.,
+            #
+            #     _NET_SUPPORTING_WM_CHECK 0x80001a
+            integer window_id_wm; window_id_wm="$(command xprop -root -notype\
+                -f _NET_SUPPORTING_WM_CHECK 32x ' $0' _NET_SUPPORTING_WM_CHECK)"
+
+            # Strip the prefixing property name from such ID.
+            window_id_wm="${window_id_wm##* }"
+
+            # Get the name of the current window manager from such window. Again,
+            # default "xprop" output is cumbersome to parse: e.g.,
+            #
+            #     _NET_WM_NAME(UTF8_STRING) = "FVWM"
+            #
+            # Hence, pass options streamlining such output: e.g.,
+            #
+            #     _NET_WM_NAME "FVWM"
+            ZESHY_WINDOW_MANAGER_NAME="$(command xprop -id "${window_id_wm}" -notype\
+                -f _NET_WM_NAME 8u ' $0' _NET_WM_NAME)"
+
+            # Munge such name. Specifically:
+            #
+            # * Strip the prefixing property name and '"' from such name.
+            # * Strip the suffixing '"' from such name.
+            ZESHY_WINDOW_MANAGER_NAME="${${ZESHY_WINDOW_MANAGER_NAME##*\"}[1,-2]}"
+        }
+    }
+
+    # Initialize the string uniquely identifying such system to the strictly
+    # lowercase name of the current operating system, which zsh guarantees to
+    # contain no whitespace. See @{*-core/*-test/*-os} for further details.
+    #
+    # Then append the "."-delimited name of:
+    #
+    # * The current display server if any or "none" otherwise.
+    # * The current window manager if any or "none" otherwise.
+    ZESHY_SYSTEM_ID="${OSTYPE}.${ZESHY_DISPLAY_SERVER_NAME:-none}.${ZESHY_WINDOW_MANAGER_NAME:-none}"
+}
+
+# --------------------( WASTELANDS                         )--------------------
+            # * Convert all spaces in such name to underscores. (Though rare, window
+            #   manager names can technically contain spaces.)
+            # ZESHY_WINDOW_MANAGER_NAME="${${ZESHY_WINDOW_MANAGER_NAME##*\"}[1,-2]// /_}"
+
+    # * The current window manager if any or "none" otherwise, converting all
+    #   spaces in such name to underscores. (Though rare, window manager names
+    #   can technically contain spaces.)
+    # ZESHY_SYSTEM_ID="${OSTYPE}.${ZESHY_DISPLAY_SERVER_NAME:-none}.${ZESHY_WINDOW_MANAGER_NAME:-none// /_}"
