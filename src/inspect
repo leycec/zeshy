@@ -167,14 +167,54 @@
 #and GNOME desktop environments are implemented -- perhaps as one or more
 #plugins? Though, that seems a bit ridiculous, given the heavy and fiercely
 #independent nature of both. In any case, at the moment, *WHO CARES.* :{}
+#FIXME: Ah! Note that @{digest} will actually need to set:
+#
+#* ZESHY_USER_DIGEST_DIR="${ZESHY_USER_DIGEST_ROOT_DIRNAME}/${HOST}.${ZESHY_SYSTEM_ID}".
+#* ZESHY_USER_CONFIG_DIR="${ZESHY_USER_CONFIG_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}".
+#
+#We prepend the hostname of the current system to the current digest but *NOT*
+#configuration root directory, ensuring that migrating zeshy to a different
+#machine triggers recompilation regardless of whether the current digest file is
+#newer than everything on such machine.
 
 # ....................{ GLOBALS                            }....................
-typeset -g ZESHY_SYSTEM_ID ZESHY_DISPLAY_SERVER_NAME ZESHY_WINDOW_MANAGER_NAME
+#FIXME: Document ${ZESHY_DESKTOP_ENVIRONMENT_NAME}.
+typeset -g\
+    ZESHY_SYSTEM_ID\
+    ZESHY_DISPLAY_SERVER_NAME\
+    ZESHY_DESKTOP_ENVIRONMENT_NAME\
+    ZESHY_WINDOW_MANAGER_NAME
 
 # ....................{ SETTERS                            }....................
+# Detecting system-specific metadata in a reliable manner is notoriously hard,
+# let alone in an efficient *AND* reliable manner. Since zeshy calls the
+# following functionality on every startup, such functionality should be
+# optimized. In practice, this means that *MOST* inspection of the current
+# system should reduce to scalar comparisons on existing string globals --
+# either guaranteed to exist by zsh itself (e.g., ${OSTYPE}) or whose existence
+# strongly implies the existence of related functionality (e.g., ${DISPLAY}
+# strongly implying that a display server supporting the X11 protocol is
+# currently running).
+#
+# As inspiration for such functionality, contemplate the following sources (in
+# descending order of subjective reliability and utility as of this writing):
+#
+# * HardInfo, a C system profiler.
+# * screenFetch, a Bash system profiler.
+# * inxi, a Bash system profiler.
+
 #FIXME: Insufficient, although certainly close enough for now. In particular,
 #the current distribution should be appended to ${OSTYPE} to also handle
 #migration of zeshy between different distributions of the same OS.
+#FIXME: Interestingy, GNOME 3.12 provides a GNOME-specific Wayland compositor
+#and hence alternative to Weston, the reference implementation for such
+#compositors. Detect such compositor below and set appropriate variables. It
+#seems likely KDE will follow suite, requiring we also detect the Wayland
+#compositor KDE 5 (?) inevitably provides as well.
+#FIXME: Interesting. Due to fewer available developers, KDE will *NOT* be
+#implementing a full Wayland compositor, suggesting KDE Wayland users will need
+#to run KDE either as a Weston or Mutter (GNOME Wayland) shell plugin. In any
+#case, detection presumably becomes that much more cumbersome.
 
 # void :set_digest_system_globals(void)
 function :set_digest_system_globals() {
@@ -186,11 +226,9 @@ function :set_digest_system_globals() {
         # further details.
         if (( ${+DISPLAY} )) {
             ZESHY_DISPLAY_SERVER_NAME='XQuartz'
-            ZESHY_WINDOW_MANAGER_NAME='XQuartz'
         # Else, only Quartz Compositor is running.
         } else {
             ZESHY_DISPLAY_SERVER_NAME='Quartz'
-            ZESHY_WINDOW_MANAGER_NAME='Quartz'
         }
     # Else if the current OS is Microsoft Windows, set such globals statically.
     } elif [[ "${OSTYPE}" == ('cygwin'|'mingw')* ]] {
@@ -198,11 +236,9 @@ function :set_digest_system_globals() {
         # or Cygwin X is probably running. For brevity, assume the former.
         if (( ${+DISPLAY} )) {
             ZESHY_DISPLAY_SERVER_NAME='XMing'
-            ZESHY_WINDOW_MANAGER_NAME='XMing'
         # Else, only Windows itself is running.
         } else {
             ZESHY_DISPLAY_SERVER_NAME='Windows'
-            ZESHY_WINDOW_MANAGER_NAME='Windows'
         }
     # Else if the current display server is Wayland, set such globals
     # statically. See :is_display_server_wayland() for further details.
@@ -210,23 +246,25 @@ function :set_digest_system_globals() {
         # If such server supports the X11 protocol, XWayland must be running.
         if (( ${+DISPLAY} )) {
             ZESHY_DISPLAY_SERVER_NAME='XWayland'
-            ZESHY_WINDOW_MANAGER_NAME='XWayland'
         # Else, only Wayland itself is running.
         } else {
             ZESHY_DISPLAY_SERVER_NAME='Wayland'
-            ZESHY_WINDOW_MANAGER_NAME='Wayland'
         }
     # Else if the current display server is Mir, set such globals statically.
     # See :is_display_server_mir() for further details.
     } elif (( ${+MIR_SOCKET} )) {
+        # Mir provides its own desktop environment as a Mir plugin. Curiously,
+        # such environment retains the predictable Ubuntu name "Unity" despite
+        # having little to nothing in common under the hood with prior GNOME-
+        # and Compiz-based Ubuntu desktop environments of the same name. *shrug*
+        ZESHY_DESKTOP_ENVIRONMENT_NAME='Unity'
+
         # If such server supports the X11 protocol, XMir must be running.
         if (( ${+DISPLAY} )) {
             ZESHY_DISPLAY_SERVER_NAME='XMir'
-            ZESHY_WINDOW_MANAGER_NAME='XMir'
         # Else, only Mir itself is running.
         } else {
             ZESHY_DISPLAY_SERVER_NAME='Mir'
-            ZESHY_WINDOW_MANAGER_NAME='Mir'
         }
     # Else if the current display server supports the X11 protocol, set such
     # globals dynamically by querying the appropriate X11 property of the root
@@ -236,10 +274,27 @@ function :set_digest_system_globals() {
     } elif (( ${+DISPLAY} )) {
         ZESHY_DISPLAY_SERVER_NAME='X'
 
-        # If "wmctrl" is installed, prefer such command. See is_pathable() for
-        # further details.
+        # Identify the current window manager.
+        #
+        # If "wmctrl" is installed, prefer such command. Whereas "xprop"
+        # requires at least two command substitutions and string mungings to
+        # reliably do so, "wmctrl" only requires one of each. See is_pathable()
+        # for further details.
         if (( ${+commands[wmctrl]} )) {
-            #FIXME: Implement me!
+            # Get a human-readable synopsis of the current window manager: e.g.,
+            #
+            #     Name: FVWM
+            #     Class: N/A
+            #     PID: N/A
+            #     Window manager's "showing the desktop" mode: N/A
+            ZESHY_WINDOW_MANAGER_NAME="$(command wmctrl -m)"
+
+            # Extract the substring between "Name: " and the first newline.
+            # Dismantled, this is:
+            #
+            # * "(f)", expanding to the first line of such synopsis.
+            # * "#...", stripping such prefix from such line.
+            ZESHY_WINDOW_MANAGER_NAME="${ZESHY_WINDOW_MANAGER_NAME[(f)1]#Name: }"
         # Else if "xprop" is installed, fallback to such command.
         } elif (( ${+commands[xprop]} )) {
             # Get the window ID of the child window of the root window whose window
@@ -274,7 +329,66 @@ function :set_digest_system_globals() {
             # * Strip the suffixing '"' from such name.
             ZESHY_WINDOW_MANAGER_NAME="${${ZESHY_WINDOW_MANAGER_NAME##*\"}[1,-2]}"
         }
+
+        # Identify the current desktop environment *AFTER* such window manager,
+        # as the latter can be used to deduce the former.
+        #
+        # If canonical GNOME-specific environment variable
+        # ${GNOME_DESKTOP_SESSION_ID} exists, this is a GNOME desktop. Note that
+        # GNOME 3 deprecated but continues to reliably set such variable to
+        # "this-is-deprecated". Amusingly, the existence of such variable thus
+        # continues to serve as the most efficient means of detecting GNOME.
+        if (( ${+GNOME_DESKTOP_SESSION_ID} )) {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME'
+        # Else if canonical KDE-specific environment variable
+        # ${KDE_FULL_SESSION} exists, this is a KDE desktop.
+        } elif (( ${+KDE_FULL_SESSION} )) {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME='KDE'
+        # Else if such window manager is "Xfwm4", this is an XFCE4 desktop.
+        } elif [[ "${ZESHY_WINDOW_MANAGER_NAME}" == 'Xfwm4' ]] {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME='XFCE4'
+        # Else if proposed canonical environment variable ${XDG_CURRENT_DESKTOP}
+        # exists, default to the value of such variable verbatim. As the answer
+        # beginning "On Ubuntu 12.04 I tested environment variables..." at
+        # http://askubuntu.com/questions/72549/how-to-determine-which-window-manager-is-running
+        # demonstrates, *ALL* desktop environments setting such variable appear
+        # to reliably format such variable's value exactly as we require (e.g.,
+        # "GNOME", "LXDE", "Unity").
+        } elif [[ -n "${XDG_CURRENT_DESKTOP}" ]] {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME="${XDG_CURRENT_DESKTOP}"
+        # Else if proposed canonical environment variable ${DESKTOP_SESSION}
+        # exists, default to the value of such variable verbatim. As C function
+        # detect_desktop_environment() in HardInfo suggests (and as the answer
+        # beginning "I've tested the best tools I've found with..." at the prior
+        # URL confirms), most desktop environments setting such variable and
+        # *NOT* also setting ${XDG_CURRENT_DESKTOP} appear to reliably format
+        # such variable's value.
+        } elif [[ -n "${DESKTOP_SESSION}" ]] {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME="${DESKTOP_SESSION}"
+        # Else if such window manager was identified, default such desktop
+        # environment to such window manager. This is sensible under minimalist
+        # window managers leveraging no known desktop environment (e.g., tiling
+        # window managers). Note the similar inverted expression below. See
+        # set_string_if_empty_to_string() for further details.
+        } else {
+            : "${ZESHY_DESKTOP_ENVIRONMENT_NAME:=${ZESHY_WINDOW_MANAGER_NAME}}"
+        }
+    # Else, there either exists no display server or the current OS is running
+    # an OS-specific and hence non-X11-compatible display server. For
+    # simplicity, ignore the latter case. In the former case, the current shell
+    # is running under a virtual console. While virtual consoles are *NOT*
+    # display servers, pretend they are. (Again, for simplicity.)
+    } else {
+        ZESHY_DISPLAY_SERVER_NAME='console'
     }
+
+    # If no desktop environment and/or window manager was identified, default
+    # such names to the name of the current display server if any. This does
+    # *NOT* signify an error but the common case for display servers serving as
+    # their sole window managers (e.g., Mir, Quartz, Wayland). See
+    # set_string_if_empty_to_string() for further details.
+    : "${ZESHY_DESKTOP_ENVIRONMENT_NAME:=${ZESHY_DISPLAY_SERVER_NAME}}"
+    : "${ZESHY_WINDOW_MANAGER_NAME:=${ZESHY_DESKTOP_ENVIRONMENT_NAME}}"
 
     # Initialize the string uniquely identifying such system to the strictly
     # lowercase name of the current operating system, which zsh guarantees to
@@ -282,12 +396,37 @@ function :set_digest_system_globals() {
     #
     # Then append the "."-delimited name of:
     #
-    # * The current display server if any or "none" otherwise.
+    # * The current display server if any or "none" otherwise. While prior logic
+    #   should guarantee such name to be set *AND* nonempty, a little care never
+    #   hurts.
+    # * The current desktop environment if any or "none" otherwise.
     # * The current window manager if any or "none" otherwise.
-    ZESHY_SYSTEM_ID="${OSTYPE}.${ZESHY_DISPLAY_SERVER_NAME:-none}.${ZESHY_WINDOW_MANAGER_NAME:-none}"
+    ZESHY_SYSTEM_ID="${OSTYPE}.${ZESHY_DISPLAY_SERVER_NAME:-none}.${ZESHY_DESKTOP_ENVIRONMENT_NAME:-none}.${ZESHY_WINDOW_MANAGER_NAME:-none}"
+
+    # Convert all spaces in such identifier to underscores.
+    ZESHY_SYSTEM_ID="${ZESHY_SYSTEM_ID// /_}"
+
+    # Inform debuggers of such identifier.
+    :output_line_if_debugging 'Identified current system as "'${ZESHY_SYSTEM_ID}'".'
 }
 
 # --------------------( WASTELANDS                         )--------------------
+        # Else if proposed canonical environment variable ${XDG_CURRENT_DESKTOP}
+        # exists, default to the value of such variable verbatim. See
+        # set_string_if_empty_to_string() for further details.
+        # } elif [[ -n "${XDG_CURRENT_DESKTOP}" ]] {
+        #     : "${ZESHY_WINDOW_MANAGER_NAME:=${XDG_CURRENT_DESKTOP}}"
+    # [[ -n "${ZESHY_DESKTOP_ENVIRONMENT_NAME}" ]] ||
+    #     ZESHY_DESKTOP_ENVIRONMENT_NAME="${ZESHY_DISPLAY_SERVER_NAME}"
+    # }
+    # [[ -n "${ZESHY_WINDOW_MANAGER_NAME}" ]] ||
+    #     ZESHY_WINDOW_MANAGER_NAME="${ZESHY_DISPLAY_SERVER_NAME}"
+    # local display_server_name
+    #     # The Wayland display server also serves as its sole window manager.
+    #     ZESHY_WINDOW_MANAGER_NAME="${ZESHY_DISPLAY_SERVER_NAME}"
+    #     # The Mir display server also serves as its sole window manager.
+    #     ZESHY_WINDOW_MANAGER_NAME="${ZESHY_DISPLAY_SERVER_NAME}"
+
             # * Convert all spaces in such name to underscores. (Though rare, window
             #   manager names can technically contain spaces.)
             # ZESHY_WINDOW_MANAGER_NAME="${${ZESHY_WINDOW_MANAGER_NAME##*\"}[1,-2]// /_}"
