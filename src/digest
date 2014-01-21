@@ -6,6 +6,27 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Handle the current digest file.
 
+#FIXME: Add support for zeshy upgrading: namely, if upgrading zeshy, have
+#:is_zeshy_digest_outdated() immediately report success.
+#FIXME: The obvious question then becomes: how do we reliably detect upgrades?
+#The answer is equally obvious:
+#
+#* Define a new global ${ZESHY_VERSION} in @{main}.
+#* Redefine (or ideally remove) get_zeshy_version() in terms of such global.
+#* Cache such global to ${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME} under the
+#  name ${ZESHY_VERSION_PRIOR}, to avoid conflicts with the existing global of
+#  the same name when sourcing such file. (See @{compile} function
+#  ::precompile_zeshy_cache().)
+#* Have :is_zeshy_digest_outdated() do the following:
+#  * After sourcing such file, append the following math comparison to the
+#    existing early test of whether or not core zeshy-specific files exist:
+#    (( ZESHY_VERSION == ZESHY_VERSION_PRIOR ))
+#  * This will induce such function to immediately report success, triggering
+#    immediate digest recompilation.
+
+#FIXME: Don't forget to perform advisory locking on digest files before and
+#during digest compilation! (We probably document this elsewhere, yes?)
+
 #FIXME: The resolution of ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}
 #should be improved from seconds to nanoseconds on systems supporting the latter
 #(e.g., BSD, Linux). Happily, this can be efficiently obtained as a float from
@@ -34,146 +55,96 @@
 #@{inspect} parcel.
 
 # ....................{ GLOBALS                            }....................
-# Such path depends on whether zeshy is currently being debugged or not. If
-# zeshy is being debugged, is_zeshy_debug_and() expands to a command running
-# the passed command; else, to a command ignoring such command. In either case,
-# the expansion for such alias directly depends on CLI option "--verbose". Since
-# functions expand aliases at function definition rather than call time, zeshy
-# functions expanding such alias compiled into zeshy's user digest file and
-# hence such file itself transitively depends on the same CLI option.
-#
-# This complexity demonstrates why aliases that depend on CLI options are
-# generally a bad idea. In this case, however, such alias is essential to
-# optimizing away debug logic from release code.
-
-#FIXME: Rename ${ZESHY_USER_DIGEST_DEPENDENCIES_FILE} to
-#${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME}.
-
 typeset -g\
     ZESHY_USER_DIGEST_FILENAME\
     ZESHY_USER_CONFIG_DIRNAME\
-    ZESHY_USER_DIGEST_DEPENDENCIES_FILE="${ZESHY_USER_CACHE_DIR}/digest_dependencies.zsh"
-
-#FIXME: Rename to ${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES}.
-typeset -gUa ZESHY_DIGEST_DEPENDENCY_PATHS
+    ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME
+typeset -gUa ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES
 
 # ....................{ ADDERS                             }....................
 # void add_zeshy_digest_dependency_path(string pathname1, ...)
 function add_zeshy_digest_dependency_path() {
     (( # )) || die 'Expected one or more paths.'
-    ZESHY_DIGEST_DEPENDENCY_PATHS+=( "${@}" )
+    ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES+=( "${@}" )
 }
 
 # ....................{ TESTERS                            }....................
-#FIXME: Add support for zeshy upgrading: namely, if upgrading zeshy,
-#immediately report success.
-
-#FIXME: Minor but annoying bug: if ${ZESHY_USER_CONFIG_DIRNAME} is empty at the
-#time of the call to this function, such directory will subsequently be created
-#with an mtime newer than that of
-#${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}, guaranteeing a subsequent
-#annoying recompilation. This is readily fixed as follows:
-#
-#* When zeshy depends on a *ZESHY*-specific path that does not exist (but will
-#  presumably be subsequently created by @{compile}),
-#  :is_zeshy_digest_outdated() should report success *WITHOUT* setting
-#  ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}.
-#* The following code should be shifted from :is_zeshy_digest_outdated() to
-#  ::digest_zeshy_compile():
-#    (( ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME )) ||
-#       ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME="$(command date +'%s')"
-#
-#Since ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} defaults to 0 as an
-#integer, this ensures the current digest file will be set to the current time
-#if no more appropriate time was found.
-#FIXME: *WAIT*. Face palm. Why are we even setting such variable in the first
-#place?  No, really. It doesn't make sense. In reflection, it *NEVER* made
-#sense. I mean, why do it in the first place? Why not simply always set the
-#newly compiled digest file to the current time? This has the profound benefit
-#of eliminating a huge amount of seemingly unnecessary complexity as well as
-#allowing us to run non-GNU versions of "touch". *sigh*
-#
-#We've more-or-less verified, after a fairly exhaustive run through the
-#codebase, that (indeed) there exists no compelling reason to perform the
-#current complex of ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}
-#contusions. Why, oh why? Well... at least we can dramatically improve this, eh?
-#FIXME: Ah. Right. Such simplification only applies under the condition
-#ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME <= EPOCHREALTIME. We currently
-#check such condition and simply print a nonfatal warning. That will need to
-#change; we'll need to throw an exception, in such case. (Or perhaps manually
-#set EPOCHREALTIME=${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}? Ideally,
-#zsh would permit such operation and confine its scope to the current shell.
-#That would probably be the ideal case. No *WAY* it works, though. Give it a
-#go nonetheless, eh? Ah. Wait. Either it works and hence fails to apply to
-#"touch", in which it doesn't *REALLY* work, or it works by globally changing
-#the current system time, which would probably be bad. So, just throw an
-#exception and get us out of here! Ah. Actually, *ONLY* throw an exception if
-#no such digest file already exists, in which case we truly are hosed. Actually,
-#no: there's little point in throwing an exception. By printing a nonfatal
-#error, we both inform the current user *AND* permit zeshy to be used, albeit at
-#a cost of recompiling zeshy on every startup until the current system time is
-#corrected. But that's a small cost.)
-#
-#Right! No change to the warning, then.
-
 # [status: bool] :is_zeshy_digest_outdated(void)
+#
+# Previously, this function implicitly set global
+# ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} to the modification time of
+# the newest path the current digest file depends upon. ::digest_zeshy_compile()
+# then explicitly changed the modification time of such digest file after
+# compiling such file. Why? We mistakenly believed that if the modification time
+# of such file is *NOT* the exact modification time of the newest path such file
+# depends upon, then :is_zeshy_digest_outdated() would report such file to be
+# outdated. However, a cursory read of :is_zeshy_digest_outdated() shows this
+# *NOT* to be the case. To ensure such function reports recently compiled digest
+# files to be up-to-date, it merely suffices to ensure that the modification
+# times of such files are as or more recent than those of their dependencies.
+#
+# However, assuming system time and such modification times to be sane, this is
+# *ALWAYS* already the case. Compiling a digest file either creates a new file
+# or modifies the contents of an existing file. In either case, the modification
+# time of such file will effectively be the current system time and hence almost
+# always more recent than those of its dependencies. Where this is *NOT* the
+# case, either the current system was installing or uninstalling software *OR*
+# the current user was editing one or more configuration files during digest
+# compilation. In either case, such behavior will induce two unavoidably
+# consecutive digest recompilations. Since this is hardly the worst thing that
+# could happen and -- all things considered -- probably the best, current edge-
+# case behavior is altogether acceptable.
+#
+# In summary: the best thing to do with respect to digest file modification time
+# is nothing.
 function :is_zeshy_digest_outdated() {
     # Validate sanity.
     (( # == 0 )) || die 'Expected no arguments.'
     local   digest_dependency_mtimes
-    integer digest_file_mtime
+    integer digest_dependency_newest_mtime digest_file_mtime
 
     # List of modification times of paths on which such digest depends.
     local -a digest_dependency_pathnames
 
-    # If the caller failed to declare such integer, do so locally. Ideally, the
-    # caller declares such integer to subsequently set such file's modification
-    # time using such integer. See ::digest_zeshy_compile() for further details.
+    # If the current digest file or one or more zeshy-specific files or
+    # directories such file depends upon does *NOT* exist, report such digest
+    # file to be outdated. This is *NOT* merely an optimization. In the latter
+    # case, such missing files or directories will be implicitly recreated as a
+    # beneficial side effect of digest compilation.
     #
-    # Avoid declaring such integer as type "integer".
-    [[     "${(t)ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME-}" == 'integer'* ]] ||
-        local -i ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME
-
-    # If the current digest file does *NOT* exist, set
-    # ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} to the current time and
-    # report such file to be outdated. Since the current time will typically be
-    # more recent than that of the newest digest dependency (e.g., command in
-    # the current ${PATH}), this ensures the modification time for such digest
-    # file will be set to a time more recent than that of the newest digest
-    # dependency, in turn ensuring that such file will *NOT* be recompiled until
-    # the next change to such a dependency (as desired).
-    [[ -f "${ZESHY_USER_DIGEST_FILENAME}" ]] || {
-        ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME="$(command date +'%s')"
+    # To ensure empty configuration directories trigger recompilation, test for
+    # the existence of a well-known non-optional subdirectory of the current
+    # configuration directory rather than merely such directory.
+    [[  -f "${ZESHY_USER_DIGEST_FILENAME}" &&
+        -f "${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME}" &&
+        -d "${ZESHY_USER_CONFIG_DIRNAME}/00-core" ]] || {
+        digest_dependency_newest_mtime="$(command date +'%s')"
         return 0
     }
 
     # Append all directories in the current user's ${PATH}, triggering
-    # recompilation on installation of new commands and uninstallation of
-    # existing commands.
+    # recompilation on installation and uninstallation of commands.
     digest_dependency_pathnames+=( "${path[@]}" )
 
-    # If the file to which zeshy previously cached the list of all paths other
-    # parcels insist such digest depends on (${ZESHY_DIGEST_DEPENDENCY_PATHS}),
-    # source such file (thus defining such list) and append such paths.
-    if [[ -f "${ZESHY_USER_DIGEST_DEPENDENCIES_FILE}" ]] {
-        source -- "${ZESHY_USER_DIGEST_DEPENDENCIES_FILE}"
-        digest_dependency_pathnames+=( "${ZESHY_DIGEST_DEPENDENCY_PATHS[@]}" )
-    }
+    # Source the file to which zeshy previously cached the list of all
+    # extraneous files and directories other parcels insist the current digest
+    # file depends upon.
+    source -- "${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME}"
 
-    # If the current configuration directory exists, append the path of the
-    # newest file or subdirectory of such directory. Test for a well-known
-    # non-optional subdirectory of such directory rather than merely such
-    # directory to ensure empty configuration directories trigger recompilation.
-    # Generally, this conditional triggers recompilation on edits to user-
-    # specific configuration files. Dismantled, this is:
+    # Append all such files and directories, triggering recompilation on
+    # modification to such paths.
+    digest_dependency_pathnames+=(
+        "${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES[@]}" )
+
+    # Append the newest file or subdirectory of the current configuration
+    # directory, triggering recompilation on configuration changes. Dismantled,
+    # this is:
     #
     # * "${...}"/**/*, matching all configuration files and directories.
     # * "(#qom...)", sorting such files and directories by descending mtime.
     # * "[1]", expanding to only the first and hence newest such path.
-    if [[ -d "${ZESHY_USER_CONFIG_DIRNAME}/00-core" ]] {
-        digest_dependency_pathnames+=(
-            "${ZESHY_USER_CONFIG_DIRNAME}"/**/*(#qom[1]) )
-    }
+    digest_dependency_pathnames+=(
+        "${ZESHY_USER_CONFIG_DIRNAME}"/**/*(#qom[1]) )
 
     # If CLI option "--compile-digest-if-zeshy-changed" was passed, append the
     # path of the newest file or subdirectory of the topmost directory
@@ -182,14 +153,13 @@ function :is_zeshy_digest_outdated() {
         digest_dependency_pathnames+=( "${ZESHY_HOME}"/**/*(#qom[1]) )
     }
 
-    # Filter nonextant files and directories from such list of dependencies.
-    # To preserve path quoting, such operation *MUST* be performed in a list
-    # context and hence cannot be inlined below. That said, such operation
-    # preserves path quoting without requiring double quoting here. To minimize
-    # race conditions, delay such operation as long as possible.
+    # Filter nonextant files and directories from such list. To preserve path
+    # quoting, such operation *MUST* be performed in a list context and hence
+    # *NOT* inlined below. Note such operation implicitly preserves path quoting
+    # without requiring double quoting here.
     digest_dependency_pathnames=( ${^digest_dependency_pathnames}(#q) )
 
-    # Newline-delimited string list of the modification times of such
+    # Newline-delimited string list of the modification times of all such
     # dependencies (in arbitrary order). Dismantled, this is:
     #
     # * "-N", outputting only modification times. By default, zstat() outputs a
@@ -208,9 +178,10 @@ function :is_zeshy_digest_outdated() {
     #   words numerically in descending order.
     # * "(w)1", expanding to the first such word.
     #
-    # Sorting such list is technically O(n lg(n)) but should approximate O(n)
-    # assuming sufficiently few dependencies and ${PATH} entries.
-    ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME="${${(Onf)digest_dependency_mtimes}[(w)1]}"
+    # While sorting such list is technically O(n lg(n)), such sort should be
+    # approximately O(n) assuming non-pathological edge cases (e.g., ${PATH}
+    # containing an absurd number of entries).
+    digest_dependency_newest_mtime="${${(Onf)digest_dependency_mtimes}[(w)1]}"
 
     # Modification time of such digest file, ensured to exist by above. To
     # minimize race conditions, delay such operation as long as possible.
@@ -221,29 +192,29 @@ function :is_zeshy_digest_outdated() {
     # digest file to be outdated by reporting success. This usually only occurs
     # under hardware malfunction (e.g., lightning-based CMOS resets).
     if (( digest_file_mtime > EPOCHREALTIME ||\
-          ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME > EPOCHREALTIME )) {
+          digest_dependency_newest_mtime > EPOCHREALTIME )) {
         # Print such warning depending on which error condition occurred.
         {
             if (( digest_file_mtime > EPOCHREALTIME )) {
                 print "zeshy: Digest modification time ${digest_file_mtime}s newer than current time ${EPOCHREALTIME}s."
             } else {
-                print "zeshy: Newest digest dependency modification time ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}s newer than current time ${EPOCHREALTIME}s."
+                print "zeshy: Newest digest dependency modification time ${digest_dependency_newest_mtime}s newer than current time ${EPOCHREALTIME}s."
             }
 
             print "zeshy: Consider calling set_time_with_ntp() to properly set the current time."
         } 2>&1
 
-        # Signify such digest file to be outdated.
+        # Since the current time is in an indeterminate state, force digest
+        # recompilation by reporting such digest file to be outdated.
         return 0
     }
 
-    # If zeshy's digest is older than its newest dependency, signify such digest
-    # to be outdated by returning success.
-#   print "mtimes: ${dependency_mtimes[@]}"
-#   print "digest file: \"${ZESHY_USER_DIGEST_FILENAME}\""
-#   print "digest: ${digest_file_mtime}"
-#   print "newest: ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}"
-    ((  digest_file_mtime < ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME ))
+    # If debugging, output such modification times.
+    :output_line_if_debugging "Current digest mtime:                   ${digest_file_mtime}"
+    :output_line_if_debugging "Current digest newest dependency mtime: ${digest_dependency_newest_mtime}"
+
+    # Such digest file is outdated if older than its newest dependency.
+    (( digest_file_mtime < digest_dependency_newest_mtime ))
 }
 
 # ....................{ SETUP                              }....................
@@ -255,14 +226,6 @@ function :digest_zeshy() {
     # Inspect the current system for high-level metadata on which the choice of
     # current digest file depends (e.g., operating system, display server).
     ::digest_zeshy_inspect
-
-    # If such digest is outdated, this is the modification time of the newest
-    # path such digest depends on; else 0. While this function itself does not
-    # refer to this variable, explicitly declare this variable here to provide
-    # shared access to this variable by functions this function calls. (Subtle!)
-    #
-    # Avoid declaring such integer as type "integer".
-    local -i ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME
 
     # If the current digest file is outdated or the caller demands recompiling
     # such file regardless of whether it's outdated or not, compile all zeshy
@@ -280,9 +243,6 @@ function :digest_zeshy() {
 #       print "autoloading \"${ZESHY_USER_DIGEST_FILENAME}\"..."
     }
 
-    # If debugging zeshy, output useful digest metadata.
-    :run_line_if_debugging ::output_digest_metadata
-
     # Prefix the function path with the absolute path to such digest, ensuring
     # zsh searches such file first for definitions of undefined functions.
     fpath=( "${ZESHY_USER_DIGEST_FILENAME}" "${fpath[@]}" )
@@ -294,7 +254,7 @@ function ::digest_zeshy_inspect() {
     (( # == 0 )) || die 'Expected no arguments.'
     local digest_dirname
 
-    # Set system-specific globals -- specifically, ${ZESHY_SYSTEM_ID}.
+    # Set globals describing the current system (e.g., ${ZESHY_SYSTEM_ID}).
     source -- "${ZESHY_HOME}/inspect"
 
     #FIXME: Technically, such directory could also depend on whether this is a
@@ -313,59 +273,196 @@ function ::digest_zeshy_inspect() {
     digest_dirname="${ZESHY_USER_DIGEST_ROOT_DIRNAME}/${HOST}.${ZESHY_SYSTEM_ID}"
 
     # The absolute paths of the current digest file depends on whether this is a
-    # debug or release build of zeshy. (The latter omits lines passed to either
-    # :run_line_if_debugging() or :output_line_if_debugging().)
+    # debug or release build of zeshy. Why? :run_line_if_debugging() expands to
+    # the passed code in the former case and to the comment prefix ignoring such
+    # code in the latter. In either case, such alias' expansion directly depends
+    # on corresponding CLI options. Since functions expand aliases at function
+    # definition rather than call time, all functions expanding such alias
+    # compiled into the current digest file (and hence such file itself) depend
+    # on the exact same CLI options.
+    #
+    # Such complexity demonstrates why defining aliases in terms of CLI options
+    # is generally a terrible idea. In this case, however, such aliases are
+    # essential to optimizing away debug logic from release code.
     if { :is_debugging } {
         ZESHY_USER_DIGEST_FILENAME="${digest_dirname}/debug.zwc"
     } else {
         ZESHY_USER_DIGEST_FILENAME="${digest_dirname}/release.zwc"
     }
+
+    # System-specific file caching the list of all extraneous files and
+    # directories such digest file depends upon.
+    ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME="${digest_dirname}/dependencies.zsh"
 }
 
 # void ::digest_zeshy_compile(void)
 function ::digest_zeshy_compile() {
-    # Validate sanity. Unless the modification time of the newest path zeshy's
-    # user digest file depends on was previously set, throw an exception.
+    # Validate sanity.
     (( # == 0 )) || die 'Expected no arguments.'
-    (( ${+ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} )) ||
-        die '${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} unset.'
 
-    # Source all applicable zeshy scripts and hence functions.
+    # Compile the current digest file.
     source -- "${ZESHY_HOME}/compile"
-
-    # Set the modification time of such digest to that of the newest
-    # modification time to avoid recompilation on the next zeshy run.
-    command touch -m\
-        --date=@${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}\
-        -- "${ZESHY_USER_DIGEST_FILENAME}"
 
     # Declare all functions defined by such digest to be autoloadable.
 #   print "autoloading \"${ZESHY_USER_DIGEST_FILENAME}\"..."
     autoload -w -- "${ZESHY_USER_DIGEST_FILENAME}" ||
-        die "Digest \"${ZESHY_USER_DIGEST_FILENAME}\" cannot be compiled."
-}
-
-# void ::output_digest_metadata(void)
-function ::output_digest_metadata() {
-    # Validate sanity.
-    (( # == 0 )) || die 'Expected no arguments.'
-
-    # If such digest no longer exists (despite having just compiled such
-    # digest), throw an exception. However unlikely, such edge cases remain
-    # feasible and must be guarded against.
-    [[ -f "${ZESHY_USER_DIGEST_FILENAME}" ]] ||
-        die "Digest \"${ZESHY_USER_DIGEST_FILENAME}\" not found or not a file."
-
-    # Describe such digest.
-    :output_line_if_debugging "Compiled digest metadata..."
-    :output_line_if_debugging "   mtime (file):              $(zstat +mtime "${ZESHY_USER_DIGEST_FILENAME}")"
-    :output_line_if_debugging "   mtime (newest dependency): ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}"
+        die "Digest \"${ZESHY_USER_DIGEST_FILENAME}\" not found or not autoloadable."
 }
 
 # ....................{ MAIN                               }....................
 :digest_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+#   print "mtimes: ${dependency_mtimes[@]}"
+#   print "digest file: \"${ZESHY_USER_DIGEST_FILENAME}\""
+#   print "digest: ${digest_file_mtime}"
+#   print "newest: ${digest_dependency_newest_mtime}"
+    # If debugging zeshy, output useful digest metadata.
+    # :run_line_if_debugging ::output_digest_metadata
+
+# void ::output_digest_metadata(void)
+# function ::output_digest_metadata() {
+#     # Validate sanity.
+#     (( # == 0 )) || die 'Expected no arguments.'
+# 
+#     # Describe such digest.
+#     :output_line_if_debugging "Compiled digest metadata..."
+#     :output_line_if_debugging "   mtime (file):              $(zstat +mtime "${ZESHY_USER_DIGEST_FILENAME}")"
+#     :output_line_if_debugging "   mtime (newest dependency): ${digest_dependency_newest_mtime}"
+# }
+
+    # If such digest is outdated, this is the modification time of the newest
+    # path such digest depends on; else 0. While this function itself does not
+    # refer to this variable, explicitly declare this variable here to provide
+    # shared access to this variable by functions this function calls. (Subtle!)
+    #
+    # Avoid declaring such integer as type "integer".
+    # local -i ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME
+
+#(The latter omits lines passed to either
+    # :run_line_if_debugging() or :output_line_if_debugging().)
+    # Such path depends on whether zeshy is currently being debugged or not. If
+    # zeshy is being debugged, is_zeshy_debug_and() expands to a command running
+    # the passed command; else, to a command ignoring such command. In either case,
+    # the expansion for such alias directly depends on CLI option "--verbose". Since
+    # functions expand aliases at function definition rather than call time, zeshy
+    # functions expanding such alias compiled into zeshy's user digest file and
+    # hence such file itself transitively depends on the same CLI option.
+    #
+    # This complexity demonstrates why aliases that depend on CLI options are
+    # generally a bad idea. In this case, however, such alias is essential to
+    # optimizing away debug logic from release code.
+
+# To minimize race conditions, delay
+    # such operation as long as possible.
+    # If the file to which zeshy previously cached the list of all paths other
+    # parcels insist such digest depends on (${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES}),
+    # such file (thus defining such list) and append such paths.
+
+    #FUXME: Such file should be moved into the digest directory containing the
+    #current digest file, permitting different digest files to depend on
+    #different external paths.
+
+#FUXME: Minor but annoying bug: if ${ZESHY_USER_CONFIG_DIRNAME} is empty at the
+#time of the call to this function, such directory will subsequently be created
+#with an mtime newer than that of
+#${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}, guaranteeing a subsequent
+#annoying recompilation. This is readily fixed as follows:
+#
+#* When zeshy depends on a *ZESHY*-specific path that does not exist (but will
+#  presumably be subsequently created by @{compile}),
+#  :is_zeshy_digest_outdated() should report success *WITHOUT* setting
+#  ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}.
+#* The following code should be shifted from :is_zeshy_digest_outdated() to
+#  ::digest_zeshy_compile():
+#    (( ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME )) ||
+#       ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME="$(command date +'%s')"
+#
+#Since ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} defaults to 0 as an
+#integer, this ensures the current digest file will be set to the current time
+#if no more appropriate time was found.
+#FUXME: *WAIT*. Face palm. Why are we even setting such variable in the first
+#place?  No, really. It doesn't make sense. In reflection, it *NEVER* made
+#sense. I mean, why do it in the first place? Why not simply always set the
+#newly compiled digest file to the current time? This has the profound benefit
+#of eliminating a huge amount of seemingly unnecessary complexity as well as
+#allowing us to run non-GNU versions of "touch". *sigh*
+#
+#We've more-or-less verified, after a fairly exhaustive run through the
+#codebase, that (indeed) there exists no compelling reason to perform the
+#current complex of ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}
+#contusions. Why, oh why? Well... at least we can dramatically improve this, eh?
+#FUXME: Wooh. Wow. We don't even *HAVE* to touch such file, since we've either
+#just created or overwritten it. SUPERFACEPALM.
+#FUXME: Ah. Right. Such simplification only applies under the condition
+#ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME <= EPOCHREALTIME. We currently
+#check such condition and simply print a nonfatal warning. That will need to
+#change; we'll need to throw an exception, in such case. (Or perhaps manually
+#set EPOCHREALTIME=${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}? Ideally,
+#zsh would permit such operation and confine its scope to the current shell.
+#That would probably be the ideal case. No *WAY* it works, though. Give it a
+#go nonetheless, eh? Ah. Wait. Either it works and hence fails to apply to
+#"touch", in which it doesn't *REALLY* work, or it works by globally changing
+#the current system time, which would probably be bad. So, just throw an
+#exception and get us out of here! Ah. Actually, *ONLY* throw an exception if
+#no such digest file already exists, in which case we truly are hosed. Actually,
+#no: there's little point in throwing an exception. By printing a nonfatal
+#error, we both inform the current user *AND* permit zeshy to be used, albeit at
+#a cost of recompiling zeshy on every startup until the current system time is
+#corrected. But that's a small cost.)
+#
+#Right! No change to the warning, then.
+
+    # ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME="${ZESHY_USER_CACHE_DIR}/digest_dependencies.zsh"
+    # If the file to which zeshy previously cached the list of all paths other
+    # parcels insist such digest depends on (${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES}),
+    # source such file (thus defining such list) and append such paths.
+
+    # If the current configuration directory exists, append the path of the
+    # newest file or subdirectory of such directory. Test for a well-known
+    # non-optional subdirectory of such directory rather than merely such
+    # directory to ensure empty configuration directories trigger recompilation.
+    # Generally, this conditional triggers recompilation on edits to user-
+    # specific configuration files. Dismantled, this is:
+
+    # # If the caller failed to declare such integer, do so locally. Ideally, the
+    # # caller declares such integer to subsequently set such file's modification
+    # # time using such integer. See ::digest_zeshy_compile() for further details.
+    # #
+    # # Avoid declaring such integer as type "integer".
+    # [[     "${(t)ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME-}" == 'integer'* ]] ||
+    #     local -i ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME
+
+    # # If the current digest file does *NOT* exist, set
+    # # ${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} to the current time and
+    # # report such file to be outdated. Since the current time will typically be
+    # # more recent than that of the newest digest dependency (e.g., command in
+    # # the current ${PATH}), this ensures the modification time for such digest
+    # # file will be set to a time more recent than that of the newest digest
+    # # dependency, in turn ensuring that such file will *NOT* be recompiled until
+    # # the next change to such a dependency (as desired).
+    # [[  -f "${ZESHY_USER_DIGEST_FILENAME}" ]] || {
+    #     ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME="$(command date +'%s')"
+
+    # If such digest no longer exists (despite having just compiled such
+    # digest), throw an exception. However unlikely, such edge cases remain
+    # feasible and must be guarded against.
+    # [[ -f "${ZESHY_USER_DIGEST_FILENAME}" ]] ||
+    #     die "Digest \"${ZESHY_USER_DIGEST_FILENAME}\" not found or not a file."
+
+    # Source all applicable zeshy scripts and hence functions.
+
+    # Unless the modification time of the newest path zeshy's user digest file
+    # depends on was previously set, throw an exception.
+    # (( ${+ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} )) ||
+    #     die '${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME} unset.'
+
+    # Set the modification time of such digest to that of the newest
+    # modification time to avoid recompilation on the next zeshy run.
+    # command touch -m\
+    #     --date=@${ZESHY_USER_DIGEST_FILE_DEPENDENCY_NEWEST_MTIME}\
+    #     -- "${ZESHY_USER_DIGEST_FILENAME}"
+
     # The newest modification time of all dependencies of zeshy's digest.
     # Sorting such list is technically O(n lg(n)) but should approximate O(n)
     # assuming a sufficiently small number of dependencies (particularly a small
@@ -442,7 +539,7 @@ function ::output_digest_metadata() {
     #   "1386576475
     #    1368426799"
     # * "${path[@]}", testing all directories on the current user's ${PATH}.
-    # * "${ZESHY_DIGEST_DEPENDENCY_PATHS[@]}", testing all paths other parcels
+    # * "${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES[@]}", testing all paths other parcels
     #   insist such digest depends on. Note that if the file caching such list
     #   did *NOT* exist above, such list remains empty. This is perfectly fine.
     # * "(@f)", splitting such output on newlines.
@@ -452,7 +549,7 @@ function ::output_digest_metadata() {
     # for further details.
     # digest_dependency_mtimes+=(
     #     "${(@f):-$(zstat +mtime -N\
-    #         "${path[@]}" "${ZESHY_DIGEST_DEPENDENCY_PATHS[@]}")}" )
+    #         "${path[@]}" "${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES[@]}")}" )
         # digest_dependency_mtimes+="$(zstat +mtime "${ZESHY_USER_CONFIG_DIRNAME}"/**/*(om[1]))"
         # digest_dependency_mtimes+="$(zstat +mtime "${ZESHY_HOME}"/**/*(om[1]))"
 #       print "adding zeshy codebase \"${ZESHY_HOME}\" as a digest dependency..."
@@ -463,7 +560,7 @@ function ::output_digest_metadata() {
     #${digest_dependency_mtimes}.
 
     # digest_dependency_mtimes="$(zstat +mtime -N\
-    #     "${path[@]}" "${ZESHY_DIGEST_DEPENDENCY_PATHS[@]}")"
+    #     "${path[@]}" "${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES[@]}")"
 
     # # Get the modification times of the newest such dependency. Dismantled, this
     # # is:
@@ -478,7 +575,7 @@ function ::output_digest_metadata() {
     # Else, only get times for all directories on the current user's ${PATH}.
     # } else {
 # the list of all paths on which such
-    # digest depends, thus defining ${ZESHY_DIGEST_DEPENDENCY_PATHS}.
+    # digest depends, thus defining ${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES}.
 
     # Append to such list the modification time of each existing directory
     # listed by the current user's ${PATH}, ensuring digest recompilation on
@@ -531,7 +628,7 @@ function ::output_digest_metadata() {
 #         "${path[@]}"
 # 
 #         # All paths other zeshy components insist such digest depends on.
-#         "${ZESHY_DIGEST_DEPENDENCY_PATHS[@]}"
+#         "${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES[@]}"
 #     ) {
 # #       print "adding mtime for dependency \"${dependency_pathname}\"..."
 #         if [[ -e "${dependency_pathname}" ]] {
@@ -575,7 +672,7 @@ function ::output_digest_metadata() {
     # Get the modification time of the newest Dismantled, this is:
     #
     # * "${path[@]}", testing all directories on the current user's ${PATH}.
-    # * "${ZESHY_DIGEST_DEPENDENCY_PATHS[@]}", testing all paths other parcels
+    # * "${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES[@]}", testing all paths other parcels
     #   insist such digest depends on.
     #
     # Such expansion *MUST* be both double-quoted and explicitly expanded as a
@@ -583,7 +680,7 @@ function ::output_digest_metadata() {
     # for further details.
 #     digest_dependency_mtimes_lines=(
 #         "${(@f):-$(zstat +mtime\
-#             "${path[@]}" "${ZESHY_DIGEST_DEPENDENCY_PATHS[@]}")}"
+#             "${path[@]}" "${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES[@]}")}"
 #     )
 # 
 #     local dependency_pathname
@@ -629,7 +726,7 @@ function ::output_digest_metadata() {
     # non-empty)
     # if ! {
     #     [[ -f "${ZESHY_USER_DIGEST_FILENAME}" &&\
-    #        -f "${ZESHY_USER_DIGEST_DEPENDENCIES_FILE}" &&\
+    #        -f "${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME}" &&\
     #        -d "${ZESHY_USER_CONFIG_ROOT_DIRNAME}/00-core" ]] &&
     #     {
     #         local -a zeshy_dot_config_dir_if_nonempty
@@ -900,13 +997,13 @@ function ::output_digest_metadata() {
 #individual components (e.g., "path/file/mime") to append arbitrary paths to
 #such dependency list. To do so, we'll need the customary adder function and
 #corresponding global (e.g., add_zeshy_digest_dependency_path() and
-#${ZESHY_DIGEST_DEPENDENCY_PATHS}). But that won't be enough. This function
+#${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES}). But that won't be enough. This function
 #is called before digest autoloading and hence requires... unconventional access
 #to such global. The simplest and sanest approach is as follows:
 #
 #* Immediately before *OR* after digest compilation but certainly after calling
 #  precompile_zeshy() and before calling startup_zeshy(), cache the contents of
-#  ${ZESHY_DIGEST_DEPENDENCY_PATHS} to a new user-specific dotfile -- say,
+#  ${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES} to a new user-specific dotfile -- say,
 #  "~/.zeshy/cache/digest.paths".
 #* In :is_zeshy_digest_outdated(), if such dotfile does *NOT* exist, Zeshy cannot
 #  have been compiled before, so the digest file is outdated (test this at the
@@ -917,7 +1014,7 @@ function ::output_digest_metadata() {
 #  certainly safer) to simply reinterpolate the ${path} on each call to this
 #  function: e.g.,
 #
-#      for dependency_pathname ("${path[@]}" "${ZESHY_DIGEST_DEPENDENCY_PATHS[@]}") {
+#      for dependency_pathname ("${path[@]}" "${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES[@]}") {
 #
 #Should be reasonably efficient, all things considered. In fact, it might
 #eventually be *MORE* efficient than the current approach. Why? Because
