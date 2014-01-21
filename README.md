@@ -1,7 +1,14 @@
 zeshy
 ===========
 
-_zeshy_ :: high-level shell scripting lingua franca implemented in pure `zsh`
+`zeshy` is a:
+
+* **Dynamically recompiled shell scripting language** implemented in and running on `zsh`.
+* Drop-in replacement for `zsh` with out-of-the-box support for:
+  * First- and third-party shell, prompt, and function themes and plugins.
+  * Genuine exception handling.
+  * Extensive runtime help.
+  * Cross-platform portable API.
 
 ## Installation
 
