@@ -14,17 +14,18 @@
 # such caller is not the "zeshy" wrapper script, the only caller permitted to
 # source this script. Print an error and return non-zero exit status.
 (( ${+ZESHY_ARGS} + ${+ZESHY_HOME_SCRIPT} + ${+ZESHY_ZDOTDIR_USER} == 3 )) || {
-    print 'zeshy: at least one of ${ZESHY_ARGS}, ${ZESHY_HOME_SCRIPT}, and ${+ZESHY_ZDOTDIR_USER} not defined' 1>&2
-    print "zeshy: \"${0}\" not sourced by wrapper script \"zeshy\"" 1>&2
+    print 'zeshy: At least one of ${ZESHY_ARGS}, ${ZESHY_HOME_SCRIPT}, and/or'
+    print 'zeshy: ${ZESHY_ZDOTDIR_USER} undefined.' 1>&2
+    print 'zeshy: "'${0}'" not sourced by wrapper script "zeshy".' 1>&2
     return 1
 }
 
-# If the current's user ${ZDOTDIR} is Zeshy's ${ZDOTDIR}, something has gone
+# If the current's user ${ZDOTDIR} is zeshy's ${ZDOTDIR}, something has gone
 # terribly awry. To avoid infinite recursion, print an error and return non-zero
 # exit status.
-[[ "${ZESHY_ZDOTDIR_USER}" == "${ZDOTDIR}" ]] && {
-    print "zeshy: user ZDOTDIR is zeshy's ZDOTDIR \"${ZESHY_ZDOTDIR_USER}\"" 1>&2
-    print "zeshy: prematurely terminating to avoid infinite recursion" 1>&2
+if [[ "${ZESHY_ZDOTDIR_USER}" == "${ZDOTDIR}" ]] {
+    print 'zeshy: User ${ZDOTDIR} is zeshy''s ${ZDOTDIR} "'${ZESHY_ZDOTDIR_USER}'".' 1>&2
+    print 'zeshy: Prematurely terminating to avoid infinite recursion.' 1>&2
     return 1
 }
 
@@ -33,12 +34,12 @@
 local zshrc_user_filename="${ZESHY_ZDOTDIR_USER}/.zshrc"
 
 # Source such script, if found.
-[[ -f "${zshrc_user_filename}" ]] && {
+if [[ -f "${zshrc_user_filename}" ]] {
 #   print "[${0}] sourcing user dotfile \"${zshrc_user_filename}\" from zeshy dotfile \"${0}\"..."
     source -- "${zshrc_user_filename}"
 }
 
-# Source the main Zeshy script, thus loading Zeshy. Convert the list of
+# Source the main zeshy script, thus loading zeshy. Convert the list of
 # arguments previously passed to the "zeshy" wrapper script from a string back
 # into its original list. Since strings but not lists cannot be inherited by
 # subshells, such circumlocution is sadly unavoidable. See restore_list() for
@@ -60,7 +61,7 @@ source -- "${ZESHY_HOME_SCRIPT}" "${(Qz)ZESHY_ARGS}"
     # avoid infinite recursion, print an error and return non-zero exit status.
 #   [[ "${zshrc_filename}"(:A) == "${0}"(:A) ]] && {
 
-# If the absolute path of the main Zeshy script was not previously defined, this
+# If the absolute path of the main zeshy script was not previously defined, this
 # script was probably not run by "zeshy". Throw an exception!
 # If the list of previously passed arguments was not previously defined, this
 # script was probably not run by "zeshy". Throw an exception!

@@ -11,7 +11,8 @@
 
 # ....................{ MAIN                               }....................
 # Source the current user's ".zlogin", if found.
-[[ -f "${ZESHY_USER_ZDOTDIR}/.zlogin" ]] &&
+if [[ -f "${ZESHY_USER_ZDOTDIR}/.zlogin" ]] {
     source -- "${ZESHY_USER_ZDOTDIR}/.zlogin"
+}
 
 # --------------------( WASTELANDS                         )--------------------

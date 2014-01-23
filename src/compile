@@ -771,7 +771,6 @@
 #
 #So. What would such a source configuration file resemble? Consider:
 #
-#
 #    #!/usr/bin/env zsh
 #
 #    declare_parcel_as_script_with_stdin <<'/---'
@@ -973,6 +972,185 @@
 #                    00-core/
 #                    command/
 #FIXME: Don't forget to maintain symlink "current"! Important for usability.
+#FIXME: Ugh. In reflection, the ponderous majority of the above discussion on
+#system-specific configuration files is skewed far afield from reality. No.
+#Really. Absolutely atrocious concept, and we're overwhelmingly lucky not to
+#have actually followed through with it. The core deficit in the whole concept
+#is its disconnect between output lines and preprocessed code. In particular,
+#consider the following problem using the underlying example of
+#${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN}: when running under a virtual console
+#(i.e., under no display server), :screenshot_screen_to_file() and hence
+#${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN} should be *UNDEFINED*, as well as the
+#corresponding documentation for each. Since both :screenshot_screen_to_file()
+#and its documentation are defined in code, preventing either from being
+#defined is readily feasible. But how exactly would we prevent documentation for
+#${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN} from being defined? In two words: we
+#wouldn't. It's infeasible given the prior preprocessing concept, which pretty
+#much throws out all other arguments in favor of such preprocessing.
+#
+#So, what do we do instead? Simple:
+#
+#* Define a new top-level parcel @{src/25-if_config_system}.
+#* Define a corresponding ::compile_zeshy_suboverlay_if_config_system() function
+#  handling the contents of such overlay, which are source configuration scripts
+#  whose output is intended to be redirected to the target configuration file
+#  under "~/.zeshy/config/system":
+#    source -- "${filename_src}" >! "${filename_trg}"
+#  Each such source script is a simple zsh script containing *NONE* of the prior
+#  proprocessing nonsense; instead, such scripts resemble:
+#
+#    #!/usr/bin/env zsh
+#
+#    () {
+#        :output_stdin <<<'---/'
+#        #!/usr/bin/env zsh
+#
+#        declare_parcel_as_script_with_stdin <<'/---'
+#        Configure *command alternatives* (i.e., lists of all possible external commands
+#        providing similar functionality, listed in descending order of preference).
+#        /---
+#
+#        # ....................{ ABBREVIATIONS                      }....................
+#        ---/
+#
+#        :string ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN_HELP='
+#        List of all possible commands which which to implement
+#        :screenshot_screen_to_file(), in descending order of preference.'
+#        if { :is_os_linux and :is_wm_x11 } {
+#            :output_stdin <<<'---/'
+#            declare_global_with_stdin list ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN\
+#                <<"${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN_HELP}"
+#            ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=(
+#                import scrot imlib2_grab 'xwd and xwdtopnm' )
+#            ---/
+#        elif { :is_os_darwin } {
+#            :output_stdin <<<'---/'
+#            declare_global_with_stdin list ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN\
+#                <<"${ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN_HELP}"
+#            ZESHY_ALTERNATIVES_SCREENSHOT_SCREEN=( apple_screenshotter )
+#            ---/
+#        }
+#    }
+#
+#  Great! Simple; efficient; and certainly maintainable. And, of course, there's
+#  the benefit of it actually working. In practice, of course, we'd probably
+#  prefer to:
+#
+#  * *ALWAYS* unconditionally declare documentation, even if the corresponding
+#    function or global is never defined. Keeps code maintainable and readable.
+#  * Implement documentation printers (e.g., :print_help()) to pretend that no
+#    documentation exists for undefined functions and globals. (Simple!)
+#
+#  Nonetheless, the fact that we even *CAN* leave documentation unconditionally
+#  undefined with the above approach but *NOT* with the preprocessing approach
+#  is the thing. At some point, we'll absolutely need such flexibility. So,
+#  let's prepare for the longest road.
+#* Unfortunately, we run into a bit of trouble here. ::compile_zeshy_source()
+#  (the function sourcing zeshy scripts) is disconnected from
+#  ::compile_zeshy_suboverlay_if_config_system() (the function registering such
+#  scripts). At the moment, ::compile_zeshy_source() simply sources all scripts.
+#  We'll need to generalize this such that:
+#
+#  * If the current script to be sourced by ::compile_zeshy_source() resides in
+#    an "if_config_system" overlay, the output of doing so should be redirected
+#    to the corresponding target configuration file:
+#  * Else, such script should simply be sourced as is.
+#
+#Great. Now how do we efficiently accomplish this? We *DON'T* want to perform
+#manual globbing of script paths to try to hackily determine whether such script
+#is in an "if_config_system" overlay. And we'll need some means of associating
+#such scripts with the target path to copy their output to.
+#
+#Hmm. We *COULD* embed such logic directly into the source script, which is
+#probably the ideal route to take here. As we see it, there are fundamentally
+#two ways of implementing such logic:
+#
+#1. By passing here-documents to an append function and then lastly calling a source
+#   function: e.g.,
+#
+#    #!/usr/bin/env zsh
+#    :source_file_config_system_start
+#
+#    :append_stdin_to_file_config_system <<'###-'
+#    #!/usr/bin/env zsh
+#
+#    declare_parcel_as_script_with_stdin <<'/---'
+#    Configure *command alternatives* (i.e., lists of all possible external commands
+#    providing similar functionality, listed in descending order of preference).
+#    /---
+#
+#    # ....................{ ABBREVIATIONS                      }....................
+#    ###-
+#
+#    ...
+#
+#    :source_file_config_system_stop
+#2. By redirecting subshell output to a single write-and-source function: e.g.,
+#
+#    #!/usr/bin/env zsh
+#
+#    :write_stdin_to_file_config_system_and_source <(
+#    :output_stdin <<<'###-'
+#    #!/usr/bin/env zsh
+#
+#    declare_parcel_as_script_with_stdin <<'/---'
+#    Configure *command alternatives* (i.e., lists of all possible external commands
+#    providing similar functionality, listed in descending order of preference).
+#    /---
+#
+#    # ....................{ ABBREVIATIONS                      }....................
+#    ###-
+#
+#    ...)
+#
+#   This has one distinct disadvantage: inefficiency. In general, this would
+#   certainly be cause for concern. In this case, however, such script is *ONLY*
+#   executed when the target configuration file does *NOT* already exist (i.e.,
+#   on first installation) *AND* on subsequent upgrades -- which is to say,
+#   hardly ever. And the advantages are numerous: a simplified interface
+#   requiring only one new function
+#   :write_stdin_to_file_config_system_and_source(), usage of any conventional
+#   aliases and functions the source configuration file desires for constructing
+#   such output (e.g., :output_stdin(), :output_string()), and no need for a
+#   final cleanup call.
+#FIXME: Actually, on a wee mote of reflection, we quite prefer the former
+#method. Despite appearances, it's much more straightforward, requires no
+#subshells, and only requires adherence to a *VERY* simple blackbox interface
+#defined by the following three functions declared somewhere here in @{compile}
+#(and then ideally undefined after sourcing the codebase but before digest
+#compilation, to prevent their unwanted compilation into such digest):
+#
+#* :source_file_config_system_start(). This function ensures the target
+#  configuration file does *NOT* exist and, if it does, removes it.
+#* :append_stdin_to_file_config_system(). This function appends standard input
+#  to such file.
+#* :source_file_config_system_stop(). This function sources such file.
+#
+#Simple. We should note that the alternative solution above actually isn't
+#terribly better, as we'd probably end up defining a new pair of aliases
+#:write_stdin_to_file_config_system_and_source_start()
+#:write_stdin_to_file_config_system_and_source_stop() to simplify and
+#abstract away such details, in which case we really haven't gained anything
+#over the more straightforward solution here.
+#
+#So. Such functions clearly require some means of mapping from source
+#configuration scripts to the target configuration files such scripts intend
+#output to be written to. How? Simple: as ever, a temporary map "global"
+#${ZESHY_CONFIG_SYSTEM_SCRIPT_NAME_TO_FILENAME} (or some such) defined at the
+#head of :compile_zeshy() and appended to within the body of
+#::compile_zeshy_suboverlay_if_config_system(). Done!
+#
+#Right. We reckon that's it then: go the :append_stdin_to_file_config_system()
+#route, define ${ZESHY_CONFIG_SYSTEM_SCRIPT_NAME_TO_FILENAME} as described, and
+#have a buckethead full of elegant codey fun.
+#FIXME: *PALM STRIKES FOREHEAD*. O.K.; obviously, given such a map "global"
+#${ZESHY_CONFIG_SYSTEM_SCRIPT_NAME_TO_FILENAME}, all we have to do is manually
+#test in each iteration of ::compile_zeshy_source() whether the current file is
+#a key of ${ZESHY_CONFIG_SYSTEM_SCRIPT_NAME_TO_FILENAME} and to respond
+#accordingly. Specifically, if so, just redirect the output of sourcing such
+#script to the corresponding value of the same map. Simple! Hence, define such
+#scripts to simply output to standard output. Done. Both efficient and (mostly)
+#ludicrously trivial to implement. *sigh*
 
 # ....................{ MODULES                            }....................
 # Load all zsh modules required by this parcel or parcels this parcel sources.
@@ -1590,6 +1768,8 @@ function ::precompile_zeshy_cache() {
 :compile_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+#* Such parcel contains configuration file *SCRIPTS* rather than merely files.
+#  Specif
     # For each overlay root, perform a stack-based depth-first search of the
     # subdirectories under such root for all zeshy scripts applicable to the
     # current user and system. Such roots commonly include:
