@@ -8,6 +8,7 @@
 
 #FIXME: Add support for zeshy upgrading: namely, if upgrading zeshy, have
 #:is_zeshy_digest_outdated() immediately report success.
+
 #FIXME: The obvious question then becomes: how do we reliably detect upgrades?
 #The answer is equally obvious:
 #
@@ -27,6 +28,39 @@
 #recompilation on zsh upgrades as well. To do so efficiently, simply compare:
 #    [[ "${ZESHY_VERSION}${ZSH_VERSION}" ==\
 #       "${ZESHY_VERSION_PRIOR}${ZSH_VERSION_PRIOR}" ]]
+#FIXME: Actually, we *REALLY* want to properly generalize this to provide an
+#easy means of defining additional scalar globals for
+#:is_zeshy_digest_outdated() to depend on. How? Well, rather than caching
+#simply ${ZESHY_VERSION_PRIOR} and ${ZSH_VERSION_PRIOR} to
+#${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME}, instead:
+#
+#* Define a new list global ${ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_NAMES}
+#  initialized as follows (perhaps at the top of @{compile}?):
+#    ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_NAMES=( ZESHY_VERSION ZSH_VERSION )
+#* Define a new scalar global ${ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_VALUES}.
+#  Yes, *SCALAR*. The core idea here is that, given list
+#  ${ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_NAMES}, both
+#  ::precompile_zeshy_cache() and :is_zeshy_digest_outdated() can dynamically
+#  compute the scalar value of ${ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_VALUES} by
+#  concatenating the individual scalar values of each such global in the same
+#  order as such list. Thanks to zsh global-string-search-and-replacement, such
+#  concatenation can be efficiently computed as follows:
+#
+#    # And thanks to flag "(e)", we shouldn't even need to run an eval()!
+#    # Note use of "-", ensuring undefined globals default to the empty string.
+#    ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_VALUES="${(e)${ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_NAMES//(#m)*/\${${MATCH}-\}}}"
+#* In :is_zeshy_digest_outdated(), we then simply perform a scalar comparison
+#  between the cached and newly computed values of such global! Bam. Efficiency
+#  incarnate and fairly simple as well (considering the complexity of what we're
+#  attempting to accomplish).
+#
+#Completely untested, of course. But this shouldn't be too far off the mark.
+#FIXME: Actually, we don't need to serialize
+#${ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_NAMES} to disk. Since such list is
+#unlikely to change anytime soon, just initialize such list as above in this
+#parcel. Naturally, we'll still have to serialize the scalar global
+#${ZESHY_USER_DIGEST_DEPENDENCY_GLOBAL_VALUES}, but that's no great trouble.
+
 #FIXME: O.K.; great! But we want to permit a second sort of upgrade path as
 #well: github-based updates. Indeed, if github activity is any indicator, this
 #will (at least initially) be the primary way that initial users interact with
@@ -209,6 +243,43 @@
 #    }
 #
 #Naturally, we'll need to implement :is_path_basename_equals(). Simple, though.
+#FIXME: [Note: Old commentary, but probably still retains some applicability.]
+#
+#We really need to interactively usher the current user into the upgrade
+#process on zeshy upgrades. To do so, consider a new difference_files() command
+#invoking some underlying "vimdiff" (only if the current EDITOR == "vim"),
+#"diff", and so on command to diff the user's current config against zeshy's
+#new config. I have two thoughts on this:
+#
+# 1. We could avoid all diffing by having the user write into a "config.local"
+#    or "config-local" file in "~/.zeshy" rather than "config". (Actually, why
+#    not let it just be their choice?) O.K.; so, here's how we roll:
+#    * When rewriting the zeshy version file, stamp the zeshy config file with
+#      the same mtime.
+#    * If the zeshy version file is ever outdated (i.e., zeshy was upgraded),
+#      compare the mtime of that file with that of the zeshy config file. If
+#      the latter is newer, the user modified it, so we need to run a diff;
+#      otherwise, silently delete the zeshy config file and let zeshy re-
+#      fabricate it for us.
+#    * The user can opt to always have such config file silently deleted by
+#      simply always using "config.local", instead. The downside is that
+#      global variables may change names and they won't necessarily notice
+#      immediately. (Or other such desynchronizations.) But probably worth it.
+#    * zeshy Global will need to look for "config.local" and, if extant,
+#      source it *AFTER* sourcing "config". Fairly simple, eh?
+#
+#Here's an existing function prototype for such upgrading:
+#
+#declare_function_with_stdin <<'/---'
+#void startup_zeshy_version(void)
+#
+#Ensure the cached zeshy version corresponds to the current zeshy version. If
+#not, interactively usher the current user into the upgrade process.
+#/---
+#function startup_zeshy_version() {
+#    # Validate sanity. If ignoring zeshy's user directory, return silently.
+#    die_if_args
+#}
 
 #FIXME: It's not *IMMEDIATELY* pressing, but there probably exist race
 #conditions in the event two zeshy shells startup at a similar time and the
@@ -460,15 +531,25 @@ function ::digest_zeshy_inspect() {
     # Set globals describing the current system (e.g., ${ZESHY_SYSTEM_ID}).
     source -- "${ZESHY_HOME}/inspect"
 
-    #FIXME: Technically, such directory could also depend on whether this is a
-    #debug or release build. We'll probably want that -- but for now this
-    #suffices.
+    #FIXME: Ugh. Normalize such nonsense by renaming
+    #${ZESHY_USER_CONFIG_ROOT_DIRNAME} back to ${ZESHY_USER_CONFIG_DIRNAME} and
+    #excising the declaration and definition of such global from this parcel,
+    #including its initialization below.
+    #FIXME: @{inspect} should now unconditionally:
+    #
+    #* Prefix ${ZESHY_SYSTEM_ID} with "${HOST}.". Hence, remove such manual
+    #  prefixation below.
+    #* Suffix ${ZESHY_SYSTEM_ID} with ".$(get_terminal_color_count)". (Yay!)
 
     # System-specific directory containing the current configuration. To allow
     # such configuration to be shared without modification across machines of
     # the system setup, such directory is host-agnostic (i.e., does *NOT* embed
     # the current value of ${HOST}).
-    ZESHY_USER_CONFIG_DIRNAME="${ZESHY_USER_CONFIG_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}"
+    ZESHY_USER_CONFIG_DIRNAME="${ZESHY_USER_CONFIG_ROOT_DIRNAME}"
+
+    #FIXME: Technically, such directory could also depend on whether this is a
+    #debug or release build. We'll probably want that -- but for now this
+    #suffices.
 
     # System-specific directory containing the current digest file. Unlike
     # system-specific configuration directories, such directory is *ALSO* host-
@@ -516,6 +597,7 @@ function ::digest_zeshy_compile() {
 :digest_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+    # ZESHY_USER_CONFIG_DIRNAME="${ZESHY_USER_CONFIG_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}"
 #FUXME: Don't forget to perform advisory locking on digest files before and
 #during digest compilation! (We probably document this elsewhere, yes?) Ah, yes:
 #   print "mtimes: ${dependency_mtimes[@]}"
