@@ -38,22 +38,6 @@ function die_unless_stdin_terminal() {
         die "${1-Standard input not read from a terminal.}"
 }
 
-#FIXME: Excise entirely, we should think. The underlying function is
-#sufficiently unreliable that we should *NEVER* be throwing an exception on its
-#result.
-declare_function_with_stdin <<'/---'
-void die_unless_stdin_readable_sans_blocking(
-    string error_message = "Standard input unreadable without blocking.")
-
-Throw an exception with the passed message unless standard input for this
-function is nonempty. See is_stdin_readable_sans_blocking() for further details.
-/---
-function die_unless_stdin_readable_sans_blocking() {
-    die_unless_args_0_to_1 'Expected optional error message.'
-    is_stdin_readable_sans_blocking or
-        die "${1-Standard input unreadable without blocking.}"
-}
-
 # ....................{ TESTERS                            }....................
 declare_function_with_stdin <<'/---'
 [status: bool] is_stdin_pipe(void)
@@ -64,8 +48,61 @@ subcommand, which receives no piped input).
 /---
 function is_stdin_pipe() {
     die_if_args
-#   output_string "call stack: ${funcstack[*]}"
     is -p "${ZESHY_STDIN_PATH-/dev/stdin}" si
+}
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_stdin_file_simple(void)
+
+Report success if standard input to the current context is a *simple file*
+(i.e., if such input is received non-interactively from a typical file rather
+than interactively from a device file). Hence, this function reports failure if
+such input is attached to either:
+
+* A *pipe*, either named (e.g., `/tmp/fifo`) or unnamed (i.e., a typical pipe).
+* A *pseudo-terminal device file* (e.g., `/dev/pts/0`). This is usually the case
+  if the current process is running unredirected under a graphical terminal
+  emulator (e.g., `xterm`).
+* The *bit bucket device file* (e.g., `/dev/null`). This is usually the case if
+  the current process is a cronjob.
+/---
+function :is_stdin_file_simple() {
+    # Validate sanity.
+    die_if_args
+    :string filename_stdin
+
+    # If standard input is attached to either a terminal or pipe, such input
+    # cannot be a simple file. In such case, report failure immediately.
+    #
+    # Since the logic below would implicitly report failure in either case, this
+    # conditional is technically unnecessary but improves the efficiency of this
+    # tester in the common case.
+    if { is_stdin_terminal or is_stdin_pipe } {
+        report_failure
+    }
+
+    # Target file to which the symbolic link for standard input points
+    # (e.g., "/dev/stdin" links to "/dev/null" when run as a cronjob).
+    set_string_to_path_canonical filename_stdin\
+        "${ZESHY_STDIN_PATH-/dev/stdin}"
+
+    # Report success if such file is simple.
+    :is_file_simple "${filename_stdin}"
+}
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_stdin_pipe_or_file_simple(void)
+
+Report success if standard input to the current context is either a pipe or
+simple file. Since both pipes and simple files tend to operate in a non-
+interactive and hence non-blocking manner, success suggests (but does _not_
+necessarily imply) that the caller may read from standard input without concern
+for whether such read will silently block. See :is_stdin_file_simple() and
+:is_stdin_file_simple() for further details.
+/---
+function :is_stdin_pipe_or_file_simple() {
+    die_if_args
+    :is_stdin_pipe or :is_stdin_file_simple
 }
 
 declare_function_with_stdin <<'/---'
@@ -87,104 +124,90 @@ bytes _and_ is still open for reading.
 
 In either case, this function does _not_ provide a reliable means of testing
 whether or not attempting to read standard input will block the current process.
-To test such condition reliably, consider calling
-is_stdin_readable_sans_blocking() instead.
+To test such condition reliably, consider either iteratively calling
+is_stdin_readable_sans_blocking() or non-iteractively calling
+:is_stdin_pipe_or_file_simple() instead.
 /---
 function is_stdin_terminal() {
     die_if_args
     is -t ${ZESHY_STDIN_FILE_DESCRIPTOR-0} si
 }
 
-#FIXME: In lieu of unit tests...
-#function empo() {
-#    print ok | { is_stdin_pipe     and print 'ok' or print 'ko' }
-#    print ok | { is_stdin_readable_sans_blocking and print 'ok' or print 'ko' }
-#    {   print "stdin: $(get_stdin)"
-#        is_stdin_readable_sans_blocking and print 'ok' or print 'ko' } <<< yumo
-#   string yimo; set_string_to_stdin yimo <<< hamo; print "yimo: ${yimo}"
-#}
-
-# ....................{ TESTERS ~ blocking                 }....................
-#FIXME: Arguably, this function should be considered harmful. There's no sane or
-#sensible way to implement it safely. The current implementation is awful, as is
-#any other forseeable implementation. The intrinsic difficulty is that it takes
-#the shell a non-negligible amount of time to establish a pipe when under heavy
-#system load. That said, there still might be a limited use case for this
-#function -- but certainly *NOT* as documented below. Note the above strong
-#caveat and substantially rewrite such documentation.
-#FIXME: To repair such function, reduce the "-t 5" below to "-t 0" and on we go!
-#This reduces the edge-case utility of such function but renders it demonstrably
-#more sane. That said, it might be helpful to define another function
-#:is_stdin_pipe_or_readable_sans_blocking(), which is probably the closest we can
-#get to a working implementation that accords with user expectations. *shrug*
-#FIXME: Actually, :is_stdin_pipe_or_readable_sans_blocking() may not be all that
-#more helpful, given the underlying indeterminism. Thankfully, we believe we've
-#unlocked this horrid puzzle box. What we *REALLY* wanted to know all along is
-#whether or not stdin is attached to an interactive terminal or not. That's
-#right: that's basically what we were asking. But we can already test that
-#simply by calling is_stdin_terminal()! Indeed, this suggests the following new
-#tester:
-#
-#    function :is_stdin_pipe_or_file() {
-#        die_if_args
-#        not is_stdin_terminal
-#    }
-#
-#Dead simple. If stdin is *NOT* an interactive terminal, it's either a (usually)
-#non-interactive pipe or file (handle). Is this actually true? Pretty much! It's
-#easy to test: since "/dev/stdin" is always a symlink to "/proc/self/fd/0" under
-#Linux, just call "ls -l /proc/self/fd/0" in a variety of different situations:
-#e.g.,
-#
-#    >>> command ls -l /proc/self/fd/0
-#    lrwx------ 1 leycec leycec 64 Jan 29 20:56 /proc/self/fd/0 -> /dev/pts/11
-#    >>> { command ls -l /proc/self/fd/0 } <<<here
-#    lr-x------ 1 leycec leycec 64 Jan 29 20:56 /proc/self/fd/0 -> /tmp/zshq4ZlVz (deleted)
-#    >>> print ok | { command ls -l /proc/self/fd/0 }
-#    lr-x------ 1 leycec leycec 64 Jan 29 20:57 /proc/self/fd/0 -> pipe:[79562890]
-#
-#Interestingly, calling "command ls -l /proc/self/fd/0" either directly at the
-#interactive CLI or from a seemingly non-interactive zsh script reports
-#"/dev/stdin" to be the same interactive pseudo-terminal. (Intriguing.)
-#
-#In any case, this more or less validates the above claim and hence function
-#implementation. Go, go, go!
-#FIXME: Interesting! When run from a cronjob, we get:
-#    >>> command ls -l /proc/self/fd/0
-#    lrwx------ 1 leycec leycec 64 Jan 29 20:56 /proc/self/fd/0 -> /dev/null
-#So, although standard input is technically always open, it can be effectively
-#closed by redirecting it to the bit bucket. Naturally, :is_stdin_pipe_or_file()
-#should test for this explicitly. For safety, we should probably implement such
-#tester manually.
-#FIXME: Great! Now document such function.
-function :is_stdin_pipe_or_file() {
-    # Validate sanity.
-    die_if_args
-
-    # If standard input is piped, report success. Else...
-    :is_stdin_pipe or {
-        # Target file to which the symbolic link for standard input points
-        # (e.g., "/dev/stdin" links to "/dev/null" when run as a cronjob).
-        :string filename_stdin
-        set_string_to_path_canonical filename_stdin\
-            "${ZESHY_STDIN_PATH-/dev/stdin}"
-
-        # If such file is regular, report success. This excludes device files,
-        # including both the bit bucket and pseudo-terminals.
-        is_file_regular "${filename_stdin}"
-    }
-}
-
 declare_function_with_stdin <<'/---'
 [status: bool] is_stdin_readable_sans_blocking(void)
 
-Report success if standard input to the current context is readable without
-blocking (i.e., readable without waiting -- possibly indefinitely and always
-silently -- for such input to be written to such context). Since reading from
-standard input via conventional techniques (e.g., `< /dev/stdin`, zsh builtin
-read(), zeshy alias get_stdin()) typically blocks or behaves erratically if no
-such input has been written, consider always calling this function or
-die_unless_stdin_readable_sans_blocking() before reading from standard input.
+Report success if standard input to the current context is *readable without
+blocking* (i.e., readable without waiting indefinitely _and_ silently for such
+input to become available). Since reading from standard input via conventional
+techniques (e.g., `< /dev/stdin`, zsh builtin read(), zeshy alias get_stdin())
+typically blocks or behaves erratically if no such input has been written,
+consider polling this function before reading from standard input.
+
+== Caveats ==
+
+*This function is inherently unreliable without iterative polling.* Only call
+this function as the test of an indefinite wait or for loop: e.g.,
+
+.is_stdin_readable_sans_blocking() Called Properly
+==========================================
+[source]
+------------------------------------------
+>>> :string on_perfect_security=\
+...     "There is a contradiction in wanting to be perfectly secure in a
+...      universe whose very nature is momentariness and fluidity."
+>>> output_string "${on_perfect_security}" | {
+...     output_string "Waiting for input."
+...     while { not is_stdin_readable_sans_blocking } {
+...         output_string_sans_newline "."
+...     }
+...     output_string "Received input: $(get_stdin)"
+... }
+Waiting for input.....
+Received input: There is a contradiction in wanting to be perfectly secure in a
+universe whose very nature is momentariness and fluidity.
+------------------------------------------
+==========================================
+
+*Never call this function as a non-iterative test* (e.g., modifying the line
+reading `while { not is_stdin_readable_sans_blocking } {` in the prior example
+to `if { not is_stdin_readable_sans_blocking } {`). Preparing to write and then
+writing to standard input requires a non-deterministic and hence non-computable
+amount of wall clock time regardless of the underlying mechanism used to do so
+(e.g., pipe, process substitution, here-string, here-document). Indeed,
+establishing pipes requires forking one asynchronous subshell for each pipe
+subcommand excluding the last -- an extremely computationally expensive task.
+Given such expense, there exists no guarantee that the source of standard input
+will have provided such input by the time of a non-iterative call to this
+function. Moreover, given such non-determinism, whether such call succeeds or
+not depends principally on current system load! To demonstrate this, consider
+the following output from calling this function non-iteratively:
+
+.is_stdin_readable_sans_blocking() Called Improperly
+==========================================
+[source]
+------------------------------------------
+>>> :int   count=0
+>>> for (( count < 7; count++)) {
+...     output_newline | {
+...         is_stdin_readable_sans_blocking and
+...             output_string "Input available." or
+...             output_string "No input available."
+...     }
+... }
+No input available.
+Input available.
+No input available.
+No input available.
+Input available.
+No input available.
+Input available.
+------------------------------------------
+==========================================
+
+In cases where iterative polling is inappropriate, consider calling
+:is_stdin_pipe_or_file_simple() instead. Such function typically only reports
+success when standard input is readable without blocking, and does so without
+requiring iterative polling.
 /---
 function is_stdin_readable_sans_blocking() {
     # Validate sanity.
@@ -215,35 +238,9 @@ function is_stdin_readable_sans_blocking() {
     # capture and test such status rather than implicitly returning such status
     # as this function's exit status.
     #
-    # Since standard input is context-specific, such exit status *CANNOT* be
-    # trivially captured with command substitution (e.g.,
-    # "$(zselect ... | get_status)"). Instead, implement the equivalent of
-    # alias set_integer_to_status(). Unfortunately, such alias transitively
-    # calls this function; breaking such recursion requires this function to
-    # internally reimplement set_integer_to_stdin(). *sigh*
-    #
     # Dismantled, this is:
     #
-    # * "-t 5", returning after waiting at most 0.05s for standard input to
-    #   receive input. While this technically constitutes blocking behavior,
-    #   such minimally negligible wait time is essential to avoid erroneously
-    #   reporting failure. As example, establishing "/dev/stdin" as a named pipe
-    #   between a simple print() writer and zselect() reader consumes on the
-    #   order of between 0.001s to 0.02s on an (admittedly) obsolete machine, in
-    #   which case the following test commonly fails:
-    #
-    #       >>> print '' | { zselect -t 0 -r 0 and print Fail or print Success }
-    #       Fail
-    #
-    #   Contrariwise, the following test commonly succeeds:
-    #
-    #       >>> print '' | { zselect -t 1 -r 0 and print Fail or print Success }
-    #       Success
-    #
-    #   Such ad-hoc observation constitutes more common sense than rocket
-    #   science. However, since decreasing such timeout to 0 breaks the common
-    #   case *AND* since increasing such timeout above 5 correspondingly slows
-    #   the entire zeshy codebase, we defer to common sense.
+    # * "-t 0", reporting whether input bytes exist to be read without waiting.
     # * "-a ...", setting such list to contain a string resembling either
     #   "-r 0" if standard input is nonempty or "" if standard input is empty.
     #   Since zselect() defaults such list to ${reply} if unpassed and since
@@ -260,7 +257,7 @@ function is_stdin_readable_sans_blocking() {
     # to *THIS* function rather than such exit status. (O^o)
     #
     # Thus does another feeble mind break.
-    { zselect -t 5 -a zselect_status -r ${ZESHY_STDIN_FILE_DESCRIPTOR-0} } and
+    { zselect -t 0 -a zselect_status -r ${ZESHY_STDIN_FILE_DESCRIPTOR-0} } and
         set_integer_to_status exit_status
 
     # If such status indicates such function to be absent, throw an exception.
@@ -277,6 +274,15 @@ function is_stdin_readable_sans_blocking() {
     # such status exactly coincides with what the caller expects. (Scoooooore!)
     return ${exit_status}
 }
+
+#FIXME: In lieu of unit tests...
+#function empo() {
+#    print ok | { is_stdin_pipe     and print 'ok' or print 'ko' }
+#    print ok | { is_stdin_readable_sans_blocking and print 'ok' or print 'ko' }
+#    {   print "stdin: $(get_stdin)"
+#        is_stdin_readable_sans_blocking and print 'ok' or print 'ko' } <<< yumo
+#   string yimo; set_string_to_stdin yimo <<< hamo; print "yimo: ${yimo}"
+#}
 
 # ....................{ GETTERS                            }....................
 declare_function_with_stdin <<'/---'
@@ -353,6 +359,176 @@ function get_stdin_until_eot() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# ....................{ TESTERS ~ blocking                 }....................
+#FUXME: Arguably, this function should be considered harmful. There's no sane or
+#sensible way to implement it safely. The current implementation is awful, as is
+#any other forseeable implementation. The intrinsic difficulty is that it takes
+#the shell a non-negligible amount of time to establish a pipe when under heavy
+#system load. That said, there still might be a limited use case for this
+#function -- but certainly *NOT* as documented below. Note the above strong
+#caveat and substantially rewrite such documentation.
+#FUXME: To repair such function, reduce the "-t 5" below to "-t 0" and on we go!
+#This reduces the edge-case utility of such function but renders it demonstrably
+#more sane. That said, it might be helpful to define another function
+#:is_stdin_pipe_or_readable_sans_blocking(), which is probably the closest we can
+#get to a working implementation that accords with user expectations. *shrug*
+#FUXME: Actually, :is_stdin_pipe_or_readable_sans_blocking() may not be all that
+#more helpful, given the underlying indeterminism. Thankfully, we believe we've
+#unlocked this horrid puzzle box. What we *REALLY* wanted to know all along is
+#whether or not stdin is attached to an interactive terminal or not. That's
+#right: that's basically what we were asking. But we can already test that
+#simply by calling is_stdin_terminal()! Indeed, this suggests the following new
+#tester:
+#
+#    function :is_stdin_pipe_or_file() {
+#        die_if_args
+#        not is_stdin_terminal
+#    }
+#
+#Dead simple. If stdin is *NOT* an interactive terminal, it's either a (usually)
+#non-interactive pipe or file (handle). Is this actually true? Pretty much! It's
+#easy to test: since "/dev/stdin" is always a symlink to "/proc/self/fd/0" under
+#Linux, just call "ls -l /proc/self/fd/0" in a variety of different situations:
+#e.g.,
+#
+#    >>> command ls -l /proc/self/fd/0
+#    lrwx------ 1 leycec leycec 64 Jan 29 20:56 /proc/self/fd/0 -> /dev/pts/11
+#    >>> { command ls -l /proc/self/fd/0 } <<<here
+#    lr-x------ 1 leycec leycec 64 Jan 29 20:56 /proc/self/fd/0 -> /tmp/zshq4ZlVz (deleted)
+#    >>> print ok | { command ls -l /proc/self/fd/0 }
+#    lr-x------ 1 leycec leycec 64 Jan 29 20:57 /proc/self/fd/0 -> pipe:[79562890]
+#
+#Interestingly, calling "command ls -l /proc/self/fd/0" either directly at the
+#interactive CLI or from a seemingly non-interactive zsh script reports
+#"/dev/stdin" to be the same interactive pseudo-terminal. (Intriguing.)
+#
+#In any case, this more or less validates the above claim and hence function
+#implementation. Go, go, go!
+#FUXME: Interesting! When run from a cronjob, we get:
+#    >>> command ls -l /proc/self/fd/0
+#    lrwx------ 1 leycec leycec 64 Jan 29 20:56 /proc/self/fd/0 -> /dev/null
+#So, although standard input is technically always open, it can be effectively
+#closed by redirecting it to the bit bucket. Naturally, :is_stdin_pipe_or_file()
+#should test for this explicitly. For safety, we should probably implement such
+#tester manually.
+#FUXME: Great! Now document such function and shift above.
+
+    # Given the criticality and commonality of this test, one would assume there
+    # to exist builtins or commands for accomplishing it. One would be wrong.
+    # Testing whether such file descriptor and hence input is readable without
+    # blocking requires calling the commonly available kernel function select().
+    # Ideally, such test would elegantly reduce to the following:
+    #
+    #     read -t 0 -k 0
+    #
+    # Dismantled, this is:
+    #
+    # * "-t 0", testing whether standard input is readable without blocking and
+    #   returning immediately if not.
+    # * "-k 0", reading 0 bytes from standard input if such input is readable.
+    #
+    # Unfortunately, "read -t 0 -k 0" always returns failure. This differs from
+    # bash, in which "read -t 0 -N 0" conditionally returns success when one
+    # expects it to. Hence, such test defers to select() instead.
+    #
+    # Since zselect() (the zsh select() wrapper) returns failure with exit
+    # status 2 when the underlying OS fails to provide a select() function,
+    # capture and test such status rather than implicitly returning such status
+    # as this function's exit status.
+    #
+    # Since standard input is context-specific, such exit status *CANNOT* be
+    # trivially captured with command substitution (e.g.,
+    # "$(zselect ... | get_status)"). Instead, implement the equivalent of
+    # alias set_integer_to_status(). Unfortunately, such alias transitively
+    # calls this function; breaking such recursion requires this function to
+    # internally reimplement set_integer_to_stdin(). *sigh*
+    #
+    # Dismantled, this is:
+    #
+    # * "-t 5", returning after waiting at most 0.05s for standard input to
+    #   receive input. While this technically constitutes blocking behavior,
+    #   such minimally negligible wait time is essential to avoid erroneously
+    #   reporting failure. As example, establishing "/dev/stdin" as a named pipe
+    #   between a simple print() writer and zselect() reader consumes on the
+    #   order of between 0.001s to 0.02s on an (admittedly) obsolete machine, in
+    #   which case the following test commonly fails:
+    #
+    #       >>> print '' | { zselect -t 0 -r 0 and print Fail or print Success }
+    #       Fail
+    #
+    #   Contrariwise, the following test commonly succeeds:
+    #
+    #       >>> print '' | { zselect -t 1 -r 0 and print Fail or print Success }
+    #       Success
+    #
+    #   Such ad-hoc observation constitutes more common sense than rocket
+    #   science. However, since decreasing such timeout to 0 breaks the common
+    #   case *AND* since increasing such timeout above 5 correspondingly slows
+    #   the entire zeshy codebase, we defer to common sense.
+    # * "-a ...", setting such list to contain a string resembling either
+    #   "-r 0" if standard input is nonempty or "" if standard input is empty.
+    #   Since zselect() defaults such list to ${reply} if unpassed and since
+    #   such list is commonly used by callers and should *NOT* be overwritten by
+    #   such a low-level function as this, explicitly specify such list. Since
+    #   this function never references such list, our specifying it here is
+    #   simply to avoid overwriting ${reply}. Frankly, this "unique" choice of
+    #   API design is one of the more eclectic that we've ever seen. And we were
+    #   proficient in ML... Once.
+    # * "-r ...", testing such file descriptor for nonempty reading.
+    #
+    # Note that the "{" and "}" delimiters surrounding such integer assignment
+    # are essential; neglecting delimiters assigns such integer standard input
+    # to *THIS* function rather than such exit status. (O^o)
+    #
+    # Thus does another feeble mind break.
+    # { zselect -t 5 -a zselect_status -r ${ZESHY_STDIN_FILE_DESCRIPTOR-0} } and
+    #     set_integer_to_status exit_status
+
+# Since reading from
+# standard input via conventional techniques (e.g., `< /dev/stdin`, zsh builtin
+# read(), zeshy alias get_stdin()) typically blocks or behaves erratically if no
+# such input has been written, consider always calling this function or
+# die_unless_stdin_readable_sans_blocking() before reading from standard input.
+
+# Creating and sending
+# output to the input end of shell pipes, process substitution, here-strings and
+# -documents, and similar means of providing standard input requires a non-
+# deterministic and hence non-computable amount of wall clock time.
+# 
+# requires forking at least one asynchronous subshell, a
+# computationally expensive task. 
+
+#FUXME: Excise entirely, we should think. The underlying function is
+#sufficiently unreliable that we should *NEVER* be throwing an exception on its
+#result.
+# declare_function_with_stdin <<'/---'
+# void die_unless_stdin_readable_sans_blocking(
+#     string error_message = "Standard input unreadable without blocking.")
+# 
+# Throw an exception with the passed message unless standard input for this
+# function is nonempty. See is_stdin_readable_sans_blocking() for further details.
+# /---
+# function die_unless_stdin_readable_sans_blocking() {
+#     die_unless_args_0_to_1 'Expected optional error message.'
+#     is_stdin_readable_sans_blocking or
+#         die "${1-Standard input unreadable without blocking.}"
+# }
+
+# This excludes device files,
+    # including both the bit bucket and pseudo-terminals.
+    # If standard input is piped, report success. Else...
+    #     # Target file to which the symbolic link for standard input points
+    #     # (e.g., "/dev/stdin" links to "/dev/null" when run as a cronjob).
+    #     :string filename_stdin
+    #     set_string_to_path_canonical filename_stdin\
+    #         "${ZESHY_STDIN_PATH-/dev/stdin}"
+
+    #     # If such file is regular, report success. This excludes device files,
+    #     # including both the bit bucket and pseudo-terminals.
+    #     :is_file_simple "${filename_stdin}"
+    # }
+
+#   output_string "call stack: ${funcstack[*]}"
 # Most functions defined by this parcel are called by printer functions (e.g.,
 # print_error()) possibly called by the exception handler and hence must be
 # defined before such functions.
