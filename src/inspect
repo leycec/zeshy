@@ -8,6 +8,41 @@
 # @{digest} depends on this parcel to determine whether or not the previously
 # compiled digest file applies to the current system.
 
+#FIXME: @{inspect} should now unconditionally suffix ${ZESHY_SYSTEM_ID} with
+#".${terminfo[colors]}" *IF AND ONLY IF* the current system provides a valid
+#"terminfo" database. We'll probably need to:
+#
+#* Test for the existence of a command implying the existence of such
+#  database. Ugh. There is none. (Not any command that's universally
+#  applicable, anyway.) Instead, what we'll need to do is test whether or
+#  not zsh module "terminfo" is currently available.
+#* If such module is available *AND* standard output is attached to a
+#  terminal device (as efficiently tested by "[[ -t 1 ]]", suggesting we
+#  should probably test that condition first), then and only then zmodload()
+#  such module, thus implicitly declaring list global ${terminfo}.
+#
+#O.K.; so, how exactly do we test for the existence of a module? While not
+#terribly hard, we actually haven't implemented that yet. But here's the
+#rough idea:
+#
+#* Iterate directory names in list global ${module_path} and for each
+#  listed directory that exists, set the result of globbing for
+#  'terminfo.'* into a local list.
+#* If such list is nonempty, successfully break such iteration.
+#* Else if such list is still empty at the end of such iteration, the
+#  current system does *NOT* provide a "terminfo" database. In such case, set
+#  integer global ${ZESHY_TERMINAL_COLOR_COUNT} to 2 (i.e., black and white).
+#
+#After we get the above algorithm working, generalize it into is_module(),
+#whose existing implementation is horribly broken.
+#FIXME: This is sufficiently complex that we probably want to define a new
+#::define_system_terminal_globals() function and associate integer global
+#${ZESHY_TERMINAL_COLOR_COUNT}. After implementing such function, we should
+#probably redefine :get_terminal_color_count() to return the value of such
+#global. (Actually, we should just *ELIMINATE* such function entirely. Just
+#expand ${ZESHY_TERMINAL_COLOR_COUNT} where required. It's now a core global
+#necessarily guaranteed to exist.)
+
 #FIXME: Note that, since neither Mir or Wayland currently appear to provide
 #command-line interfaces to query for the current window manager,
 #${ZESHY_WINDOW_MANAGER_NAME} should simply be set to either "Mir" or
@@ -98,23 +133,30 @@ function ::set_system_globals() {
     ::set_system_globals_os
     ::set_system_globals_gui
 
-    # Define the global uniquely identifying the current system to (in order):
+    # Define the global uniquely identifying the current system as (in order):
     #
-    # * The lowercase name of the current operating system guaranteed to contain
-    #   no whitespace. See @{*-core/*-test/*-os} for further details.
-    # * The lowercase name of the current CPU architecture guaranteed to contain
-    #   no whitespace. See @{*-core/*-test/*-architecture} for further details.
+    # * The hostname of the current system if any or "none" otherwise. (Yes,
+    #   the hostname can technically be set to the empty string. It's not a
+    #   particularly good idea, but then... is anything? --Signed, Nihilist)
+    # * The lowercase name of the current operating system, guaranteed to be
+    #   nonempty. See @{*-core/*-test/*-os} for further details.
+    # * The lowercase name of the current CPU architecture, guaranteed to be
+    #   nonempty. See @{*-core/*-test/*-architecture} for further details.
     # * The current Linux-specific distribution if any or "none" otherwise.
     # * The current display server if any or "none" otherwise.
     # * The current desktop environment if any or "none" otherwise.
     # * The current window manager if any or "none" otherwise.
     #
-    # While prior logic should guarantee all such names to be both set *AND*
-    # nonempty, overzealous caution never hurt no one.
-    ZESHY_SYSTEM_ID="${OSTYPE}.${MACHTYPE}.${ZESHY_LINUX_DISTRO_NAME:-none}.${ZESHY_DISPLAY_SERVER_NAME:-none}.${ZESHY_DESKTOP_ENVIRONMENT_NAME:-none}.${ZESHY_WINDOW_MANAGER_NAME:-none}"
+    # While prior logic should guarantee most such names to be both set *AND*
+    # nonempty, a bit of overzealous caution never hurt no one.
+    ZESHY_SYSTEM_ID="${HOST:-none}.${OSTYPE}.${MACHTYPE}.${ZESHY_LINUX_DISTRO_NAME:-none}.${ZESHY_DISPLAY_SERVER_NAME:-none}.${ZESHY_DESKTOP_ENVIRONMENT_NAME:-none}.${ZESHY_WINDOW_MANAGER_NAME:-none}"
 
-    # Convert all spaces in such identifier to underscores.
-    ZESHY_SYSTEM_ID="${ZESHY_SYSTEM_ID// /_}"
+    # Convert such identifier into a valid cross-portable pathname as follows:
+    #
+    # * Convert all spaces in such identifier to underscores.
+    # * Remove all characters prohibited in pathnames from such identifier (i.e.,
+    #   directory separators, null characters).
+    ZESHY_SYSTEM_ID="${${ZESHY_SYSTEM_ID// /_}//[\/$'\0']}"
 
     # Inform debuggers of such identifier.
     :output_line_if_debugging 'Identified current system as "'${ZESHY_SYSTEM_ID}'".'
@@ -190,10 +232,12 @@ function ::set_system_globals_os() {
         #
         # * "(?m)", matching such PCRE in a multiline-aware manner (i.e., such
         #   that "^" and "$" match both newlines and the string start and end).
-        } elif [[ -f '/etc/lsb-release' && "${mapfile[/etc/lsb-release]}" =~\
-            '(?m)^DISTRIB_ID='${pcre_value}'$' ]] ||
+        # } elif false && { [[ -f '/etc/lsb-release' && "${mapfile[/etc/lsb-release]}" =~\
+        } elif\
+           [[ -f '/etc/lsb-release' && "${mapfile[/etc/lsb-release]}" =~\
+                 '(?m)^DISTRIB_ID='${pcre_value}'$' ]] ||
            [[ -f '/etc/os-release' && "${mapfile[/etc/os-release]}" =~\
-            '(?m)^NAME='${pcre_value}'$' ]] {
+                 '(?m)^NAME='${pcre_value}'$' ]] {
             ZESHY_LINUX_DISTRO_NAME="${match[1]}"
 
             # Canonicalize such distribution name. Do *NOT* implicitly
@@ -263,25 +307,10 @@ function ::set_system_globals_os() {
             local -a distro_filenames
             local -A distro_filename_to_name
 
-            # List of all recognized distribution-specific files in "/etc".
-            # Dismantled, this is:
-            #
-            # * "(.)", including only files that actually exist.
-            distro_filenames=(
-                # All recognized "-release"-suffixed files in arbitrary order,
-                # excluding "redhat-release". Several non-Red Hat distributions
-                # erroneously install such file (presumably for dubious backward
-                # compatibility), requiring such file only be used as a fallback.
-                /etc/{arch,chakra,centos,distro,enlisy,fedora,frugalware,gentoo,mageia,pardus,redflag,sabayon,SuSE,slackware,system,turbolinux,vine,yellowdog}-release(.)
-
-                # All recognized "-version"-suffixed files in arbitrary order.
-                /etc/{knoppix,lfs,zenwalk}-version(.)
-
-                # All other distribution-specific files.
-                /etc/DISTRO_SPECS(.)
-            )
-
-            # Map from such files to corresponding distribution names.
+            # Map each recognized distribution-specific file in "/etc" to the
+            # corresponding human-readable distribution name. Exclude files
+            # shared between multiple distributions (e.g., "redhat-release"),
+            # tested below only if no distribution-specific file is found.
             distro_filename_to_name=(
                 '/etc/arch-release'       'Arch'
                 '/etc/centos-release'     'Red Hat Enterprise'
@@ -306,6 +335,15 @@ function ::set_system_globals_os() {
                 '/etc/yellowdog-release'  'Yellow Dog'
                 '/etc/zenwalk-version'    'Zenwalk'
             )
+
+            # List of all such files found on the current system. Dismantled,
+            # this is:
+            #
+            # * "${(k@)^...}", expanding to each key of such map (which
+            #   coincidentally are all such files).
+            # * "(#q.)", excluding all files *NOT* found on the current system.
+            distro_filenames=( ${(k@)^distro_filename_to_name}(#q.) )
+            # print okok
 
             # If at least one such file exists...
             if (( ${#distro_filenames} )) {
@@ -581,6 +619,27 @@ function ::set_system_globals_gui_x() {
 ::set_system_globals
 
 # --------------------( WASTELANDS                         )--------------------
+# See @{*-core/*-test/*-os} for further details.
+    # * The lowercase name of the current CPU architecture. See @{*-core/*-test/*-architecture} for further details.
+
+            # # List of all recognized distribution-specific files in "/etc".
+            # # Dismantled, this is:
+            # #
+            # # * "(.)", including only files that actually exist.
+            # distro_filenames=(
+            #     # All recognized "-release"-suffixed files in arbitrary order,
+            #     # excluding "redhat-release". Several non-Red Hat distributions
+            #     # erroneously install such file (presumably for dubious backward
+            #     # compatibility), requiring such file only be used as a fallback.
+            #     /etc/{arch,chakra,centos,distro,enlisy,fedora,frugalware,gentoo,mageia,pardus,redflag,sabayon,SuSE,slackware,system,turbolinux,vine,yellowdog}-release(.)
+
+            #     # All recognized "-version"-suffixed files in arbitrary order.
+            #     /etc/{knoppix,lfs,zenwalk}-version(.)
+
+            #     # All other distribution-specific files.
+            #     /etc/DISTRO_SPECS(.)
+            # )
+
             #FUXME: Don't forget a last-ditch fallback, probably setting:
             #ZESHY_LINUX_DISTRO_NAME='Unknown'
             #FUXME: Implement me! And, yes: for our crude purposes here, merely
@@ -766,10 +825,10 @@ function ::set_system_globals_gui_x() {
 #  And that's it, for now.
 #* This implies we should rename:
 #  * ${ZESHY_USER_DIGEST_ROOT_DIRNAME} to ${ZESHY_USER_DIGEST_ROOT_DIRNAME}.
-#  * ${ZESHY_USER_CONFIG_ROOT_DIRNAME} to ${ZESHY_USER_CONFIG_ROOT_DIRNAME}.
+#  * ${ZESHY_USER_CONFIG_DIRNAME} to ${ZESHY_USER_CONFIG_DIRNAME}.
 #  Then set:
 #  * ZESHY_USER_DIGEST_ROOT_DIRNAME="${ZESHY_USER_DIGEST_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}".
-#  * ZESHY_USER_CONFIG_ROOT_DIRNAME="${ZESHY_USER_CONFIG_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}".
+#  * ZESHY_USER_CONFIG_DIRNAME="${ZESHY_USER_CONFIG_DIRNAME}/${ZESHY_SYSTEM_ID}".
 #* Shift the window manager detection code currently embodied in
 #  :set_string_to_window_manager() to @{inspect}. Thereafter,
 #  :set_string_to_window_manager() should be dynamically defined to always
@@ -810,7 +869,7 @@ function ::set_system_globals_gui_x() {
 #FUXME: Ah! Note that @{digest} will actually need to set:
 #
 #* ZESHY_USER_DIGEST_ROOT_DIRNAME="${ZESHY_USER_DIGEST_ROOT_DIRNAME}/${HOST}.${ZESHY_SYSTEM_ID}".
-#* ZESHY_USER_CONFIG_ROOT_DIRNAME="${ZESHY_USER_CONFIG_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}".
+#* ZESHY_USER_CONFIG_DIRNAME="${ZESHY_USER_CONFIG_DIRNAME}/${ZESHY_SYSTEM_ID}".
 #
 #We prepend the hostname of the current system to the current digest but *NOT*
 #configuration root directory, ensuring that migrating zeshy to a different
