@@ -18,8 +18,8 @@ void die_unless_module(
     string module_name,
     string exception_message = "Module \"${module_name}\" not found.")
 
-Throw an exception with the passed message unless the passed module exists. See
-is_module() for further details.
+Throw an exception with the passed message unless the current `zsh` interpreter
+provides the passed module. See is_module() for further details.
 /---
 function die_unless_module() {
     die_unless_args_1_or_2\
@@ -33,41 +33,48 @@ function die_unless_module() {
 declare_function_with_stdin <<'/---'
 [status: bool] is_module(string module_name)
 
-Report success if the passed `zsh` module exists.
+Report success if the current `zsh` interpreter provides the passed module.
 /---
 function is_module() {
+    # Validate sanity.
+    die_unless_arg 'Expected one module name.'
+    :string module_name="${1}"
+
+    # If such module is already loaded, such module necessarily exists. Avoid
+    # calling is_module_loaded(), which implicitly calls this function.
     # Dismantled, this is:
     #
     # * "-F", testing module features.
     # * "-e", returning success if such module is loaded and failure otherwise.
     #
     # Since zsh guarantees such command not to output, this suffices.
-    die_unless_arg 'Expected one module name.'
-    :string module_name="${1}"
-
-    #FIXME: *UGH*. We should *REALLY* have become familiar with "man zshparams"
-    #sooner. Look, all we have to do is manually search each path in list global
-    #${module_path} for a file matching such module name. It's really simple.
-    #Honestly... *sigh*
-
-    # If such module is already loaded, such module exists. Avoid calling
-    # is_module_loaded(), which implicitly calls this function.
-    zmodload -Fe -- "${module_name}" or (
-        # Else, if loading such module succeeds, such module exists.
-        # Astonishingly, zsh offers no means of testing whether such module
-        # exists without loading such module. Since merely loading numerous
-        # modules can have unpleasant side effects (e.g., resource consumption
-        # under "zsh/zprof" profiling), we take the following precautions:
+    zmodload -Fe -- "${module_name}" or {
+        # Else, such module is *NOT* already loaded and must be searched for.
+        # Unfortunately, zsh provides no explicit means of testing for the
+        # availability of an unloaded module without loading such module. Since
+        # merely loading a module can have unpleasant side effects (e.g.,
+        # resource consumption under "zsh/zprof" profiling), avoid loading
+        # modules at all cost.
         #
-        # * Load such module in a subshell rather than the current shell (e.g.,
-        #   with a "("- and ")"- rather than "{"- and "}"-delimited block).
-        # * Immediately unload such module if successfully loaded.
-        #
-        # Due to said side effects, avoid calling zeshy functions here.
-        if { zmodload     -- "${module_name}" &>/dev/null } {
-             zmodload -ui -- "${module_name}" &>/dev/null
+        # Instead, note canonical list global ${module_path} containing all
+        # directories the current interpreter searches for modules. Given that,
+        # this test reduces to testing whether at least one such directory
+        # contains a shared library implementing such module. Since shared
+        # library filetypes are specific to the current operating system, we
+        # assume *ANY* file in such a directory with basename-sans-filetype
+        # matching such module to implement such module. (Such assumption
+        # *SHOULD* hold across most systems. *SHOULD*.)
+        :list module_filenames
+        :string modules_dirname
+        for     modules_dirname ("${module_path[@]}") {
+            # If at least one such shared library exists, report success.
+            module_filenames=( "${modules_dirname}/${module_name}."*(#q.) )
+            is_list_empty module_filenames or report_success
         }
-    )
+
+        # If no such shared library exists, report failure.
+        report_failure
+    }
 }
 
 declare_function_with_stdin <<'/---'
@@ -78,7 +85,7 @@ Report success if the passed `zsh` module is currently loaded.
 function is_module_loaded() {
     # Validate sanity.
     die_unless_arg 'Expected one module name.'
-    string module_name="${1}"
+    :string module_name="${1}"
     die_unless_module "${module_name}"
 
     # Test such module. Since zsh guarantees such command not to output, the
@@ -90,6 +97,7 @@ function is_module_loaded() {
 }
 
 # ....................{ GETTERS                            }....................
+#FIXME: Convert into a setter.
 declare_function_with_stdin <<'/---'
 string get_module_features(string module_name)
 
@@ -299,22 +307,23 @@ function startup_zeshy_module_autoloads() {
     # * "i", ignoring rather than failing when such builtins, functions, or
     #   parameters have already been loaded by such module.
     #
-    # Avoid mapping modules already loaded by the main Zeshy script as well as:
+    # Avoid mapping modules already loaded by the main zeshy script as well as:
     #
     # * "mapfile", whose overly permissive style poses a profound risk of
     #   permanent, silent file deletion or modification. For safety, this module
-    #   must be manually loaded and unloaded.
+    #   *MUST* be manually loaded and unloaded.
     # * "prof", which when loaded begins aggressively profiling zsh functions.
     #   While useful, autoloading the zprof() function this module defines will
     #   begin profiling *ONLY* at the first call of such function, whereas such
     #   function is intended to be called after having already loaded this
     #   module and performed the profiled code. By intentional design, this
-    #   module must be manually loaded and unloaded.
+    #   module *MUST* be manually loaded and unloaded.
     zmodload -abi zsh/cap cap getcap setcap
     zmodload -abi zsh/clone clone
     zmodload -abi zsh/compctl compctl compcall
     zmodload -abi zsh/computil comparguments compdescribe compfiles compgroups\
         compquote comptags comptry compvalues
+    zmodload -abi zsh/db/gdbm ztie zuntie
     zmodload -afi zsh/deltochar delete-to-char zap-to-char
     zmodload -api zsh/langinfo langinfo
     zmodload -afi zsh/mathfunc abs int float acos acosh asin asinh atan atanh\
@@ -336,6 +345,44 @@ function startup_zeshy_module_autoloads() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#* Iterate directory names in list global ${module_path} and for each
+#  listed directory that exists, set the result of globbing for
+#  'terminfo.'* into a local list.
+#* If such list is nonempty, successfully break such iteration.
+#* Else if such list is still empty at the end of such iteration, the
+#  current system does *NOT* provide a "terminfo" database. In such case, set
+#  integer global ${ZESHY_TERMINAL_COLOR_COUNT} to 2 (i.e., black and white).
+
+    #FUXME: *UGH*. We should *REALLY* have become familiar with "man zshparams"
+    #sooner. Look, all we have to do is manually search each path in list global
+    #${module_path} for a file matching such module name. It's really simple.
+    #Honestly... *sigh*
+
+    # # If such module is already loaded, such module exists. Avoid calling
+    # # is_module_loaded(), which implicitly calls this function. Dismantled,
+    # # this is:
+    # #
+    # # * "-F", testing module features.
+    # # * "-e", returning success if such module is loaded and failure otherwise.
+    # #
+    # # Since zsh guarantees such command not to output, this suffices.
+    # zmodload -Fe -- "${module_name}" or (
+    #     # Else, if loading such module succeeds, such module exists.
+    #     # Astonishingly, zsh offers no means of testing whether such module
+    #     # exists without loading such module. Since merely loading numerous
+    #     # modules can have unpleasant side effects (e.g., resource consumption
+    #     # under "zsh/zprof" profiling), we take the following precautions:
+    #     #
+    #     # * Load such module in a subshell rather than the current shell (e.g.,
+    #     #   with a "("- and ")"- rather than "{"- and "}"-delimited block).
+    #     # * Immediately unload such module if successfully loaded.
+    #     #
+    #     # Due to said side effects, avoid calling zeshy functions here.
+    #     if { zmodload     -- "${module_name}" &>/dev/null } {
+    #          zmodload -ui -- "${module_name}" &>/dev/null
+    #     }
+    # )
+
     #FUXME: Actually, there is a way of improving this. It's fairly sneaky, but
     #it should work. Note that if you run "zmodload oeuntoheuntoheuntoehunotehu"
     #with an arbitrarily long string basically guaranteed to fail, zsh always
