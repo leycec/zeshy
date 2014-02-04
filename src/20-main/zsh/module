@@ -286,15 +286,127 @@ function autoload_module_globals() {
 }
 
 # ....................{ STARTUP                            }....................
-run_hook_on_zeshy_startup_first startup_zeshy_module_autoloads
+run_hook_on_zeshy_startup_first ::startup_zeshy_module_autoloads
+
+#FIXME: Such function should probably unconditionally be called below at the
+#top level: e.g.,
+#
+# ....................{ MAIN                               }....................
+#::startup_zeshy_module_autoloads
+#
+#The reason why is simple: as always, exception handling. Our exception handlers
+#are sufficiently complex that they almost certainly depend on functionality in
+#the main codebase implicitly assuming access to module builtins, functions, or
+#globals. Ensure this.
+#FIXME: Wait... We don't want such functions or globals to be compiled into the
+#digest file, so we suppose we *CAN'T* do this. This implies, in turn, that
+#die() (as defined in @{main}) should be calling print_exception() only if all
+#of the conditions apply:
+#
+#* print_exception() exists.
+#* zeshy has already successfully started up, as probably indicated by some
+#  global somewhere.
+#FIXME: But that's getting a tad complex. Alternatively, we could explicitly
+#define and call such function in @{compile} (and ensure such function is
+#compiled into the digest file and added as a startup hook, of course). That's
+#probably the best idea, frankly. Naturally, such function should be called
+#*BEFORE* recording the set of all currently defined aliases, functions, and
+#globals. None of this is much of a hardship, happily. Yo-yo!
+
+#FIXME: Oddly, we've omitted entries for "zsh/terminfo". And yet... map global
+#${terminfo} still seems to be available. I've checked; we're not explicitly
+#loading such module anywhere. Probably an oversight, but we have *NO* idea how
+#it's currently usable.
+#FIXME: This brings up an interesting question. What *EXACTLY* happens when we
+#attempt to define autoloads for an unavailable module (i.e., not installed on
+#the current system)? Easy to test! It would appear, unfortunately, that
+#zmodload() silently succeeds without even attempting to test whether such
+#module exists. Naturally, attempting to call autoloads defined against
+#unavailable modules results in zsh reporting failure at the point of such
+#calls: e.g.,
+#
+#    >>> zmodload -abi zsh/oeuoeu yim
+#    >>> yim and print ok
+#    zsh: failed to load module `zsh/oeuoeu': /usr/lib64/zsh/5.0.5/zsh/oeuoeu.so: cannot open shared object file: No such file or directory
+#
+#That's not *QUITE* so bad when autoloading builtins or functions (though it's
+#still definitely bad). At least zsh reports failure! But the result of
+#attempting to autoload parameters for unavailable modules is simply horrid:
+#
+#    >>> zmodload -api zsh/oeuoeu yoz
+#    >>> print $yoz and print ok
+#    zsh: failed to load module `zsh/oeuoeu': /usr/lib64/zsh/5.0.5/zsh/oeuoeu.so: cannot open shared object file: No such file or directory
+#    zsh/oeuoeu
+#    ok
+#
+#Ugh! zsh reports the call to print() as having succeeded, despite ${yoz} most
+#definitely *NOT* existing. We need to avoid all such nonesense, we need to do
+#it sanely, and by the above constraints we probably need to do so at the top-
+#level (i.e., in @{compile}). How?
+#
+#Well, first of all, I'd question whether we *DO* genuinely need to call this at
+#the top-level. It'd be significantly nicer if we could call this from within
+#@{00-core}. To do so safely, however, we need to ascertain whether calling
+#"zmodload -api" (for example) is sufficient to cause @{compile} to record the
+#existence of such global. We doubt it. But does the same apply to "zmodload
+#-afi"?
+#FIXME: Interesting! A few ad-hoc tests strongly suggest we do *NOT* need to
+#call this at the top-level, greatly simplifying matters. Why? Because zsh
+#internally records builtins, functions, and globals autoloaded in this manner
+#differently than it records the existence of conventional builtins, functions,
+#and globals. The two are non-orthogonal and do *NOT* interfere or inform one
+#another. Excellent!
+#
+#Given that, what we'll need to do is ensure we *ONLY* call zmodload() on
+#modules that are actually available on the current system. That's right: it's
+#time for three new helper functions:
+#
+#* "void :autoload_module_builtin_if_found(string module_name, string builtin_name1, ...)".
+#* "void :autoload_module_function_if_found(string module_name, string function_name1, ...)".
+#* "void :autoload_module_global_if_found(string module_name, string global_name1, ...)".
+#
+#Such functions should internally call :is_module(), which we've recently
+#defined correctly. (Yay!) For example:
+#
+#function :autoload_module_builtin_if_found() {
+#    # Validate sanity.
+#    die_unless_args_2_or_more
+#    :string module_name="${1}"
+#    shift_arg
+#
+#    is_module "${module_name}" and zmodload -abi -- "${module_name}" "${@}"
+#}
+#
+#Done and done, yes? Note such function reports failure if such module does
+#*NOT* exist. In this specific use case, we'll want to ignore such failures with
+#"or ignore_status".
+#FIXME: For efficiency, we should probably only call
+#:autoload_module_builtin_if_found() when we know we need to. Err... Actually,
+#we strongly suspect that, if we examine the zsh codebase, we'll find that
+#pretty much *ALL* such modules are strictly optional (depending on the
+#capabilities of the current system), which is why they're modules in the first
+#place. That means we *WILL* definitely need to call such protective functions
+#for *ALL* such autoloads. *shrug*
+#FIXME: To recap:
+#
+#* Shift such function to a new parcel in @{00-core} -- say,
+#  @{00-core/10-module/module}. Something *VERY* early, in any case.
+#* Shift is_module() to the same parcel.
+#* Define the above three helper functions in such parcel (e.g.,
+#  :autoload_module_builtin_if_found()).
+#* Rename ::startup_zeshy_module_autoloads() to ::autoload_modules().
+#* Refactor ::autoload_modules() to call such helper functions.
+#* Call ::autoload_modules() at the very bottom of such parcel.
+#
+#Done! Awesomeness.
 
 declare_function_with_stdin <<'/---'
-void startup_zeshy_module_autoloads(void)
+void ::startup_zeshy_module_autoloads(void)
 
 Autoload all `zsh` modules not already loaded on the first call of a function or
 expansion of a global provided by such module.
 /---
-function startup_zeshy_module_autoloads() {
+function ::startup_zeshy_module_autoloads() {
     # Validate sanity.
     die_if_args
 
@@ -345,6 +457,15 @@ function startup_zeshy_module_autoloads() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: If such approach is inefficient, we could always optimize it as follows:
+#
+#* Cache the absolute paths of all files recursively in all directories in
+#  ${module_path} into keys of a temporary map local.
+#* Perform lookups on such map rather than calls to is_module().
+#
+#That said, my spidey sense is tingling "Extreme premature optimization!" Just
+#go with the above approach. *shakes head*
+
 #* Iterate directory names in list global ${module_path} and for each
 #  listed directory that exists, set the result of globbing for
 #  'terminfo.'* into a local list.
