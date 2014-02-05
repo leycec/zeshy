@@ -1,0 +1,461 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'/---'
+Handle *`zsh` module autoloaders* (i.e., functions autoloading `zsh` modules on
+the first reference to a builtin, function, or global exported by such module).
+/---
+
+#FIXME: To improve safety, we should probably add the command
+#"zmodload -ui zsh/mapfile" to the top-level print_exception_with_status()
+#implementation, absolutely guaranteeing such module to be unloaded in the event
+#of an exception.
+
+# ....................{ EXCEPTIONS                         }....................
+declare_function_with_stdin <<'/---'
+void die_unless_module(
+    string module_name,
+    string exception_message = "Module \"${module_name}\" not found.")
+
+Throw an exception with the passed message unless the current `zsh` interpreter
+provides the passed module. See is_module() for further details.
+/---
+function die_unless_module() {
+    die_unless_args_1_or_2\
+        'Expected one module name and optional exception message.'
+    :string module_name="${1}"
+    is_module "${module_name}" or
+        die "${2-Module \"${module_name}\" not found.}"
+}
+
+# ....................{ TESTERS                            }....................
+declare_function_with_stdin <<'/---'
+[status: bool] is_module(string module_name)
+
+Report success if the current `zsh` interpreter provides the passed module.
+/---
+function is_module() {
+    # Validate sanity.
+    die_unless_arg 'Expected one module name.'
+    :string module_name="${1}"
+
+    # If such module is already loaded, such module necessarily exists. Avoid
+    # calling is_module_loaded(), which implicitly calls this function.
+    # Dismantled, this is:
+    #
+    # * "-F", testing module features.
+    # * "-e", returning success if such module is loaded and failure otherwise.
+    #
+    # Since zsh guarantees such command not to output, this suffices.
+    zmodload -Fe -- "${module_name}" or {
+        # Else, such module is *NOT* already loaded and must be searched for.
+        # Unfortunately, zsh provides no explicit means of testing for the
+        # availability of an unloaded module without loading such module. Since
+        # merely loading a module can have unpleasant side effects (e.g.,
+        # resource consumption under "zsh/zprof" profiling), avoid loading
+        # modules at all cost.
+        #
+        # Instead, note canonical list global ${module_path} containing all
+        # directories the current interpreter searches for modules. Given that,
+        # this test reduces to testing whether at least one such directory
+        # contains a shared library implementing such module. Since shared
+        # library filetypes are specific to the current operating system, we
+        # assume *ANY* file in such a directory with basename-sans-filetype
+        # matching such module to implement such module. (Such assumption
+        # *SHOULD* hold across most systems. *SHOULD*.)
+        :list module_filenames
+        :string modules_dirname
+        for     modules_dirname ("${module_path[@]}") {
+            # If at least one such shared library exists, report success.
+            module_filenames=( "${modules_dirname}/${module_name}."*(#q.) )
+            (( ${#module_filenames} )) or report_success
+        }
+
+        # If no such shared library exists, report failure.
+        report_failure
+    }
+}
+
+# ....................{ AUTOLOADERS                        }....................
+declare_function_with_stdin <<'/---'
+void autoload_module_builtins(
+    string module_name,
+    string builtin_name1, ...)
+
+Autoload the passed module providing the passed builtins on the first attempt to
+call any such builtin: e.g.,
+
+.autoload_module_builtins()
+==========================================
+[source]
+------------------------------------------
+>>> unload_module            zsh/pcre
+>>> autoload_module_builtins zsh/pcre pcre_compile pcre_study pcre_match
+>>> is_module_loaded         zsh/pcre or output_string "Module unloaded."
+Module unloaded.
+>>> pcre_compile\
+...    "I will not be pushed, filed, stamped, indexed, briefed, debriefed, or
+...     numbered. My life is my own!"
+>>> is_module_loaded zsh/pcre and output_string "Module loaded."
+Module loaded.
+------------------------------------------
+==========================================
+/---
+function autoload_module_builtins() {
+    # Validate sanity.
+    die_unless_args_2_or_more\
+        'Expected one module name and one or more builtin names.'
+    :string module_name="${1}"
+    die_unless_module "${module_name}"
+    shift_arg
+
+    # Autoload such builtins. See startup_zeshy_autoload_modules() for details.
+    zmodload -abi -- "${module_name}" "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+void autoload_module_globals(
+    string module_name,
+    string global_name1, string global_name2, ...)
+
+Define the passed globals to autoload the passed module defining such globals:
+e.g.,
+
+.autoload_module_globals()
+==========================================
+[source]
+------------------------------------------
+>>> unload_module           zsh/zleparameter
+>>> autoload_module_globals zsh/zleparameter keymaps widgets
+>>> is_module_loaded        zsh/zleparameter or output_string "Module unloaded."
+Module unloaded.
+>>> output_string "${keymaps}"
+listscroll command .safe vicmd main menuselect isearch viins emacs
+>>> is_module_loaded zsh/zleparameter and output_string "Module loaded."
+Module loaded.
+------------------------------------------
+==========================================
+/---
+function autoload_module_globals() {
+    # Validate sanity.
+    die_unless_args_2_or_more\
+        'Expected one module name and one or more global names.'
+    :string module_name="${1}"
+    die_unless_module "${module_name}"
+    shift_arg
+
+    # Autoload such globals. See startup_zeshy_autoload_modules() for details.
+    zmodload -api -- "${module_name}" "${@}"
+}
+
+# ....................{ STARTUP                            }....................
+run_hook_on_zeshy_startup_first ::startup_zeshy_autoload_modules
+
+#FIXME: Such function should probably unconditionally be called below at the
+#top level: e.g.,
+#
+# ....................{ MAIN                               }....................
+#::startup_zeshy_autoload_modules
+#
+#The reason why is simple: as always, exception handling. Our exception handlers
+#are sufficiently complex that they almost certainly depend on functionality in
+#the main codebase implicitly assuming access to module builtins, functions, or
+#globals. Ensure this.
+#FIXME: Wait... We don't want such functions or globals to be compiled into the
+#digest file, so we suppose we *CAN'T* do this. This implies, in turn, that
+#die() (as defined in @{main}) should be calling print_exception() only if all
+#of the conditions apply:
+#
+#* print_exception() exists.
+#* zeshy has already successfully started up, as probably indicated by some
+#  global somewhere.
+#FIXME: But that's getting a tad complex. Alternatively, we could explicitly
+#define and call such function in @{compile} (and ensure such function is
+#compiled into the digest file and added as a startup hook, of course). That's
+#probably the best idea, frankly. Naturally, such function should be called
+#*BEFORE* recording the set of all currently defined aliases, functions, and
+#globals. None of this is much of a hardship, happily. Yo-yo!
+
+#FIXME: Oddly, we've omitted entries for "zsh/terminfo". And yet... map global
+#${terminfo} still seems to be available. I've checked; we're not explicitly
+#loading such module anywhere. Probably an oversight, but we have *NO* idea how
+#it's currently usable.
+#FIXME: This brings up an interesting question. What *EXACTLY* happens when we
+#attempt to define autoloads for an unavailable module (i.e., not installed on
+#the current system)? Easy to test! It would appear, unfortunately, that
+#zmodload() silently succeeds without even attempting to test whether such
+#module exists. Naturally, attempting to call autoloads defined against
+#unavailable modules results in zsh reporting failure at the point of such
+#calls: e.g.,
+#
+#    >>> zmodload -abi zsh/oeuoeu yim
+#    >>> yim and print ok
+#    zsh: failed to load module `zsh/oeuoeu': /usr/lib64/zsh/5.0.5/zsh/oeuoeu.so: cannot open shared object file: No such file or directory
+#
+#That's not *QUITE* so bad when autoloading builtins or functions (though it's
+#still definitely bad). At least zsh reports failure! But the result of
+#attempting to autoload parameters for unavailable modules is simply horrid:
+#
+#    >>> zmodload -api zsh/oeuoeu yoz
+#    >>> print $yoz and print ok
+#    zsh: failed to load module `zsh/oeuoeu': /usr/lib64/zsh/5.0.5/zsh/oeuoeu.so: cannot open shared object file: No such file or directory
+#    zsh/oeuoeu
+#    ok
+#
+#Ugh! zsh reports the call to print() as having succeeded, despite ${yoz} most
+#definitely *NOT* existing. We need to avoid all such nonesense, we need to do
+#it sanely, and by the above constraints we probably need to do so at the top-
+#level (i.e., in @{compile}). How?
+#
+#Well, first of all, I'd question whether we *DO* genuinely need to call this at
+#the top-level. It'd be significantly nicer if we could call this from within
+#@{00-core}. To do so safely, however, we need to ascertain whether calling
+#"zmodload -api" (for example) is sufficient to cause @{compile} to record the
+#existence of such global. We doubt it. But does the same apply to "zmodload
+#-afi"?
+#FIXME: Interesting! A few ad-hoc tests strongly suggest we do *NOT* need to
+#call this at the top-level, greatly simplifying matters. Why? Because zsh
+#internally records builtins, functions, and globals autoloaded in this manner
+#differently than it records the existence of conventional builtins, functions,
+#and globals. The two are non-orthogonal and do *NOT* interfere or inform one
+#another. Excellent!
+#
+#Given that, what we'll need to do is ensure we *ONLY* call zmodload() on
+#modules that are actually available on the current system. That's right: it's
+#time for three new helper functions:
+#
+#* "void :autoload_module_builtin_if_found(string module_name, string builtin_name1, ...)".
+#* "void :autoload_module_function_if_found(string module_name, string function_name1, ...)".
+#* "void :autoload_module_global_if_found(string module_name, string global_name1, ...)".
+#
+#Such functions should internally call :is_module(), which we've recently
+#defined correctly. (Yay!) For example:
+#
+#function :autoload_module_builtin_if_found() {
+#    # Validate sanity.
+#    die_unless_args_2_or_more
+#    :string module_name="${1}"
+#    shift_arg
+#
+#    is_module "${module_name}" and zmodload -abi -- "${module_name}" "${@}"
+#}
+#
+#Done and done, yes? Note such function reports failure if such module does
+#*NOT* exist. In this specific use case, we'll want to ignore such failures with
+#"or ignore_status".
+#FIXME: For efficiency, we should probably only call
+#:autoload_module_builtin_if_found() when we know we need to. Err... Actually,
+#we strongly suspect that, if we examine the zsh codebase, we'll find that
+#pretty much *ALL* such modules are strictly optional (depending on the
+#capabilities of the current system), which is why they're modules in the first
+#place. That means we *WILL* definitely need to call such protective functions
+#for *ALL* such autoloads. *shrug*
+#FIXME: To recap:
+#
+#* Shift such function to a new parcel in @{00-core} -- say,
+#  @{00-core/10-module/module}. Something *VERY* early, in any case.
+#* Shift is_module() to the same parcel.
+#* Define the above three helper functions in such parcel (e.g.,
+#  :autoload_module_builtin_if_found()).
+#* Rename ::startup_zeshy_autoload_modules() to ::autoload_modules().
+#* Refactor ::autoload_modules() to call such helper functions.
+#* Call ::autoload_modules() at the very bottom of such parcel.
+#
+#Done! Awesomeness.
+
+declare_function_with_stdin <<'/---'
+void ::startup_zeshy_autoload_modules(void)
+
+Autoload all `zsh` modules not already loaded on the first call of a function or
+expansion of a global provided by such module.
+/---
+function ::startup_zeshy_autoload_modules() {
+    # Validate sanity.
+    die_if_args
+
+    #FIXME: Oddly, we're getting the following errors on digest compilation:
+    #
+    #zeshy: Calling ::startup_zeshy_autoload_modules()...
+    #::startup_zeshy_autoload_modules:35: Can't add module parameter `langinfo': parameter already exists
+    #::startup_zeshy_autoload_modules:46: Can't add module parameter `errnos': parameter already exists
+    #::startup_zeshy_autoload_modules:46: Can't add module parameter `sysparams': parameter already exists
+    #
+    #Such errors pertain to autoloading some but *NOT* all available module
+    #globals. Until we track down the culprit, we've temporarily disabled
+    #autoloading the offending module globals below.
+
+    # Define autoloads for all autoloadable functions defined by zsh modules not
+    # autoloaded above. Unlike above, this requires manually mapping modules to
+    # function names -- an unctuous proposition. Dismantled, this is:
+    #
+    # * "-a", autoloading the following builtins ("b"), functions ("f"), or
+    #   global parameters ("p") from the following module.
+    # * "i", ignoring rather than failing when such builtins, functions, or
+    #   parameters have already been loaded by such module.
+    #
+    # Avoid mapping modules already loaded by the main zeshy script as well as:
+    #
+    # * "mapfile", whose overly permissive style poses a profound risk of
+    #   permanent, silent file deletion or modification. For safety, this module
+    #   *MUST* be manually loaded and unloaded.
+    # * "prof", which when loaded begins aggressively profiling zsh functions.
+    #   While useful, autoloading the zprof() function this module defines will
+    #   begin profiling *ONLY* at the first call of such function, whereas such
+    #   function is intended to be called after having already loaded this
+    #   module and performed the profiled code. By intentional design, this
+    #   module *MUST* be manually loaded and unloaded.
+    zmodload -abi zsh/cap cap getcap setcap
+    zmodload -abi zsh/clone clone
+    zmodload -abi zsh/compctl compctl compcall
+    zmodload -abi zsh/computil\
+        comparguments compdescribe compfiles compgroups\
+        compquote comptags comptry compvalues
+    zmodload -abi zsh/db/gdbm ztie zuntie
+    zmodload -afi zsh/deltochar delete-to-char zap-to-char
+    # zmodload -api zsh/langinfo langinfo
+    zmodload -afi zsh/mathfunc\
+        abs int float acos acosh asin asinh atan atanh\
+        cbrt ceil cos cosh erf erfc exp expm1 fabs floor gamma j0 j1 lgamma log\
+        log10 log1p logb sin sinh sqrt tan tanh y0 y1 ilogb signgam copysign\
+        fmod hypot nextafter jn yn ldexp scalb rand48
+    zmodload -abi zsh/pcre pcre_compile pcre_study pcre_match
+    zmodload -abi zsh/sched sched
+    zmodload -abi zsh/net/socket zsocket
+    zmodload -abi zsh/net/tcp ztcp
+    zmodload -abi zsh/system syserror sysread syswrite zsystem
+    # zmodload -api zsh/system errnos sysparams
+    zmodload -abi zsh/termcap echotc
+    zmodload -api zsh/termcap termcap
+    zmodload -abi zsh/zftp zftp
+    zmodload -api zsh/zleparameter keymaps widgets
+    zmodload -abi zsh/zpty zpty
+    zmodload -abi zsh/zselect zselect
+}
+
+# ....................{ MAIN                               }....................
+# Autoload all available zsh modules *BEFORE* the brunt of the zeshy codebase,
+# which commonly assumes the availability of features provided by such modules.
+::startup_zeshy_autoload_modules
+
+# --------------------( WASTELANDS                         )--------------------
+#FUXME: Odd example. We should do actually something constructive with
+#${mapfile} in the example, which we certainly don't at the moment.
+
+#Such map and hence module remains inherently unsafe. 
+# Define builtins pcre_compile(), pcre_study(), and pcre_match() to autoload
+# module "zsh/pcre" defining such builtins.
+# Define globals keymaps() and widgets() to autoload module "zsh/zleparameter".
+# Define the passed builtins to autoload the passed module defining such builtins:
+
+#FUXME: If such approach is inefficient, we could always optimize it as follows:
+#
+#* Cache the absolute paths of all files recursively in all directories in
+#  ${module_path} into keys of a temporary map local.
+#* Perform lookups on such map rather than calls to is_module().
+#
+#That said, my spidey sense is tingling "Extreme premature optimization!" Just
+#go with the above approach. *shakes head*
+
+#* Iterate directory names in list global ${module_path} and for each
+#  listed directory that exists, set the result of globbing for
+#  'terminfo.'* into a local list.
+#* If such list is nonempty, successfully break such iteration.
+#* Else if such list is still empty at the end of such iteration, the
+#  current system does *NOT* provide a "terminfo" database. In such case, set
+#  integer global ${ZESHY_TERMINAL_COLOR_COUNT} to 2 (i.e., black and white).
+
+    #FUXME: *UGH*. We should *REALLY* have become familiar with "man zshparams"
+    #sooner. Look, all we have to do is manually search each path in list global
+    #${module_path} for a file matching such module name. It's really simple.
+    #Honestly... *sigh*
+
+    # # If such module is already loaded, such module exists. Avoid calling
+    # # is_module_loaded(), which implicitly calls this function. Dismantled,
+    # # this is:
+    # #
+    # # * "-F", testing module features.
+    # # * "-e", returning success if such module is loaded and failure otherwise.
+    # #
+    # # Since zsh guarantees such command not to output, this suffices.
+    # zmodload -Fe -- "${module_name}" or (
+    #     # Else, if loading such module succeeds, such module exists.
+    #     # Astonishingly, zsh offers no means of testing whether such module
+    #     # exists without loading such module. Since merely loading numerous
+    #     # modules can have unpleasant side effects (e.g., resource consumption
+    #     # under "zsh/zprof" profiling), we take the following precautions:
+    #     #
+    #     # * Load such module in a subshell rather than the current shell (e.g.,
+    #     #   with a "("- and ")"- rather than "{"- and "}"-delimited block).
+    #     # * Immediately unload such module if successfully loaded.
+    #     #
+    #     # Due to said side effects, avoid calling zeshy functions here.
+    #     if { zmodload     -- "${module_name}" &>/dev/null } {
+    #          zmodload -ui -- "${module_name}" &>/dev/null
+    #     }
+    # )
+
+    #FUXME: Actually, there is a way of improving this. It's fairly sneaky, but
+    #it should work. Note that if you run "zmodload oeuntoheuntoheuntoehunotehu"
+    #with an arbitrarily long string basically guaranteed to fail, zsh always
+    #responds with an error message giving the absolute path of the directory
+    #containing such modules: e.g.,
+    #
+    #    zsh: failed to load module `oeuntoheuntoheuntoehunotehu': /usr/lib64/zsh/5.0.2/oeuntoheuntoheuntoehunotehu.so: cannot open shared object file: No such file or directory
+    #
+    #There's no other reliable means of determining such path, but the above at
+    #least works (and hopefully portably).
+    #
+    #For efficiency (and safety), we could parse such message *AT DIGEST COMPILE
+    #TIME* for such path and store such path in a string global to be serialized
+    #into such digest -- say, ${ZESHY_ZSH_MODULE_DIR}. Then, this function could
+    #perform the following test:
+    #
+    #* First, try 'zmodload -Fe -- "${module_name}"' as we currently do.
+    #* Failing that, try 'is_file "${ZESHY_ZSH_MODULE_DIR}/${module_name}"'.
+    #  *NO MODULE LOAD REQUIRED*.
+    #
+    #Actually, it's not *QUITE* that simple. Modules can be statically linked
+    #into the "zsh" binary itself, in which case the above isn't quite enough.
+    #Hence, we require a third test doing exactly what we do now: try loading it
+    #manually. *sigh* Can't really get away from that; but, the above does at
+    #least substantially reduce the likelihood of spurious module loads, as one
+    #would only ever call this function with a module likely to exist as a
+    #dynamically linked library on most systems.
+
+# Ensure "mapfile" to be unloaded despite throwing an exception.
+
+# Whenever calling this function, _always_ call :unload_module_mapfile() on no
+# longer requiring ${mapfile} access -- even if such access throws an exception
+
+#FUXME: Uhm; how actually does one do this? The zsh manual explicitly suggests
+#the best method is:
+#
+#    run_code_silent zmodload "${1}"
+#
+#But that's demonstrably silly. A test method shouldn't actually have non-
+#idempotent side effects. In lieu of any builtin method, the best way might
+#simply be to search the appropriate path under "/usr/share/zsh" for filenames
+#corresponding to passed modules.
+
+# void load_mapfile(void)
+#
+# Load zsh module "mapfile". This module is *INHERENTLY* dangerous; in
+# particular, unsetting list elements permanently and silently deletes files
+# with the same name as such elements. To prevent accidental calamity, either:
+#
+# * If possible, call run_code_with_mapfile:() rather than this function, which safely
+#   handles such lifecycle issues for you.
+# * Otherwise, unload "mapfile" immediately after use via unload_mapfile().
+#function load_mapfile() {
+#    load_module zsh/mapfile
+#}
+
+# void unload_mapfile(void)
+#
+# Unload zsh module "mapfile". See load_mapfile().
+#function unload_mapfile() {
+#    unload_module zsh/mapfile
+#}
+
