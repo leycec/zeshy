@@ -15,15 +15,15 @@ the first reference to a builtin, function, or global exported by such module).
 
 # ....................{ EXCEPTIONS                         }....................
 declare_function_with_stdin <<'/---'
-void die_unless_module(
+void :die_unless_module(
     string module_name,
     string exception_message = "Module \"${module_name}\" not found.")
 
-Throw an exception with the passed message unless the current `zsh` interpreter
-provides the passed module. See is_module() for further details.
+Throw an exception with the passed message unless the passed module is available
+under the current `zsh` interpreter. See is_module() for further details.
 /---
-function die_unless_module() {
-    die_unless_args_1_or_2\
+function :die_unless_module() {
+    die_unless_args_1_to_2\
         'Expected one module name and optional exception message.'
     :string module_name="${1}"
     is_module "${module_name}" or
@@ -34,7 +34,8 @@ function die_unless_module() {
 declare_function_with_stdin <<'/---'
 [status: bool] is_module(string module_name)
 
-Report success if the current `zsh` interpreter provides the passed module.
+Report success if the passed module is available under the current `zsh`
+interpreter.
 /---
 function is_module() {
     # Validate sanity.
@@ -67,6 +68,112 @@ function is_module() {
 
     # If no such shared library exists, report failure.
     report_failure
+}
+
+# ....................{ AUTOLOADERS                        }....................
+declare_function_with_stdin <<'/---'
+void :autoload_module_global_if_found_or_noop(
+    string module_name,
+    string global_name1, ...)
+
+Autoload the passed module on the first expansion of any of the passed globals
+if such module is available under the current `zsh` interpreter or return
+silently otherwise. This function assumes (but does _not_ validate) such globals
+to be *features* of such module (i.e., publicly exported by such module).
+
+== Motivation ==
+
+This function rectifies zmodload()'s failure to validate whether passed modules
+are available under the current `zsh` interpreter.
+
+=== Autoloading Runnables from Unavailable Modules ===
+
+If the module passed to zmodload() does _not_ exist and an undefined *runnable*
+(e.g., builtin, math function) registered as provided by such module is called,
+`zsh` prints a fatal error to standard error and reports failure at the point of
+such call: e.g.,
+
+.zmodload() Runnable Autoload Failure
+==========================================
+[source]
+------------------------------------------
+>>> zmodload -abi birmingham/jail letter
+>>> letter and output_string\
+...     "Civilization and violence are antithetical concepts."
+zsh: failed to load module `birmingham/jail': /usr/lib64/zsh/5.0.5/birmingham/jail.so: cannot open shared object file: No such file or directory
+------------------------------------------
+==========================================
+
+Helpfully, this is exactly as one would expect. While `zeshy` could avoid
+registering runnables provided by unavailable modules, doing so would require
+convoluted logic with the end result of merely switching the verbose error above
+for the considerably terser error of `zsh: command not found: letter`. This is
+to say, avoiding registering runnables provided by unavailable modules actively
+hinders rather than helps usability.
+
+=== Autoloading Globals from Unavailable Modules ===
+
+However, if the module passed to zmodload() does _not_ exist and an undefined
+global registered as provided by such module is expanded, `zsh` prints a
+nonfatal error to standard error, expands such global regardless of type as if
+such global were a string global with value the name of such module, and fails
+to report failure at the point of such expansion: e.g.,
+
+.zmodload() Global Autoload Failure
+==========================================
+[source]
+------------------------------------------
+>>> zmodload -api permaculture/design principles
+>>> output_string "${principles}" and output_string\
+...     "Don't mistake anything for reality."
+zsh: failed to load module `permaculture/design': /usr/lib64/zsh/5.0.5/permaculture/design.so: cannot open shared object file: No such file or directory
+permaculture/design
+Don't mistake anything for reality.
+------------------------------------------
+==========================================
+
+This is, undeniably, a travesty. To reiterate, `zsh` not only suggests such
+global to be a garbage string constant but fails to report its inability to
+autoload the module providing such global. To avoid such bad behaviour, consider
+only autoloading globals for modules guaranteed to exist on the current system
+by calling this function.
+/---
+function :autoload_module_global_if_found_or_noop() {
+    # Validate sanity.
+    die_unless_args_2_or_more\
+        'Expected one module name and one or more global names.'
+    :string module_name="${1}" global_name
+    shift_arg
+
+    # If such module exists *AND* no such variable already exists, autoload such
+    # module on the first expansion of any such global. The latter condition
+    # is an unfortunate consequence of the following seemingly inexplicable
+    # nonfatal warnings zsh prints to standard error on zeshy startup *UNLESS*
+    # such condition is explicitly tested here:
+    #
+    #    zsh: Can't add module parameter `langinfo': parameter already exists
+    #    zsh: Can't add module parameter `errnos': parameter already exists
+    #    zsh: Can't add module parameter `sysparams': parameter already exists
+    #
+    # Interestingly:
+    #
+    # * Such modules are *NOT* loaded, despite the globals they provide being
+    #   defined to valid values.
+    # * Such globals do *NOT* comprise the set of all autoloaded module globals.
+    #
+    # Until we resolve what's happening here, shamefully kludge this issue away.
+    if { is_module "${module_name}" } {
+        :string global_name
+        for     global_name ("${@}") {
+            # Ideally, we would specifically test for whether such global
+            # variable rather than merely variable exists. Unfortunately, the
+            # former test is comparatively expensive. See :is_var() and
+            # :is_var_global() for further details.
+            if not (( ${+parameters[${global_name}]} )) {
+                zmodload -api "${module_name}" "${global_name}"
+            }
+        }
+    }
 }
 
 # ....................{ STARTUP                            }....................
@@ -106,6 +213,11 @@ run_hook_on_zeshy_startup_first ::startup_zeshy_autoload_modules
 # Ensure this function does *NOT* attempt to autoload:
 #
 # * Modules already loaded by top-level parcels (typically, @{main}).
+# * Modules *NOT* autoloadable, including:
+#   * "deltochar", defining two ZLE functions delete-to-char() and
+#     zap-to-char(). zmodload() provides option "-f" for autoloading math
+#     functions but no corresponding option for autoloading ZLE functions,
+#     requiring such module be loaded explicitly.
 # * Inherently dangerous modules, including:
 #   * "mapfile", whose overly permissive style poses a profound risk of
 #     permanent, silent file deletion or modification. For safety, this module
@@ -153,8 +265,7 @@ function ::startup_zeshy_autoload_modules() {
     zmodload -abi zsh/zselect zselect
 
     # Autoload the following modules on the first call to any of the following
-    # functions provided by such module.
-    zmodload -afi zsh/deltochar delete-to-char zap-to-char
+    # math functions provided by such module.
     zmodload -afi zsh/mathfunc\
         abs int float acos acosh asin asinh atan atanh\
         cbrt ceil cos cosh erf erfc exp expm1 fabs floor gamma j0 j1 lgamma log\
@@ -163,7 +274,24 @@ function ::startup_zeshy_autoload_modules() {
 
     # Autoload the following modules on the first expansion of any of the
     # following globals provided by such module.
-    #
+    :autoload_module_global_if_found_or_noop zsh/langinfo langinfo
+    :autoload_module_global_if_found_or_noop zsh/system errnos sysparams
+    :autoload_module_global_if_found_or_noop zsh/termcap termcap
+    :autoload_module_global_if_found_or_noop zsh/terminfo terminfo
+    :autoload_module_global_if_found_or_noop zsh/zleparameter keymaps widgets
+}
+
+# ....................{ MAIN                               }....................
+# Autoload all available zsh modules *BEFORE* the brunt of the zeshy codebase,
+# which commonly assumes the availability of features provided by such modules.
+::startup_zeshy_autoload_modules
+
+# --------------------( WASTELANDS                         )--------------------
+    # If such module exists *AND* has not already been loaded, autoload such
+    # module on the first expansion of any such global.
+
+# Fortunately, there are considerably fewer such globals than runnables.
+
     # Unfortunately, since zmodload() does *NOT* validate whether the passed
     # module actually exists, the logic for doing so is somewhat more involved
     # than that for runnables (e.g., builtins, functions). If such module does
@@ -204,19 +332,38 @@ function ::startup_zeshy_autoload_modules() {
     # behaviour, only register globals for modules guaranteed to exist on the
     # current system. Fortunately, there are considerably fewer such globals
     # than runnables.
-    if { is_module zsh/langinfo     } { zmodload -api zsh/langinfo langinfo }
-    if { is_module zsh/system       } { zmodload -api zsh/system errnos sysparams }
-    if { is_module zsh/termcap      } { zmodload -api zsh/termcap termcap }
-    if { is_module zsh/terminfo     } { zmodload -api zsh/terminfo terminfo }
-    if { is_module zsh/zleparameter } { zmodload -api zsh/zleparameter keymaps widgets }
-}
+    # If "zmodload -Fl" successfully lists all features provided by such module,
+    # such module *MUST* necessarily be loaded. This is readily testable by
+    # passing "zmodload -Fl" an unloaded module, for which such builtin reports
+    # failure and prints an error to standard error: e.g.,
+    #
+    #     >>> zmodload -Fl zsh/cap and print ok
+    #     zmodload: module `zsh/cap' is not yet loaded
+    #
+    # Hence, ignore all output produced by such command regardless of success.
+    # { zmodload -Fl -- "${module_name}" } silent:
 
-# ....................{ MAIN                               }....................
-# Autoload all available zsh modules *BEFORE* the brunt of the zeshy codebase,
-# which commonly assumes the availability of features provided by such modules.
-::startup_zeshy_autoload_modules
+    # zmodload -afi zsh/deltochar delete-to-char zap-to-char
 
-# --------------------( WASTELANDS                         )--------------------
+# declare_function_with_stdin <<'/---'
+# [status: bool] :is_module_unloaded(string module_name)
+# 
+# Report success if the passed `zsh` module is currently unloaded (i.e., is _not_
+# currently loaded).
+# /---
+# function :is_module_unloaded() {
+#     die_unless_arg 'Expected one module name.'
+#     not :is_module_loaded "${1}"
+# }
+
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with :is_module_unloaded().
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # if { is_module "${module_name}" and
+    #      not :is_module_global_loaded "${module_name}" "${@}" }
+
+    # is_module "${module_name}" and
+
     # If such module is already loaded, such module necessarily exists. Avoid
     # calling is_module_loaded(), which implicitly calls this function.
     # Dismantled, this is:
