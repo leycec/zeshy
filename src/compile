@@ -54,6 +54,9 @@
 #   * Subdirectories with arbitrary names and nesting. (`zeshy` automatically
 #     finds all scripts in such subdirectories. Subdirectory structure is
 #     insignificant and hence only for optional organization.)
+# * `if_config`, a subdirectory directly containing only:
+#   * `zeshy` configuration files, to be unconditionally copied into the user-
+#     specific `~/.zeshy/config` directory if not already found.
 # * `if_pathable`, a subdirectory directly containing only:
 #   * `zeshy` scripts, each conditionally compiled into `zeshy`\'s digest file
 #     _only_ if an executable file of the same case-sensitive basename currently
@@ -62,14 +65,10 @@
 #     subject to recursive processing (e.g., for an `always` subdirectory) only
 #     if an executable file of the same case-sensitive basename currently exists
 #     in the user-specific ${PATH}.
-# * `if_distro`, a subdirectory directly containing only:
+# * `if_package_manager`, a subdirectory directly containing only:
 #   * Subdirectories, each conditionally enabled as a `zeshy` overlay _only_ if
-#     the current system-specific Linux and/or BSD distribution has the same
-#     lowercase name. At most one such subdirectory matches; `zeshy` ignores the
-#     remaining subdirectories.
-# * `if_config`, a subdirectory directly containing only:
-#   * `zeshy` configuration files, to be unconditionally copied into the user-
-#     specific `~/.zeshy/config` directory if not already found.
+#     the corresponding package management system is currently available under
+#     the current system.
 
 #FIXME: Woops. Now that this parcel supports ordered suboverlays, there would
 #appear to be little point to having precompilation hooks. Such hooks introduce
@@ -858,7 +857,6 @@ typeset -Uag\
     ZESHY_GLOBAL_NAMES\
     ZESHY_HOOKS_RUN_ON_ZESHY_PRECOMPILE
 
-#FIXME: Rename ${ZESHY_ZSH_GLOBAL_NAMES_GLOB} to ${ZESHY_ZSH_GLOBAL_NAMES_GLOB}.
 typeset -g\
     ZESHY_SCRIPT_NAME_GLOB='*~*.swp(-.)'\
     ZESHY_ZSH_GLOBAL_NAMES_GLOB='(REPLY|MATCH|MBEGIN|MEND|match|mbegin|mend|(chpwd|preexec)_functions)'
@@ -1002,34 +1000,15 @@ function ::compile_zeshy_source() {
     # Validate sanity.
     (( # == 0 )) || die 'Expected no arguments.'
 
-    # List set of the absolute paths of all zsh scripts in such overlays, to be
-    # compiled into the current digest file.
-    local -Ua ZESHY_OVERLAY_FILENAMES
-
-    # Since recursion is prohibitively expensive, perform a non-recursive depth-
-    # first search of overlays starting from the following tree roots (in order):
+    # Since function-based recursion is prohibitively expensive, implement such
+    # iteration-based recursion as a depth-first search (DFS) of overlays
+    # starting from the following standard roots (in order):
     #
     # * The system-wide zeshy root.
     # * The user-specific zeshy root, if found.
     ::compile_zeshy_overlay_root "${ZESHY_OVERLAY_DIR}"
     if [[ -d "${ZESHY_USER_OVERLAY_DIR}" ]] {
         ::compile_zeshy_overlay_root "${ZESHY_USER_OVERLAY_DIR}"
-    }
-
-    # Source all zsh scripts in all overlays applicable to the current system
-    # and user, thus defining all applicable aliases, functions, and globals.
-    #
-    # Note that ${ZESHY_SCRIPT_NAME} masquerades as a global and is frequently
-    # expanded as such elsewhere in the codebase. See such variable's
-    # documentation for further details.
-    :output_line_if_debugging 'Sourcing discovered scripts.'
-    local ZESHY_SCRIPT_NAME
-    for   ZESHY_SCRIPT_NAME ("${ZESHY_OVERLAY_FILENAMES[@]}") {
-        # Source such script. If such script no longer exists, such call fails
-        # and hence implicitly throws an exception (as expected).
-#       print "sourcing \"${ZESHY_SCRIPT_NAME}\"..."
-        source -- "${ZESHY_SCRIPT_NAME}"
-#       print "sourced \"${ZESHY_SCRIPT_NAME}\"."
     }
 }
 
@@ -1048,71 +1027,153 @@ function ::compile_zeshy_digest() {
 }
 
 # ....................{ COMPILERS ~ overlay                }....................
+#FIXME: While zeshy implements no overlays as symbolic links (due both to the
+#cross-platform incompatibility of such links *AND* to the fact that such links
+#would generalize the codebase from what would otherwise be an directed acyclic
+#graph (DAG) and hence tree into a directed, possibly cyclic graph and hence
+#non-tree, which would require more robust and hence inefficient data structures
+#to avoid infinite loops), individual users certainly could. The algorithm below
+#should explicitly guard against such cyclicity -- ideally, by supporting rather
+#than merely ignoring such symbolic links, which will unfortunately require
+#additional bookkeeping as suggested above. That said, this shouldn't introduce
+#*TOO* much inefficiency, due to the small number of suboverlays.
+#
+#Namely, we'll need to introduce a new map local
+#${ZESHY_OVERLAY_DIRNAME_VISITED_TO_NIL} or some such, permitting efficient
+#lookup of prospective new overlays to determine whether or not they've already
+#been visited. Immediately before visiting a suboverlay (i.e., calling the
+#corresponding ::compile_zeshy_suboverlay_*() function), perform the following:
+#
+#* If the absolute path of such suboverlay is already a key of such map, ignore
+#  such suboverlay.
+#* Else:
+#  * Add such suboverlay as a key with value the empty string to such map.
+#  * Call the corresponding ::compile_zeshy_suboverlay_*() function.
+
 # void ::compile_zeshy_overlay_root(string overlay_dirname)
 function ::compile_zeshy_overlay_root() {
     # Validate sanity.
     (( # == 1 )) || die 'Expected one overlay dirname.'
+    local overlay_dirname suboverlay_compiler
     local -Ua ZESHY_OVERLAY_DIRNAMES
 
-    # List set of the absolute paths of all zeshy overlays applicable to the
-    # current user and system, as incrementally discovered by a depth-first
-    # first search through the subdirectories of the initial zeshy overlays.
-    # Hence, such list comprises a FIFO stack of such paths in discovery order.
+    # FIFO stack of the absolute paths of all overlays applicable to the current
+    # system, incrementally discovered by depth-first first search (DFS) of root
+    # overlays. In zsh, adding and removing the last item of a list is
+    # considerably more efficient than the same operation on any other list
+    # items. Consequently, FIFO stacks are efficiently implemented in zsh by
+    # pushing and popping onto and off the end of lists.
     #
-    # Root such stack and hence search to the passed root overlay.
+    # This stack contains both overlays and suboverlays (i.e., immediate
+    # subdirectories of overlays), each requiring distinct handling. Hence, we
+    # distinguish the two by prefixing each of the former with the null
+    # character. Since POSIX pathnames are guaranteed to *NOT* contain null
+    # characters, using such characters to do so is inherently safe.
+    #
+    # Initialize such stack to the passed dirname, thus rooting such search to
+    # such overlay.
     ZESHY_OVERLAY_DIRNAMES=( "${1}" )
 
     # Perform a depth-first search of all applicable overlays in such overlay.
-    # To do so safely, iterate dynamically (e.g., "for ((...))") rather than
-    # statically (e.g., "for overlay_dir (...)").
-    integer index=1
-    for ((; index <= ${#ZESHY_OVERLAY_DIRNAMES}; index++ )) {
-        ::compile_zeshy_overlay "${ZESHY_OVERLAY_DIRNAMES[index]}"
+    # While such stack is nonempty, pop the top overlay off such stack and
+    # push all immediate subdirectories of such overlay satisfying any
+    # conditional requirements of such overlay onto the top of such stack (e.g.,
+    # only pushing subdirectories whose basenames match those of existing
+    # pathables for "if_pathable" suboverlays).
+    while (( ${#ZESHY_OVERLAY_DIRNAMES} )) {
+        # Pop the top overlay off such stack. See pop_list() for further
+        # details.
+        overlay_dirname="${ZESHY_OVERLAY_DIRNAMES[-1]}"
+        ZESHY_OVERLAY_DIRNAMES[-1]=()
+
+        # If such overlay is prefixed by the null character, such overlay is a
+        # suboverlay. Unlike overlays, suboverlays are typed according to their
+        # directory names (e.g., suboverlays matching "*-if_pathable" are
+        # pathable suboverlays). Parse the type of such suboverlay from its name
+        # and call the corresponding compiler.
+        if [[ "${overlay_dirname[1]}" == $'\0' ]] {
+            # Strip such prefix from such dirname.
+            overlay_dirname="${overlay_dirname[2,-1]}"
+
+            # Name of the function compiling such overlay if such overlay
+            # requires special handling. Dismantled, this is:
+            #
+            # * ":t", reducing such directory to its basename.
+            # * "##*-", reducing such basename to the substring following the
+            #   last "-" in such basename, if found.
+            suboverlay_compiler="::compile_zeshy_suboverlay_${${overlay_dirname:t}##*-}"
+
+            # If such function does *NOT* exist, default such function to the
+            # standard function compiling overlays requiring no special
+            # handling. (Such function is guaranteed to exist.)
+            (( ${+functions[${suboverlay_compiler}]} )) ||
+                suboverlay_compiler='::compile_zeshy_suboverlay_simple'
+
+            # Compile such suboverlay.
+            :output_line_if_debugging "Searching suboverlay \"${overlay_dirname}\"."
+            "${suboverlay_compiler}" "${overlay_dirname}"
+        # Else, such overlay is an actual overlay. Unlike suboverlays, overlays
+        # are untyped and hence share the same compiler. Compile such overlay.
+        } else {
+            ::compile_zeshy_overlay_container "${overlay_dirname}"
+        }
     }
 }
 
-# void ::compile_zeshy_overlay(string overlay_dirname)
-function ::compile_zeshy_overlay() {
+# void ::compile_zeshy_overlay_container(string overlay_dirname)
+function ::compile_zeshy_overlay_container() {
     # Validate sanity.
     (( # == 1 )) || die 'Expected one overlay dirname.'
-    local dirname_overlay="${1}" dirname_overlay_main
-    local -a dirnames_suboverlay
-    [[ -d "${dirname_overlay}" ]] ||
-        die "Overlay \"${dirname_overlay}\" not found or not a directory."
-    # :output_line_if_debugging "Searching overlay \"${dirname_overlay}\"."
+    local overlay_dirname="${1}"
+    local -a overlay_subdirnames
+    [[ -d "${overlay_dirname}" ]] ||
+        die "Overlay \"${overlay_dirname}\" not found or not a directory."
+    # :output_line_if_debugging "Searching overlay \"${overlay_dirname}\"."
 
-    # If such overlay is *NOT* the topmost system-wide overlay, register all
-    # files in such directory. The topmost system-wide overlay contains the
-    # current script (among others) and must *NOT* be resourced.
-    if [[ "${dirname_overlay}" != "${ZESHY_OVERLAY_DIR}" ]] {
-        ZESHY_OVERLAY_FILENAMES+=(
-            "${dirname_overlay}"/${~ZESHY_SCRIPT_NAME_GLOB} )
+    # If such overlay is not zeshy's root, push all files in such directory
+    # onto the script stack. zeshy's root overlay contains the already sourced
+    # current script (among others), which should never be resourced.
+    if [[ "${overlay_dirname}" != "${ZESHY_OVERLAY_DIR}" ]] {
+        ::compile_zeshy_overlay_scripts\
+            "${overlay_dirname}"/${~ZESHY_SCRIPT_NAME_GLOB}
     }
 
-    # List of the absolute paths of all subdirectories and hence suboverlays of
-    # such overlay in lexicographic order.
-    dirnames_suboverlay=( "${dirname_overlay}"/*(-/) )
+    # List of all subdirectories in such overlay in reverse lexical order.
+    # Such subdirectories are pushed onto the overlay stack below. Since
+    # ::compile_zeshy_overlay_root() treats the last item on such stack as the
+    # next directory to be visited, reversing their ordering here ensures such
+    # function visits such subdirectories in the expected order. (Think reverse
+    # Polish notation). Dismantled, this is:
+    #
+    # * "-/", matching only subdirectories after resolving symbolic links.
+    # * "On", reversing the order of such subdirectories.
+    overlay_subdirnames=( "${overlay_dirname}"/*(-/On) )
 
-    # Compile such suboverlays.
-    local dirname_suboverlay compile_suboverlay
-    for   dirname_suboverlay ("${dirnames_suboverlay[@]}") {
-        # Name of the function compiling such overlay if such overlay requires
-        # special handling. Dismantled, this is:
-        #
-        # * ":t", reducing such directory to its basename.
-        # * "##*-", reducing such basename to the substring following the last
-        #   "-" in such basename, if found.
-        compile_suboverlay="::compile_zeshy_suboverlay_${${dirname_suboverlay:t}##*-}"
+    # Push all subdirectories in such overlay onto the overlay stack as
+    # suboverlays, identified by being prefixed by the null character. See
+    # ::compile_zeshy_overlay_root() for further details.
+    ZESHY_OVERLAY_DIRNAMES+=( $'\0'"${^overlay_subdirnames[@]}" )
+}
 
-        # If such function does *NOT* exist, default such function to the
-        # standard function compiling overlays requiring no special handling.
-        # Such function is guaranteed to exist.
-        (( ${+functions[${compile_suboverlay}]} )) ||
-            compile_suboverlay='::compile_zeshy_suboverlay_simple'
+#FIXME: Document such function.
+# void ::compile_zeshy_overlay_scripts(string filename1?, ...)
+function ::compile_zeshy_overlay_scripts() {
+    # Validate sanity. For flexibility, this function accepts any number of
+    # script filenames, including none.
 
-        # Compile such suboverlay.
-        :output_line_if_debugging "Searching suboverlay \"${dirname_suboverlay}\"."
-        "${compile_suboverlay}" "${dirname_suboverlay}"
+    # Source such scripts, thus defining all aliases, functions, and globals in
+    # such scripts (to be subsequently compiled into the current digest file).
+    # Note that ${ZESHY_SCRIPT_NAME} masquerades as a global and is frequently
+    # expanded as such elsewhere in the codebase. See such variable's
+    # documentation for further details.
+    # :output_line_if_debugging 'Sourcing discovered scripts.'
+    local ZESHY_SCRIPT_NAME
+    for   ZESHY_SCRIPT_NAME ("${@}") {
+        # Source such script. If such script no longer exists, such call fails
+        # and hence implicitly throws an exception (as expected).
+        # print "sourcing \"${ZESHY_SCRIPT_NAME}\"..."
+        source -- "${ZESHY_SCRIPT_NAME}"
+#       print "sourced \"${ZESHY_SCRIPT_NAME}\"."
     }
 }
 
@@ -1120,38 +1181,33 @@ function ::compile_zeshy_overlay() {
 function ::compile_zeshy_suboverlay_simple() {
     # Validate sanity.
     (( # == 1 )) || die 'Expected one suboverlay dirname.'
-    local\
-        dirname_suboverlay="${1}"\
-        filename_src\
-        filename_trg
+    local dirname_suboverlay="${1}"
     [[ -d "${dirname_suboverlay}" ]] ||
         die "Suboverlay \"${dirname_suboverlay}\" not found or not a directory."
 
-    # Recursively register all `zsh` scripts in such directory.
-    ZESHY_OVERLAY_FILENAMES+=(
-        "${dirname_suboverlay}"/**/${~ZESHY_SCRIPT_NAME_GLOB} )
+    # Recursively push all files in such directory onto the script stack.
+    ::compile_zeshy_overlay_scripts\
+        "${dirname_suboverlay}"/**/${~ZESHY_SCRIPT_NAME_GLOB}
 }
 
 # void ::compile_zeshy_suboverlay_if_config(string suboverlay_dirname)
 function ::compile_zeshy_suboverlay_if_config() {
     # Validate sanity.
     (( # == 1 )) || die 'Expected one suboverlay dirname.'
-    local\
-        dirname_suboverlay="${1}"\
-        filename_src\
-        filename_trg
+    local dirname_suboverlay="${1}" filename_trg
     [[ -d "${dirname_suboverlay}" ]] ||
         die "Suboverlay \"${dirname_suboverlay}\" not found or not a directory."
 
     # For each configuration file recursively globbed in such suboverlay...
-    for filename_src ("${dirname_suboverlay}/"**/${~ZESHY_SCRIPT_NAME_GLOB}) {
+    local filename_src
+    for   filename_src ("${dirname_suboverlay}/"**/${~ZESHY_SCRIPT_NAME_GLOB}) {
         # Absolute path of the target configuration file in the current user's
         # zeshy dot directory (and hence stripped of the source directory).
         filename_trg="${ZESHY_USER_CONFIG_DIRNAME}/${filename_src#${dirname_suboverlay}/}"
 
         # Register such file for subsequent sourcing. Assuming no outside
         # intervention, subsequent logic guarantees such file to exist.
-        ZESHY_OVERLAY_FILENAMES+="${filename_trg}"
+        ::compile_zeshy_overlay_scripts "${filename_trg}"
 
         #FIXME: *NOT* necessarily. This is a subtle but important point, and we
         #absolutely need to tighten this up. Suppose the following two files:
@@ -1222,31 +1278,43 @@ function ::compile_zeshy_suboverlay_if_pathable() {
         "${dirname_suboverlay}/"*(e^'(( ${+commands[${REPLY:t}]} ))'^)
     ) || true
 
-    # Register all files in such suboverlay as additional sourcable scripts.
-    ZESHY_OVERLAY_FILENAMES+=( "${^pathnames_pathable[@]}"(.) )
+    # Push all files in such suboverlay onto the script stack.
+    ::compile_zeshy_overlay_scripts "${^pathnames_pathable[@]}"(-.)
 
-    # Register all directories in such suboverlay as additional suboverlays.
-    ZESHY_OVERLAY_DIRNAMES+=( "${^pathnames_pathable[@]}"(/) )
+    # Push all subdirectories in such suboverlay onto the overlay stack.
+    ZESHY_OVERLAY_DIRNAMES+=( "${^pathnames_pathable[@]}"(-/) )
 }
 
-# void ::compile_zeshy_suboverlay_if_distro(string suboverlay_dirname)
-function ::compile_zeshy_suboverlay_if_distro() {
+# void ::compile_zeshy_suboverlay_if_package_manager(string suboverlay_dirname)
+function ::compile_zeshy_suboverlay_if_package_manager() {
     # Validate sanity.
     (( # == 1 )) || die 'Expected one overlay dirname.'
-    local dirname_suboverlay="${1}"
+    local dirname_suboverlay="${1}" package_manager_id package_manager_tester
     [[ -d "${dirname_suboverlay}" ]] ||
         die "Suboverlay \"${dirname_suboverlay}\" not found or not a directory."
 
-    # If the current operating system is unrecognized, return silently.
-    [[ -n "${ZESHY_LINUX_DISTRO_NAME}" ]] || return 0
+    # For all subdirectories in such suboverlay matching an available package
+    # manager, push such subdirectories onto the overlay stack.
+    local dirname_package_manager
+    for   dirname_package_manager ("${dirname_suboverlay}/"*(-/)) {
+        # Machine-readable ID of such package manager. See get_path_basename()
+        # for further details.
+        package_manager_id="${dirname_package_manager:t}"
 
-    # If such overlay has a subdirectory with lowercase name such system,
-    # register such subdirectory as a suboverlay.
-    dirname_suboverlay+="/${(L)ZESHY_LINUX_DISTRO_NAME}"
-    if [[ -d "${dirname_suboverlay}" ]] {
-        ZESHY_OVERLAY_DIRNAMES+="${dirname_suboverlay}"
+        # Name of the function testing the availability of such package manager.
+        package_manager_tester=":is_package_manager_${package_manager_id}"
+
+        # If such function does *NOT* exist, throw an exception. See
+        # :is_function() for further details.
+        (( ${+functions[${package_manager_tester}]} )) || die\
+            'Package manager '${package_manager_id}' unrecognized (i.e., function '${package_manager_tester}'() not found).'
+
+        # If calling such function succeeds, push the current subdirectory onto
+        # the overlay stack.
+        if { "${package_manager_tester}" } {
+            ZESHY_OVERLAY_DIRNAMES+=( "${dirname_package_manager}" )
+        }
     }
-    # print "distro dir: ${dirname_suboverlay}"
 }
 
 # ....................{ PRECOMPILERS                       }....................
@@ -1415,6 +1483,108 @@ function ::precompile_zeshy_cache() {
 :compile_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+    # dirname_overlay_main suboverlay_compiler
+    # local -a dirnames_suboverlay
+    # List of the absolute paths of all subdirectories and hence suboverlays of
+    # such overlay in lexicographic order.
+    # dirnames_suboverlay=( "${dirname_overlay}"/*(-/) )
+
+    # Compile such suboverlays.
+    # local dirname_suboverlay
+    # for   dirname_suboverlay ("${dirnames_suboverlay[@]}") {
+    #     # Name of the function compiling such overlay if such overlay requires
+    #     # special handling. Dismantled, this is:
+    #     #
+    #     # * ":t", reducing such directory to its basename.
+    #     # * "##*-", reducing such basename to the substring following the last
+    #     #   "-" in such basename, if found.
+    #     suboverlay_compiler="::compile_zeshy_suboverlay_${${dirname_suboverlay:t}##*-}"
+
+    #     # If such function does *NOT* exist, default such function to the
+    #     # standard function compiling overlays requiring no special handling.
+    #     # Such function is guaranteed to exist.
+    #     (( ${+functions[${suboverlay_compiler}]} )) ||
+    #         suboverlay_compiler='::compile_zeshy_suboverlay_simple'
+
+    #     # Compile such suboverlay.
+    #     :output_line_if_debugging "Searching suboverlay \"${dirname_suboverlay}\"."
+    #     "${suboverlay_compiler}" "${dirname_suboverlay}"
+    # }
+
+    # If only one script was passed, avoid iteration for efficiency.
+    # if (( # == 1 )) {
+    #     ZESHY_SCRIPT_NAME="${1}"
+    #     source -- "${ZESHY_SCRIPT_NAME}"
+    # # Else, manually iterate such scripts.
+    # } else {
+
+    # (( # )) || die 'Expected one or more script filenames.'
+
+    # excluding files in subdirectory "00-start". If such subdirectory exists,
+    # all files in such subdirectory should be sourced *NOW*.
+    # See below for further 
+
+    # # List set of the absolute paths of all zsh scripts in such overlays, to be
+    # # compiled into the current digest file.
+    # local -Ua ZESHY_OVERLAY_FILENAMES
+
+#     # Source all zsh scripts in all overlays applicable to the current system
+#     # and user, thus defining all applicable aliases, functions, and globals.
+#     #
+#     # Note that ${ZESHY_SCRIPT_NAME} masquerades as a global and is frequently
+#     # expanded as such elsewhere in the codebase. See such variable's
+#     # documentation for further details.
+#     :output_line_if_debugging 'Sourcing discovered scripts.'
+#     local ZESHY_SCRIPT_NAME
+#     for   ZESHY_SCRIPT_NAME ("${ZESHY_OVERLAY_FILENAMES[@]}") {
+#         # Source such script. If such script no longer exists, such call fails
+#         # and hence implicitly throws an exception (as expected).
+# #       print "sourcing \"${ZESHY_SCRIPT_NAME}\"..."
+#         source -- "${ZESHY_SCRIPT_NAME}"
+# #       print "sourced \"${ZESHY_SCRIPT_NAME}\"."
+#     }
+
+    # Push all files in such directory onto the script stack.
+    # ZESHY_OVERLAY_FILENAMES+=(
+    #     "${dirname_suboverlay}"/**/${~ZESHY_SCRIPT_NAME_GLOB} )
+
+    # If the current operating system is unrecognized, return silently.
+    # [[ -n "${ZESHY_LINUX_DISTRO_NAME}" ]] || return 0
+
+    # # If such overlay has a subdirectory with lowercase name such system,
+    # # register such subdirectory as a suboverlay.
+    # dirname_suboverlay+="/${(L)ZESHY_LINUX_DISTRO_NAME}"
+    # if [[ -d "${dirname_suboverlay}" ]] {
+    #     ZESHY_OVERLAY_DIRNAMES+="${dirname_suboverlay}"
+    # }
+    # print "distro dir: ${dirname_suboverlay}"
+
+    #FUXME: Incorrect. We've implemented a breadth-first search here, actually.
+    #Correct this by:
+    #
+    #* Iterating from the back rather than front of such stack.
+    #
+    #That should be it. Reimplement!
+
+    # To do so safely, iterate dynamically (e.g., "for ((...))") rather than
+    # statically (e.g., "for overlay_dir (...)").
+    # integer index=1
+    # for ((; index <= ${#ZESHY_OVERLAY_DIRNAMES}; index++ )) {
+    #     ::compile_zeshy_overlay "${ZESHY_OVERLAY_DIRNAMES[index]}"
+    # }
+
+    # implemented as a list set
+    # List set of the absolute paths of all zeshy overlays applicable to the
+    # current user and system. Such paths are incrementally discovered by a
+    # depth-first first search through all overlays reachable from root zeshy
+    # overlays
+    # .
+    # Hence, such list comprises a FIFO stack of such paths in discovery order.
+    #
+    # Root such stack and hence search to the passed root overlay.
+
+ # At most one such subdirectory matches; `zeshy` ignores the
+#     remaining subdirectories.
  # This could probably be optimized, of course.
 #For example, if the current OS is proprietary (e.g., Darwin or Windows),
 #there's
