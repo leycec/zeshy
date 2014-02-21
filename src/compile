@@ -1128,11 +1128,11 @@ function ::compile_zeshy_overlay_container() {
     local -a overlay_subdirnames
     [[ -d "${overlay_dirname}" ]] ||
         die "Overlay \"${overlay_dirname}\" not found or not a directory."
-    # :output_line_if_debugging "Searching overlay \"${overlay_dirname}\"."
+    :output_line_if_debugging "Searching ...overlay \"${overlay_dirname}\"."
 
-    # If such overlay is not zeshy's root, push all files in such directory
-    # onto the script stack. zeshy's root overlay contains the already sourced
-    # current script (among others), which should never be resourced.
+    # If such overlay is not zeshy's root, compile all zeshy scripts. zeshy's
+    # root overlay contains the already sourced current script (among others),
+    # which should never be resourced.
     if [[ "${overlay_dirname}" != "${ZESHY_OVERLAY_DIR}" ]] {
         ::compile_zeshy_overlay_scripts\
             "${overlay_dirname}"/${~ZESHY_SCRIPT_NAME_GLOB}
@@ -1149,24 +1149,18 @@ function ::compile_zeshy_overlay_container() {
     # * "On", reversing the order of such subdirectories.
     overlay_subdirnames=( "${overlay_dirname}"/*(-/On) )
 
-    # Push all subdirectories in such overlay onto the overlay stack as
-    # suboverlays, identified by being prefixed by the null character. See
-    # ::compile_zeshy_overlay_root() for further details.
-    ZESHY_OVERLAY_DIRNAMES+=( $'\0'"${^overlay_subdirnames[@]}" )
+    # Compile all subdirectories in such overlay, prefixed by the null
+    # character. See ::compile_zeshy_overlay_root() for further details.
+    ::compile_zeshy_overlay_dirs $'\0'"${^overlay_subdirnames[@]}"
 }
 
-#FIXME: Document such function.
 # void ::compile_zeshy_overlay_scripts(string filename1?, ...)
 function ::compile_zeshy_overlay_scripts() {
-    # Validate sanity. For flexibility, this function accepts any number of
-    # script filenames, including none.
-
-    # Source such scripts, thus defining all aliases, functions, and globals in
-    # such scripts (to be subsequently compiled into the current digest file).
+    # For flexibility, this function accepts any number of filenames.
+    #
     # Note that ${ZESHY_SCRIPT_NAME} masquerades as a global and is frequently
     # expanded as such elsewhere in the codebase. See such variable's
     # documentation for further details.
-    # :output_line_if_debugging 'Sourcing discovered scripts.'
     local ZESHY_SCRIPT_NAME
     for   ZESHY_SCRIPT_NAME ("${@}") {
         # Source such script. If such script no longer exists, such call fails
@@ -1177,6 +1171,13 @@ function ::compile_zeshy_overlay_scripts() {
     }
 }
 
+# void ::compile_zeshy_overlay_dirs(string dirname1?, ...)
+function ::compile_zeshy_overlay_dirs() {
+    # For flexibility, this function accepts any number of dirnames.
+    ZESHY_OVERLAY_DIRNAMES+=( "${@}" )
+}
+
+# ....................{ COMPILERS ~ suboverlay             }....................
 # void ::compile_zeshy_suboverlay_simple(string suboverlay_dirname)
 function ::compile_zeshy_suboverlay_simple() {
     # Validate sanity.
@@ -1185,7 +1186,7 @@ function ::compile_zeshy_suboverlay_simple() {
     [[ -d "${dirname_suboverlay}" ]] ||
         die "Suboverlay \"${dirname_suboverlay}\" not found or not a directory."
 
-    # Recursively push all files in such directory onto the script stack.
+    # Compile all zeshy scripts in such directory.
     ::compile_zeshy_overlay_scripts\
         "${dirname_suboverlay}"/**/${~ZESHY_SCRIPT_NAME_GLOB}
 }
@@ -1245,7 +1246,7 @@ function ::compile_zeshy_suboverlay_if_config() {
             command cp -- "${filename_src}" "${filename_trg}"
         }
 
-        # Source such file.
+        # Compile such zeshy script.
         ::compile_zeshy_overlay_scripts "${filename_trg}"
     }
 }
@@ -1274,41 +1275,120 @@ function ::compile_zeshy_suboverlay_if_pathable() {
         "${dirname_suboverlay}/"*(e^'(( ${+commands[${REPLY:t}]} ))'^)
     ) || true
 
-    # Push all files in such suboverlay onto the script stack.
+    # Compile all zeshy scripts in such suboverlay.
     ::compile_zeshy_overlay_scripts "${^pathnames_pathable[@]}"(-.)
 
-    # Push all subdirectories in such suboverlay onto the overlay stack.
-    ZESHY_OVERLAY_DIRNAMES+=( "${^pathnames_pathable[@]}"(-/) )
+    # Compile all subdirectories in such suboverlay.
+    ::compile_zeshy_overlay_dirs "${^pathnames_pathable[@]}"(-/)
+}
+
+# ....................{ COMPILERS ~ suboverlay : tester    }....................
+# void ::compile_zeshy_suboverlay_if_display_server(string suboverlay_dirname)
+function ::compile_zeshy_suboverlay_if_display_server() {
+    (( # == 1 )) || die 'Expected one overlay dirname.'
+    ::compile_zeshy_suboverlay_with_tester_prefix\
+        "${1}" ':is_display_server'
 }
 
 # void ::compile_zeshy_suboverlay_if_package_manager(string suboverlay_dirname)
 function ::compile_zeshy_suboverlay_if_package_manager() {
-    # Validate sanity.
     (( # == 1 )) || die 'Expected one overlay dirname.'
-    local dirname_suboverlay="${1}" package_manager_id package_manager_tester
-    [[ -d "${dirname_suboverlay}" ]] ||
-        die "Suboverlay \"${dirname_suboverlay}\" not found or not a directory."
+    ::compile_zeshy_suboverlay_with_tester_prefix\
+        "${1}" ':is_package_manager'
+}
 
-    # For all subdirectories in such suboverlay matching an available package
-    # manager, push such subdirectories onto the overlay stack.
-    local dirname_package_manager
-    for   dirname_package_manager ("${dirname_suboverlay}/"*(-/)) {
-        # Machine-readable ID of such package manager. See get_path_basename()
+function ::compile_zeshy_suboverlay_with_tester_prefix() {
+    # Validate sanity.
+    (( # == 2 )) || die\
+        'Expected one suboverlay dirname and one tester prefix.'
+    local\
+        suboverlay_dirname="${1}"\
+        tester_prefix="${2}"\
+        tester_any\
+        tester_any_dirname
+    [[ -d "${suboverlay_dirname}" ]] || die\
+        'Suboverlay "'${suboverlay_dirname}'" not found or not a directory.'
+
+    # If such suboverlay contains a subdirectory "any":
+    #
+    # * Call the tester whose name is exactly the passed prefix (e.g., tester
+    #   :is_display_server() for suboverlay subdirectory
+    #   "if_display_server/any").
+    # * If such tester succeeds, compile such subdirectory. Ideally, this occurs
+    #   if the current system provides at least one of the subject being tested.
+    tester_any_dirname="${suboverlay_dirname}/any"
+    if [[ -d "${tester_any_dirname}" ]] {
+        # If such tester does *NOT* exist, throw an exception. See
+        # :die_unless_function() for further details.
+        tester_any="${tester_prefix}"
+        (( ${+functions[${tester_any}]} )) || die\
+            'Overlay "'${tester_any_dirname}'" uncompileable (i.e., function '${tester_any}'() not found).'
+
+        # Compile such subdirectory if such tester succeeds.
+        if { "${tester_any}" } {
+            ::compile_zeshy_overlay_dirs "${tester_any_dirname}"
+        }
+    }
+
+    # If such suboverlay contains a subdirectory "name", perform the following
+    # for all immediate subdirectories of such subdirectory:
+    #
+    # * Call the tester whose name is the basename of such immediate
+    #   subdirectory prefixed by such prefix and "_" (e.g., tester
+    #   :is_display_server_x() for suboverlay subdirectory
+    #   "if_display_server/name/x").
+    # * If such tester succeeds, compile such subdirectory. Ideally, this occurs
+    #   if the current system provides the subject being tested.
+    ::compile_zeshy_suboverlay_subdir_with_tester_prefix\
+        "${suboverlay_dirname}/name" "${tester_prefix}_"
+
+    # If such suboverlay contains a subdirectory "trait", perform the following
+    # for all immediate subdirectories of such subdirectory:
+    #
+    # * Call the tester whose name is the basename of such immediate
+    #   subdirectory prefixed by such prefix and "_trait" (e.g., tester
+    #   :is_display_server_trait_x() for suboverlay subdirectory
+    #   "if_display_server/trait/x").
+    # * If such tester succeeds, compile such subdirectory. Ideally, this occurs
+    #   if the current system provides at least one of the subject being tested
+    #   having such trait.
+    ::compile_zeshy_suboverlay_subdir_with_tester_prefix\
+        "${suboverlay_dirname}/trait" "${tester_prefix}_trait_"
+}
+
+function ::compile_zeshy_suboverlay_subdir_with_tester_prefix() {
+    # Validate sanity.
+    (( # == 2 )) || die\
+        'Expected one suboverlay subdirectory dirname and one tester prefix.'
+    local\
+        suboverlay_subdirname="${1}"\
+        tester_prefix="${2}"\
+        tester\
+        tester_basename
+
+    # If such subdirectory does *NOT* exist, return silently. Since suboverlays
+    # are *NOT* required to provide all or even any such subdirectories (e.g.,
+    # "name/", "trait/"), this does *NOT* constitute an error condition.
+    [[ -d "${suboverlay_dirname}" ]] || return 0
+
+    # For all immediate subdirectories of such subdirectory for which the
+    # tester whose name is the basename of such immediate subdirectory prefixed
+    # by such prefix and "_trait", compile such immediate subdirectory.
+    local tester_dirname
+    for   tester_dirname ("${suboverlay_subdirname}/"*(-/)) {
+        # Basename of such subdirectory. See :set_string_to_path_basename()
         # for further details.
-        package_manager_id="${dirname_package_manager:t}"
+        tester_basename="${tester_dirname:t}"
 
-        # Name of the function testing the availability of such package manager.
-        package_manager_tester=":is_package_manager_${package_manager_id}"
+        # If such tester does *NOT* exist, throw an exception. See
+        # :die_unless_function() for further details.
+        tester="${tester_prefix}${tester_basename}"
+        (( ${+functions[${tester}]} )) || die\
+            'Overlay "'${tester_dirname}'" uncompileable (i.e., function '${tester}'() not found).'
 
-        # If such function does *NOT* exist, throw an exception. See
-        # :is_function() for further details.
-        (( ${+functions[${package_manager_tester}]} )) || die\
-            'Package manager '${package_manager_id}' unrecognized (i.e., function '${package_manager_tester}'() not found).'
-
-        # If calling such function succeeds, push the current subdirectory onto
-        # the overlay stack.
-        if { "${package_manager_tester}" } {
-            ZESHY_OVERLAY_DIRNAMES+=( "${dirname_package_manager}" )
+        # Compile such subdirectory if such tester succeeds.
+        if { "${tester}" } {
+            ::compile_zeshy_overlay_dirs "${tester_dirname}"
         }
     }
 }
@@ -1479,6 +1559,31 @@ function ::precompile_zeshy_cache() {
 :compile_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+    # :output_line_if_debugging 'Sourcing discovered scripts.'
+#     # For all subdirectories in such suboverlay matching an available package
+#     # manager, push such subdirectories onto the overlay stack.
+#     local dirname_package_manager
+#     for   dirname_package_manager ("${dirname_suboverlay}/"*(-/)) {
+#         # Machine-readable ID of such package manager. See get_path_basename()
+#         # for further details.
+#         package_manager_id="${dirname_package_manager:t}"
+# 
+#         # Name of the function testing the availability of such package manager.
+#         package_manager_tester=":is_package_manager_${package_manager_id}"
+# 
+#         # If such function does *NOT* exist, throw an exception. See
+#         # :is_function() for further details.
+#         (( ${+functions[${package_manager_tester}]} )) || die\
+#             'Package manager '${package_manager_id}' unrecognized (i.e., function '${package_manager_tester}'() not found).'
+# 
+#         # If calling such function succeeds, push the current subdirectory onto
+#         # the overlay stack.
+#         if { "${package_manager_tester}" } {
+#             ZESHY_OVERLAY_DIRNAMES+=( "${dirname_package_manager}" )
+#         }
+#     }
+# }
+
         # directory,
         # continue to the next file without sourcing the current file. zeshy's
         # sourcing of component "config" previously sourced such file, already.
