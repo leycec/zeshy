@@ -1466,7 +1466,8 @@ function ::precompile_zeshy() {
 function ::precompile_zeshy_startup() {
     # Validate sanity.
     (( # )) && die 'Expected no arguments.'
-    local globals aliases
+    local globals_binding aliases_binding
+    local -a aliases_global
 
     #FIXME: We should probably throw exceptions or print warnings if *ANY*
     #zeshy globals to be compiled into the digest are exported. I suspect we'll
@@ -1474,38 +1475,23 @@ function ::precompile_zeshy_startup() {
     #prevents their recompilation into zeshy's user digest file.
 
     # String concatenating all zeshy-specific global bindings.
-    :set_string_to_var_binding globals "${ZESHY_GLOBAL_NAMES[@]}"
-  # print -r -- "globals: ${globals}"|less
+    :set_string_to_var_binding globals_binding "${ZESHY_GLOBAL_NAMES[@]}"
+  # print -r -- "globals: ${globals_binding}"|less
 
     #FIXME: Eliminate subshells by converting getters to setters.
 
     # String concatenating all zeshy-specific alias bindings.
-    aliases="$(get_alias_nonsuffix_binding "${ZESHY_ALIAS_NAMES[@]}")"
+    aliases_binding="$(get_alias_nonsuffix_binding "${ZESHY_ALIAS_NAMES[@]}")"
 
     # If at least one zeshy-specific suffix alias was defined, list all such
     # alias bindings. Avoid calling alias() on an empty list, which uselessly
     # returns *ALL* alias bindings -- zeshy-specific or not.
-    if (( ${#ZESHY_ALIAS_SUFFIX_NAMES} )) {
+    if { is_list_nonempty ZESHY_ALIAS_SUFFIX_NAMES } {
         # Prefix such bindings with a newline to delimit such bindings from the
         # preceding alias suffixes in the function containing both below.
-        aliases+=$'\n'"$(get_alias_suffix_binding\
+        aliases_binding+=$'\n'"$(get_alias_suffix_binding\
             "${ZESHY_ALIAS_SUFFIX_NAMES[@]}")"
     }
-
-    # Undefine all zeshy-specific aliases *AFTER* listing such aliases above.
-    # The reasons why are, unsurprisingly, subtle. The subsequent definition of
-    # startup_zeshy_globals() may attempt to declare nonscalar globals
-    # containing unquoted elements equal to zeshy-specific global alias names
-    # (e.g., "is", "or"), in which case such call will fail with an unhelpful
-    # parse error if such global aliases exist. Undefining *ALL* aliases also
-    # undefines such problematic global aliases, as desired.
-    #
-    # Interestingly, undefining such aliases does *NOT* induce errors on zeshy
-    # functions expanding such aliases (as demonstrated by the call to
-    # redefine_function() below). Since zsh expands aliases in function bodies
-    # at function definition definition rather than call time, *ALL* zeshy
-    # functions may still be called without error despite such undefinition.
-    unalias -- "${ZESHY_ALIAS_NAMES[@]}"
 
     # If compiling a debug-specific digest file, call startup_zeshy_sanity()
     # immediately *AFTER* startup hooks defining zeshy globals and aliases.
@@ -1539,14 +1525,49 @@ function ::precompile_zeshy_startup() {
     is_shell_interactive && startup_zeshy_if_shell_interactive
     is_shell_login       && startup_zeshy_if_shell_login"
 
-    redefine_function startup_zeshy_globals "${globals}"
-    redefine_function startup_zeshy_aliases "${aliases}"
     redefine_function startup_zeshy_if_shell_interactive\
         "$(print -rl -- "${ZESHY_HOOKS_RUN_ON_STARTUP_IF_INTERACTIVE[@]}")"
     redefine_function startup_zeshy_if_shell_login\
         "$(print -rl -- "${ZESHY_HOOKS_RUN_ON_STARTUP_IF_LOGIN[@]}")"
 #   print_function startup_zeshy_globals
 #   die_unless_function startup_zeshy
+
+    redefine_function startup_zeshy_aliases "${aliases_binding}"
+
+    # List of all global alias names.
+    :set_list_to_aliases_global aliases_global
+
+    # Temporarily disable all global aliases *BEFORE* defining
+    # startup_zeshy_globals().
+    #
+    # Unsurprisingly, the reasons why are fairly subtle. Such function's
+    # implementation may attempt to declare nonscalar globals containing
+    # unquoted items of the same name as zeshy-specific global alias names
+    # (e.g., "is", "or"), in which case attempting to define such function
+    # below will typically fail with one or more fatal parse errors.
+    #
+    # Disable *ALL* global aliases rather than merely zeshy-specific global
+    # aliases. If non-zeshy-specific global aliases are currently defined, such
+    # aliases could prove as problematic as zeshy-specific global aliases.
+    #
+    # Technically, disabling all currently defined non-suffix aliases (i.e.,
+    # normal and global aliases) rather than merely all global aliases would
+    # suffice to undefine the latter as well. However, doing so would also
+    # introduce another unhelpful subtlety: namely, inducing fatal errors in
+    # subsequently called zeshy functions expanding such aliases in subshells
+    # (e.g., "$(get_caller)", "$(get_stdin)"). Since zsh expands aliases in
+    # function bodies at function definition definition rather than call time,
+    # *ONLY* zeshy functions expanding such aliases directly in their function
+    # bodies remain unaffected. Unfortunately, the print_exception() exception
+    # handler transitively calls functions expanding such aliases in subshells.
+    # To avoid breaking exception handling (at least in the interim until
+    # startup_zeshy_aliases() redefines such aliases), undefine the minimum
+    # number of problematic aliases (i.e., all global aliases) rather than all
+    # non-suffix aliases.
+    # undefine_alias_nonsuffix "${aliases_global[@]}"
+    :disable_alias_nonsuffix "${aliases_global[@]}"
+    redefine_function startup_zeshy_globals "${globals_binding}"
+     :enable_alias_nonsuffix "${aliases_global[@]}"
 }
 
 # void ::precompile_zeshy_cache(void)
@@ -1571,6 +1592,45 @@ function ::precompile_zeshy_cache() {
 :compile_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+#
+    # Undefine all global aliases *AFTER* listing such aliases above.
+    #FUXME: Wait. We actually only need to undefine all *GLOBAL* aliases,
+    #and we only need to do so immediately prior to zeshy startup (which is to
+    #say, much later than here). Implementing both corrections should
+    #substantially improve matters, yes?
+
+    #FUXME: O.K.; we now have :set_list_to_aliases_global(). Call such function
+    #to obtain the set of global alias names and unalias *ONLY* such aliases.
+
+    # Reduce such list to only zeshy-specific global alias names by
+    # intersecting the prior list and list of all zeshy-specific alias names.
+    # :intersect_lists aliases_global ZESHY_ALIAS_NAMES
+
+    # Undefine all zeshy-specific aliases *AFTER* listing such aliases above.
+    # The reasons why are, unsurprisingly, subtle. The subsequent definition of
+    # startup_zeshy_globals() may attempt to declare nonscalar globals
+    # containing unquoted elements equal to zeshy-specific global alias names
+    # (e.g., "is", "or"), in which case such call will fail with an unhelpful
+    # parse error if such global aliases exist. Undefining *ALL* aliases also
+    # undefines such problematic global aliases, as desired.
+    #
+    # Undefining such aliases induces fatal errors and hence thrown exceptions
+    # in zeshy functions expanding such aliases in subshells (e.g.,
+    # "$(get_caller)", "$(get_stdin)"). Since zsh expands aliases in function
+    # bodies at function definition definition rather than call time, *ONLY*
+    # zeshy functions expanding such aliases directly in their function bodies
+    # remain unaffected.
+    #
+    # Unfortunately, the print_exception() exception handler transitively calls
+    # functions expanding such aliases in subshells, implying such handler to
+    # be broken until such aliases are restored.
+    # unalias -- "${ZESHY_ALIAS_NAMES[@]}"
+
+    # subshells (as demonstrated by the
+    # call to
+    # redefine_function() below).  *ALL* zeshy
+    # functions may still be called without error despite such undefinition.
+
     #FUXME: The current implementation below literally makes no sense. In
     #particular, if no zeshy function was defined, then certainly
     #die_unless_list_nonempty() could not have been defined to be called below.
