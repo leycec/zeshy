@@ -78,18 +78,19 @@ function die_unless_string_matches_glob_capturing_groups() {
 declare_function_with_stdin <<'/---'
 <globbable> [status: bool] is_string_matches_glob(string text, string glob)
 
-Report success if the passed string matches the passed glob and, in such case,
-unconditionally set match scalar globals ${MATCH}, ${MBEGIN}, and ${MEND}. For
-both efficiency and safety, this function does _not_ set nonscalar globals
-${match}, ${mbegin}, or ${mend} unless such glob contains
-${ZESHY_GLOB_CAPTURE_GROUPS} (i.e., `(#b)`). Alternately, consider calling
-is_string_matches_glob_capturing_groups() to set all such globals: e.g.,
+Report success if the passed string matches the passed glob. If such glob is
+syntactically invalid (e.g., `[^]]`), an exception is thrown. If such string
+matches such glob, scalar globals ${MATCH}, ${MBEGIN}, and ${MEND} will be set
+to their customary values. For both efficiency and safety, this function does
+_not_ set nonscalar globals ${match}, ${mbegin}, or ${mend} unless such glob
+contains ${ZESHY_GLOB_CAPTURE_GROUPS} (i.e., `(#b)`). Alternately, consider
+calling is_string_matches_glob_capturing_groups() to have such globals set: e.g.,
 
 .is_string_matches_glob()
 ==========================================
 [source]
 ------------------------------------------
->>> string on_law=\
+>>> :string on_law=\
 ...    "If you reason instead of repeating what is taught you; if you analyze
 ...     the law and strip off those cloudy fictions with which it has been
 ...     draped in order to conceal its real origin, which is the right of the
@@ -110,20 +111,57 @@ Men lived thousands of years before the first States were constituted.
 ==========================================
 /---
 function is_string_matches_glob() {
+    # Validate sanity.
     die_unless_args_2 'Expected one string and one glob.'
-    is_string_matches_glob_safely\
-        "${1}" "$(convert_string_to_glob_capturing_substrings "${2}")"
+    :string text="${1}" glob="${2}"
+#   output_string_to_stderr "glob: ${glob}"
+
+    # Set scalar globals on successful matches (e.g., ${MATCH}).
+    :enable_glob_capturing glob
+
+    # Perform such test. If such glob is syntactically invalid, zsh emits a
+    # nonfatal warning to standard error and reports failure; if such glob is
+    # syntactically valid but such test fails, zsh reports failure without
+    # printing to standard error. In the former case, this function converts
+    # such nonfatal warning to a fatal exception; in the latter case, this
+    # function merely reports failure.
+    #
+    # If such test fails, distinguish the two cases by capturing and testing
+    # standard error produced by such test.
+    #
+    # If such test succeeds, such glob *MUST* be syntactically valid. In such
+    # case, report success.
+    { is "${text}" == ${~glob} si } silent_stderr: or {
+        # Repeat such test, capturing standard error if any and ignoring the
+        # expected failure. For efficiency, capture such error *ONLY* if such
+        # test fails. Subshells are non-negligibly inefficient!
+        :string error; error="$(
+            { is "${text}" == ${~glob} si } to_stdout: or ignore_failure)"
+
+        # If such error is nonempty, such glob *MUST* be syntactically invalid.
+        # Convert such nonfatal error into a fatal exception.
+        if { is_string_nonempty "${error}" } {
+            # If such error is prefixed by "zsh: ", remove such prefix.
+            remove_string_prefix error 'zsh: '
+            die 'Glob "'${glob}'" invalid:'${ZESHY_ASCII_NEWLINE}${error}
+        # Else, such glob is syntactically valid but such test failed. In such
+        # case, report failure.
+        } else {
+            report_failure
+        }
+    }
 }
 
-#FIXME: Rename to is_string_matches_glob_grouped:().
+#FIXME: Rename to :is_string_matches_glob_grouped().
 declare_function_with_stdin <<'/---'
 <globbable> [status: bool] is_string_matches_glob_capturing_groups(
     string text, string glob)
 
-Report success if the passed string matches the passed glob and, in such case,
-set match globals ${MATCH}, ${MBEGIN}, ${MEND}, ${match}, ${mbegin}, and
-${mend}. If capturing only one match group, consider calling
-get_string_match_group_first() or
+Report success if the passed string matches the passed glob. If such glob is
+syntactically invalid (e.g., `[^]]`), an exception is thrown. If such string
+matches such glob, globals ${MATCH}, ${MBEGIN}, ${MEND}, ${match}, ${mbegin},
+and ${mend} will be set to their customary values. If capturing only one match
+group, consider calling get_string_match_group_first() or
 get_string_match_group_first_if_found() instead. See
 convert_string_to_glob_capturing_groups_and_substrings() for further details:
 e.g.,
@@ -132,7 +170,7 @@ e.g.,
 ==========================================
 [source]
 ------------------------------------------
->>> string glob="crazy, ([[:alpha:]]##)" on_awareness=\
+>>> :string glob="crazy, ([[:alpha:]]##)" on_awareness=\
 ...    "The first characteristic is a slowing down of time, a concentration in
 ...     the present. One's normally compulsive concern for the future decreases,
 ...     and one becomes aware of the enormous importance and interest of what is
@@ -153,107 +191,8 @@ failing
 /---
 function is_string_matches_glob_capturing_groups() {
     die_unless_args_2 'Expected one string and one glob.'
-    is_string_matches_glob_safely\
+    is_string_matches_glob\
         "${1}" "$(convert_string_to_glob_capturing_groups_and_substrings "${2}")"
-}
-
-#FUXME: Rename to :is_string_matches_glob_safe_by_coprocess(). It's critical
-#we inform the caller that we're internally closing and reopening the coprocess.
-#Likewise, all functions transitively calling *THIS* function should be
-#similarly renamed. Note that, while the glob test this function internally
-#performs *APPEARS* to be side-effect free and hence call the safer function
-#:run_code_silent_and_set_string_to_stderr_by_subshell() internally, such test
-#sets global variables (e.g., ${match}) and hence *MUST* be run in the current
-#shell with a coprocess.
-#FIXME: *WAIT*. We've uncovered how to implement this safely. Happily,
-#redefine_function() demonstrates how to do so already: first perform a silent
-#match in the current shell *WITHOUT* a coprocess and then if such match reports
-#failure reperform such match in a command substitution to capture stderr. In
-#the latter case, if stderr is nonempty, a glob error occurred, so throw stderr
-#as an exception; else, no such error occurred, implying the match simply
-#failed, so report failure from such function. Efficient. Safe. Requires *NO*
-#coprocess and only requires a subshell when such match fails. (Since
-#coprocesses always require a subshell, the above is in fact a significantly
-#more efficient approach.) Go-go-go!
-
-declare_function_with_stdin <<'/---'
-<globbable> [status: bool] is_string_matches_glob_safely(
-    string text, string glob)
-
-Report success if the passed string matches the passed syntactically valid glob.
-If such glob is syntactically invalid (e.g., `[^]]`), an exception is thrown.
-This differs from normal `zsh` behavior, in which `zsh` merely reports failure
-and prints a nonfatal warning: e.g.,
-
-.is_string_matches_glob_safely()
-==========================================
-[source]
-------------------------------------------
->>> string on_mystical_experiencies=\
-...    "The idea of mystical experiences resulting from drug use is not readily
-...     accepted in Western societies. Western culture has, historically, a
-...     particular fascination with the value and virtue of man as an
-...     individual, self-determining, responsible ego, controlling himself and
-...     his world by the power of conscious effort and will. Nothing, then,
-...     could be more repugnant to this cultural tradition than the notion of
-...     spiritual or psychological growth through the use of drugs. A
-...     \"drugged\" person is by definition dimmed in consciousness, fogged in
-...     judgment, and deprived of will. But not all psychotropic (consciousness-
-...     changing) chemicals are narcotic and soporific, as are alcohol, opiates,
-...     and barbiturates. The effects of what are now called psychedelic (mind-
-...     manifesting) chemicals differ from those of alcohol as laughter differs
-...     from rage, or delight from depression. There is really no analogy
-...     between being \"high\" on LSD and \"drunk\" on bourbon. True, no one in
-...     either state should drive a car, but neither should one drive while
-...     reading a book, playing a violin, or making love. Certain creative
-...     activities and states of mind demand a concentration and devotion that
-...     are simply incompatible with piloting a death-dealing engine along a
-...     highway."
->>> is "${on_mystical_experiencies}" == (#thc)(#cbd) si
-zsh: run_code:56: bad pattern: (#thc)(#cbd)
->>> is_string_matches_glob_safely "${on_mystical_experiencies}" (#thc)(#cbd)
-┎┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈• is_string_matches_glob_safely •┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┒
-┋ is_string_matches_glob_safely() failed with exit status 1.                  ┋
-┋ Glob "(#thc)(#cbd)" invalid:                                                ┋
-┋     run_code:56: bad pattern: (#thc)(#cbd)                                  ┋
-┖┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┚
-┖• die() { /home/leycec/.zeshy/cache/digest/debug.zwc/is_string_matches_glob_safely: 28 }
- ┖• is_string_matches_glob_safely() { /bin/zsh: 2 }
-------------------------------------------
-==========================================
-/---
-function is_string_matches_glob_safely() {
-    # Validate sanity.
-    die_unless_args_2 'Expected one string and one glob.'
-    string text="${1}" glob="${2}" stderr
-#   output_string_to_stderr "glob: ${glob}"
-
-    # Test such match. Avoid quoting such glob. Since such test fails to signal
-    # fatal errors and hence throw exceptions on glob syntax errors, forcefully
-    # capture standard error into a string local to be subsequently tested.
-    #
-    # If such test succeeds, such glob *MUST* be syntactically valid. Return
-    # success.
-    if { :run_code_silent_and_set_string_to_stderr_by_coprocess\
-        'is "${text}" == ${~glob} si' stderr } {
-#       'is "${text}" == '${(q)glob}' si' stderr } {
-        report_success
-    # Else, such test failed. Since this implies that either such glob is
-    # syntactically invalid *OR* such glob is syntactically valid and such
-    # string fails to match such glob, examine the captured standard error to
-    # determine which occurred.
-    #
-    # If such glob is syntactically invalid, throw an exception with the error
-    # reported by zsh. See is_string_nonempty() for further details.
-    } elif { is -n "${stderr}" si } {
-        # If such error is prefixed by "zsh: ", remove such prefix.
-        stderr="$(remove_string_prefix "${stderr}" 'zsh: ')"
-        die "Glob \"${glob}\" invalid:${ZESHY_ASCII_NEWLINE}    ${stderr}"
-    # Else, such glob is syntactically valid and such string fails to match such
-    # glob. Return failure, "damn your eyes!"
-    } else {
-        report_failure
-    }
 }
 
 #FIXME: In lieu of unit tests...
@@ -402,6 +341,137 @@ function get_string_text_matching_glob_group_if_found() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# function is_string_matches_glob() {
+#     die_unless_args_2 'Expected one string and one glob.'
+#     is_string_matches_glob_safely\
+#         "${1}" "$(convert_string_to_glob_capturing_substrings "${2}")"
+# }
+
+# declare_function_with_stdin <<'/---'
+# <globbable> [status: bool] is_string_matches_glob_safely(
+#     string text, string glob)
+# 
+# Report success if the passed string matches the passed glob. If such glob is
+# syntactically invalid (e.g., `[^]]`), an exception is thrown. (This differs
+# substantially from `zsh`\'s customary behavior of only printing nonfatal
+# warnings on syntactically invalid globs): e.g.,
+#
+# .is_string_matches_glob_safely()
+# ==========================================
+# [source]
+# ------------------------------------------
+# >>> :string on_entheogens=\
+# ...    'The idea of mystical experiences resulting from drug use is not readily
+# ...     accepted in Western societies. Western culture has, historically, a
+# ...     particular fascination with the value and virtue of man as an
+# ...     individual, self-determining, responsible ego, controlling himself and
+# ...     his world by the power of conscious effort and will. Nothing, then,
+# ...     could be more repugnant to this cultural tradition than the notion of
+# ...     spiritual or psychological growth through the use of drugs. A
+# ...     "drugged" person is by definition dimmed in consciousness, fogged in
+# ...     judgment, and deprived of will. But not all psychotropic (consciousness-
+# ...     changing) chemicals are narcotic and soporific, as are alcohol, opiates,
+# ...     and barbiturates. The effects of what are now called psychedelic (mind-
+# ...     manifesting) chemicals differ from those of alcohol as laughter differs
+# ...     from rage, or delight from depression. There is really no analogy
+# ...     between being "high" on LSD and "drunk" on bourbon. True, no one in
+# ...     either state should drive a car, but neither should one drive while
+# ...     reading a book, playing a violin, or making love. Certain creative
+# ...     activities and states of mind demand a concentration and devotion that
+# ...     are simply incompatible with piloting a death-dealing engine along a
+# ...     highway.'
+# >>> is "${on_entheogens}" == (#thc)(#cbd) si
+# zsh: run_code:56: bad pattern: (#thc)(#cbd)
+# >>> is_string_matches_glob_safely "${on_entheogens}" (#thc)(#cbd)
+# ┎┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈• is_string_matches_glob_safely •┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┒
+# ┋ is_string_matches_glob_safely() failed with exit status 1.                  ┋
+# ┋ Glob "(#thc)(#cbd)" invalid:                                                ┋
+# ┋     run_code:56: bad pattern: (#thc)(#cbd)                                  ┋
+# ┖┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┚
+# ┖• die() { /home/leycec/.zeshy/cache/digest/debug.zwc/is_string_matches_glob_safely: 28 }
+#  ┖• is_string_matches_glob_safely() { /bin/zsh: 2 }
+# ------------------------------------------
+# ==========================================
+# /---
+
+#FUXME: Rename to :is_string_matches_glob_safe_by_coprocess(). It's critical
+#we inform the caller that we're internally closing and reopening the coprocess.
+#Likewise, all functions transitively calling *THIS* function should be
+#similarly renamed. Note that, while the glob test this function internally
+#performs *APPEARS* to be side-effect free and hence call the safer function
+#:run_code_silent_and_set_string_to_stderr_by_subshell() internally, such test
+#sets global variables (e.g., ${match}) and hence *MUST* be run in the current
+#shell with a coprocess.
+#FUXME: *WAIT*. We've uncovered how to implement this safely. Happily,
+#redefine_function() demonstrates how to do so already: first perform a silent
+#match in the current shell *WITHOUT* a coprocess and then if such match reports
+#failure reperform such match in a command substitution to capture stderr. In
+#the latter case, if stderr is nonempty, a glob error occurred, so throw stderr
+#as an exception; else, no such error occurred, implying the match simply
+#failed, so report failure from such function. Efficient. Safe. Requires *NO*
+#coprocess and only requires a subshell when such match fails. (Since
+#coprocesses always require a subshell, the above is in fact a significantly
+#more efficient approach.) Go-go-go!
+#FUXME: After implementing the above correction, rename such function to simply
+#:is_string_matches_glob(). Yay!
+
+    # Test to be performed. For obscure error handling reasons, we interpolate
+    # such test into several eval() calls below.
+    #
+    # Note that such glob *MUST* be left unquoted here.
+    # test='is "${text}" == ${~glob} si'
+
+    # Perform such test. If such glob is syntactically invalid, zsh emits a
+    # nonfatal warning to standard error and reports failure; if such glob is
+    # syntactically valid but such test fails, zsh reports failure without
+    # printing to standard error. In the former case, this function converts
+    # such nonfatal warning to a fatal exception; in the latter case, this
+    # function merely reports failure.
+    #
+    # If such test fails, distinguish the two cases by capturing and testing
+    # standard error produced by such test.
+    #
+    # If such test succeeds, such glob *MUST* be syntactically valid. In such
+    # case, report success.
+    # { eval "${test}" } silent_stderr: or {
+    #     # Capture such error, ignoring the expected failure.
+    #     :string error; error="$(
+    #         { eval "${test}" } to_stdout: or ignore_failure)"
+
+    # Since zsh fails to signal a trap (and hence fatal
+    # exception) on syntactic errors in such glob, forcefully capture standard
+    # error into a string local to be subsequently tested.
+    #
+    # If such test succeeds, such glob *MUST* be syntactically valid. Return
+    # success.
+
+    # Test such match. Avoid quoting such glob. Since such test fails to signal
+    # fatal errors and hence throw exceptions on glob syntax errors, forcefully
+    # capture standard error into a string local to be subsequently tested.
+    #
+    # If such test succeeds, such glob *MUST* be syntactically valid. Return
+    # success.
+#     if { :run_code_silent_and_set_string_to_stderr_by_coprocess\
+#         'is "${text}" == ${~glob} si' stderr } {
+# #       'is "${text}" == '${(q)glob}' si' stderr } {
+#         report_success
+    # Else, such test failed. Since this implies that either such glob is
+    # syntactically invalid *OR* such glob is syntactically valid and such
+    # string fails to match such glob, examine the captured standard error to
+    # determine which occurred.
+    #
+    # If such glob is syntactically invalid, throw an exception with the error
+    # reported by zsh. See is_string_nonempty() for further details.
+    # } elif { is -n "${stderr}" si } {
+    #     # If such error is prefixed by "zsh: ", remove such prefix.
+    #     stderr="$(remove_string_prefix "${stderr}" 'zsh: ')"
+    #     die "Glob \"${glob}\" invalid:${ZESHY_ASCII_NEWLINE}    ${stderr}"
+    # # Else, such glob is syntactically valid and such string fails to match such
+    # # glob. Return failure, "damn your eyes!"
+    # } else {
+    #     report_failure
+    # }
+
 #FUXME: Rename to :is_string_matches_glob_safely_by_coprocess(). It's critical
 #we inform the caller that we're internally closing and reopening the coprocess.
 #Likewise, all functions transitively calling *THIS* function should be
