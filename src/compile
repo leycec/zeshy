@@ -827,14 +827,14 @@
 #be merely guestimated at. For example, we might estimate a maximum of 32
 #discovered overlays, and then increment the progress bar accordingly.
 
-# ....................{ MODULES                            }....................
+# ....................{ DEPENDENCIES                       }....................
 # Load all zsh modules required by this parcel or parcels this parcel sources.
 # Since this only applies to digest file compilation, we still retain autoload
 # declarations for all such modules in "zsh/module".
 
 # Bind "libpcre" functions to zsh builtins, thus exposing Perl-compatible
 # Regular Expression (PCRE) functionality during digest file compilation. In
-# particular, alias and function declaration requires such functionality for
+# particular, alias and function declarations require such functionality for
 # matching the admittedly obtuse prototype syntax prefixing help strings.
 zmodload zsh/pcre
 
@@ -857,13 +857,18 @@ typeset -Uag\
     ZESHY_GLOBAL_NAMES\
     ZESHY_HOOKS_RUN_ON_ZESHY_PRECOMPILE
 
+#FIXME: Document me.
+typeset -g ZESHY_SCRIPT_FILENAME_GLOB_EXCLUDE='~*.swp'
+
+typeset -g ZESHY_SCRIPT_NAME_GLOB="*${ZESHY_SCRIPT_FILENAME_GLOB_EXCLUDE}(-.)"
+
 #FIXME: Shift ${ZESHY_ZSH_GLOBAL_NAMES_GLOB} to @{*-main/zsh/var/var}. While
 #such glob (probably) still retains value, such glob is no longer used below.
-typeset -g\
-    ZESHY_SCRIPT_NAME_GLOB='*~*.swp(-.)'\
-    ZESHY_ZSH_GLOBAL_NAMES_GLOB='(REPLY|MATCH|MBEGIN|MEND|match|mbegin|mend|(chpwd|preexec)_functions)'
+typeset -g ZESHY_ZSH_GLOBAL_NAMES_GLOB='(REPLY|MATCH|MBEGIN|MEND|match|mbegin|mend|(chpwd|preexec)_functions)'
 
 # ....................{ RUNNERS                            }....................
+#FIXME: Excise such nonsensicality.
+
 # void :run_hook_on_zeshy_precompile(string code)
 function :run_hook_on_zeshy_precompile() {
     (( # == 1 )) || die 'Expected one code string.'
@@ -1106,29 +1111,41 @@ function ::compile_zeshy_overlay_root() {
         # If such overlay is prefixed by the null character, such overlay is a
         # suboverlay. Unlike overlays, suboverlays are typed according to their
         # directory names (e.g., suboverlays matching "*-if_pathable" are
-        # pathable suboverlays). Parse the type of such suboverlay from its name
-        # and call the corresponding compiler.
+        # pathable suboverlays). Parse such suboverlay's type from its name and
+        # call the corresponding compiler function.
         if [[ "${overlay_dirname[1]}" == $'\0' ]] {
             # Strip such prefix from such dirname.
             overlay_dirname="${overlay_dirname[2,-1]}"
 
-            # Name of the function compiling such overlay if such overlay
-            # requires special handling. Dismantled, this is:
-            #
-            # * ":t", reducing such directory to its basename.
-            # * "##*-", reducing such basename to the substring following the
-            #   last "-" in such basename, if found.
-            suboverlay_compiler="::compile_zeshy_suboverlay_${${overlay_dirname:t}##*-}"
+            # If such suboverlay is a file, source such file. While files are
+            # *NOT* suboverlays, ::compile_zeshy_overlay_container() blurs the
+            # line between the two by pushing files onto the overlay stack.
+            # Doing so permits files directly residing in overlays to order
+            # themselves before or after suboverlays in the same overlay (e.g.,
+            # an overlay with file "late" and suboverlay "00-early" will source
+            # the latter *BEFORE* the former, due to lexicographic order).
+            if [[ -f "${overlay_dirname}" ]] {
+                ::compile_zeshy_overlay_scripts "${overlay_dirname}"
+            # Else, such suboverlay is a subdirectory as expected.
+            } else {
+                # Name of the function compiling such overlay if such overlay
+                # requires special handling. Dismantled, this is:
+                #
+                # * ":t", reducing such directory to its basename.
+                # * "##*-", reducing such basename to the substring following
+                #   the last "-" in such basename, if found.
+                suboverlay_compiler="::compile_zeshy_suboverlay_${${overlay_dirname:t}##*-}"
 
-            # If such function does *NOT* exist, default such function to the
-            # standard function compiling overlays requiring no special
-            # handling. (Such function is guaranteed to exist.)
-            (( ${+functions[${suboverlay_compiler}]} )) ||
-                suboverlay_compiler='::compile_zeshy_suboverlay_simple'
+                # If such function does *NOT* exist, default such function to
+                # the standard function compiling overlays requiring no special
+                # handling. (Such function is guaranteed to exist.)
+                (( ${+functions[${suboverlay_compiler}]} )) ||
+                    suboverlay_compiler='::compile_zeshy_suboverlay_simple'
 
-            # Compile such suboverlay.
-            :output_line_if_debugging "Searching suboverlay \"${overlay_dirname}\"."
-            "${suboverlay_compiler}" "${overlay_dirname}"
+                # Compile such suboverlay.
+                :output_line_if_debugging "Searching suboverlay \"${overlay_dirname}\"."
+                "${suboverlay_compiler}" "${overlay_dirname}"
+            }
         # Else, such overlay is an actual overlay. Unlike suboverlays, overlays
         # are untyped and hence share the same compiler. Compile such overlay.
         } else {
@@ -1147,28 +1164,49 @@ function ::compile_zeshy_overlay_container() {
         die "Overlay \"${overlay_dirname}\" not found or not a directory."
     :output_line_if_debugging "Searching ...overlay \"${overlay_dirname}\"."
 
-    # If such overlay is not zeshy's root, compile all zeshy scripts. zeshy's
-    # root overlay contains the already sourced current script (among others),
-    # which should never be resourced.
-    if [[ "${overlay_dirname}" != "${ZESHY_OVERLAY_DIR}" ]] {
-        ::compile_zeshy_overlay_scripts\
-            "${overlay_dirname}"/${~ZESHY_SCRIPT_NAME_GLOB}
-    }
-
     # List of all subdirectories in such overlay in reverse lexical order.
     # Such subdirectories are pushed onto the overlay stack below. Since
     # ::compile_zeshy_overlay_root() treats the last item on such stack as the
     # next directory to be visited, reversing their ordering here ensures such
     # function visits such subdirectories in the expected order. (Think reverse
-    # Polish notation). Dismantled, this is:
+    # Polish notation).
+    #
+    # Ideally, we would match both simple files and subdirectories with a glob
+    # qualifier disjunction (i.e., a syntactic construct matching only paths
+    # that are either simple files or subdirectories). Unfortunately, zsh only
+    # currently supports glob qualifier conjunctions (e.g., "(-./)", matching
+    # paths that are both simple files and directories and hence nothing).
+    # However, since the set of all simple files and directories is exactly the
+    # negation of the set of all non-special files (i.e., paths that are
+    # neither sockets, named pipes, or device files), we negate the latter with
+    # "^" to match the former. Dismantled, this is:
+    #
+    # * "-", transitively resolving all symbolic links.
+    # * "On", reversing the order of such paths.
+    # * "^=p%", excluding all special files.
+    #
+    # If such overlay is not zeshy's root, also list and hence push all scripts
+    # directly residing in such overlay onto the overlay stack. The root
+    # overlay  See
+    # ::compile_zeshy_overlay_root() for further details.
+    if [[ "${overlay_dirname}" != "${ZESHY_OVERLAY_DIR}" ]] {
+        overlay_subdirnames=(
+            "${overlay_dirname}"/*${~ZESHY_SCRIPT_FILENAME_GLOB_EXCLUDE}(-On^=p%)
+        )
+    # Else, such overlay is zeshy's root overlay. Since all scripts directly
+    # residing in such overlay have already been sourced (including the current
+    # script), avoid erroneously resourcing such scripts by listing only
+    # overlay subdirectories. Dismantled, this is:
     #
     # * "-/", matching only subdirectories after resolving symbolic links.
-    # * "On", reversing the order of such subdirectories.
-    overlay_subdirnames=( "${overlay_dirname}"/*(-/On) )
+    } else {
+        overlay_subdirnames=( "${overlay_dirname}"/*(-/On) )
+    }
 
     # Compile all subdirectories in such overlay, prefixed by the null
     # character. See ::compile_zeshy_overlay_root() for further details.
     ::compile_zeshy_overlay_dirs $'\0'"${^overlay_subdirnames[@]}"
+    # print -r -- "pushing: ${overlay_subdirnames[*]}"
 }
 
 # void ::compile_zeshy_overlay_scripts(string filename1?, ...)
@@ -1180,6 +1218,12 @@ function ::compile_zeshy_overlay_scripts() {
     # documentation for further details.
     local ZESHY_SCRIPT_NAME
     for   ZESHY_SCRIPT_NAME ("${@}") {
+        # source() reports failure if such file is not found but *NOT* if such
+        # file is a directory. Since this function accepts only files, test
+        # whether such file is actually a file before calling source().
+        [[ -f "${ZESHY_SCRIPT_NAME}" ]] || die\
+            'Script "'${ZESHY_SCRIPT_NAME}'" not found or not a file.'
+
         # Source such script. If such script no longer exists, such call fails
         # and hence implicitly throws an exception (as expected).
         # print "sourcing \"${ZESHY_SCRIPT_NAME}\"..."
@@ -1415,6 +1459,27 @@ function ::compile_zeshy_suboverlay_subdir_with_tester_prefix() {
 :compile_zeshy
 
 # --------------------( WASTELANDS                         )--------------------
+    # * "-./", matching both files and subdirectories after transitively
+    #   resolving all symbolic links.
+    # If such overlay is not zeshy's root, compile all zeshy scripts. zeshy's
+    # root overlay contains the already sourced current script (among others),
+    # which should never be resourced.
+    # if [[ "${overlay_dirname}" != "${ZESHY_OVERLAY_DIR}" ]] {
+    #     ::compile_zeshy_overlay_scripts\
+    #         "${overlay_dirname}"/${~ZESHY_SCRIPT_NAME_GLOB}
+    # }
+
+    # List of all subdirectories in such overlay in reverse lexical order.
+    # Such subdirectories are pushed onto the overlay stack below. Since
+    # ::compile_zeshy_overlay_root() treats the last item on such stack as the
+    # next directory to be visited, reversing their ordering here ensures such
+    # function visits such subdirectories in the expected order. (Think reverse
+    # Polish notation). Dismantled, this is:
+    #
+    # * "-/", matching only subdirectories after resolving symbolic links.
+    # * "On", reversing the order of such subdirectories.
+    # overlay_subdirnames=( "${overlay_dirname}"/*(-/On) )
+
 #
     # Undefine all global aliases *AFTER* listing such aliases above.
     #FUXME: Wait. We actually only need to undefine all *GLOBAL* aliases,
