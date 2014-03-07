@@ -1,0 +1,730 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2013 by Cecil Curry.
+# See "COPYING" for additional details.
+
+declare_parcel_as_script_with_stdin <<'/---'
+Handle *static block alias definers* (i.e., functions defining sets of related
+aliases intended to be expanded together, typically delimiting blocks of
+user-defined code effectively evaluated by such aliases).
+
+== Caveats ==
+
+Due to technical inadequacies in the `zsh` parser, *block aliases may only
+statically expand to string constants*. Block alias expansions may _not_
+dynamically depend on the values or names of variables passed to such aliases.
+Since split aliases suffer no such constraints, consider defining split rather
+than block aliases where feasible.
+
+=== Hypothetical Dynamic Block Aliases ===
+
+The staticity of block aliases unavoidably limits their usefulness. If such
+constraint could be circumvented, a fairly exciting class of new block aliases
+could be constructed: *iterators* (i.e., aliases dynamically evaluating user-
+defined code on each alias iteration, typically over user-passed variables): e.g.,
+
+.:for_map_keys()
+==========================================
+[source]
+------------------------------------------
+>>> :map map; map=( 'a' '0' 'b' '1' )
+>>> :for_map_keys :string key (map) :for_map_keys{
+...     output_string "key: ${key}"
+... }:for_map_keys
+key: a
+key: b
+------------------------------------------
+==========================================
+
+Consider the following well-intentioned attempt to implement such aliases:
+
+.:for_map_keys() Hypothetical Implementation
+==========================================
+[source]
+------------------------------------------
+>>> alias ':for_map_keys'=':set_list_to_strings args__fmk'
+>>> alias_global ':for_map_keys{'='{ eval ''
+...     :string ''${args__fmk[1]}''
+...     for     ''${args__fmk[1]}'' ("${''${args__fmk[2]}''[@]}") {
+...         ''$(get_stdin)''
+...     }'' } <<<''/--:for_map_keys'''
+>>> alias '}:for_map_keys'='
+/--:for_map_keys'
+------------------------------------------
+==========================================
+
+Unfortunately, such attempt fails. `zsh` parses aliases concurrently with
+*string literals* (i.e., here-document and single- and double-quoted strings).
+After expanding global alias `:for_map_keys{`, `zsh` parses a here-document
+delimiter `/--:for_map_keys` and ceases all other parsing (including alias
+parsing) until subsequently parsing the same delimiter again.
+
+Since no such delimiter exists, `zsh` never attempts to expand simple alias
+`}:for_map_keys` and hence to expand such delimiter -- a catch-22 guaranteeing
+invalid `zsh` syntax and hence fatal parse errors and thrown exceptions
+wherever such aliases are expanded.
+
+=== Hypothetical zsh Parsing Patches ===
+
+Can such constraint be circumvented? Yes, but only by officially patching the
+`zsh` codebase to parse aliases in a distinct phase prior to that currently
+parsing here-document strings. Such patch is likely to both break backwards
+compatibility (if only in obscure edge cases unlikely to arise in practice)
+_and_ reduce efficiency (by requiring an additional syntactic parsing pass over
+all code, arguably the larger complaint) and hence unlikely to enjoy community
+approval. While both complaints are addressable by locking such changes behind
+a new shell option disabled by default under all emulation modes (e.g.,
+`PARSE_ALIASES_EARLY`), it's unclear whether the community could be convinced
+of the ultimate utility of such a patch.
+/---
+
+# ....................{ ALIASES ~ sans args                }....................
+#FIXME: Woops! We can't use a string local-based approach here, as eval() only
+#succeeds on complete code (whereas here we would typically attempt to e eval()
+#an incomplete code fragment containing a prefixing "{" but no suffixing "}").
+#Hence, we have to defer back to an alias-based approach.
+#FIXME: Wait. That doesn't work either. Contemplete either using a
+#here-document or anonymous function. (One or the other *SHOULD* work.)
+#FIXME: The only issue with the anonymous function approach is when embedded in
+#nested iteration and/or conditionals. Is zsh actually robust enough to
+#tolerate that sort of mayhem?
+#FIXME: O.K.; the implementation's become a bit... eccentric. Should work, but
+#*JEEBUS* is that some wicked complexity. We probably don't want to trudge any
+#further down this road. (Wow. Just... wow.)
+#FIXME: O.K.; it was a modest try, but it's evident that the approach of the
+#prior function simply doesn't scale to this case. However, this function *IS*
+#still implementably by defining aliases resembling: 
+#
+#     :sise humdo lumro stimly :sise{
+#        print "${arg__s}: ${(P)arg__s}"
+#    }:sise
+#
+#Hence, we need to define *THREE* such aliases. (No, we *CANNOT* define
+#":sise}" instead of "}:sise". Yes, we tried.)
+#
+#Clearly, ":sise{" is the linchpin. Rather than have such alias expand a string
+#local, such alias should simply expand to the passed start expansion and
+#"}:sise" expand to the passed stop expansion. It's so simple, we're fairly
+#embarassed we didn't concoct it earlier. *sigh*
+#FIXME: O.K.; extensive testing conclusively demonstrates that, given current
+#zsh constraints, we absolutely *CANNOT* implement the sort of dynamic block
+#aliases we had hoped to. We can, however, implement static block aliases
+#(i.e., aliases whose expansions are unconditionally hard-coded): e.g.,
+#
+#    >>> :map map; map=( 'a' '0' 'b' '1' )
+#    >>> :for_map_keys map :for_map_keys{
+#    ...     output_string "key: ${key}"
+#    ... }:for_map_keys
+#    key: a
+#    key: b
+#
+#Note use of hard-coded string local ${key}. This could be ameloriated by
+#defining a fourth alias expanded like so:
+#
+#    >>> :map my_map; my_map=( 'a' '0' 'b' '1' )
+#    >>> :for_map_keys key :for_map_keys( my_map ):for_map_keys{
+#    ...     output_string "key: ${key}"
+#    ... }:for_map_keys
+#
+#The principle problem is that that's horrible. I mean, really. Yes, it *IS*
+#feasible, but it's also both unmaintainable and unreadable. The raw underlying
+#code is *FAR* more readable. So, revert to this:
+#
+#    >>> :map map; map=( 'a' '0' 'b' '1' )
+#    >>> :for_map_keys:key key
+#    >>> :for_map_keys map :for_map_keys{
+#    ...     output_string "key: ${key}"
+#    ... }:for_map_keys
+#    key: a
+#    key: b
+#
+#That's merely tolerable, but at least it's that much. The corresponding three
+#aliases would be defined like so:
+#
+#alias ':for_map_keys:key'=':string key_name__fmk
+#alias ':for_map_keys'=':string "${key_name__fmk-key}"
+#    for "${key_name__fmk-key}" ("${(k@)'
+#alias_global ':for_map_keys{'='}") {'
+#alias_global '}:for_map_keys'='{'
+#
+#No. Wait. Obviously, even the above approach doesn't work. Why? Because zsh
+#parses quotes concurrently with aliases (whether global or not), even when
+#all such aliases appear on the same line. Yes, this is a hard zsh constraint.
+#No, this *CANNOT* be worked around. This means that, in the above example, zsh
+#never even attempts to expand ":for_map_keys{" because it's still looking for
+#a '"' to terminate the prior '"'. Let's be honest: we can't even create decent
+#static block aliases. Pretty much the *ONLY* thing we can implement are
+#absurdly simplistic static block aliases: e.g.,
+#
+#    # This works.
+#     :run_code_with_mapfile{
+#        print "${mapfile[/etc/passwd]}"
+#    }:run_code_with_mapfile
+#
+#    # This works. (Probably.)
+#     :run_code_in_dir /etc :run_code_in_dir{
+#        command cat passwd
+#    }:run_code_in_dir
+#
+#    # Given the following aliases:
+#    alias ":run_code_in_dir"=':push_dir'
+#    alias_global ":run_code_in_dir{"=':try{'
+#    alias "}:run_code_in_dir"='}:always{
+#        :pop_dir
+#    }:always'
+#
+#I mean, it's great that we can even implement the above. But it's unfortunate
+#that we really can't implement much else. That said, the above examples
+#suggests two different sorts of possible block aliases:
+#
+#* :define_alias_block_sans_args(), defining only two low-level aliases.
+#* :define_alias_block_with_args(), defining three low-level aliases.
+#
+#As we've noted, it's absolutely worth implementing the above. It saves a bit,
+#and lends itself to future generalizations, improvements, and fixes. It may
+#not have been nearly as much as we would have liked, but it'll have to do.
+#FIXME: If we ever want to do better (and we do), we'll probably have to submit
+#a zsh patch. The ideal improvement would be to simply have zsh parse aliases
+#*BEFORE* quotes and/or here-documents (ideally, at least the latter.) That
+#simple fix alone would permit us to implement *EVERYTHING* we wanted to do,
+#since we could then do something resembling:
+#
+#alias_global ":for_map_keys{"='{ eval ''
+#    :string '${key_name__fmk}'
+#    for     '${key_name__fmk}' ("${'${map_name__fmk}'[@]}") {'' } <<<''/---:for_map_keys''"
+#alias "}:for_map_keys{"='/---:for_map_keys'
+#
+#And, yes. That *WOULD* absolutely work. That being said, convincing anyone
+#else of the utility of such patch is probably an exercise in futility,
+#particularly as performing alias parsing in a prior phase would (hopefully
+#only slightly) reduce the efficiency of zsh parsing. We're not terribly
+#proficient at thaumaturgy, which is what such an exercise typically demands.
+
+#FIXME: Correct example.
+
+declare_function_with_stdin <<'/---'
+void :define_alias_block_static_sans_args(
+    string alias_name,
+    string start_alias_expansion,
+    string stop_alias_expansion)
+
+Define the passed *argument-less static block alias* (i.e., pair of related
+aliases accepting no passed arguments and intended to be expanded together,
+typically delimiting blocks of user-defined code effectively evaluated by such
+aliases). If either such alias has already been defined, an exception is
+thrown: e.g.,
+
+.:define_alias_block_static_sans_args()
+==========================================
+[source]
+------------------------------------------
+>>> :define_alias_block_static_sans_args :for_strings_capitalized args '
+...     :die_unless_list_nonempty args "Expected one or more strings."
+...     :string text
+...     for     text ("${args[@]}") {
+...         :capitalize_string text'
+>>> :string on_wants=\
+...    "If we should want to substitute one government for another, that is,
+...     impose our desires upon others, it would only be necessary to combine
+...     the material forces needed to resist the actual oppressors and put
+...     ourselves in their place."
+>>> :string on_coercion=\
+...    "But we do not want this; we want Anarchism which is a society based on
+...     free and voluntary accord – a society in which no one can force his
+...     wishes on another and in which everyone can do as he pleases and
+...     together all will voluntarily contribute to the well-being of the
+...     community."
+>>> :string on_control=\
+...    "But because of this Anarchism will not have definitively and
+...     universally triumphed until all men will not only not want to be
+...     commanded but will not want to command."
+>>>  :for_strings_capitalized "${on_wants}" "${on_coercion}" "${on_control}" :{
+...     get_string_line "${text}" 1
+... }:for_strings_capitalized
+If We Should Want To Substitute One Government For Another, That Is,
+But We Do Not Want This; We Want Anarchism Which Is A Society Based On
+But Because Of This Anarchism Will Not Have Definitively And
+------------------------------------------
+==========================================
+
+== Implementation ==
+
+Specifically, this function defines:
+
+* A prefixing simple alias with the passed alias name suffixed by `{` expanding
+  to the passed start expansion.
+* A suffixing simple alias with the passed alias name prefixed by `}` expanding
+  to the passed stop expansion.
+/---
+function :define_alias_block_static_sans_args() {
+    # Validate sanity.
+    die_unless_args_3\
+        'Expected one alias name, one start alias expansion, and one stop alias expansion.'
+    :string\
+        alias_name__dabssa="${1}"\
+        alias_start_expansion__dabssa="${2}"\
+        alias_stop_expansion__dabssa="${3}"\
+        alias_start_name__dabssa\
+        alias_stop_name__dabssa
+    is -n "${alias_name__dabssa}" si or die\
+        'Expected nonempty block alias name.'
+    is -n "${alias_start_expansion__dabssa}" si or die\
+        'Expected nonempty block alias '${alias_name__dabssa}':() start expansion.'
+    is -n "${alias_stop_expansion__dabssa}" si or die\
+        'Expected nonempty block alias '${alias_name__dabssa}'}() stop expansion.'
+
+    # Define such aliases.
+    :define_alias\
+        "${alias_name__dabssa}{"\
+        "${alias_start_expansion__dabssa}"
+    :define_alias\
+        "}${alias_name__dabssa}"\
+        "${alias_stop_expansion__dabssa}"
+}
+
+# ....................{ UNDEFINERS                         }....................
+declare_function_with_stdin <<'/---'
+void :undefine_alias_block_static_sans_args(string alias_name1, ...)
+
+Undefine all passed argument-less static block aliases. See
+:define_alias_block_static_sans_args() for further details.
+/---
+function :undefine_alias_block_static_sans_args() {
+    # Such aliases consist of two simple aliases each, one with such name
+    # suffixed by "{" and the other with such name prefixed by "}".
+    die_unless_args 'Expected one or more split block alias names.'
+    :undefine_alias_simple ${^@}'{' '}'${^@}
+}
+
+#FIXME: In lieu of unit tests...
+function sile() {
+    # Define such alias to locally define all passed arguments as integers
+    # initialized to 42. (Undefine such alias if already defined.)
+    { :undefine_alias_split_block :sise } silent_stderr: or ignore_failure
+    :define_alias_split_block :sise args__s '
+    die_unless_list_nonempty args__s\
+        "Expected one or more integer variable names."
+    print_list args__s
+
+    :string arg__s
+    for     arg__s ("${args__s[@]}") {
+        :die_unless_var_name "${arg__s}"
+        :int "${arg__s}"=42' '
+    }'
+
+    # Dynamically define a function expanding such alias *AFTER*
+    # dynamically defining such alias above.
+    :redefine_func syile '
+        # Expand the previously defined alias.
+        :sise humdo lumro stimly :{
+            print "${arg__s}: ${(P)arg__s}"
+#}:
+        }:sise
+
+        # Ensure such variables were properly defined.
+        :print_var humdo lumro stimly'
+    # Call such function.
+    syile
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#FUXME: Improve documentation. Specifically, document the motivation for this
+#function: namely, effectively adding new syntactic block constructs (e.g.,
+#conditionals, iterators) to the zsh language.
+
+# declare_function_with_stdin <<'/---'
+# void :define_alias_split_block(
+#     string alias_name,
+#     string args_list_name,
+#     string start_alias_expansion,
+#     string stop_alias_expansion)
+# 
+# Define the passed *split block alias* (i.e., alias split into one prefixing
+# simple alias defining a local list with the passed name containing all
+# arguments passed to such alias, one suffixing global alias expanding to the
+# passed start expansion presumably operating on such arguments, and one
+# subsequent simple alias expanding to the passed stop expansion presumably
+# cleaning up after the prior start expansion). This function requires bothe last
+# argument passed to such alias be `:{` as well as an alias with such alias name
+# prefixed by `}` be subsequently expanded in the same context.  If either such
+# alias has already been declared, an exception is thrown: e.g.,
+# 
+# .:define_alias_split_block()
+# ==========================================
+# [source]
+# ------------------------------------------
+# >>> :define_alias_split_block :for_strings_capitalized args '
+# ...     :die_unless_list_nonempty args "Expected one or more strings."
+# ...     :string text
+# ...     for     text ("${args[@]}") {
+# ...         :capitalize_string text'
+# >>> :string on_wants=\
+# ...    "If we should want to substitute one government for another, that is,
+# ...     impose our desires upon others, it would only be necessary to combine
+# ...     the material forces needed to resist the actual oppressors and put
+# ...     ourselves in their place."
+# >>> :string on_coercion=\
+# ...    "But we do not want this; we want Anarchism which is a society based on
+# ...     free and voluntary accord – a society in which no one can force his
+# ...     wishes on another and in which everyone can do as he pleases and
+# ...     together all will voluntarily contribute to the well-being of the
+# ...     community."
+# >>> :string on_control=\
+# ...    "But because of this Anarchism will not have definitively and
+# ...     universally triumphed until all men will not only not want to be
+# ...     commanded but will not want to command."
+# >>>  :for_strings_capitalized "${on_wants}" "${on_coercion}" "${on_control}" :{
+# ...     get_string_line "${text}" 1
+# ... }:for_strings_capitalized
+# If We Should Want To Substitute One Government For Another, That Is,
+# But We Do Not Want This; We Want Anarchism Which Is A Society Based On
+# But Because Of This Anarchism Will Not Have Definitively And
+# ------------------------------------------
+# ==========================================
+# /---
+# function :define_alias_split_block() {
+#     # Validate sanity.
+#     die_unless_args_4\
+#         'Expected one alias name, one argument list name, one start alias expansion, and one start alias expansion.'
+#     :string\
+#         alias_name_base__dasb="${1}"\
+#         list_name_args__dasb="${2}"\
+#         alias_start_expansion__dasb="${3}"\
+#         alias_stop_expansion__dasb="${4}"\
+#         alias_start_name__dasb\
+#         alias_stop_name__dasb
+#     is -n "${alias_name_base__dasb}" si or die\
+#         'Expected nonempty split block alias name.'
+#     is -n "${alias_start_expansion__dasb}" si or die\
+#         'Expected nonempty split block alias '${alias_name_base__dasb}':() start expansion.'
+#     is -n "${alias_stop_expansion__dasb}" si or die\
+#         'Expected nonempty split block alias '${alias_name_base__dasb}'}() stop expansion.'
+#     is "${list_name_args__dasb}" == ${~ZESHY_VAR_NAME_GLOB} si or die\
+#         'Argument list name "'${list_name_args__dasb}'" invalid.'
+# 
+#     # Suffix such start and stop alias names by the corresponding suffixes.
+#     alias_start_name__dasb="${alias_name_base__dasb}"
+#     alias_stop_name__dasb="}${alias_name_base__dasb}"
+# 
+#     #FIXME: Fix documentation. *sigh*
+# 
+#     # Escape all single quotes in such start expansion, which we interpolate in
+#     # a single-quoted manner into the definition of such variable below. Since
+#     # such stop expansion is interpolated as is into an alias rather than
+#     # variable definition, such expansion need *NOT* be escaped.
+#     alias_start_expansion__dasb="${alias_start_expansion__dasb//'/''}"  # stifle vim errors: '}"
+#     alias_stop_expansion__dasb="${alias_stop_expansion__dasb//'/''}"  # stifle vim errors: '}"
+# 
+#     # Define such start alias.
+#     :define_alias "${alias_start_name__dasb}" '
+#     :string zeshy_alias_split_block_expansion__=''
+#     unset   zeshy_alias_split_block_expansion__
+#     '${alias_start_expansion__dasb}'''
+# 
+#     :list '${list_name_args__dasb}'
+#     :set_list_to_strings '${list_name_args__dasb}
+# 
+#     # Define such stop alias.
+#     :define_alias "${alias_stop_name__dasb}" '
+# /---:define_alias_split_block_body
+# zeshy_alias_split_block_expansion__+='''${alias_stop_expansion__dasb}'''
+# output_string "block: ${zeshy_alias_split_block_expansion__}"
+# eval "${zeshy_alias_split_block_expansion__}"'
+# }
+
+# Consider the following well-intentioned attempt to circumvent such constraint,
+# implementing the prior hypothetical block alias:
+
+# This hard constraint differs substantially from split
+# aliases, whose expansions may dynamically depend on passed variables, 
+
+# alias_global ':{'='
+#     {
+#         zeshy_alias_split_block_expansion__+="$(get_stdin)"
+#     } <<''/---:define_alias_split_block_body'''
+    # eval ''() {
+    #     ''${zeshy_alias_split_block_expansion__}''
+    # '''
+    # eval "${zeshy_alias_split_block_expansion__}"'
+
+# ....................{ ITERATORS                          }....................
+#FUXME: We've realized there's a simple means of eliminating the duplication in
+#for loop iteration: e.g.,
+#
+#    # This is bad.
+#    :string yum
+#    for     yum ("${@}") { ... }
+#
+#    # This is good.
+#    :for_string yum ("${@}") { ... }
+#
+#Sweet, no? Implement two aliases :for_string() and :for_int() in the
+#expected here-document-driven manner. Should be fairly simple, but
+#produces much more elegant code. Yay!
+#FUXME: Ugh. As the half-hearted implementation below demonstrates, this isn't
+#so simple after all and in fact requires the "~{"- and "}~"-delimited multiple
+#argument approach: e.g.,
+#
+#    :for_string~{ yum mmy }~ ("${@}") { ... }
+#
+#That said, the bright side here is that (as the prior example demonstrates)
+#such technique supports arbitrarily many arguments and hence variable names.
+#Still, it will have to wait until we implement support for such aliases.
+#FUXME: Wait. Even the above fails to scale. We need something resembling:
+#
+#    :for :string yum mmy :rof ("${@}") { ... }
+#
+#Sweet, no? We'll need :rof() to be a global alias expanding the local list set
+#by simple alias :for(), but this all should be fairly straightforward.
+#FUXME: Ugh. Even *THAT* doesn't work, as zsh fails to expand iterated shell
+#words: e.g.,
+#
+#    >>> :string yim='yum' yum
+#    >>> for "${yim}" (ou ouuu) { print ${yum} }
+#    zsh: parse error near `"${yim}"'
+#
+#Clearly, we'll have to employ eval() to get this working. This, in turn,
+#suggests split aliases as the only means of implementing such concept,
+#increasing the verbosity of such iterators. Consider:
+#
+#    :for :string yum mmy :rof ("${@}") {
+#        ...
+#    }
+#
+#Rather than copying the passed arguments to a local list, :for::() would have to do something resembling:
+#
+#alias ':for::'='
+#    :list args__f
+#    ::set_list_to_strings_and_define_alias_global_rof args__f'
+#
+#    alias_global "::"
+#"
+#alias_global ':for{'='
+#    () {
+#        :rofl'
+#alias ':for'='
+#    :list args__f
+#    noglob ::set_list_to_strings_and_define_alias_rofl args__f'
+#alias '}:for'='}
+#    }'
+#function ::set_list_to_strings_and_define_alias_rofl() {
+#    # Basically, copy the current definition of :set_list_to_strings()
+#    # and define alias ":rofl" accordingly. Err; actually, don't we just do
+#    # the latter?
+#}
+#
+#Expand such aliases like so:
+#
+#     :for :string yum lil (oum muz) :for{
+#    }:for
+#
+#Actually, since ":{" and "}:" are no longer requisitioned by anything else and
+#since for loops are among the most prevalent of syntactic constructs,
+#consider:
+#
+#    :for :string yum lil (oum muz) :{
+#    }:
+#
+#That's hardly horrible, eh?
+
+#FUXME: Actually, this is the smallest working example:
+#
+#     :for :string yum lil :for(oum muz) {
+#    }:for
+#
+#Rather lame, isn't it? It's inefficient, obtuse, and gains us little over the
+#corresponding low-level version. However, the above technique *DOES* gain us
+#something: it (theoretically, as it's untested) provides us a means of
+#defining *hook-based split block aliases* (i.e., split block aliases whose
+#definitions are dynamically defined at runtime by a hook function rather than
+#statically defined at compile time). The hook function above, of course, was
+#called ::set_list_to_strings_and_define_alias_global_rof(). But as the above
+#alias definitions demonstrate, we could substitute the name of *ANY* hook
+#function for such function.
+#
+#This implies we may add a new category of aliases: hook-based split block
+#aliases defined by a new function with signature:
+#
+#"void :define_alias_split_block_dynamic(
+#    string alias_name,
+#    string args_list_name,
+#    string define_start_alias_function,
+#    string define_stop_alias_function)"
+#
+#Unlike :define_alias_split_block(), which statically defines the corresponding
+#start and stop aliases based on passed strings,
+#:define_alias_split_block_dynamic() defers the definition of such aliases to
+#the passed functions called by the initial alias.
+#FUXME: So. That's nice, but can we do anything practical with hook-based split
+#block aliases? The answer, of course, is an extraordinary lot. If one
+#considers, most if not all zeshy iterators (e.g., :for_map_keys()) will *NEED*
+#to be implemented as dynamic rather than static hook blocks, since the for
+#the definition of the loop such aliases expand to conditionally depends upon
+#the names of the local variables to be used for such loop. This implies that,
+#ultimately, dynamic split block aliases may be expanded more frequently than
+#their static split block compatriots.
+#FUXME: O.K.; we can't keep saying "dynamic split block aliases" and so forth.
+#Let's just drop the "split." That's not really relevant here. It's the "block"
+#that's of ultimate relevance, implying final function names of:
+#
+#* :define_alias_block_static().
+#* :define_alias_block_dynamic().
+
+#FUXME: Before going any further down this road, we *NEED* to test the core
+#concept behind dynamic block aliases. To do so, we note that although there's
+#little to gain in defining our own general-purpose :for() iterator, there
+#*WOULD* be quite a bit of gain in defining our own :for_list() iterator
+#expanded like so:
+#
+#    >>> :list list1 list2
+#    >>> list1=('contago is' contagious)
+#    >>> list2=('limbo is' limbonic)
+#    >>> :for_list :string item (list1 list2)
+#    ... :for_list{
+#    ...     print "${item}"
+#    ... }:for_list
+#    contago is
+#    contagious
+#    limbo is
+#    limbonic
+#
+#Nice, right? Clearly, :for_list() is a dynamic block alias. So let's try to
+#just implement a special-purpose, hardcoded implementation for such alias and
+#see if we can even cobble a working version together.
+#FUXME: Since such iterators require function helpers, shift everything below
+#to @{25-alias_func} for safety.
+
+#FUXME: Ugh. Astonishingly, even *THAT* doesn't work. zsh resolves aliases in
+#nested anonymous functions at the time the outer function is defined. Since
+#zsh appears to parse here-document delimiters at the same time as aliases, we
+#can't use here-documents either. Which means we're pretty much out of luck,
+#we're afraid. We probably won't be able to generate nice iterators under
+#current zsh conventions. (We know. Damn! Right? We invested quite a bit of
+#cognitive effort to the task, but it's simply infeasible. No worries, for the
+#moment. The long code march continues.)
+#FUXME: We'll leave this as commentary. Given the syntactic obscurity, it's
+#probably not worth implementing this. But, for the record, a here-document
+#approach in which the terminating string resembles a suffixing block delimiter
+#provides the nearest approximation of a working example we've had so far.
+#: e.g.,
+#
+#    :for_list_start :string yum lil (oum muz sim bol) :{
+#        print "${yum} ${lil}"
+#    }:
+#    :for_list_stop
+#
+#Theoretically, how would the above work? Something like this:
+#
+#alias ':for_list{'='
+#    () {
+#        ::for_list'
+#alias ':for_list_stop'='
+#    eval "${zeshy_for_list__}"'
+#
+#We can readily define deeper indentation levels as follows, which isn't
+#terribly bad at all, actually:
+#
+#alias_global ":{"="
+#    { eval "" } <<<'    }:'
+#alias_global "::{"="
+#    { eval } <<<'        }::'
+#
+#And so on, with each additional ":" in such global aliases implying an
+#additional level of indentation. Of course, this is horribly error-prone,
+#since changing indentation levels suddenly breaks your code. That's probably
+#the worst aspect of the whole affair, frankly. Given that, it would probably
+#be best to force no indentation at all: e.g.,
+#
+#alias_global ":{"="
+#    { eval "" } <<<'}:'
+#
+#While the aesthetics of such an implementation are admittedly poor, the
+#fragility of the alternative would be too much to bear. (Really.)
+#
+#That leaves us with:
+#
+#    :for_list_start :string yum lil (oum muz sim bol) :{
+#        print "${yum} ${lil}"
+#}:
+#    :for_list_stop
+#
+#Uh. Yeah. That's terrible. It also introduces a similar indentation problem,
+#since such code *CANNOT* be safely indented.
+#
+#Let's face it: given current zsh constraints, this is pointless. We know. It
+#sucks. But it's what is, and we have little choice but to abide by it.
+#
+#What this *DOES* leave us with, however, is still respectable: static block
+#aliases. They'll need to have hard-coded implementations (meaning no
+#caller-provide variable names, in particular), but that still leaves us with a
+#fairly decent means of defining custom iterators. If callers absolutely
+#require dynamic implementations, they'll need to manually implement them for
+#now. Look: it's the best we can do. And it's not half bad.
+#
+#Thus ends the fifth battle.
+
+# alias ':for_list'='noglob :for_list'
+# function :for_list() {
+#     # Validate sanity.
+#     die_unless_args_3_or_more\
+#         'Expected one variable type, one or more variable names, and one or more list names.'
+#     :string var_type__fl="${1}" var_names__fl list_expansions__fl
+# 
+#     # If such arguments are *NOT* suffixed by "("- and ")"-delimited source
+#     # list names, throw an exception. Dismantled, this is:
+#     #
+#     # * "(#b)", enabling capturing of matched groups into list global ${match}.
+#     # * "(...)", capturing all target variable names into ${match[1]}.
+#     # * "(*)", capturing all source list names into ${match[2]}.
+#     :is "${*[2,-1]}" == (#b)([^'(']##)'('(*)')' :si or die\
+#         'For loop parameter list "'${@}'" not suffixed by "("- and ")"-delimited source list names.'
+# 
+#     # List of all passed variable names as a string, truncating all trailing
+#     # whitespace from such string for alias readability.
+#     var_names__fl="${match[1]%% #}"
+# 
+#     # List of all passed list expansions as a string.
+#     list_expansions__fl='"${'${^match[2]}'[@]}" '
+# 
+#     # Define such alias.
+#     :define_alias '::for_list'\
+#     ${var_type__fl}' '${var_names__fl}'
+#     for '${var_names__fl}' ('${list_expansions__fl}') {'
+# }
+# 
+# alias_global ':for_list{'='
+#     () {
+#         ::for_list'
+# alias '}:for_list'='}
+#     }'
+# 
+# #FUXME: In lieu of unit tests...
+# function olom() {
+#     :list list1 list2
+#     list1=('contago is' contagious)
+#     list2=('limbo is' limbonic)
+# 
+#      :for_list :string item (list1 list2) :for_list{
+#         print "${item}"
+#     }:for_list
+# }
+
+# alias ':for_list'='::define_alias::for_list'
+# function ::define_alias::for_list() {
+
+# declare_alias_with_stdin\
+#     'void :for(
+#         string var_type,
+#         string var_name1, ...)'\
+#     '{
+#         # Declare .
+#         :string string_name__fs; string_name__fs="$(get_stdin)"
+#         :string "${string_name__fs}"
+#     } <<<' <<'/---'
+# 
+# Iterate Declare all passed variables to be of the passed type and . All expansions of this alias _must_ be followed by expansions of global alias :rof() (typically as the last argument to this alias): e.g.,
+# 
+# == Motivation ==
+# /---
+
+
