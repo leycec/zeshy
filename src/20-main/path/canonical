@@ -9,114 +9,135 @@ canonical to canonical form).
 /---
 
 # ....................{ SETTERS                            }....................
-#FIXME: Whoops! Turns out canonicalize_path() is subtly dangerous. Here's why:
-#if the passed path is a shell-specific path (e.g., "/proc/mounts"), then
-#calling canonicalize_path() from a command substitution success *BUT* basically
-#fails since the returned path ceases to exist when such substitution completes.
-#Hence, we basically need to replace every call to canonicalize_path() to
-#set_string_to_path_canonicalized() *AND* document why in this documentation.
-#It's important, to avoid bugs both here and elsewhere.
-#FIXME: Indeed, given the subtle bugs inherent to canonicalize_path(), excise
-#such function completely and document why such function no longer exists.
-
 declare_function_with_stdin <<'/---'
-void set_string_to_path_canonical(string string_name, string pathname)
+void :set_string_to_path_canonical(string string_name, string pathname)
 
 Set the passed string variable to the canonical form of the passed path. See
-canonicalize_path() for further details.
+::canonicalize_path() for further details.
 /---
-function set_string_to_path_canonical() {
+function :set_string_to_path_canonical() {
     # Validate sanity.
     die_unless_args_2 'Expected one string name and one pathname.'
-    string string_name__sstpc="${1}" pathname__sstpc="${2}"
-    :die_unless_var_string "${string_name__sstpc}"
-    die_unless_path "${pathname__sstpc}"
+    :string string_name__sstpc="${1}" pathname__sstpc="${2}"
 
-    # Set such string.
+    # History expansion modifier "(:A)" (applied below to canonicalize such
+    # path) silently fails to report failure and hence erroneously expands to
+    # the same path when such path either:
+    #
+    # * Does *NOT* exist.
+    # * Does exist but is a broken symbolic link.
+    #
+    # To avoid such erroneous behavior, throw an exception in either case.
+    :die_unless_path_unbroken "${pathname__sstpc}"
+
+    # Set such string to such path in canonical form.
     :set_string_to_string "${string_name__sstpc}" "${pathname__sstpc}"(:A)
 }
 
 # ....................{ CANONICALIZERS                     }....................
 declare_function_with_stdin <<'/---'
-string canonicalize_path(string pathname)
+void ::canonicalize_path(string string_name)
 
-Convert the passed path to *canonical form*. Specifically:
+Convert the value (an existing path) of the passed string variable to
+*canonical form* (i.e., absolute path, no component of which is a pseudo-
+directory or symbolic link). If such value is _not_ an existing path, an
+exception is thrown: e.g.,
 
-* If such path does not exist, throw an exception.
-* If such path is *relative* (i.e., not prefixed by `/`), convert such path into
-  an *absolute path* (i.e., prefixed by `/`).
-* Expand all symbolic links in such path recursively to the corresponding
-  *physical paths* (i.e., non-symbolic links).
-* Expand all *pseudo-directories* (i.e., `./`, `../`) in such path to the
-  corresponding directory names.
-
-Two canonicalized paths are equal if and only if such paths refer to the same
-file or directory (e.g., canonical paths `/etc/passwd` and `/etc/passwd` are
-equal and hence refer to the same file), a constraint _not_ applicable to non-
-canonicalized paths (e.g., non-canonical paths `/etc/./` and `/etc/../etc/./`
-are unequal but still refer to the same directory): e.g.,
-
-.canonicalize_path()
+.::canonicalize_path()
 ==========================================
 [source]
 ------------------------------------------
 >>> get_pid
 5993
->>> canonicalize_path /proc/mounts
+>>> :string pathname='/proc/mounts'
+>>> ::canonicalize_path pathname
+>>> output_string "${pathname}"
 /proc/5993/mounts
 >>> change_dir /proc/self/cwd/root
->>> canonicalize_path ./.././.././../
+>>> pathname='./.././.././../'
+>>> ::canonicalize_path "${pathname}"
+>>> output_string "${pathname}"
 /
 ------------------------------------------
 ==========================================
 
-== Caveats ==
+== Implementation ==
 
-This function is typically called as a getter function from command substitution
-and hence subshell of the current shell. While typically safe, such substitution
-is _inherently_ unsafe in the general case. Specifically, if the passed path is
-a symbolic link managed by the underlying operating system in a shell-specific
-manner (i.e., created on shell forks and deleted on shell termination), then the
-canonical form of such path returned by calling this function from a command
-substitution will _not_ exist in the caller's shell -- even though such symbolic
-link _does_ exist in the caller's shell. In such case, consider calling
-set_string_to_path_canonical() instead.
+Such canonicalization effectively implements the following algorithm:
 
-Consider `/proc/mounts`, a shell-specific path in the `/proc` pseudo-filesystem
-managed by the Linux kernel. Such path symbolically links to
-`/proc/self/mounts`, itself linking to `/proc/$(get_pid)/mounts`. While
-`/proc/mounts` exists in all shells and subshells, its temporary target
-`/proc/$(get_pid)/mounts` exists only in the current shell. Hence, call
-set_string_to_path_canonical() rather than this function to canonicalize
-`/proc/mounts`: e.g.,
+* If such path is *relative* (i.e., not prefixed by `/`), such path is
+  converted to an *absolute path* (i.e., prefixed by `/`).
+* All symbolic links in such path are recursively expanded to their targets
+  until all components of such path are *physical* (i.e., non-symbolic links).
+* All *pseudo-directories* (i.e., `./`, `../`) in such path are non-recursively
+  expanded to their corresponding directory names until all components of such
+  path are unique pathnames.
 
-.canonicalize_path() vs set_string_to_path_canonical()
-==========================================
-[source]
-------------------------------------------
->>> string filename
+== Equality ==
 
->>> get_pid
-6797
->>> set_string_to_path_canonical filename /proc/mounts
->>> print_string "${filename}"
-/proc/6797/mounts
->>> is_file "${filename}" or print_string "\"${filename}\" not found"
-
->>> filename="$(canonicalize_path /proc/mounts; run_code_to_stderr get_pid)"
-59117
->>> print_string "${filename}"
-/proc/59117/mounts
->>> is_file "${filename}" or print_string "\"${filename}\" not found"
-"/proc/59117/mounts" not found
-------------------------------------------
-==========================================
+Two canonicalized paths are equal _if and only if_ such paths refer to the same
+file or directory (e.g., canonical paths `/etc/passwd` and `/etc/passwd`, equal
+and hence referring to the same file), a constraint inapplicable to non-
+canonicalized paths (e.g., non-canonical paths `/etc/./` and `/etc/../etc/./`,
+unequal but still referring to the same directory).
 /---
-function canonicalize_path() {
+function ::canonicalize_path() {
     # Validate sanity.
-    die_unless_arg 'Expected one pathname.'
-    string pathname="${1}"
-    die_unless_path "${pathname}"
+    die_unless_arg 'Expected one string name.'
+    :string string_name__cp="${1}"
+    die_unless_string "${string_name__cp}"
+
+    # Canonicalize such path.
+    :set_string_to_path_canonical "${string_name__cp}" "${(P)string_name__cp}"
+}
+
+# --------------------( WASTELANDS                         )--------------------
+    # If the canonical symbolic link for standard input is broken, 
+
+    #FUXME: Insufficient. If such path is a broken symbolic link, "(:A)"
+    #bizarrely returns the *EXACT SAME PATH* without reporting failure. This
+    #means we need to explicitly call is_symlink_broken() before attempting
+    #canonicalization and, if so, throw an exception. Perhaps we want a new
+    #exception handler :die_unless_path_unbroken() reporting success if such
+    #path exists and is *NOT* a broken symbolic link.
+
+
+    # guarantee such path exists prior to applying such modifier.
+    # Since such modifier also fails to report failure when such path is a
+    # broken symbolic link, 
+
+    # :string string_name__cp="${1}" pathname__cp
+    # die_unless_string "${string_name__cp}"
+
+    # # Path to be canonicalized. Since the history expansion modifier "(:A)"
+    # # used below to perform such canonicalization fails to report failure when
+    # # such path is *NOT* found, guarantee such path exists prior to applying
+    # # such modifier.
+    # pathname__cp="${(P)string_name__cp}"
+    # die_unless_path "${pathname__cp}"
+
+    # # Canonicalize such path with such modifier.
+    # :set_string_to_string "${string_name__cp}" "${pathname__cp}"(:A)
+
+    # Set such string to such path in canonical form. While we could instead
+    # set such string to such path and then canonicalize such string with
+    # ::canonicalize_path(), doing so is both more cumbersome and inefficient
+    # than the current approach. See such function for further details.
+
+#FUXME: Whoops! Turns out :canonicalize_path() is subtly dangerous. Here's why:
+#if the passed path is a shell-specific path (e.g., "/proc/mounts"), then
+#calling :canonicalize_path() from a command substitution success *BUT* basically
+#fails since the returned path ceases to exist when such substitution completes.
+#Hence, we basically need to replace every call to :canonicalize_path() to
+#:set_string_to_path_canonicalized() *AND* document why in this documentation.
+#It's important, to avoid bugs both here and elsewhere.
+#FUXME: Indeed, given the subtle bugs inherent to :canonicalize_path(), excise
+#such function completely and document why such function no longer exists.
+
+    # die_unless_path "${pathname__sstpc}"
+
+    # # Set such string.
+    # :set_string_to_string "${string_name__sstpc}" "${pathname__sstpc}"(:A)
 
     # Canonicalize such path. Call output_string() rather than return_string().
     # While the two are typically synonymous when called as the final statement
@@ -125,21 +146,69 @@ function canonicalize_path() {
     # input and since "(:A)" is a history expansion modifier, only
     # output_string() suffices. Yes, this is laboriously inscrutable and
     # insufferably laborious.
-    output_string "${pathname}"(:A)
-}
+    # output_string "${pathname}"(:A)
 
-# --------------------( WASTELANDS                         )--------------------
-#See canonicalize_path() for further details.
+    # Canonicalize such path. Call output_string() rather than return_string().
+    # While the two are typically synonymous when called as the final statement
+    # of a function body, return_string() is implemented to accept herestring-
+    # style standard input. Since zsh fails to perform history expansion on such
+    # input and since "(:A)" is a history expansion modifier, only
+    # output_string() suffices. Yes, this is laboriously inscrutable and
+    # insufferably laborious.
 
-#FUXME: Whoops! Turns out canonicalize_path() is subtly dangerous. Here's why:
+# == Caveats ==
+# 
+# This function is typically called as a getter function from command substitution
+# and hence subshell of the current shell. While typically safe, such substitution
+# is _inherently_ unsafe in the general case. Specifically, if the passed path is
+# a symbolic link managed by the underlying operating system in a shell-specific
+# manner (i.e., created on shell forks and deleted on shell termination), then the
+# canonical form of such path returned by calling this function from a command
+# substitution will _not_ exist in the caller's shell -- even though such symbolic
+# link _does_ exist in the caller's shell. In such case, consider calling
+# :set_string_to_path_canonical() instead.
+# 
+# Consider `/proc/mounts`, a shell-specific path in the `/proc` pseudo-filesystem
+# managed by the Linux kernel. Such path symbolically links to
+# `/proc/self/mounts`, itself linking to `/proc/$(get_pid)/mounts`. While
+# `/proc/mounts` exists in all shells and subshells, its temporary target
+# `/proc/$(get_pid)/mounts` exists only in the current shell. Hence, call
+# :set_string_to_path_canonical() rather than this function to canonicalize
+# `/proc/mounts`: e.g.,
+# 
+# .:canonicalize_path() vs :set_string_to_path_canonical()
+# ==========================================
+# [source]
+# ------------------------------------------
+# >>> string filename
+# 
+# >>> get_pid
+# 6797
+# >>> :set_string_to_path_canonical filename /proc/mounts
+# >>> print_string "${filename}"
+# /proc/6797/mounts
+# >>> is_file "${filename}" or print_string "\"${filename}\" not found"
+# 
+# >>> filename="$(:canonicalize_path /proc/mounts; run_code_to_stderr get_pid)"
+# 59117
+# >>> print_string "${filename}"
+# /proc/59117/mounts
+# >>> is_file "${filename}" or print_string "\"${filename}\" not found"
+# "/proc/59117/mounts" not found
+# ------------------------------------------
+# ==========================================
+
+#See :canonicalize_path() for further details.
+
+#FUXME: Whoops! Turns out :canonicalize_path() is subtly dangerous. Here's why:
 #if the passed path is a shell-specific path (e.g., "/proc/mounts"), then
-#calling canonicalize_path() from a command substitution success *BUT* basically
+#calling :canonicalize_path() from a command substitution success *BUT* basically
 #fails since the returned path ceases to exist when such substitution completes.
-#Hence, we basically need to replace every call to canonicalize_path() to
-#set_string_to_path_canonicalized() *AND* document why in this documentation.
+#Hence, we basically need to replace every call to :canonicalize_path() to
+#:set_string_to_path_canonicalized() *AND* document why in this documentation.
 #It's important, to avoid bugs both here and elsewhere.
 
-#Consider calling set_string_to_path_canonical() rather than this function when
+#Consider calling :set_string_to_path_canonical() rather than this function when
 #canonicalizing general-purpose paths possibly referring to shell-specific
 #symbolic links.
 #
