@@ -39,62 +39,91 @@ function die_unless_stdin_terminal() {
 }
 
 # ....................{ TESTERS                            }....................
-#FIXME: Actually, even this generalization fails to suffice. Thanks to here-
-#documents and -strings, we need to generalize this a bit further, also
-#necessitating a nomenclature change -- ideally, to something a bit more
-#generic (e.g., :is_stdin_readable_non_int()). In turn, such tester
-#should first call :is_stdin_readable_sans_blocking() before attempting more
-#complex testing heuristics. How about this:
-#
-#    :is_stdin_readable_sans_blocking or
-#        { not :is_stdin_terminal and :is_stdin_open }
-#
-#While we could probably replace the latter condition with the following, the
-#above seems both simpler and more generally applicable:
-#
-#        :is_stdin_pipe or
-#        :is_stdin_file_simple or
-#        :is_stdin_here_doc_or_string
-#
-#Actually, such function should *NEVER* report success if standard input is a
-#terminal. Hence, such condition should resemble:
-#
-#    not :is_stdin_terminal and {
-#        :is_stdin_readable_sans_blocking or
-#        :is_stdin_open
-#    }
-#
-#Wait. Since :is_stdin_open() is almost always true, the above reduces to:
-#
-#    not :is_stdin_terminal and :is_stdin_open
-#
-#Nice. Such function should then be named :is_stdin_readable_noninteractive(),
-#readily capturing such function's intent.
-#FIXME: Define :is_stdin_open() to call :is_file_descriptor_open() with the
-#file descriptor for standard input, as required above.
-#FIXME: Ugh. Rename "::is_stdin_" to ":is_stdin_" everywhere. *sigh*
+declare_function_with_stdin <<'/---'
+[status: bool] :is_stdin(void)
 
-#FIXME: Unrelatedly, define a new tester :is_stdin_here_doc_or_string(),
-#reporting success if standard input derived from a here-document or -string.
-#Given functionality we've implemented elsewhere, the implementation should be
-#fairly trivial:
-#
-#* Get the transitive target of the symbolic link for standard input.
-#* If such target no longer exists *AND* is prefixed by the zsh temporary
-#  prefix, report success; else, failure.
+Report success if standard input to the current context is *open* (i.e.,
+attached to either an existing pipe _or_ file other than that of the bit
+bucket). Typically, such input is closed only if the current process is
+*headless* (i.e., _not_ running under a terminal process) and hence attached to
+the bit bucket (e.g., `/dev/null`).
+/---
+function :is_stdin() {
+    # Validate sanity.
+    die_if_args
+
+    # If standard input is attached to either a terminal or pipe, such input is
+    # by definition open. This is *NOT* merely an optimization. See the body of
+    # :is_stdin_file_simple() for further details.
+    :is_stdin_terminal or :is_stdin_pipe or {
+        # Else, such input is open only if the target file to which such
+        # input's symbolic link points both exists and is *NOT* the bit bucket.
+        :string stdin_target
+        :set_string_to_symlink_target_last stdin_target\
+            "${ZESHY_STDIN_PATH-/dev/stdin}"
+
+        # Report success only if such target exists and...
+        is_file "${stdin_target}" and {
+            # ...is *NOT* the bit bucket.
+            :string bit_bucket
+            :set_string_to_bit_bucket bit_bucket
+
+            # Is such target the bit bucket?
+            :is "${stdin_target}" != "${bit_bucket}" :si
+        }
+    }
+}
 
 declare_function_with_stdin <<'/---'
-[status: bool] ::is_stdin_file_simple(void)
+[status: bool] :is_stdin_here_doc_or_string(void)
+
+Report success if standard input to the current context is either a
+*here-document or -string* (i.e., if such input is received non-interactively
+from either a `<<`-enabled here-document or `<<<`-enabled here-string mediated
+through a `zsh`-specific temporary file).
+
+== Caveats ==
+
+*Success only strongly implies (rather than strictly guaranteeing) such input
+to be either a here-document or -string.* If such input is in fact a here-
+document or -string, `zsh` mediates such input through a temporary file deleted
+immediately after use prefixed by the standard `zsh`-specific prefix for such
+files (e.g., `/tmp/zsh`). Technically, the current user and/or system _could_
+symbolically link such input to such a file outside of a here-document or
+-string, in which case this function erroneously reports success.
+
+The unlikelihood of such a meaninglessly malicious scenario strongly implies
+the exit status reported by this function to signify its specified condition.
+/---
+function :is_stdin_here_doc_or_string() {
+    # Validate sanity.
+    die_if_args
+    :string stdin_target
+
+    # Target file to which the symbolic link for standard input points.
+    :set_string_to_symlink_target_last stdin_target\
+        "${ZESHY_STDIN_PATH-/dev/stdin}"
+
+    # Report success if such file does not exist *AND* is prefixed by the
+    # zsh-specific temporary path prefix.
+    not is_file "${stdin_target}" and {
+        # Prefix prefixing all zsh-specific temporary paths.
+        :string zsh_temp_prefix
+        :set_string_to_zsh_temp_prefix zsh_temp_prefix
+
+        # Test such target.
+        :is_string_prefix "${stdin_target}" "${zsh_temp_prefix}"
+    }
+}
+
+declare_function_with_stdin <<'/---'
+[status: bool] :is_stdin_file_simple(void)
 
 Report success if standard input to the current context is a *simple file*
 (i.e., if such input is received non-interactively from a typical file rather
 than interactively from a device file).
 
 == Implications ==
-
-This function reports success if such input is either:
-
-* A 
 
 This function reports failure if such input is either:
 
@@ -105,26 +134,47 @@ This function reports failure if such input is either:
 * The *bit bucket device file* (e.g., `/dev/null`). This is usually the case if
   the current process is a cronjob.
 /---
-function ::is_stdin_file_simple() {
+function :is_stdin_file_simple() {
     # Validate sanity.
     die_if_args
-    :string filename_stdin
 
     # If standard input is attached to either a terminal or pipe, such input
-    # cannot be a simple file. In such case, report failure immediately. Since
-    # the logic below would implicitly report failure in either case, this
-    # conditional is unnecessary but improves efficiency in the common case.
-    if { :is_stdin_terminal or :is_stdin_pipe } {
-        report_failure
+    # cannot be a simple file. In either case, report failure.
+    #
+    # Technically, in either case (under Linux, at least), the canonical
+    # symbolic link for standard input is guaranteed to transitively point to a
+    # non-simple file. Assuming such guarantee holds across all other supported
+    # platforms, the logic below would implicitly report failure in either
+    # case, implying this conditional to be unnecessary (but improve efficiency
+    # in the common case).
+    #
+    # We now instructively show why this must be the case (again -- under
+    # Linux, at least). If standard input is attached to a:
+    #
+    # * Terminal, such link points to such terminal's device file. Since device
+    #   files are *NOT* simple files, the logic below would implicitly report
+    #   failure in such case.
+    # * Pipe, such link points to a non-existent file in the same directory
+    #   with basename resembling "pipe:[35692595]". Since non-existent files
+    #   are also *NOT* simple files, the logic below would implicitly report
+    #   failure in such case. If such file were creatable, such guarantee could
+    #   be circumvented by merely creating an empty simple file in such
+    #   directory with such basename. However, since such directory resides in
+    #   the "/proc" pseudo-filesystem under Linux and hence is read-only, such
+    #   file cannot be created -- even when attempting to do so as root.
+    #
+    # While this test is merely an optimization under Linux, there exists no
+    # guarantee of it not being required under other platforms. In short, it's
+    # best not to leave such delicate matters to chance.
+    not { :is_stdin_terminal or :is_stdin_pipe } and {
+        # Target file to which such link points.
+        :string stdin_target
+        :set_string_to_symlink_target_last stdin_target\
+            "${ZESHY_STDIN_PATH-/dev/stdin}"
+
+        # Report success only if such file exists *AND* is simple.
+        is_file "${stdin_target}" and :is_file_simple "${stdin_target}"
     }
-
-    # Target file to which the symbolic link for standard input points
-    # (e.g., "/dev/null", linked from "/dev/stdin" when running as a cronjob).
-    :set_string_to_path_canonical filename_stdin\
-        "${ZESHY_STDIN_PATH-/dev/stdin}"
-
-    # Report success if such file is simple.
-    :is_file_simple "${filename_stdin}"
 }
 
 declare_function_with_stdin <<'/---'
@@ -160,29 +210,26 @@ In either case, this function does _not_ provide a reliable means of testing
 whether or not attempting to read standard input will block the current process.
 To test such condition reliably, consider either iteratively calling
 :is_stdin_readable_sans_blocking() or non-iteractively calling
-::is_stdin_pipe_or_file_simple() instead.
+:is_stdin_pipe_or_file_simple() instead.
 /---
 function :is_stdin_terminal() {
     die_if_args
     is -t ${ZESHY_STDIN_FILE_DESCRIPTOR-0} si
 }
 
-# ....................{ GETTERS ~ readable                 }....................
-#FIXME: Implement :is_stdin_open().
-
 declare_function_with_stdin <<'/---'
-[status: bool] :is_stdin_readable_noninteractive(void)
+[status: bool] :is_stdin_noninteractive(void)
 
 Report success if standard input to the current context is *non-interactively
-readable* (i.e., attached to neither an interactive terminal or the bit
-bucket). Success suggests -- but due to improbable edge cases does _not_
-necessarily imply -- that the caller may read such input without silently
+open* (i.e., attached to neither an interactive terminal or the bit bucket).
+Success suggests (but, due to improbable but possible edge cases, does _not_
+necessarily imply) that the caller may read such input without silently
 blocking on interactive input. See :is_stdin_terminal() and :is_stdin_open()
 for further details.
 /---
-function :is_stdin_readable_noninteractive() {
+function :is_stdin_noninteractive() {
     die_if_args
-    not :is_stdin_terminal and :is_stdin_open
+    not :is_stdin_terminal and :is_stdin
 }
 
 declare_function_with_stdin <<'/---'
@@ -257,7 +304,7 @@ Input available.
 ==========================================
 
 In cases where iterative polling is inappropriate, consider calling
-::is_stdin_pipe_or_file_simple() instead. Such function typically only reports
+:is_stdin_pipe_or_file_simple() instead. Such function typically only reports
 success when standard input is readable without blocking, and does so without
 requiring iterative polling.
 /---
@@ -412,20 +459,82 @@ function get_stdin_until_eot() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: Actually, even this generalization fails to suffice. Thanks to here-
+#documents and -strings, we need to generalize this a bit further, also
+#necessitating a nomenclature change -- ideally, to something a bit more
+#generic (e.g., :is_stdin_readable_non_int()). In turn, such tester
+#should first call :is_stdin_readable_sans_blocking() before attempting more
+#complex testing heuristics. How about this:
+#
+#    :is_stdin_readable_sans_blocking or
+#        { not :is_stdin_terminal and :is_stdin_open }
+#
+#While we could probably replace the latter condition with the following, the
+#above seems both simpler and more generally applicable:
+#
+#        :is_stdin_pipe or
+#        :is_stdin_file_simple or
+#        :is_stdin_here_doc_or_string
+#
+#Actually, such function should *NEVER* report success if standard input is a
+#terminal. Hence, such condition should resemble:
+#
+#    not :is_stdin_terminal and {
+#        :is_stdin_readable_sans_blocking or
+#        :is_stdin_open
+#    }
+#
+#Wait. Since :is_stdin_open() is almost always true, the above reduces to:
+#
+#    not :is_stdin_terminal and :is_stdin_open
+#
+#Nice. Such function should then be named :is_stdin_readable_noninteractive(),
+#readily capturing such function's intent.
+#FUXME: Define :is_stdin_open() to call :is_file_descriptor_open() with the
+#file descriptor for standard input, as required above.
+
+#FUXME: Unrelatedly, define a new tester :is_stdin_here_doc_or_string(),
+#reporting success if standard input derived from a here-document or -string.
+#Given functionality we've implemented elsewhere, the implementation should be
+#fairly trivial:
+#
+#* Get the transitive target of the symbolic link for standard input.
+#* If such target no longer exists *AND* is prefixed by the zsh temporary
+#  prefix, report success; else, failure.
+
+# , such conditions
+# do *NOT* suffice to 
+    #   In
+    # practice, such file should *NOT* exist.
+    # Since device files are *NOT*
+    # simple files, the logic below would implicitly report failure in such
+    # case, in which case this does reduce to a mere optimization.
+    #
+    # Hence, in the general case, this is *NOT* merely an optimization.
+    #
+    # canonical file for  While the logic would implicitly report failure in the former case (since
+    # d, this
+
+    # While this is merely an optimization;
+    #
+    # Since
+    # the logic below would implicitly report failure in either case, this
+    # conditional is unnecessary but improves efficiency in the common case.
+
 #FUXME: Excise.
 # declare_function_with_stdin <<'/---'
-# [status: bool] ::is_stdin_pipe_or_file_simple(void)
+# [status: bool] :is_stdin_pipe_or_file_simple(void)
 # 
 # Report success if standard input to the current context is either a pipe or
 # simple file. Since both pipes and simple files tend to operate in a non-
 # interactive and hence non-blocking manner, success suggests (but does _not_
 # necessarily imply) that the caller may read from standard input without concern
-# for whether such read will silently block. See ::is_stdin_file_simple() and
-# ::is_stdin_file_simple() for further details.
+# for whether such read will silently block. See :is_stdin_file_simple() and
+# :is_stdin_file_simple() for further details.
 # /---
-# function ::is_stdin_pipe_or_file_simple() {
+# function :is_stdin_pipe_or_file_simple() {
 #     die_if_args
-#     ::is_stdin_pipe or ::is_stdin_file_simple
+#     :is_stdin_pipe or :is_stdin_file_simple
 # }
 
 #FUXME: Actually, doesn't the above cond imply standard input to be readable without blocking?
@@ -442,9 +551,9 @@ function get_stdin_until_eot() {
 #FUXME: To repair such function, reduce the "-t 5" below to "-t 0" and on we go!
 #This reduces the edge-case utility of such function but renders it demonstrably
 #more sane. That said, it might be helpful to define another function
-#::is_stdin_pipe_or_readable_sans_blocking(), which is probably the closest we can
+#:is_stdin_pipe_or_readable_sans_blocking(), which is probably the closest we can
 #get to a working implementation that accords with user expectations. *shrug*
-#FUXME: Actually, ::is_stdin_pipe_or_readable_sans_blocking() may not be all that
+#FUXME: Actually, :is_stdin_pipe_or_readable_sans_blocking() may not be all that
 #more helpful, given the underlying indeterminism. Thankfully, we believe we've
 #unlocked this horrid puzzle box. What we *REALLY* wanted to know all along is
 #whether or not stdin is attached to an interactive terminal or not. That's
@@ -452,7 +561,7 @@ function get_stdin_until_eot() {
 #simply by calling :is_stdin_terminal()! Indeed, this suggests the following new
 #tester:
 #
-#    function ::is_stdin_pipe_or_file() {
+#    function :is_stdin_pipe_or_file() {
 #        die_if_args
 #        not :is_stdin_terminal
 #    }
@@ -480,7 +589,7 @@ function get_stdin_until_eot() {
 #    >>> command ls -l /proc/self/fd/0
 #    lrwx------ 1 leycec leycec 64 Jan 29 20:56 /proc/self/fd/0 -> /dev/null
 #So, although standard input is technically always open, it can be effectively
-#closed by redirecting it to the bit bucket. Naturally, ::is_stdin_pipe_or_file()
+#closed by redirecting it to the bit bucket. Naturally, :is_stdin_pipe_or_file()
 #should test for this explicitly. For safety, we should probably implement such
 #tester manually.
 #FUXME: Great! Now document such function and shift above.
@@ -1024,7 +1133,7 @@ function get_stdin_until_eot() {
 #   string output; output="$(< /dev/stdin)";
 
 # declare_function_with_stdin <<'/---'
-# [status: bool] ::is_stdin_pipe_or_readable_sans_blocking(void)
+# [status: bool] :is_stdin_pipe_or_readable_sans_blocking(void)
 # 
 # Report success if standard input to the current context is either a pipe _or_
 # readable without blocking (i.e., readable without waiting -- possibly
