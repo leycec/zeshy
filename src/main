@@ -9,20 +9,6 @@
 # specific to the current system and user into a zsh digest file and autoloading
 # such file.
 
-#FIXME: I've begun to reluctantly realize that if we want zeshy to remain both
-#reliably portable, we're going to need to segregate all runnables zeshy defines
-#to a zeshy-specific namespace. No, really. Aghast, I noted today an external
-#command named "match_parens" installed on my system. Ruby! Hideous stuff. If
-#commands have begun eating into the "_"-delimited lowercase words namespace, we
-#have no choice but to escalate the namespace war by going one farther. For
-#readability, I hereby propose we insulate the *ENTIRE* codebase from conflicts
-#with external commands by appending ":" to *ALL* existing and future runnables
-#(e.g., function name "die:" rather than "die"). This preserves both readability
-#and unique nomenclature, at least in the forseeable future. Make it so, please.
-#FIXME: Absolutely. This has become a hard requirement. Consider it, man! Yikes.
-#zsh itself defines builtins pcre_compile(), pcre_match(), and pcre_study(). We
-#absolutely have to avoid future conflicts... and there's only one way.
-
 #FIXME: Given short form while, case, etc. statements, there's no longer a need
 #for long form-specific reserved words. I believe the full set of such words is,
 #according to section "RESERVED WORDS" of "man zshmisc": "esac", "do", "done",
@@ -358,13 +344,16 @@ zmodload -F zsh/stat b:zstat
 zmodload zsh/parameter
 
 # ....................{ EXCEPTIONS ~ throw                 }....................
+#FIXME: Hmm; if an unhandled exception is thrown from within a call to builtin
+#source(), what happens? So far, the answer appears to be: nothing good.
+
 function TRAPZERR() {
     # Exit status of the prior command inducing the current error signal.
     integer exit_status="${?}"
 #   print -r -- "TRAPZERR() triggered with ${exit_status}"
 
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    # Synchronize with throw_exception().
+    # Synchronize with die().
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
     # If this trap handler is recursively triggering itself, halt such recursion
@@ -386,9 +375,9 @@ function TRAPZERR() {
        [[ "${funcsourcetrace[${funcstack[(I)TRAPZERR]}]-}" != *':0' ]] {
         # Print an exception message.
         print
-        print "zeshy: TRAPZERR() threw exception: ${*}"
-        print "zeshy: TRAPZERR() failed with exit status ${exit_status}"
-        print "current call stack:"
+        print 'zeshy: TRAPZERR() threw exception: '${*}
+        print 'zeshy: TRAPZERR() failed with exit status '${exit_status}
+        print 'current call stack:'
 
         # Print an exception stack trace.
         local runnable_name
@@ -400,20 +389,29 @@ function TRAPZERR() {
         return ${exit_status}
     }
 
-    # Convert such error into an exception. Since zsh only passes this handler
-    # an exit status, do *NOT* bother fabricating an error message. Subsequent
-    # exception handling should do so already.
+    # If such function is undefined, print a nonfatal warning. Since the end of
+    # this function already throws an exception, do *NOT* report failure and
+    # hence induce infinite recursion.
     #
-    # If such function is defined, globalize such exception.
-    if { typeset -f store_exception_with_status &>/dev/null } {
-        store_exception_with_status '' "${exit_status}"
-    # Else, print an error. Since the end of this function already throws an
-    # exception, do *NOT* report failure and hence induce infinite recursion.
-    } else {
-        print 'zeshy: store_exception_with_status() undefined in TRAPZERR()' 1>&2
+    # Since this is a trap handler, avoid the following customary approach to
+    # testing function existence (which assumes both module "zsh/parameter"
+    # *AND* feature "parameters" from such module to have been loaded):
+    #
+    #    if (( ${+functions[store_exception_with_status]} )) { ... }
+    typeset -f store_exception_with_status &>/dev/null || {
+        #FIXME: The prevalence of such repeated logic has become fairly
+        #unctuous. Shift alias :output_warning() from
+        #@{*-start/*-alias/io/output} here.
+        print 'zeshy: store_exception_with_status() undefined in TRAPZERR().' 1>&2
+        return ${exit_status}
     }
 
-    # Run all external hooks previously associated with such signal.
+    # Else, convert such error into an exception. Since zsh only passes this
+    # handler an exit status, do *NOT* bother fabricating an error message.
+    # Subsequent exception handling should do so already.
+    store_exception_with_status '' "${exit_status}"
+
+    # Run all external hooks registered for such signal.
     typeset -ag ZESHY_HOOK_CODE_RUN_ON_SIGNAL_ZERR
     local hook_code
     for   hook_code ("${ZESHY_HOOK_CODE_RUN_ON_SIGNAL_ZERR[@]}") {
@@ -425,10 +423,13 @@ function TRAPZERR() {
     return ${exit_status}
 }
 
+#FIXME: Honestly: we *NEVER* call throw_exception() anywhere, so what's the
+#point? Ditch such obfusctation.
+
 # To comply with existing zsh code, preserve the original exception global
 # rather than declaring a zeshy-specific alternative (e.g.,
 # ${ZESHY_EXCEPTION_MESSAGE}).
-function die throw_exception() {
+function throw_exception die() {
     # Get the exit status to be associated with such exception from the current
     # runtime environment rather than expecting such status to be explicitly
     # passed. Specifically, get the exit status of the prior command --
@@ -465,17 +466,17 @@ function die throw_exception() {
        [[ "${funcsourcetrace[${funcstack[(I)(die|throw_exception)]}]-}" != *':0' ]] {
         # Print an exception message.
         print
-        print "zeshy: throw_exception() threw exception: ${*}"
-        print "zeshy: throw_exception() failed with exit status ${exception_status}"
-        print "current call stack:"
+        print 'zeshy: throw_exception() threw exception: '${*}
+        print 'zeshy: throw_exception() failed with exit status '${exception_status}
+        print 'current call stack:'
 
         # Print an exception stack trace.
         local runnable_name
         for   runnable_name ("${funcstack[@]}") {
-            print "  \\_ ${runnable_name}()"
+            print '  \_ '${runnable_name}'()'
         }
 
-        # Unwind the current call stack and shell.
+        # Immediately unwind the current call stack and shell.
         readonly THROW=
         THROW= 2>/dev/null
     }
@@ -483,9 +484,10 @@ function die throw_exception() {
     # If such function is defined, globalize such exception.
     if { typeset -f store_exception_with_status &>/dev/null } {
         store_exception_with_status "${*}" "${exception_status}"
-    # Else, print an error. Since the end of this function already throws an
+    # Else, print a nonfatal warning. Since the end of this function already
+    # throws an exception, refrain from doing so here.
     } else {
-        print 'store_exception_with_status() undefined in throw_exception()' 1>&2
+        print 'store_exception_with_status() undefined in throw_exception().' 1>&2
     }
 
     # By default, zsh coerces integer global ${TRY_BLOCK_ERROR} to -1. On entry,
@@ -513,32 +515,33 @@ function die throw_exception() {
 }
 
 function store_exception_with_status() {
-    # Validate sanity. Since throw_exception() calls this function, avoid
-    # calling such function; in the event of an error, simply print a message to
-    # standard error and report success. Do *NOT* report failure. Since this
-    # function is called by both throw_exception() and TRAPZERR(), reporting
-    # failure here could induce infinite recursion. Rather, permit whichever of
-    # throw_exception() or TRAPZERR() called this function to continue throwing
-    # their exception.
+    # Validate sanity. Since die() calls this function, avoid calling such
+    # function; in the event of an error, simply print a message to standard
+    # error and report success. Do *NOT* report failure. Since this function is
+    # called by both die() and TRAPZERR(), reporting failure here could induce
+    # infinite recursion. Rather, permit whichever of die() or TRAPZERR()
+    # called this function to continue throwing their exception.
     (( # == 2 )) || {
-        print "zeshy: store_exception_with_status() expected one exception message and one exit status" 1>&2
+        print 'zeshy: store_exception_with_status() expected one exception message and one exit status.' 1>&2
         return 0
     }
     local exception_message="${1}" exit_status="${2}"
 
+    #FIXME: Actually, in such case, wouldn't it be more robust to attempt to
+    #reload module "zsh/parameter"?
+
     # If any canonical call stack list is undefined or not a list, fail.
-    { [[ "${(t)funcstack-}" == 'array-'* ]] &&
-      [[ "${(t)funcfiletrace-}" == 'array-'* ]] &&
-      [[ "${(t)funcsourcetrace-}" == 'array-'* ]] } || {
-        print "zeshy: \${funcstack\}, \${funcfiletrace\}, and/or \${funcsourcetrace\} undefined or not lists for exception: ${EXCEPTION-}" 1>&2
+    [[ "${(t)funcstack-}${(t)funcfiletrace-}${(t)funcsourcetrace-}" ==\
+        'array-'*'array-'*'array-'* ]] || {
+        print 'zeshy: ${funcstack}, ${funcfiletrace}, and/or ${funcsourcetrace} undefined or not lists for exception: '${EXCEPTION-} 1>&2
         return 0
     }
 
     # If this function is called directly from the command line, fail. (In this
-    # case, since this function cannot have been called by throw_exception(),
-    # there's no possibility of undesired recursion. Hence, report failure.)
+    # case, since this function cannot have been called by die(), there's no
+    # possibility of undesired recursion. Hence, report failure.)
     (( ${#funcstack} >= 2 )) || {
-        print "zeshy: store_exception_with_status() called directly from command line" 1>&2
+        print 'zeshy: store_exception_with_status() called directly from command line.' 1>&2
         return 1
     }
 
@@ -546,7 +549,7 @@ function store_exception_with_status() {
     # further details.
     { [[ "${exit_status}" == <-> ]] &&
       (( 0 <= exit_status && exit_status <= 255 )) } || {
-        print "zeshy: store_exception_with_status() exit status \"${exit_status}\" not an integer in [0, 255]" 1>&2
+        print 'zeshy: store_exception_with_status() exit status "'${exit_status}'" not an integer in [0, 255].' 1>&2
         return 0
     }
 
@@ -555,19 +558,19 @@ function store_exception_with_status() {
         exit_status=1
     }
 
-    # If ${EXCEPTION} is currently defined, an exception has been thrown but not
-    # caught. To preserve such exception, append such exception's message to the
-    # passed message.
+    # If ${EXCEPTION} is currently defined, an exception has been thrown but
+    # not caught. To preserve such exception, append such exception's message
+    # to the passed message.
     #
     # Technically, if the call stack for such uncaught exception is still
     # defined to a nonempty list *AND* the exit status for such uncaught
     # exception is still defined to an integer, such stack and status could be
     # incorporated into such message as well. Since retrieving a human-readable
     # runnable name from such stack is nontrivial (e.g., due to necessarily
-    # ignoring runnables matching throw_exception(), TRAPZERR(), and so forth),
-    # such incorporation is nontrivial. It currently isn't worth the effort.
+    # ignoring runnables matching die(), TRAPZERR(), and so forth), such
+    # incorporation is nontrivial. It currently isn't worth the effort.
     if (( ${+EXCEPTION} )) {
-        exception_message+=$'\n\n'"Uncaught exception:"$'\n'"${EXCEPTION}"
+        exception_message+=$'\n\n''Uncaught exception:'$'\n'${EXCEPTION}
     }
 
     # Store such metadata as documented above.
@@ -579,27 +582,27 @@ function store_exception_with_status() {
         ZESHY_EXCEPTION_FUNCSOURCETRACE
 
     # Since this function call will convey no meaningful context to most users,
-    # omit such call from such exception's stored call stack.
+    # omit such call from the call stack stored for such exception.
     #
-    # Do *NOT* quote list slices, as that merely concatenates elements.
+    # Do *NOT* quote list slices. (Doing so concatenates all list items.)
     ZESHY_EXCEPTION_FUNCSTACK=(       ${funcstack[2,-1]} )
     ZESHY_EXCEPTION_FUNCFILETRACE=(   ${funcfiletrace[2,-1]} )
     ZESHY_EXCEPTION_FUNCSOURCETRACE=( ${funcsourcetrace[2,-1]} )
 
     # If this function was *NOT* called from within a ":try {...} always ={...}="
-    # block, the exception that TRAPZERR() or throw_exception() subsequently
-    # throws will induce zsh to silently unwind the call stack for the current
-    # shell without printing such exception. To avoid that, print such exception
-    # here *BEFORE* throwing such exception.
+    # block, the exception that TRAPZERR() or die() subsequently throws will
+    # induce zsh to silently unwind the call stack for the current shell
+    # without printing such exception. To avoid that, print such exception here
+    # *BEFORE* throwing such exception.
     if (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} <= 0 )) {
-        # If such function is defined, print such exception.
-        if { typeset -f print_exception_unhandled &>/dev/null } {
-            print_exception_unhandled
-        # Else, print a nonfatal warning.
-        } else {
-            print 'zeshy: print_exception_unhandled() undefined in store_exception_with_status()' 1>&2
+        # If such function is undefined, print a nonfatal warning.
+        typeset -f print_exception_unhandled &>/dev/null || {
+            print 'zeshy: print_exception_unhandled() undefined in store_exception_with_status().' 1>&2
             return 0
         }
+
+        # Else, call such function to print such exception.
+        print_exception_unhandled
     }
 }
 
@@ -623,11 +626,11 @@ function print_exception_if_unhandled() {
     (( ${TRY_BLOCK_ERROR--1} >= 0 )) || die\
         'Not in an "always ={...}=" block (or ${TRY_BLOCK_ERROR\} '${TRY_BLOCK_ERROR--1}' not in [0, 255] and hence an invalid exit status).'
 
-    # Else if list global ${ZESHY_TRY_LEVEL} is not defined or has no element
-    # corresponding to the current shell or such element is non-positive, throw
-    # an exception. Assuming the current "always ={...}=" block was preceded by
-    # a sane ":try {...}" block, such element should always be positive. See
-    # try() for further details.
+    # Else if list global ${ZESHY_TRY_LEVEL} is undefined or has no item
+    # corresponding to the current shell or such item is non-positive, throw an
+    # exception. Assuming the current "always ={...}=" block to be preceded by
+    # a sane ":try {...}" block, such item should always be positive. See
+    # :try() for further details.
     (( ${ZESHY_TRY_LEVEL[${SHLVL}]-0} > 0 )) || {
         # Coerce such element to its default value to ensure proper operation
         # hereafter. See :try() for further details.
@@ -635,16 +638,15 @@ function print_exception_if_unhandled() {
 
         # Throw an appropriate exception.
         if (( ${+ZESHY_TRY_LEVEL[${SHLVL}]} )) {
-            die "\${ZESHY_TRY_LEVEL[${SHLVL}]\} ${ZESHY_TRY_LEVEL[${SHLVL}]} <= 0 (e.g., due to no preceding \"try\")."
+            die '${ZESHY_TRY_LEVEL['${SHLVL}']} '${ZESHY_TRY_LEVEL[${SHLVL}]}' <= 0 (e.g., due to no preceding ":try{").'
         } else {
-            die "\${ZESHY_TRY_LEVEL[${SHLVL}]\} undefined (e.g., due to no preceding \"try\")."
+            die '${ZESHY_TRY_LEVEL['${SHLVL}']} undefined (e.g., due to no preceding ":try").'
         }
     }
 
-    # Else, the current context is sane.
-    #
-    # Decrement the shell-specific try level incremented by the prior "try
-    # {...}" block. See :try() for further details.
+    # Else, such global is sane. Decrement such global to undo its
+    # incrementation by the prior ":try {...}" block. See :try() for further
+    # details.
     ZESHY_TRY_LEVEL[${SHLVL}]=$(( ZESHY_TRY_LEVEL[${SHLVL}] - 1 ))
 
     # If an exception was caught, clear the canonical string global storing the
@@ -674,7 +676,7 @@ function print_exception_unhandled() {
 
         # If ${funcstack} is undefined or not a list, throw an exception.
         (( ${+funcstack} )) && [[ "${(t)funcstack}" == 'array-'* ]] ||
-            die "\${funcstack\} undefined for exception: ${EXCEPTION-}"
+            die '${funcstack} undefined for exception: '${EXCEPTION-}
 
         # If called directly from the command line *OR* no exception is
         # currently thrown, throw an exception.
@@ -687,8 +689,8 @@ function print_exception_unhandled() {
         # sufficiently early in zeshy startup, print_exception() will *NOT* have
         # been defined yet.
         } else {
-            print -r "zeshy: ${EXCEPTION}"
-            print -r "zeshy: failed with exit status ${ZESHY_EXCEPTION_STATUS-1}"
+            print -r 'zeshy: '${EXCEPTION}
+            print -r 'zeshy: Failed with exit status '${ZESHY_EXCEPTION_STATUS-1}'.'
 
             # Print a stack trace. Ideally, such trace would only be
             # conditionally printed when the current user configuration requests
@@ -703,12 +705,10 @@ function print_exception_unhandled() {
             # prefer to *ALWAYS* print stack traces of such early exceptions.
             #
             # See output_call_stack_lists_with_style_prefix() for related logic.
-            local   caller_name filename frame_prefix='    \\_'
+            local   caller_name filename frame_prefix='    \_'
             integer caller_line frame_index
 
-            for (( frame_index = 1;
-                   frame_index <= ${#funcstack};
-                   frame_index++ )) {
+            for frame_index ({1..${#funcstack}}) {
                 caller_name="${funcstack[${frame_index}]}"
                 caller_line="${funcfiletrace[${frame_index}]##*:}"
                    filename="${funcfiletrace[${frame_index}]%:*}"
@@ -1266,6 +1266,20 @@ if [[ -n "${*}" ]] {
 return 0
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: I've begun to reluctantly realize that if we want zeshy to remain both
+#reliably portable, we're going to need to segregate all runnables zeshy defines
+#to a zeshy-specific namespace. No, really. Aghast, I noted today an external
+#command named "match_parens" installed on my system. Ruby! Hideous stuff. If
+#commands have begun eating into the "_"-delimited lowercase words namespace, we
+#have no choice but to escalate the namespace war by going one farther. For
+#readability, I hereby propose we insulate the *ENTIRE* codebase from conflicts
+#with external commands by appending ":" to *ALL* existing and future runnables
+#(e.g., function name "die:" rather than "die"). This preserves both readability
+#and unique nomenclature, at least in the forseeable future. Make it so, please.
+#FUXME: Absolutely. This has become a hard requirement. Consider it, man! Yikes.
+#zsh itself defines builtins pcre_compile(), pcre_match(), and pcre_study(). We
+#absolutely have to avoid future conflicts... and there's only one way.
+
 #FUXME: Non-ideal. Ideally, replace this with a generic zeshy function accepting
 #two version specifiers and reporting success if the former exceeds the latter.
 #FUXME: For obvious reasons, such function should be defined and called *AFTER*
