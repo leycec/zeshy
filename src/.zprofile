@@ -9,6 +9,13 @@
 # Sourced by login zsh shells before other dot files when run by "zeshy".
 
 # ....................{ MAIN                               }....................
+#FIXME: O.K.; now that we've eliminating sourcing of either system- or
+#user-specific zsh dotfiles, the *ONLY* possible way ${PATH} could be set is if
+#"/etc/zshenv" both exists and sets such path -- which seems mildly likely,
+#although not the case under Gentoo. However, it's unclear how we could
+#distinguish such case from the conventional case. The best thing to do is
+#probably leave ${PATH} as is. *shrug*
+
 # Clear global list ${path} and hence global string ${PATH}, if inherited from a
 # parent shell. Doing so allows zeshy to reliably test whether or not the
 # canonical "/etc/zsh/zprofile" script sourced by zsh immediately after sourcing
@@ -20,11 +27,10 @@
 # so). In the latter case, the main zeshy script must establish a default login
 # profile. In either case, only clearing ${path} here subsequently allows the
 # main zeshy script to decide which case applies.
-path=( )
-
-# Source the current user's ".zprofile", if found.
-if [[ -f "${ZESHY_USER_ZDOTDIR}/.zprofile" ]] {
-    source -- "${ZESHY_USER_ZDOTDIR}/.zprofile"
-}
+# path=( )
 
 # --------------------( WASTELANDS                         )--------------------
+# Source the current user's ".zprofile", if found.
+# if [[ -f "${ZESHY_USER_ZDOTDIR}/.zprofile" ]] {
+#     source -- "${ZESHY_USER_ZDOTDIR}/.zprofile"
+# }
