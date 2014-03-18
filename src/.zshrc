@@ -36,17 +36,38 @@
     print 'zeshy: Script "'${0}'" not sourced by wrapper script "zeshy".'
     return 1
 } 1>&2
-
-# Source the main zeshy script, thus loading zeshy. Convert the list of
-# arguments previously passed to the "zeshy" wrapper script from a string back
-# into its original list. Since strings but not lists cannot be inherited by
-# subshells, such circumlocution is sadly unavoidable. See restore_list() for
-# further details.
 #print "[${0}] sourcing ${ZESHY_MAIN_SCRIPT} ${(Qz)ZESHY_ARGS}"
 #print "[${0}] ZESHY_ARGS=${ZESHY_ARGS}"
-source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
+
+#FIXME: Fix documentation.
+
+# Call the passed function before printing a command prompt for the current
+# shell if *interactive* (i.e., if standard input to such shell is attached to
+# a terminal device).
+#
+# Such indirection ensures that zeshy will be sourced *AFTER* zsh startup,
+# which may be the only means of enabling TRAPZERR() during zeshy startup.
+# Neither defining TRAPZERR() *OR* enabling options "ERR_RETURN" or "ERR_EXIT"
+# appear to enable such behavior during startup. Yet, such logic does clearly
+# enable such behavior *AFTER* startup.
+function precmd() {
+    # Undefine such hook, preventing zsh from erroneously reloading zeshy on
+    # subsequent command prompts.
+    unfunction precmd
+
+    # Source zeshy's entry script, conditionally compiling and autoloading the
+    # zeshy codebase into the current digest file.
+    #
+    # Convert the list of arguments previously passed to wrapper script "zeshy"
+    # from a flattened string back into the original list. Since strings but
+    # not lists cannot be inherited by subshells, such circumlocution is sadly
+    # unavoidable. See restore_list() for further details.
+    source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
+}
 
 # --------------------( WASTELANDS                         )--------------------
+# source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
+# the main zeshy script, thus loading zeshy.
 # (( ${+ZESHY_ARGS} + ${+ZESHY_MAIN_SCRIPT} + ${+ZESHY_ZDOTDIR_USER} == 3 )) || {
 #     # print "ZESHY_MAIN_SCRIPT: ${ZESHY_MAIN_SCRIPT}"
 #     print 'zeshy: At least one of ${ZESHY_ARGS}, ${ZESHY_MAIN_SCRIPT}, and/or'
