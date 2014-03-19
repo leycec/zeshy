@@ -1,6 +1,4 @@
 #!/usr/bin/env zsh
-# ====================[ .zshrc                             ]====================
-#
 # --------------------( LICENSE                            )--------------------
 # Copyright 2007-2013 by Cecil Curry.
 # See "COPYING" for additional details.
@@ -40,6 +38,8 @@
 #print "[${0}] ZESHY_ARGS=${ZESHY_ARGS}"
 
 #FIXME: Fix documentation.
+
+# Source zeshy's entry script
 
 # Call the passed function before printing a command prompt for the current
 # shell if *interactive* (i.e., if standard input to such shell is attached to
