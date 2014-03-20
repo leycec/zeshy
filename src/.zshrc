@@ -7,8 +7,62 @@
 # Sourced by login zsh shells after sourcing ".zprofile" when run by "zeshy".
 #print "[${0}] starting .zshrc (zeshy-specific)"
 
+# ....................{ OPTIONS                            }....................
+# Enable shell strictness. See wrapper script "zeshy" for further details.
+setopt err_return no_unset warn_create_global
+
 # ....................{ MAIN                               }....................
-#FIXME: O.K.; this is currently broken under my home setup. The reason is
+# If even one global referenced below was not previously defined by the caller,
+# such caller cannot be the "zeshy" wrapper script, the only caller permitted
+# to source this script. Print an error and return nonzero exit status.
+(( ${+ZESHY_ARGS} + ${+ZESHY_MAIN_SCRIPT} == 2 )) || {
+    # print "ZESHY_MAIN_SCRIPT: ${ZESHY_MAIN_SCRIPT}"
+    print 'zeshy: ${ZESHY_ARGS} and/or ${ZESHY_MAIN_SCRIPT} undefined.'
+    print 'zeshy: Script "'${0}'" not sourced by "zeshy" or "zeshy-login".'
+    return 1
+} 1>&2
+#print "[${0}] sourcing ${ZESHY_MAIN_SCRIPT} ${(Qz)ZESHY_ARGS}"
+#print "[${0}] ZESHY_ARGS=${ZESHY_ARGS}"
+
+# Source zeshy's entry script immediately *BEFORE* printing the first command
+# prompt for the current interactive shell. (This script is sourced only under
+# interactive invocations of "zeshy" and "zeshy-login".)
+#
+# Such indirection ensures that the zeshy codebase will be loaded *AFTER* zsh
+# startup, which appears to be the only means of enabling TRAPZERR() (i.e.,
+# converting failure status to thrown exceptions) during zeshy startup.
+# (Curiously, avoiding such indirection by sourcing such script directly here
+# does *NOT* suffice to enable such trap handler during zeshy startup, despite
+# such script clearly defining such function. We attribute this to an as-yet
+# unidentified bug in which zsh enables trap handlers defined by startup
+# dotfiles only *AFTER* sourcing all such dotfiles. Curiously, the same bug
+# also extends to shell options "ERR_RETURN" and "ERR_EXIT".)
+#
+# Enabling such trap handler during (rather than after) zeshy startup (and
+# hence such indirection) is essential to "inoculating" zeshy startup against
+# unanticipated errors.
+function precmd() {
+    # Undefine such hook, preventing zsh from erroneously reloading zeshy on
+    # subsequent command prompts.
+    unfunction precmd
+
+    # Source zeshy's entry script. Convert the list of arguments previously
+    # passed to wrapper script "zeshy" from a flattened string back into the
+    # original list. Since only scalars (and hence *NOT* lists) can be
+    # inherited by child shells, such circumlocution is sadly unavoidable. See
+    # restore_list() for further details.
+    source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
+}
+
+# --------------------( WASTELANDS                         )--------------------
+# , conditionally compiling and autoloading the
+    # zeshy codebase into the current digest file
+#FUXME: Fix documentation.
+
+# if this script  merely defining TRAPZERR() in zeshy's entry script appears to be
+# insufficient to actually enable such trap handler during zeshy startup.)
+
+#FUXME: O.K.; this is currently broken under my home setup. The reason is
 #fairly subtle but simple: @{main} undefines all globals matching "ZESHY_"*
 #*AFTER* wrapper script "bin/zeshy" sets such globals. Why does this
 #unexpectedly occur? Because we currently source zeshy from "/etc/zsh/zshrc"
@@ -25,47 +79,6 @@
 #
 #Then edit "/etc/passwd" accordingly. See "bin/zeshy" for further details.
 
-# If even one global referenced below was not previously defined by the caller,
-# such caller cannot be the "zeshy" wrapper script, the only caller permitted
-# to source this script. Print an error and return nonzero exit status.
-(( ${+ZESHY_ARGS} + ${+ZESHY_MAIN_SCRIPT} == 2 )) || {
-    # print "ZESHY_MAIN_SCRIPT: ${ZESHY_MAIN_SCRIPT}"
-    print 'zeshy: ${ZESHY_ARGS} and/or ${ZESHY_MAIN_SCRIPT} undefined.'
-    print 'zeshy: Script "'${0}'" not sourced by wrapper script "zeshy".'
-    return 1
-} 1>&2
-#print "[${0}] sourcing ${ZESHY_MAIN_SCRIPT} ${(Qz)ZESHY_ARGS}"
-#print "[${0}] ZESHY_ARGS=${ZESHY_ARGS}"
-
-#FIXME: Fix documentation.
-
-# Source zeshy's entry script
-
-# Call the passed function before printing a command prompt for the current
-# shell if *interactive* (i.e., if standard input to such shell is attached to
-# a terminal device).
-#
-# Such indirection ensures that zeshy will be sourced *AFTER* zsh startup,
-# which may be the only means of enabling TRAPZERR() during zeshy startup.
-# Neither defining TRAPZERR() *OR* enabling options "ERR_RETURN" or "ERR_EXIT"
-# appear to enable such behavior during startup. Yet, such logic does clearly
-# enable such behavior *AFTER* startup.
-function precmd() {
-    # Undefine such hook, preventing zsh from erroneously reloading zeshy on
-    # subsequent command prompts.
-    unfunction precmd
-
-    # Source zeshy's entry script, conditionally compiling and autoloading the
-    # zeshy codebase into the current digest file.
-    #
-    # Convert the list of arguments previously passed to wrapper script "zeshy"
-    # from a flattened string back into the original list. Since strings but
-    # not lists cannot be inherited by subshells, such circumlocution is sadly
-    # unavoidable. See restore_list() for further details.
-    source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
-}
-
-# --------------------( WASTELANDS                         )--------------------
 # source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
 # the main zeshy script, thus loading zeshy.
 # (( ${+ZESHY_ARGS} + ${+ZESHY_MAIN_SCRIPT} + ${+ZESHY_ZDOTDIR_USER} == 3 )) || {
