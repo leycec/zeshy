@@ -4,110 +4,60 @@
 # See "COPYING" for additional details.
 
 declare_parcel_as_script_with_stdin <<'/---'
-Handle *shell scripts* (i.e., executable text files interpreted by some shell
-scripting language (e.g., Bourne, `bash`, `zsh`, `zeshy`)).
+Handle *shell scripts* (i.e., executable text files implemented in shell
+scripting languages and hence interpretable by shells interpreting such
+languages).
 /---
 
-# ....................{ GLOBALS                            }....................
-declare_global_with_stdin string\
-    ZESHY_SHELL_EMULATABLE_DIRECTLY_GLOB='zsh|sh|ksh|csh' <<'/---'
-Glob matching all shells directly emulatable by emulate().
-/---
-
-declare_global_with_stdin string\
-    ZESHY_SHELL_EMULATABLE_INDIRECTLY_GLOB='zeshy|(|a|ba|c|da|k|mk|pdk|re|tc|z)sh'\
-    <<'/---'
-Glob matching all shells implicitly emulatable by emulate() and hence sourceable
-by :source_script().
-/---
-
-declare_global_with_stdin map ZESHY_SHELL_NAME_TO_EMULATABLE_SHELL_NAME <<'/---'
-Map from shell name to the name of the `zsh`-emulatable shell closest in
-ancestry and hence operation to the former shell if a sufficiently close shell
-exists. `zsh`-emulatable shells are those explicitly accepted by the emulate()
-builtin: at present, only `sh`, `csh`, `ksh`, and `zsh` itself.
-/---
-ZESHY_SHELL_NAME_TO_EMULATABLE_SHELL_NAME=(
-    # Bourne shell variants.
-    'ash'  'sh'
-    'bash' 'sh'
-    'dash' 'sh'
-    'resh' 'sh'
-    'sh' 'sh'
-
-    # csh variants.
-    'csh'  'csh'
-    'tcsh' 'csh'
-
-    # ksh variants.
-    'ksh'   'ksh'
-    'mksh'  'ksh'
-    'pdksh' 'ksh'
-
-    # zsh variants.
-    'zsh'   'zsh'
-    'zeshy' 'zeshy'
-)
+#FIXME: Refactor getters into setters.
+#FIXME: Do sourcer functions defined below also suffer from the same issue as
+#in @{compile} (namely, that TRAPZERR() fails to trigger on the scripts such
+#functions source reporting failure)?
 
 # ....................{ EXCEPTIONS                         }....................
 declare_function_with_stdin <<'/---'
-string die_unless_shell_script(
+string :die_unless_script(
     string pathname,
-    string error_message = "\"${pathname}\" not a shell script.")
+    string error_message = "\"${pathname}\" not a recognized shell script.")
 
-Throw an exception with the passed message unless the passed path is an existing
-shell script. See is_shell_script() for further details.
+Throw an exception with the passed message unless the passed path is an
+existing shell script. See :is_script() for further details.
 /---
-function die_unless_shell_script() {
+function :die_unless_script() {
     die_unless_args_1_to_2\
         'Expected one pathname and optional error message.'
-    :string pathname="${1}"
-    is_shell_script "${pathname}" or
-        die "${2-\"${pathname}\" not a shell script.}"
-}
-
-declare_function_with_stdin <<'/---'
-string die_unless_shell_emulatable(
-    string shell_name,
-    string error_message = "Shell \"${shell_name}\" not emulatable by zsh.")
-
-Throw an exception with the passed message unless the passed shell is emulatable
-by `zsh`. See is_shell_emulatable() for further details.
-/---
-function die_unless_shell_emulatable() {
-    die_unless_args_1_to_2\
-        'Expected one shell name and optional error message.'
-    string shell_name="${1}"
-
-    #FIXME: Implement me! Probably with map lookup, yes?
-    is_shell_emulatable "${shell_name}" or
-        die "${2-shell \"${shell_name}\" not emulatable by zsh.}"
+    :is_script "${1}" or {
+        :string pathname="${1}"
+        :die "${2-Path \"${pathname}\" not a recognized shell script.}"
+    }
 }
 
 # ....................{ TESTERS                            }....................
-#FIXME: Pretty shoddy implementation, honestly. Shell scripts lacking
-#shebang lines may still be shell scripts. Now that we have get_shell_script_shell_if_found(), we should
-#simply reduce to:
-#
-#   is_file_text "${pathname}" and
-#       run_code_silent get_shell_script_shell_if_found "${pathname}"
-#
-#Remarkably close to the current implementation, but much more general.
-
 declare_function_with_stdin <<'/---'
-[status: bool] is_shell_script(string pathname)
+[status: bool] :is_script(string pathname)
 
-Report success if the passed path is an existing *shell script* (i.e., text
-file with first line prefixed by `#!`).
+Report success if the passed path is an existing *shell script* (i.e.,
+executable text file implemented in a shell scripting language and hence
+interpretable by all shells interpreting such language). Specifically, report
+success if such path is:
+
+* A plaintext file. See is_file_text() for further details.
+* Self-identified as interpretable by a shell (e.g., due to the first line of
+  such file being a `#!`-prefixed shebang line running a recognized shell). See
+  :set_string_to_script_shell_if_found() for further details.
 /---
-function is_shell_script() {
+function :is_script() {
     # Validate sanity.
     die_unless_arg 'Expected one pathname.'
-    string pathname="${1}"
+    :string pathname="${1}"
 
-    # Test such path.
-    is_file_text "${pathname}" and
-        run_code_silent get_shell_script_shebang_command_if_found "${pathname}"
+    # If such path corresponds to a text file identified as a shell script,
+    # report success. Since such identification throws exceptions if such path
+    # is not a text file, ensure the former before calling the latter.
+    is_file_text "${pathname}" and {
+        :string shell_name
+        :set_string_to_script_shell_if_found shell_name "${pathname}"
+    }
 }
 
 # ....................{ GETTERS                            }....................
@@ -155,24 +105,26 @@ function get_shell_script_shell_if_found() {
     if { shell_name="$(get_shell_script_shebang_command_name_if_found\
         "${filename}")" } {
         return_string "${shell_name}"
-    # Else, attempt to match such shell from such script's basename --
-    # specifically, either the filetype of such basename or substring of such
-    # basename preceding "rc", matching a known shell. Match with a PCRE rather
-    # than glob to take advantage of duplicate subpattern numbers (i.e., "(?|"
-    # group syntax), ensuring in either case ${match[1]} captures such shell.
-    #
-    # Note that if such basename is suffixed by a filetype *NOT* matching a
-    # known shell, such filetype is ignorable.
-    } elif { is_string_matches_pcre "$(get_path_basename "${filename}")"\
-        '(?|\.('${ZESHY_SHELL_EMULATABLE_INDIRECTLY_GLOB}')|^\.?('${ZESHY_SHELL_EMULATABLE_INDIRECTLY_GLOB}')rc)$' } {
-        return_string "${match[1]}"
-    # Else, fail.
+    # Else, attempt to match such shell from such script's basename (i.e.,
+    # either such basename's filetype *OR* substring preceding "rc" matching a
+    # known shell). For convenience, leverage duplicate subpattern indices
+    # (i.e., "(?|" group syntax) by matching with a PCRE rather than glob.
     } else {
-        report_failure
+        # Script basename.
+        :string basename
+        :set_string_to_path_basename basename "${filename}"
+.
+
+        # If such basename matches a shell, set such string to such shell.
+        if { is_string_matches_pcre\
+            "${basename}"\
+            '(?|\.('${ZESHY_SHELL_EMULATABLE_INDIRECTLY_GLOB}')|^\.?('${ZESHY_SHELL_EMULATABLE_INDIRECTLY_GLOB}')rc)$' } {
+            return_string "${match[1]}"
+        }
     }
 
-    # This should never happen. Force a smile if it does.
-    die "Thank you, user! But our princess is in another castle."
+    # Else, fail.
+    report_failure
 }
 
 #FIXME: Rename to get_shell_script_defining_function_autoload(). (The current
@@ -202,27 +154,99 @@ listed by ${FPATH}: e.g.,
 function get_shell_script_defining_function() {
     # Validate sanity.
     die_unless_arg 'expected one function name'
-    string function_name="${1}"
+    :string function_name="${1}"
 
     # Dismantled, this is:
     #
     # * "^", iteratively expanding to each directory listed by ${fpath}.
     # * "(N)", excluding non-extant filenames.
-    list shell_scripts; shell_scripts=( ${^fpath}"/${function_name}"(.N) )
+    :list shell_scripts; shell_scripts=( ${^fpath}"/${function_name}"(.N) )
 
     # If no shell script defines such function, throw an exception; otherwise,
     # print the absolute path of the first such script.
 #   print_message "filename_matches: \"${filename_matches[@]}\""
     die_unless_list_nonempty shell_scripts\
-        "shell script defining ${function_name}() not found"
+        "zsh script defining ${function_name}() not found."
     return_string "${shell_scripts[1]}"
+}
+
+# ....................{ SETTERS                            }....................
+declare_function_with_stdin <<'/---'
+void :set_string_to_script_shell(
+    string string_name, string filename)
+
+Set the passed string variable to the basename of the shell interpreting the
+passed shell script if either the file contents or filename of such script
+identify such shell or throw an exception otherwise. See
+:set_string_to_script_shell_if_found() for further details.
+/---
+function :set_string_to_script_shell() {
+    :set_string_to_script_shell_if_found "${@}" or :die_unless_script "${2}"
+}
+
+declare_function_with_stdin <<'/---'
+[status: bool] :set_string_to_script_shell_if_found(
+    string string_name, string filename)
+
+Set the passed string variable to the basename of the shell interpreting the
+passed shell script if either the file contents or filename of such script
+identify such shell or report failure otherwise. Typically, the first line of
+such script is a `#!`-prefixed shebang line declaring such shell (e.g.,
+`#!/usr/bin/env bash`).
+/---
+function :set_string_to_script_shell_if_found() {
+    # Validate sanity.
+    die_unless_args_2 'Expected one string name and one script filename.'
+    :string\
+        string_name__sstsssif="${1}"\
+        filename__sstsssif="${2}"\
+        shell_name__sstsssif
+    die_unless_file_text "${filename__sstsssif}"
+
+    #FIXME: Ugh. Subshells.
+    #FIXME: Documentation's a bit out-of-order, now.
+
+    # If:
+    #
+    # * Such script is prefixed by a shebang line invoking a recognized
+    #   shell, parse such shell from such line.
+    # * Such script's filetype matches a recognized shell, set such shell to
+    #   such filetype.
+    #
+    # Technically, if both tests fail, there are additional shell-specific
+    # fallback tests we could perform. Since such tests are shell-specific,
+    # however, their utility remains in question. Such tests include:
+    #
+    # * If such filename matches that of a system-wide shell dotfile (e.g.,
+    #   "/etc/bash/bash_logout", "/etc/zsh/zprofile"), such filename identifies
+    #   such shell.
+    # * If such filename matches that of a user-specific shell dotfile (e.g.,
+    #   "~/.bash_profile", "~/.zlogin"), such filename probably identifies such
+    #   shell. While system-wide shell dotfiles are (typically) compile-time
+    #   constants and hence uniquely identify such shell, user-specific shell
+    #   dotfiles may have arbitrary pathnames (e.g., via ${ZDOTDIR})  and
+    #   hence do _not_ reliably identify such shell.
+    #
+    # For reliability, avoid such subtle entanglements. "Cthulhu code beckons!"
+    {
+        shell_name__sstsssif="$(get_shell_script_shebang_command_name_if_found\
+            "${filename__sstsssif}")" or
+        :set_string_to_file_type_if_found\
+            shell_name__sstsssif "${filename__sstsssif}"
+    # If such shell was recognized, set such string to such shell.
+    } and
+    :is_string_matches_glob\
+        "${shell_name__sstsssif}" "${ZESHY_SHELL_GLOB}" and
+    :set_string_to_string\
+        "${string_name__sstsssif}" "${shell_name__sstsssif}"
 }
 
 # ....................{ SOURCERS                           }....................
 declare_function_with_stdin <<'/---'
-string :source_script_defining_function(
+[stdout: string, stderr: string, status: int] :source_script_defining_function(
     string function_name,
-    string filename, string arg1, string arg2, ...)
+    string filename,
+    string arg1?, ...)
 
 Source the shell script defining the passed function with the passed
 arguments, reading and executing all commands in such script under the current
@@ -233,8 +257,9 @@ shell. See:
 /---
 function :source_script_defining_function() {
     # Validate sanity.
-    die_unless_args 'expected one function name and optional script arguments'
-    string function_name="${1}" filename
+    die_unless_args\
+        'Expected one function name, one script filename, and optional script arguments.'
+    :string function_name="${1}" filename
     shift_arg
 
     # Source such script.
@@ -243,7 +268,9 @@ function :source_script_defining_function() {
 }
 
 declare_function_with_stdin <<'/---'
-string :source_script(string script_name, string arg1, ...)
+[stdout: string, stderr: string, status: int] :source_script(
+    string script_name,
+    string arg1?, ...)
 
 Source the passed shell script with the passed arguments, interpreting all
 commands in such script under the current shell.
@@ -260,8 +287,8 @@ If such script:
 * Otherwise, throw an exception.
 
 For these purposes, an *emulatable shell* is any shell whose name is a key of
-map global ${ZESHY_SHELL_NAME_TO_EMULATABLE_SHELL_NAME} (e.g., since
-`${ZESHY_SHELL_NAME_TO_EMULATABLE_SHELL_NAME[tcsh]}` exists, `tcsh` is an emulatable
+map global ${ZESHY_SHELL_NAME_TO_EMULATABLE_NAME} (e.g., since
+`${ZESHY_SHELL_NAME_TO_EMULATABLE_NAME[tcsh]}` exists, `tcsh` is an emulatable
 shell).
 
 If such script requires a non-emulatable shell (e.g., with a shebang line
@@ -282,28 +309,33 @@ If such script requires `zeshy` (e.g., with a shebang line resembling
 See :source_script_under_shell() for further details.
 /---
 function :source_script() {
-    # Validate sanity. Since get_shell_script_shell() already
-    # validates such file to be a sourcable shell script, avoid duplicating such
-    # validation here.
+    # Validate sanity.
     die_unless_args\
         'Expected one script filename and optional script arguments.'
-    :string filename="${1}"
+    :string filename="${1}" shell_name
+    shift_arg
+
+    # Shell interpreting such script.
+    :set_string_to_script_shell shell_name "${filename}"
+
+    # If such shell is *NOT* emulatable by zsh, throw an exception.
+    :die_unless_shell_emulatable "${shell_name}"
 
     # Source such script emulated under such shell.
-    :source_script_under_shell "${@}"\
-        "$(get_shell_script_shell "${filename}")"
+    :source_script_under_shell "${filename}" "${@}" "${shell_name}"
 }
 
 declare_function_with_stdin <<'/---'
-string :source_script_under_shell(
-    string script_name, string arg1, ...,
+[stdout: string, stderr: string, status: int] :source_script_under_shell(
+    string script_name,
+    string arg1?, ...,
     string shell_command)
 
 Source the passed shell script with the sanity emulated under the
 passed shell, interpreting all commands in such script under the current shell.
 Since `zsh` emulates only some (but not all) shell commands, this function maps
 the passed shell command to a `zsh`-emulated shell command according to global
-map ${ZESHY_SHELL_NAME_TO_EMULATABLE_SHELL_NAME}.
+map ${ZESHY_SHELL_NAME_TO_EMULATABLE_NAME}.
 
 == Caveats ==
 
@@ -328,10 +360,11 @@ function :source_script_under_shell() {
 
 # ....................{ RUNNERS                            }....................
 declare_function_with_stdin <<'/---'
-string run_code_under_zsh_defaults(string code1, ...)
+[stdout: string, stderr: string, status: int] run_code_under_zsh_defaults(
+    string code1, ...)
 
 Run the passed code emulated under default `zsh` options and traps, as typically
-required for autoloadable functions bundled with `zsh`: e.g.,
+required by autoloadable `zsh` functions bundled with `zsh`: e.g.,
 
 .run_code_under_zsh_defaults()
 ==========================================
@@ -347,16 +380,17 @@ function run_code_under_zsh_defaults() {
 }
 
 declare_function_with_stdin <<'/---'
-string run_code_under_shell(
+[stdout: string, stderr: string, status: int] run_code_under_shell(
     string code1, ...,
     string shell_name)
 
-Run the passed command emulated under the passed shell.
+Run the passed code emulated under the passed shell.
 /---
 function run_code_under_shell() {
     # Validate sanity.
     die_unless_args 'Expected one or more shell words and one shell name.'
     :string shell_name="${@[-1]}" shell_name_emulatable
+    :die_unless_shell_emulatable "${shell_name}"
     pop_arg
 #   output_string "running \"${@}\" under shell \"${shell_name}\""
 
@@ -364,9 +398,10 @@ function run_code_under_shell() {
     # emulatable shell. Since such assignment overwrites the prior result of
     # ${shell_name} *EVEN* if such test fails, avoid assigning the result to
     # ${shell_name}. (Yes, this is unhelpful, zsh.) Else, throw an exception.
-    shell_name_emulatable="$(get_map_key_value_if_found\
-        ZESHY_SHELL_NAME_TO_EMULATABLE_SHELL_NAME "${shell_name}")" or
-        die "Shell \"${shell_name}\" not emulatable."
+    :set_string_to_map_key_value\
+        shell_name_emulatable\
+        ZESHY_SHELL_NAME_TO_EMULATABLE_NAME\
+        "${shell_name}"
 
     # Source such script under such emulation. Dismantled, this is:
     #
@@ -377,11 +412,12 @@ function run_code_under_shell() {
     # is universally useful and not conflicting with script expectations.
     case "${shell_name}" {
     # If such shell is directly emulatable by zsh, do so.
-    ${~ZESHY_SHELL_EMULATABLE_DIRECTLY_GLOB})
-        emulate -LR "${shell_name}";;
+    (${~ZESHY_SHELL_EMULATABLE_DIRECTLY_GLOB})
+        emulate -LR "${shell_name}"
+        :end_case
     # If such shell is bash, attempt Bourne shell emulation with bash-specific
     # options. Such emulation is admittedly... imperfect.
-    bash)
+    (bash)
         #FIXME: The bash_source() function defined at a Googleable URL defines
         #additional aliases (e.g., "alias shopt=':'"). Unfortunately, zeshy
         #currently has no means of temporarily defining aliases and then
@@ -396,10 +432,12 @@ function run_code_under_shell() {
             ksh_array\
             ksh_glob\
             no_sh_glob\
-        ;;
+        :end_case
     # Else, this function failed to properly map such script's required shell to
     # a zsh-supported shell; throw an exception.
-    *) die "Shell ${shell_name} not mapped to an emulatable shell.";;
+    (*)
+        :die 'Shell "'${shell_name}'" not mapped to an emulatable shell.'
+        :end_case
     }
 
     # Temporarily cease throwing exceptions on non-zero exit status.
@@ -419,19 +457,85 @@ function run_code_under_shell() {
     # * run_code() is largely useful only for running zeshy-specific runnables.
     #   Since an emulated runnable is, by definition, not such a runnable,
     #   run_code() offers little benefit.
-    eval "${@}" or die\
+    eval "${@}" or :die\
         "${shell_name} code failed with exit status ${status}:${ZESHY_ASCII_NEWLINE}${@}"
 }
 
 # --------------------( WASTELANDS                         )--------------------
+        # Else, attempt to parse such shell from such script's basename (i.e.,
+        # either such basename's filetype *OR* substring preceding "rc"
+        # matching a recognized shell). For convenience, leverage duplicate
+        # subpattern indices (i.e., "(?|" group syntax) by matching via a PCRE
+        # rather than glob.
+        # {
+        #     # Script basename.
+        #     :string basename__sstsssif
+        #     :set_string_to_path_basename\
+        #         basename__sstsssif "${filename__sstsssif}"
+
+        #     #FUXME: Honestly, the latter half of this PCRE is rather "naff."
+        #     #While it certainly works in the laziest sense of that word for
+        #     #bash and zsh, it demonstrably fails as follows:
+        #     #
+        #     #* It fails to match other well-known bash and zsh dotfiles (e.g.,
+        #     #  "zshenv", "bash_logout").
+        #     #* It fails to match system-wide bash and zsh dotfiles (e.g.,
+        #     #  "/etc/zshrc").
+        #     #* It fails to match dotfiles for other shells.
+        #     #
+        #     #Honestly, such code is sufficiently difficult to implement that we
+        #     #should probably drop it entirely -- and note why.
+        #     #FUXME: This then reduces such test to a filetype test (e.g.,
+        #     #is_file_type_matches_glob()).
+
+        #     # If such basename matches a recognized shell, record such fact.
+        #     is_string_matches_pcre\
+        #         "${basename__sstsssif}"\
+        #         '(?|\.('${ZESHY_SHELL_GLOB}')|^\.?('${ZESHY_SHELL_GLOB}')rc)$' and
+        #         shell_name__sstsssif="${match[1]}"
+
+    #     :string filename="${2}"
+    #     die 'Script "'${filename}'" shell unrecognized or not a shell script (i.e., unrecognized shebang line or filetype).'
+    # }
+
+ # or
+ #    :die\
+ #        'Shell "'${shell_name}'" not emulatable (i.e., not a key of ${ZESHY_SHELL_NAME_TO_EMULATABLE_NAME}).'
+ 
+ # Since get_shell_script_shell() already
+    # validates such file to be a sourcable shell script, avoid duplicating such
+    # validation here.
+#*emulatable shell* (i.e., shell emulatable by `zsh`)
+#FUXME: Pretty shoddy implementation, honestly. Shell scripts lacking
+#shebang lines may still be shell scripts. Now that we have get_shell_script_shell_if_found(), we should
+#simply reduce to:
+#
+#   is_file_text "${pathname}" and
+#       run_code_silent get_shell_script_shell_if_found "${pathname}"
+#
+#Remarkably close to the current implementation, but much more general.
+
+# text file with first line prefixed by `#!`).
+    # Else, fail.
+    # report_failure
+
+# (e.g., Bourne, `bash`, `zsh`, `zeshy`)
+        # Note that if such basename is suffixed by a filetype *NOT* matching a
+        # known shell, such filetype is ignorable.
+
+# , ensuring ${match[1]} to
+    # capture such shell
+    # This should never happen. Force a smile if it does.
+    # die "Thank you, user! But our princess is in another castle."
+
 #FUXME: Actually, isn't this redundant? I mean, can't we simply lookup keys in
-#${ZESHY_SHELL_NAME_TO_EMULATABLE_SHELL_NAME} instead?
+#${ZESHY_SHELL_NAME_TO_EMULATABLE_NAME} instead?
 #I suspect the external command
 #"file" will output much more useful output for such scripts; hence,
 #consider deferring to "file" if the passed path is a text file lacking a
 #shebang line. Test us up!
 #FUXME: Right. 
-    # Avoid calling die_unless_shell_script(), whose
+    # Avoid calling :die_unless_script(), whose
     # implementation duplicates our parsing of the script shebang line here.
 #   print_message "filename: ${filename}\nfiletype: ${filetype}"
     #FUXME: Shift into a new function get_shell_script_shell().
@@ -561,7 +665,7 @@ function run_code_under_shell() {
 #    # Validate sanity.
 #    die_unless_arg 'expected one filename'
 
-#   # Validate sanity. Avoid calling die_unless_shell_script(), which
+#   # Validate sanity. Avoid calling :die_unless_script(), which
 #   # transitively calls this function.
 #   string filename="${1}" shebang_command
 #   die_unless_file_text "${filename}"
@@ -593,7 +697,7 @@ function run_code_under_shell() {
 #"-o EMACS" or "-o VI" should be enabled depending on ${EDITOR}. Make it so! So?
 
 #FUXME: Undefined here. *shrug* Perhaps extract into an alias in "alias"?
-#freeze_variable ZESHY_SHELL_NAME_TO_EMULATABLE_SHELL_NAME
+#freeze_variable ZESHY_SHELL_NAME_TO_EMULATABLE_NAME
 
 # ....................{ STARTUP                            }....................
 # Initialize shell script-specific constants early to permit subsequent Zeshy
@@ -667,7 +771,7 @@ function run_code_under_shell() {
 #    emulate -R "${shell_name}" -c "eval \$(${@})"
 #}
 
-# Avoid calling die_unless_shell_script(), whose
+# Avoid calling :die_unless_script(), whose
     # implementation duplicates our parsing of the script shebang line here.#       PATH="${PATH}:${FPATH}" source -- "${@}"
 #   * A supported non-Zeshy shell (e.g., "#!/usr/bin/env zsh", "#!/bin/bash"),
 #     source such script "safely" by emulating the shell environment expected by
