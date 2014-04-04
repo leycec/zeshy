@@ -12,6 +12,10 @@
 setopt err_return no_unset warn_create_global
 
 # ....................{ MAIN                               }....................
+#FIXME: Something odd going on here. The error below is output when loggin
+#in as the superuser (e.g., via "su") *DESPITE* such login otherwise
+#succeeding. What the heck?
+
 # If even one global referenced below was not previously defined by the caller,
 # such caller cannot be the "zeshy" wrapper script, the only caller permitted
 # to source this script. Print an error and return nonzero exit status.
@@ -52,6 +56,9 @@ function precmd() {
     # inherited by child shells, such circumlocution is sadly unavoidable. See
     # restore_list() for further details.
     source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
+    # print "dir stack [main/after]: ${ZESHY_USER_DIR_STACK_FILE}"
+    # typeset -g ZESHY_USER_DIR_STACK_FILE="${ZESHY_USER_CACHE_DIR}/dir_stack"
+    # typeset -g Z="${ZESHY_USER_CACHE_DIR}/dir_stack"
 }
 
 # --------------------( WASTELANDS                         )--------------------
