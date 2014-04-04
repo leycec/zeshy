@@ -15,6 +15,10 @@ setopt err_return no_unset warn_create_global
 #FIXME: Something odd going on here. The error below is output when loggin
 #in as the superuser (e.g., via "su") *DESPITE* such login otherwise
 #succeeding. What the heck?
+#FIXME: Nevermind. This is a non-issue: it's due to root's login shell being
+#"zsh" and the various hacks that stem from that. Since we've already engaged
+#in kludging there, the solution is another kludge: manually set such string
+#globals to the empty string in "/etc/zsh/zshrc". *sigh*
 
 # If even one global referenced below was not previously defined by the caller,
 # such caller cannot be the "zeshy" wrapper script, the only caller permitted
