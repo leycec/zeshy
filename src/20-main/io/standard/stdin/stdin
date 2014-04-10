@@ -239,149 +239,6 @@ function :is_stdin_noninteractive() {
 #standard input *BEFORE* calling the function receiving such input; in such
 #case, this function *ALWAYS* reports success if called by such function.
 
-declare_function_with_stdin <<'/---'
-[status: bool] :is_stdin_readable_sans_blocking(void)
-
-Report success if standard input to the current context is *readable without
-blocking* (i.e., readable without waiting indefinitely _and_ silently for such
-input to become available). Since reading from standard input via conventional
-techniques (e.g., `< /dev/stdin`, zsh builtin read(), zeshy alias get_stdin())
-typically blocks or behaves erratically if no such input has been written,
-consider polling this function before reading from standard input.
-
-== Caveats ==
-
-*This function is inherently unreliable without iterative polling.* Only call
-this function as the test of an indefinite wait or for loop: e.g.,
-
-.:is_stdin_readable_sans_blocking() Called Properly
-==========================================
-[source]
-------------------------------------------
->>> :string on_perfect_security=\
-...     "There is a contradiction in wanting to be perfectly secure in a
-...      universe whose very nature is momentariness and fluidity."
->>> output_string "${on_perfect_security}" | {
-...     output_string "Waiting for input."
-...     while { not :is_stdin_readable_sans_blocking } {
-...         output_string_sans_newline "."
-...     }
-...     output_string "Received input: $(get_stdin)"
-... }
-Waiting for input.....
-Received input: There is a contradiction in wanting to be perfectly secure in a
-universe whose very nature is momentariness and fluidity.
-------------------------------------------
-==========================================
-
-*Never call this function as a non-iterative test* (e.g., modifying the line
-reading `while { not :is_stdin_readable_sans_blocking } {` in the prior example
-to `if { not :is_stdin_readable_sans_blocking } {`). Preparing to write and then
-writing to standard input requires a non-deterministic and hence non-computable
-amount of wall clock time regardless of the underlying mechanism used to do so
-(e.g., pipe, process substitution, here-string, here-document). Indeed,
-establishing pipes requires forking one asynchronous subshell for each pipe
-subcommand excluding the last -- an extremely computationally expensive task.
-Given such expense, there exists no guarantee that the source of standard input
-will have provided such input by the time of a non-iterative call to this
-function. Moreover, given such non-determinism, whether such call succeeds or
-not depends principally on current system load! To demonstrate this, consider
-the following output from calling this function non-iteratively:
-
-.:is_stdin_readable_sans_blocking() Called Improperly
-==========================================
-[source]
-------------------------------------------
->>> :int count=0
->>> for  count ({0..7}) {
-...     output_newline | {
-...         :is_stdin_readable_sans_blocking and
-...             output_string "Input available." or
-...             output_string "No input available."
-...     }
-... }
-No input available.
-Input available.
-No input available.
-No input available.
-Input available.
-No input available.
-Input available.
-------------------------------------------
-==========================================
-
-In cases where iterative polling is inappropriate, consider calling
-:is_stdin_pipe_or_file_simple() instead. Such function typically only reports
-success when standard input is readable without blocking, and does so without
-requiring iterative polling.
-/---
-function :is_stdin_readable_sans_blocking() {
-    # Validate sanity.
-    die_if_args
-    :int exit_status
-    :list zselect_status
-
-    # Given the criticality and commonality of this test, one would assume there
-    # to exist builtins or commands for accomplishing it. One would be wrong.
-    # Testing whether such file descriptor and hence input is readable without
-    # blocking requires calling the commonly available kernel function select().
-    # Ideally, such test would elegantly reduce to the following:
-    #
-    #     read -t 0 -k 0
-    #
-    # Dismantled, this is:
-    #
-    # * "-t 0", testing whether standard input is readable without blocking and
-    #   returning immediately if not.
-    # * "-k 0", reading 0 bytes from standard input if such input is readable.
-    #
-    # Unfortunately, "read -t 0 -k 0" always returns failure. This differs from
-    # bash, in which "read -t 0 -N 0" conditionally returns success when one
-    # expects it to. Hence, this test defers to select() instead.
-    #
-    # Since zselect() (the zsh select() wrapper) returns failure with exit
-    # status 2 when the underlying OS fails to provide a select() function,
-    # capture and test such status rather than implicitly returning such status
-    # as this function's exit status.
-    #
-    # Dismantled, this is:
-    #
-    # * "-t 0", reporting whether input bytes exist to be read without waiting.
-    # * "-a ...", setting such list to contain a string resembling either
-    #   "-r 0" if standard input is nonempty or "" if standard input is empty.
-    #   Since zselect() defaults such list to ${reply} if unpassed *AND* since
-    #   such list is commonly used by callers and should *NOT* be overwritten by
-    #   such a low-level function as this, explicitly specify such list. Since
-    #   this function never references such list, our specifying it here is
-    #   simply to avoid overwriting ${reply}. (Frankly, this "unique" choice of
-    #   API design is one of the more eclectic that we've ever seen. And we were
-    #   proficient in ML... once.)
-    # * "-r ...", testing such file descriptor for nonempty reading.
-    #
-    # Note that the "{" and "}" delimiters surrounding such integer assignment
-    # are essential; neglecting delimiters assigns such integer standard input
-    # to *THIS* function rather than such exit status. (O^o)
-    #
-    # Thus does another feeble mind break.
-    if { zselect -t 0 -a zselect_status -r ${ZESHY_STDIN_FILE_DESCRIPTOR-0} } {
-        set_integer_to_status exit_status
-    }
-
-    # If such status indicates such function to be absent, throw an exception.
-    if (( exit_status == 2 )) {
-        :die 'Kernel function select() undefined.'
-    }
-
-    # Else, return such status as is. Technically, zselect() returns:
-    #
-    # * 0 if any passed file descriptor is both nonempty and readable.
-    # * 1 otherwise.
-    #
-    # Since this function tests only one file descriptor for nonempty reading,
-    # such status exactly coincides with what the caller expects. (Scoooooore!)
-    return ${exit_status}
-}
-
 #FIXME: In lieu of unit tests...
 #function empo() {
 #    print ok | { :is_stdin_pipe     and print 'ok' or print 'ko' }
@@ -448,9 +305,10 @@ function get_stdin_until_eot() {
     # indefinite, pseudo-random, and always silent.
     #
     # See page_stdin() for related logic.
+    :string IFS=
     while {
-        IFS= read -r stdin_line and\
-        is "${stdin_line}" != "${ZESHY_ASCII_EOT}" si } {
+        read -r stdin_line and
+        :is "${stdin_line}" != "${ZESHY_ASCII_EOT}" :si } {
         stdin+="${stdin_line}${ZESHY_ASCII_NEWLINE}"
     }
 
@@ -466,6 +324,73 @@ function get_stdin_until_eot() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# function :is_stdin_readable_sans_blocking() {
+#     # Validate sanity.
+#     die_if_args
+#     :int exit_status
+#     :list zselect_status
+# 
+#     # Given the criticality and commonality of this test, one would assume there
+#     # to exist builtins or commands for accomplishing it. One would be wrong.
+#     # Testing whether such file descriptor and hence input is readable without
+#     # blocking requires calling the commonly available kernel function select().
+#     # Ideally, such test would elegantly reduce to the following:
+#     #
+#     #     read -t 0 -k 0
+#     #
+#     # Dismantled, this is:
+#     #
+#     # * "-t 0", testing whether standard input is readable without blocking and
+#     #   returning immediately if not.
+#     # * "-k 0", reading 0 bytes from standard input if such input is readable.
+#     #
+#     # Unfortunately, "read -t 0 -k 0" always returns failure. This differs from
+#     # bash, in which "read -t 0 -N 0" conditionally returns success when one
+#     # expects it to. Hence, this test defers to select() instead.
+#     #
+#     # Since zselect() (the zsh select() wrapper) returns failure with exit
+#     # status 2 when the underlying OS fails to provide a select() function,
+#     # capture and test such status rather than implicitly returning such status
+#     # as this function's exit status.
+#     #
+#     # Dismantled, this is:
+#     #
+#     # * "-t 0", reporting whether input bytes exist to be read without waiting.
+#     # * "-a ...", setting such list to contain a string resembling either
+#     #   "-r 0" if standard input is nonempty or "" if standard input is empty.
+#     #   Since zselect() defaults such list to ${reply} if unpassed *AND* since
+#     #   such list is commonly used by callers and should *NOT* be overwritten by
+#     #   such a low-level function as this, explicitly specify such list. Since
+#     #   this function never references such list, our specifying it here is
+#     #   simply to avoid overwriting ${reply}. (Frankly, this "unique" choice of
+#     #   API design is one of the more eclectic that we've ever seen. And we were
+#     #   proficient in ML... once.)
+#     # * "-r ...", testing such file descriptor for nonempty reading.
+#     #
+#     # Note that the "{" and "}" delimiters surrounding such integer assignment
+#     # are essential; neglecting delimiters assigns such integer standard input
+#     # to *THIS* function rather than such exit status. (O^o)
+#     #
+#     # Thus does another feeble mind break.
+#     if { zselect -t 0 -a zselect_status -r ${ZESHY_STDIN_FILE_DESCRIPTOR-0} } {
+#         set_integer_to_status exit_status
+#     }
+# 
+#     # If such status indicates such function to be absent, throw an exception.
+#     if (( exit_status == 2 )) {
+#         :die 'Kernel function select() undefined.'
+#     }
+# 
+#     # Else, return such status as is. Technically, zselect() returns:
+#     #
+#     # * 0 if any passed file descriptor is both nonempty and readable.
+#     # * 1 otherwise.
+#     #
+#     # Since this function tests only one file descriptor for nonempty reading,
+#     # such status exactly coincides with what the caller expects. (Scoooooore!)
+#     return ${exit_status}
+# }
+
 #FUXME: Actually, even this generalization fails to suffice. Thanks to here-
 #documents and -strings, we need to generalize this a bit further, also
 #necessitating a nomenclature change -- ideally, to something a bit more
