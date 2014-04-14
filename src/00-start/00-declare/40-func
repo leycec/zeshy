@@ -128,7 +128,8 @@ defining, other functions).
 #  function called in such a pipe, wouldn't ${pipestatus} be the empty list?
 
 # ....................{ GLOBALS                            }....................
-typeset -g ZESHY_DECLARE_FUNC_PROTOTYPE__
+#FIXME: Document me.
+typeset -g ZESHY_DECLARE_FUNC_PROTOTYPE__ ZESHY_DECLARE_FUNC_ARGS__
 
 #FIXME: Document me.
 typeset -gA ZESHY_DECLARE_FUNC_ATTRS__
@@ -158,7 +159,7 @@ function :declare_func_ ::declare_func_start() {
 
     # To safeguard against (accidental or intentional) deletion of globals
     # referenced below and elsewhere, forcefully redeclare such globals.
-    typeset -g  ZESHY_DECLARE_FUNC_PROTOTYPE__
+    typeset -g  ZESHY_DECLARE_FUNC_PROTOTYPE__ ZESHY_DECLARE_FUNC_ARGS__
     typeset -gA ZESHY_DECLARE_FUNC_ATTRS__
     typeset -ga ZESHY_DECLARE_FUNC_NAMES__
 
@@ -167,9 +168,10 @@ function :declare_func_ ::declare_func_start() {
 
     # Parse the map of function attributes and list of function names declared
     # from such prototype.
-    :set_map,list_to_func_prototype_attrs,names\
+    :set_map,list,string_to_func_prototype_attrs,names,args\
         ZESHY_DECLARE_FUNC_ATTRS__\
         ZESHY_DECLARE_FUNC_NAMES__\
+        ZESHY_DECLARE_FUNC_ARGS__\
         "${ZESHY_DECLARE_FUNC_PROTOTYPE__}"
 
     # If any such function already exists, throw an exception. See
@@ -184,25 +186,157 @@ function :declare_func_ ::declare_func_start() {
     }
 }
 
-#FIXME: Document me.
+#FIXME: Document me. And oh, cripes -- is this function gonna need it.
+#FIXME: Implement support for validating variable types (e.g.,
+#":string:list", ":int").
+#FIXME: Implement support for default argument handling. Since arguments
+#can be directly set by index (e.g., "argv[1]='ok'"), this should be more
+#than feasible. It will, however, require us to reexamine *ALL* current
+#prototypes for valid default value definitions. (Ugh; we know.) Or, I
+#suppose we could just defer such examination until the inevitable bugs
+#crop up. Yah. Probably the latter.
+#FIXME: Avoid performing such validation if compiling an optimized zeshy build.
+
 # :void ::declare_func_stop[stdin: :string func_asciidoc]
 function ::declare_func_stop() {
     # Validate sanity.
     (( # == 0 )) || :die 'Expected no arguments.'
+    local func_preamble
+    integer arg_count_min=0 arg_count_max=0 func_is_variadic=0
 
     # If any such variable is either undefined or of unexpected type, throw an
     # exception. See die_unless_string(), die_unless_map(), and
     # die_unless_list() for further details.
-    [[ "${(t)ZESHY_DECLARE_FUNC_PROTOTYPE__-}" == 'scalar'* ]] || :die\
-        'Variable ${ZESHY_DECLARE_FUNC_PROTOTYPE__} undefined or not a string (e.g., as :declare_func_() not previously called).'
+    [[ "${(t)ZESHY_DECLARE_FUNC_PROTOTYPE__-}${(t)ZESHY_DECLARE_FUNC_ARGS__-}" == 'scalar'*'scalar'* ]] || :die\
+        'Strings ${ZESHY_DECLARE_FUNC_PROTOTYPE__} and/or ${ZESHY_DECLARE_FUNC_ARGS__} undefined or not strings (e.g., as :declare_func_() not previously called).'
     [[ "${(t)ZESHY_DECLARE_FUNC_ATTRS__-}" == 'association'* ]] || :die\
         'Map ${ZESHY_DECLARE_FUNC_ATTRS__} undefined or not a map.'
     [[ "${(t)ZESHY_DECLARE_FUNC_NAMES__-}" == 'array'* ]] || :die\
         'List ${ZESHY_DECLARE_FUNC_NAMES__} undefined or not a list.'
 
-    # For each such function...
+    #FIXME: O.K.; this is *GREAT* for parsing merely argument lists, but fails
+    #to account for argument channels. We only care about the "args = "
+    #argument channel, for obvious reasons. So, if such string is prefixed by
+    #"[", we'll need to reparse the substring of such string following the "("
+    #in "args = (" and preceding the corresponding ")" *BACK* into such string.
+    #This sort-of implies we'll need to add a new PCRE string global to
+    #@{*-pcre} to perform such matching. *sigh*
+    #FIXME: Wait. *ACTUALLY*, why don't we just modify the existing PCRE string
+    #global ${ZESHY_PROTOTYPE_RUNNABLE_ATTRS_NAMES_ARGS_PCRE} to capture *ONLY*
+    #the contents of the "args =" channel into such match group?  Indeed, using
+    #"(?|...)"-style capturing, we should be able to ensure that such match
+    #group contains the desired substring regardless of whether it was embedded
+    #in a channel or not. Sweet, no?
+
+    # If such argument string is *NOT* the empty string, such function accepts
+    # at least one argument. In such case, parse such arguments.
+    [[ -n "${ZESHY_DECLARE_FUNC_ARGS__}" ]] || {
+        # Compile such PCRE. See for_string_text_matching_pcre:() for further
+        # details.
+        pcre_compile -- "${ZESHY_PROTOTYPE_RUNNABLE_ARGS_NEXT_PCRE}"
+        pcre_study
+
+        # Parse each such argument into the following indices of canonical list
+        # global ${match}:
+        #
+        # * 1, such argument's mandatory type.
+        # * 2, such argument's mandatory name.
+        # * 3, such argument's optional default value.
+        # * 4, such argument's optional eroteme (i.e., "?"), signifying such
+        #   argument to be optional. If unspecified, such argument is mandatory.
+        # * 5, such argument's optional ellipse (i.e., "..."), signifying such
+        #   argument and hence function to be variadic.
+        local ZPCRE_OP='0 0'
+        while {
+            pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY_DECLARE_FUNC_ARGS__}"
+        } {
+            # Since the current argument may (but not necessarily) be passed,
+            # increment the maximum argument count.
+            arg_count_max+=1
+
+            # If such argument is mandatory (i.e., was *NOT* suffixed by an
+            # erotome), increment the minimum argument count as well.
+            if [[ -z "${match[4]-}" ]] {
+                arg_count_min+=1
+            }
+
+            # If such argument is variadic (i.e., was suffixed by an ellipse),
+            # record such fact.
+            if [[ -n "${match[5]-}" ]] {
+                func_is_variadic=1
+            }
+        }
+    }
+
+    # Declare and redefine each such function to begin with such preamble.
+    # Alias :declare_func{() previously defined such function, internally
+    # stored by zsh in pre-parsed form (i.e., *NOT* stripped of all ignorable
+    # lexical constructs, including comments and negligible whitespace). Hence,
+    # such definitions retains all comments and negligible whitespace. As we
+    # shall see, this is *NOT* necessarily a good thing.
+    #
+    # Redefining such function here reduces such function to its post-parsed
+    # form (i.e., stripped of all ignorable lexical constructs).
+    #
+    # Hence, functions defined by :declare_func() fundamentally differ to
+    # those defined by builtin function(). The former omits all ignorable
+    # lexical constructs internally preserved by the latter, a seemingly
+    # trivial fact that nonetheless provokes non-trivial side effects: e.g.,
+    #
+    # * While the pre- and post-parsed definitions for functions defined by
+    #   builtin function() almost always differ, the pre- and post-parsed
+    #   definitions for functions defined by this function are guaranteed to
+    #   *NEVER* differ.
+    # * Canonical integer global ${LINENO} corresponds to the current line
+    #   number of the current function or script's pre-parsed definition.
+    # * Similarly, line numbers suffixing canonical list global ${functrace}
+    #   correspond to the line number of the listed function or script's
+    #   pre-parsed definition on which the "next" function or script in the
+    #   call stack was called.
+    # * There currently exists no generally reliably means of accessing the
+    #   pre-parsed definition of *ANY* function or script -- particularly if
+    #   such function derives from a digest file, as all zeshy functions do.
+    # * The prior observations directly imply that the definitions of functions
+    #   defined by this function (but *NOT* by builtin function()) may be
+    #   correlated with line numbers: both the current line number and the line
+    #   numbers recorded on the call stack (e.g., due to thrown exceptions).
+    # * The prior implication itself implies that functions defined by this
+    #   function (but *NOT* by builtin function()) may support otherwise
+    #   unsupportable functionality, including:
+    #   * On detecting an uncaught exception, printing the lines of the
+    #     function responsible for initially throwing such exception.
     local func_name
     for   func_name ("${ZESHY_DECLARE_FUNC_NAMES__[@]}") {
+        #FIXME: Technically, such functionname could contain double quotes. In
+        #such case, we'll need to prefix such quotes by "\" to prevent errors
+        #when throwing exceptions below. Define a new string local
+        #${func_name_sanitized} here and then use such local in exception
+        #messages below.
+
+        # Function preamble, validating the argument list passed to such function
+        # against the prototype constraints parsed above.
+        #
+        # If such function is variadic, such function accepts a countably
+        # infinite number of arguments only bounded below by such minimum.
+        if (( func_is_variadic )) {
+            func_preamble='(( # >= '${arg_count_min}' )) || :die "Function '${func_name}'() expects at least '${arg_count_min}' rather than ${#} arguments:'$'\n\n"'${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}
+        # Else, such function is non-variadic, in which case such function
+        # accepts a number of arguments bounded by such minimum and maximum.
+        #
+        # If such minimum and maximum are equal, simplify such test as such.
+        } elif (( arg_count_min == arg_count_max )) {
+            func_preamble='(( # == '${arg_count_min}' )) || :die "Function '${func_name}'() expects '${arg_count_min}' rather than ${#} arguments:'$'\n\n"'${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}
+        # Else, such minimum and maximum are unequal.
+        } else {
+            func_preamble='(( '${arg_count_min}' <= # && # <= '${arg_count_max}' )) || :die "Function '${func_name}'() expects between '${arg_count_min}' and '${arg_count_max}' rather than ${#} arguments:'$'\n\n"'${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}
+        }
+        print -r "${func_name} preamble: ${func_preamble}"
+
+        # Redefine such function in a manner preserving post-parsed form (i.e.,
+        # containing no comments or negligible whitespace).
+        functions[${func_name}]=${func_preamble}$'\n'${functions[${func_name}]}
+        # functions[${func_name}]=${functions[${func_name}]}
+
         # If such prototype declared attributes, handle such attributes.
         if (( ${#ZESHY_DECLARE_FUNC_ATTRS__} )) {
             # If such attributes include "globbable," disable filename globbing
@@ -236,7 +370,8 @@ function ::declare_func_stop() {
     unset\
         ZESHY_DECLARE_FUNC_PROTOTYPE__\
         ZESHY_DECLARE_FUNC_ATTRS__\
-        ZESHY_DECLARE_FUNC_NAMES__
+        ZESHY_DECLARE_FUNC_NAMES__\
+        ZESHY_DECLARE_FUNC_ARGS__
 }
 
 #FIXME: In liue of unit tests...
@@ -359,6 +494,22 @@ function declare_function_with_stdin() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# initially validate the passed
+    # argument list against the prototype constraints parsed above.
+    # Redefine such function in terms of such prototype.
+#     ::declare_func_redefinition
+# 
+# # :void ::declare_func_redefinition(:void)
+# function ::declare_func_redefinition() {
+#     # Validate sanity.
+#     (( # == 0 )) || :die 'Expected no arguments.'
+# }
+
+            # coerce the maximum argument count to a suitably small integer
+            # effectively guaranteeing such count.
+    # [[ "${(t)ZESHY_DECLARE_FUNC_PROTOTYPE__-}${(t)ZESHY_DECLARE_FUNC_ARGS__-}" == 'scalar'*'scalar'* ]] || :die\
+    #     'Strings ${ZESHY_DECLARE_FUNC_PROTOTYPE__} and/or ${ZESHY_DECLARE_FUNC_ARGS__} undefined or not strings (e.g., as :declare_func_() not previously called).'
+
 #FUXME: Unfortunately, it's fairly evident we have an efficiency problem.
 #Startup up time discernably scale linearly with function declarations, which
 #isn't good. Ideally, such declarations should be negligible. We strongly
