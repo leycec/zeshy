@@ -270,6 +270,7 @@ function :declare_func_ ::declare_func_start() {
         ZESHY_DECLARE_FUNC_NAMES__\
         ZESHY_DECLARE_FUNC_ARGS__\
         "${ZESHY_DECLARE_FUNC_PROTOTYPE__}"
+    # print -r "args: ${ZESHY_DECLARE_FUNC_ARGS__}"
 
     # If any such function already exists, throw an exception. See
     # :die_unless_func() and :define_function() for further details.
@@ -316,12 +317,6 @@ function ::declare_func_stop() {
     local func_preamble die_arg_count_prefix die_arg_count_suffix
     integer arg_count_min=0 arg_count_max=0 func_is_variadic=0
 
-    #FIXME: Getting a bit old, honestly. Just declare appropriate type testers
-    #and exception handlers in @{*-test}. Sadly, this implies pretty much
-    #shifting the *ENTIRETY* of @{var/type} into @{*-test} -- but it's
-    #difficult to see an alternative. Repetition of the code below is simply
-    #horrible, and nseds to cease sooner than later.
-
     # If any such variable is either undefined or of unexpected type, throw an
     # exception. See :die_unless_var_string(), :die_unless_var_map(), and
     # :die_unless_var_list() for further details.
@@ -331,7 +326,7 @@ function ::declare_func_stop() {
 
     # Define integer locals declared above by parsing each argument in the
     # argument list embedded in such function's prototype.
-    ::declare_func_stop:parse_args
+    ::declare_func_stop_parse_args
 
     # Substring suffixing argument count-specific exception messages below.
     die_arg_count_suffix=$'.\n\n''Function prototype:'$'\n"'${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}$'"\n\n''Arguments passed:'$'\n"''${(qq)@}'
@@ -375,6 +370,13 @@ function ::declare_func_stop() {
     #     function responsible for initially throwing such exception.
     local func_name
     for   func_name ("${ZESHY_DECLARE_FUNC_NAMES__[@]}") {
+        #FIXME: Terrifically silly. We can simply rewrite this to read:
+        #    die_arg_count_prefix=' || :die "Function ${funcstack[1]}() expects '
+        #
+        #Obvious, if moderately clever. Given that, shift this and the
+        #following if conditional to the very end of
+        #::declare_func_stop_parse_args(). (Yes!)
+
         # Substring prefixing argument count-specific exception messages below.
         die_arg_count_prefix=' || :die "Function "'${(qq)func_name}'"() expects '
 
@@ -399,8 +401,7 @@ function ::declare_func_stop() {
 
         # Redefine such function in a manner preserving post-parsed form (i.e.,
         # containing no comments or negligible whitespace).
-        # functions[${func_name}]=${func_preamble}$'\n'${functions[${func_name}]}
-        # functions[${func_name}]="${functions[${func_name}]}"
+        functions[${func_name}]=${func_preamble}$'\n'${functions[${func_name}]}
 
         # If such prototype declared attributes, handle such attributes.
         if (( ${#ZESHY_DECLARE_FUNC_ATTRS__} )) {
@@ -439,10 +440,11 @@ function ::declare_func_stop() {
         ZESHY_DECLARE_FUNC_ARGS__
 }
 
-# :void ::declare_func_stop:parse_args()
-function ::declare_func_stop:parse_args() {
+# :void ::declare_func_stop_parse_args()
+function ::declare_func_stop_parse_args() {
     # Validate sanity.
     (( # == 0 )) || :die 'Expected no arguments.'
+    local arg_name arg_type
 
     # Human-readable names of canonical list global ${match} indices. While
     # such indices are both unnecessary and slightly inefficient, their use
@@ -461,7 +463,7 @@ function ::declare_func_stop:parse_args() {
     # constraints of such type (e.g., a non-numeric string passed where an
     # integer was expected). If unspecified, such definition is prefixed by
     # such a call.
-    integer -r arg_match_index_type_is_unvalidated=2
+    integer -r arg_match_index_type_is_ignored=2
 
     # The current argument's mandatory name.
     integer -r arg_match_index_name=3
@@ -479,11 +481,12 @@ function ::declare_func_stop:parse_args() {
 
     # If such argument string is *NOT* the empty string, such function accepts
     # at least one argument. In such case, parse such arguments.
-    [[ -n "${ZESHY_DECLARE_FUNC_ARGS__}" ]] || {
-        # Compile such PCRE. See for_string_text_matching_pcre:() for further
-        # details.
+    if [[ -n "${ZESHY_DECLARE_FUNC_ARGS__}" ]] {
+        # Compile such PCRE. For efficiency, avoid optionally optimizing such
+        # PCRE by calling pcre_study(). (Ad-hoc profiling suggests such
+        # optimization to consume more time than it saves.) See
+        # for_string_text_matching_pcre:() for further details.
         pcre_compile -- "${ZESHY_PROTOTYPE_RUNNABLE_ARGS_NEXT_PCRE}"
-        pcre_study
         # print -r "${ZESHY_DECLARE_FUNC_NAMES__[1]} args: ${ZESHY_DECLARE_FUNC_ARGS__}"
 
         # Parse each such argument into canonical list global ${match}, whose
@@ -501,16 +504,45 @@ function ::declare_func_stop:parse_args() {
             # count as well.
             if [[ -z "${match[${arg_match_index_is_optional}]-}${match[${arg_match_index_value}]-}" ]] {
                 arg_count_min+=1
+            # Else, such argument is optional.
+            #
+            # If such argument follows a variadic argument list, throw an
+            # exception, as there exists no means of distinguishing the two.
+            } elif (( func_is_variadic )) {
+                #FIXME: $(::get_parcel_preposition_if_found_or_noop) is
+                #horrible, isn't it? ${ZESHY_PARCEL_NAME} should *ALWAYS* be
+                #set to a non-empty string, implying we should just excise such
+                #function and expand such low-level string global here and
+                #everywhere similar else.
+                #FIXME: Hmm; define a new string local above:
+                #   #  For simplicity, print only the first function name in such message.
+                #   local error_message_prefix='Function '${ZESHY_DECLARE_FUNC_NAMES__[1]}'() in parcel '${ZESHY_PARCEL_NAME-(undefined)}
+                #FIXME: Insufficient. We *ALSO* need to throw an exception if
+                #optional arguments precede variadic arguments. Given that,
+                #we'll probably want to validate this constraint *AFTER*
+                #parsing all arguments. Then simply perform the following test
+                #below after iteration and excise this conditional here:
+                #
+                #if (( func_is_variadic && arg_count_min != arg_count_max )) {
+                #    :die '...'
+                #}
+                #
+                #No need to add or track a new boolean, which is nice.
 
-                # If such argument was suffixed by both an eroteme *AND*
-                # default value, print a nonfatal warning. While redundant,
-                # such edge case does *NOT* warrant a fatal exception.  For
-                # simplicity, print only the first function name in such
-                # warning message.
-                [[ -z "${match[${arg_match_index_is_optional}]-}" ||
-                   -z "${match[${arg_match_index_value}]-}" ]] ||
-                    :print_warning 'Function '${ZESHY_DECLARE_FUNC_NAMES__[1]}'() argument '${match[arg_match_index_name]}' redundantly suffixed by both "?" and "=":'$'\n\n'${ZESHY_DECLARE_FUNC_PROTOTYPE__}
+                :die\
+                    'Function '${ZESHY_DECLARE_FUNC_NAMES__[1]}'()'$(::get_parcel_preposition_if_found_or_noop)' accepts both optional and variadic arguments:'$'\n\n'${ZESHY_DECLARE_FUNC_PROTOTYPE__}
+            # If such argument is suffixed by both an eroteme *AND* default
+            # value, print a nonfatal warning. While redundant, such edge case
+            # does *NOT* warrant a fatal exception.
+            } elif [[\
+                -n "${match[${arg_match_index_is_optional}]-}" &&
+                -n "${match[${arg_match_index_value}]-}" ]] {
+                :print_warning 'Function '${ZESHY_DECLARE_FUNC_NAMES__[1]}'() argument '${match[arg_match_index_name]}' redundantly suffixed by both "?" and "=":'$'\n\n'${ZESHY_DECLARE_FUNC_PROTOTYPE__}
             }
+
+            #FIXME: If there exists at least one optional argument *FOLLOWING*
+            #a variadic argument list, throw an exception, as there exists no
+            #means of distinguishing the two. 
 
             # If such argument is variadic (i.e., was suffixed by an ellipse),
             # record such fact.
@@ -526,10 +558,78 @@ function ::declare_func_stop:parse_args() {
                 # simplicity, print only the first function name in such
                 # exception message.
                 (( func_is_variadic == 0 )) || :die\
-                    'Function '${ZESHY_DECLARE_FUNC_NAMES__[1]}'() accepts two or more variadic argument lists:'$'\n\n'${ZESHY_DECLARE_FUNC_PROTOTYPE__}
+                    'Function '${ZESHY_DECLARE_FUNC_NAMES__[1]}'()'$(::get_parcel_preposition_if_found_or_noop)' accepts two or more variadic argument lists:'$'\n\n'${ZESHY_DECLARE_FUNC_PROTOTYPE__}
 
                 # Else, record such fact.
                 func_is_variadic=1
+            }
+
+            # If such argument's type is *NOT* to be ignored (i.e., is to be
+            # validated), validate such type. To avoid overriding canonical
+            # list global ${match} with matches captured below, do so *AFTER*
+            # performing all other argument parsing above.
+            if [[ -z "${match[${arg_match_index_type_is_ignored}]}" ]] {
+                arg_type="${match[${arg_match_index_type}]}"
+
+                # If such type is *NOT* ":string", validate such type. (Since
+                # all arguments are untyped scalars from the low-level zsh
+                # perspective, there exists no validation to be performed for
+                # arguments of type ":string".)
+                if [[ "${arg_type}" != ':string' ]] {
+                    arg_name="${match[${arg_match_index_name}]}"
+
+                    #FIXME: Implement me as commented above. We'll likely want to:
+                    #
+                    #* Append all such code to string local ${func_preamble},
+                    #  defined by the caller.
+                    #* If such type:
+                    #  * Matches glob ":string:(#b)([a-zA-Z0-9-_])", call
+                    #    :die_unless_var_${match[1]}_of_cause().
+                    #  * Matches glob ":(#b)([a-zA-Z0-9-_])", call
+                    #    :die_unless_${match[1]}_of_cause(). Throw an exception
+                    #    here if such exception handler does not exist.
+                    #* How do we handle optional arguments? Right. By the above
+                    #  guarantee, an argument list cannot contain both optional
+                    #  and variadic arguments. Given that, if the current
+                    #  argument is optional, simply assume no variadicity (on
+                    #  good faith) and... What? Hmm; right. For now, since the
+                    #  function will almost certainly be setting such optional
+                    #  value to its default if unpassed, we'll probably want
+                    #  to (within such appended code, of course):
+                    #  * Test whether such argument was passed by checking the
+                    #    number of passed arguments. That's easily enough
+                    #    tested for functions with only one optional argument,
+                    #    of course, but for functions accepting more than one,
+                    #    the algorithm becomes a bit more complex. In any case,
+                    #    we won't know the maximum number of arguments until
+                    #    *AFTER* parsing, suggesting we'll probably want to
+                    #    append to a list local for each optional argument
+                    #    type (to be handled after iteration). Say, append the
+                    #    name, type, and index of such argument as three
+                    #    separate list items, then iterate such list
+                    #    three-at-a-time? Seems tolerable enough.
+                    #  * In any case, if such test implies such argument to
+                    #    have been passed, validate such argument's type; else,
+                    #    assume the default value the function itself supplies
+                    #    to be of the correct type. (Sane assumption, in most
+                    #    cases. Yay!)
+                    #* Don't forget to handle variadic arguments! (Ugh.)
+                    #  We'll probably only be able to handle type validation
+                    #  for such arguments *AFTER* parsing all arguments and
+                    #  hence determining how many (if any) arguments follow
+                    #  such variadic list. Unctuous, but not infeasible. See
+                    #  the discussion above for optional arguments. Probably a
+                    #  similar post-iteration implementation, we should think.
+                    #FIXME: Actually, for efficiency, perform low-level raw
+                    #string indexing with hard-coded indices rather than
+                    #capturing match groups with "(#b)" above. Happily, this
+                    #also has the beneficial side-effect of preserving
+                    #${match}, which may prove essential later.
+
+                    # Append validation of such type to the string of all
+                    # validation for such function.
+                    true
+                }
             }
         }
     }
@@ -663,6 +763,13 @@ function declare_function_with_stdin() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+        # functions[${func_name}]="${functions[${func_name}]}"
+    #FUXME: Getting a bit old, honestly. Just declare appropriate type testers
+    #and exception handlers in @{*-test}. Sadly, this implies pretty much
+    #shifting the *ENTIRETY* of @{var/type} into @{*-test} -- but it's
+    #difficult to see an alternative. Repetition of the code below is simply
+    #horrible, and nseds to cease sooner than later.
+
         #FUXME: Technically, such function name could contain double quotes. In
         #such case, we'll need to prefix such quotes by "\" to prevent errors
         #when throwing exceptions below. Define a new string local
