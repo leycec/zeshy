@@ -201,6 +201,15 @@ defining, other functions).
 #
 #For readability, external prototypes omit all compilation-specific syntactic
 #directives. Nice, eh?
+#FIXME: Actually, even the above is a bit... amiss. The default should be to
+#localize, as that's what end users rightfully expect of reasonably high-level
+#languages. They can elect to localize manually, of course, but that could
+#simply be regarded as an optimization, which we syntactically denote with "?".
+#Then, the following syntax serves to disable localization enabled by default:
+#
+#    :void my_func(?:string my_string{__mf}, ?:int my_int{__mf})
+#
+#Quite readable, we trust.
 
 #FIXME: Replace the current "<globbable>" attribute by a new argument
 #pseudo-type ":glob", which function parsing should then internally detect and
@@ -490,15 +499,15 @@ function ::declare_func_stop_parse_args() {
     # Validate sanity.
     (( # == 0 )) || :die 'Expected no arguments.'
 
-    #FIXME: Documentation unsurprisingly obsolete, as is this list's name.
-    #Resurrect the prior list's name and documentation from the wastelands.
-
-    # Map from argument index to a character signifying optional metadata
-    # associated with such argument:
-    #
-    # * "?", signifying such argument to be optional.
-    # * ".", signifying such argument to be variadic.
-    local -a arg_index_to_state
+    # List of argument-specific metadata for all arguments whose types are to
+    # be programmatically validated (excluding of type ":string", requiring no
+    # such validation). Such validation typically depends on the maximum number
+    # of arguments accepted by such function, a quantity available only *AFTER*
+    # parsing all such arguments. Such parsing thus appends this list by such
+    # metadata, which post-parsing then converts into such validation. Such
+    # metadata comprises a conceptual 4-tuple
+    # (${arg_index} ${arg_type} ${arg_is_optional} ${arg_is_variadic}).
+    local -a args_index_type_optional_variadic
 
     # Map from argument type to a space-delimited string of the indices of all
     # arguments of such type.
@@ -577,12 +586,13 @@ function ::declare_func_stop_parse_args() {
             # eroteme *OR* a default value), increment the minimum argument
             # count as well.
             if [[ -z "${match[${arg_match_index_is_optional}]-}${match[${arg_match_index_value}]-}" ]] {
-                arg_count_min+=1
+                # Note such fact.
                 arg_is_optional=0
+
+                # Increment such count.
+                arg_count_min+=1
             # Else, such argument is optional.
             } else {
-                arg_is_optional=1
-
                 # If such argument is suffixed by both an eroteme *AND* default
                 # value, throw an exception. While either suffices to imply
                 # such argument to be optional, each implies distinct and
@@ -590,49 +600,45 @@ function ::declare_func_stop_parse_args() {
                 [[ -z "${match[${arg_match_index_is_optional}]-}" ||
                    -z "${match[${arg_match_index_value}]-}" ]] ||\
                    ::die_of_func_prototype 'argument '${match[arg_match_index_name]}' suffixed by both "?" and "="'
+
+                # If a prior argument is also variadic, throw an exception.
+                # See below for related logic and commentary.
+                (( args_is_variadic == 0 )) || ::die_of_func_prototype\
+                    'accepts both optional and variadic arguments'
+
+                # Else, note such fact.
+                arg_is_optional=1
+
+                # Note such function to accept at least one optional argument.
+                args_is_optional=1
             }
 
             # If such argument is variadic (i.e., was suffixed by an ellipse),
             # record such fact.
             if [[ -n "${match[${arg_match_index_is_variadic}]-}" ]] {
+
+                # If a prior argument is also optional, throw an exception.
+                # Such case implies such function to accept one or more
+                # optional arguments *AND* one or more variadic argument lists
+                # of arbitrary count, implying there exists no general-purpose
+                # means of deciding which such argument a subsequently passed
+                # argument was intended to correspond to.
+                (( args_is_optional == 0 )) || ::die_of_func_prototype\
+                    'accepts both optional and variadic arguments'
+
                 # If a prior argument is also variadic, throw an exception.
                 # Such case implies such function to accept two or more
-                # variadic argument lists of arbitrary count. However, there
-                # exists no general-purpose means of differentiating which such
-                # list the caller intended *ANY* passed argument to belong to,
-                # itself implying this function cannot reliably validate the
-                # types of subsequent arguments. Given such quandries, the only
-                # sane response is to prohibit such prototypes altogether. For
-                # simplicity, print only the first function name in such
-                # exception message.
+                # variadic argument lists of arbitrary count, implying there
+                # exists no general-purpose means of deciding which such list a
+                # subsequently passed argument was intended to to belong to.
                 (( args_is_variadic == 0 )) || ::die_of_func_prototype\
                     'accepts two or more variadic argument lists'
 
-                # Else, record such fact.
+                # Else, note such fact.
                 args_is_variadic=1
 
-                # Record the index of the first variadic argument.
+                # Note the index of the first variadic argument.
                 arg_index_variadic_first="${arg_count_max}"
-
-                # If such argument is both variadic *AND* optional, ignore the
-                # latter fact. This barefaced kludge prevents validation below
-                # from throwing an exception due to such function accepting
-                # both variadic and optional arguments. In general, there
-                # exists no reliable means of distinguishing such arguments
-                # apart, constituting a fatal error. In this case, however,
-                # assuming the variadic argument to also be the only optional
-                # argument, there exists no conflict between the two, in which
-                # case condition is genuinely ignorable.
-                if (( arg_is_optional )) {
-                    arg_is_optional=0
-                }
-            }
-
-            # If such argument is optional, note such function to accept at
-            # least one optional argument. Perform such test *AFTER* the
-            # variadic-specific logic above possibly adjusts such boolean.
-            if (( arg_is_optional )) {
-                args_is_optional=1
             }
 
             # If such argument's type is *NOT* to be ignored (i.e., is to be
@@ -645,41 +651,14 @@ function ::declare_func_stop_parse_args() {
                 # perspective, there exists no validation to be performed for
                 # arguments of type ":string".)
                 if [[ "${match[${arg_match_index_type}]}" != ':string' ]] { 
-                    arg_index_to_state+=(
+                    args_index_type_optional_variadic+=(
                         "${arg_count_max}"
                         "${match[${arg_match_index_type}]}"
                         "${arg_is_optional}"
                         "${arg_is_variadic}" )
-
-                    #FIXME: Obsolete.
-                    # # if such argument is variadic, note such fact.
-                    # if (( arg_is_variadic )) {
-                    #     arg_index_to_state+=( "${arg_max_count}" 1 0 )
-                    # # Else if such argument is optional, note such fact.
-                    # } elif (( arg_is_optional )) {
-                    #     arg_index_to_state+=( "${arg_max_count}" 0 1 )
-                    # }
                 }
             }
         }
-    }
-
-    # If such function accepts both optional and variadic arguments, there
-    # exists no general-purpose means of distinguishing the two for *ANY*
-    # purposes (let alone for argument validation coded below). Since this
-    # signifies a fatal error, throw an exception.
-    #
-    # We maintain booleans for tracking whether such function accepts variadic
-    # but *NOT* optional arguments. Happily, testing whether the minimum and
-    # maximum number of arguments such function accepts suffices to test
-    # whether such function accepts optional arguments.
-    #
-    # While such test *COULD* be tested for above with multiple discrete tests
-    # (e.g., if the current argument is optional, testing for prior variadic
-    # arguments, and the inverse if the current argument is variadic), the
-    # current approach is considerably more intelligible.
-    if (( args_is_variadic && arg_count_min != arg_count_max )) {
-        ::die_of_func_prototype 'accepts both optional and variadic arguments'
     }
 
     #FIXME: Arguably shift everything below to a separate function.
@@ -689,153 +668,6 @@ function ::declare_func_stop_parse_args() {
     
     # Code validating the types of arguments passed to such function.
     local check_arg_types
-
-    #FIXME: Implement me as commented above. We'll likely want to:
-    #
-    #* Append all such code to string local ${func_preamble},
-    #  defined by the caller.
-    #* If such type:
-    #  * Matches glob ":string:(#b)([a-zA-Z0-9-_])", call
-    #    :die_unless_var_${match[1]}_of_cause().
-    #  * Matches glob ":(#b)([a-zA-Z0-9-_])", call
-    #    :die_unless_${match[1]}_of_cause(). Throw an exception
-    #    here if such exception handler does not exist.
-    #* How do we handle optional arguments? Right. By the above
-    #  guarantee, an argument list cannot contain both optional
-    #  and variadic arguments. Given that, if the current
-    #  argument is optional, simply assume no variadicity (on
-    #  good faith) and... What? Hmm; right. For now, since the
-    #  function will almost certainly be setting such optional
-    #  value to its default if unpassed, we'll probably want
-    #  to (within such appended code, of course):
-    #  * Test whether such argument was passed by checking the
-    #    number of passed arguments. That's easily enough
-    #    tested for functions with only one optional argument,
-    #    of course, but for functions accepting more than one,
-    #    the algorithm becomes a bit more complex. In any case,
-    #    we won't know the maximum number of arguments until
-    #    *AFTER* parsing, suggesting we'll probably want to
-    #    append to a list local for each optional argument
-    #    type (to be handled after iteration). Say, append the
-    #    name, type, and index of such argument as three
-    #    separate list items, then iterate such list
-    #    three-at-a-time? Seems tolerable enough.
-    #  * In any case, if such test implies such argument to
-    #    have been passed, validate such argument's type; else,
-    #    assume the default value the function itself supplies
-    #    to be of the correct type. (Sane assumption, in most
-    #    cases. Yay!)
-    #* Don't forget to handle variadic arguments! (Ugh.)
-    #  We'll probably only be able to handle type validation
-    #  for such arguments *AFTER* parsing all arguments and
-    #  hence determining how many (if any) arguments follow
-    #  such variadic list. Unctuous, but not infeasible. See
-    #  the discussion above for optional arguments. Probably a
-    #  similar post-iteration implementation, we should think.
-    #FIXME: Actually, for efficiency, perform low-level raw
-    #string indexing with hard-coded indices rather than
-    #capturing match groups with "(#b)" above. Happily, this
-    #also has the beneficial side-effect of preserving
-    #${match}, which may prove essential later.
-
-    #FIXME: Actually, the following iteration appears to be unnecessary. We can
-    #probably embed the following statement in the prior iteration:
-    #
-    #    arg_type_to_indices[${arg_type}]+=" ${arg_index}"
-    #
-    #However, to support optional and variadic arguments, we'll probably want
-    #to embed delimiting characters indicating the current argument index in
-    #the above string value to be either optional and variadic. For example,
-    #optional argument indices could be indicated as follows:
-    #
-    #    arg_type_to_indices[${arg_type}]+=" ${arg_index}?"
-    #
-    #Variadic argument indices could be indicated as follows:
-    #
-    #    arg_type_to_indices[${arg_type}]+=" ${arg_index}."
-    #
-    #Dead simple. Both time- and space-efficient to parse. So, let's do that.
-
-    # Construct code validation of such type to the string of all
-    # validation for such function.
-    local arg_index
-    for   arg_index arg_type arg_is_optional arg_is_variadic (
-        "${arg_index_to_state[@]}") {
-        #FIXME: How to implement optional and variadic argument indices? Hmm.
-        #
-        # [optiona]
-        # arg_min_count = 2
-        # arg_max_count = 4
-        # arg_optional_count = 2 = arg_max_count - arg_min_count
-        #
-        #   ? ?
-        # 1 2 3 4
-        # to check 2, this suffices: "(( # >= 3 ))"
-        # to check 3, this suffices: "(( # == 4 ))"
-        #
-        # [optiona]
-        # arg_min_count = 5
-        # arg_max_count = 5
-        # arg_optional_count = 0 = arg_max_count - arg_min_count
-        #
-        # {non-optional case}
-        # arg_max_count = 5
-        # #             = 9
-        # 1 2  3 4 5 6 7   8  9 (true indices in reality)
-        # 1 2  3           4  5 (fake indices here)
-        # 1 2 [3 4 5 ...] -2 -1 (desired indices to be rewritten to)
-        #
-        # {optional case}
-        # arg_max_count = 5
-        # 1 2  3           4  5
-        # 1 2 [3 4 5 ...] -2 -1
-        # ...hmm; looks the same as above, eh?
-        #
-        #If variadic argument present, all indices following such argument
-        #should be negative rather than positive. However, this can only be
-        #achieved *AFTER* parsing such arguments. To do so, we'll need to
-        #preserve the index of the variadic argument in the iteration above
-        #-- say, as ${arg_index_variadic_first}. Easily done, at least.
-        #
-        #Seems sensible, no?
-        #
-        #Of course, the above assumes such variadic argument to be nonoptional.
-        #If optional, things change somewhat -- not substantially, but they
-        #*DO* change. Contemplate.
-
-        # If such argument is optional, ...
-        if (( arg_is_optional )) {
-            true
-        # Else if such argument is variadic, ...
-        } elif (( arg_is_variadic )) {
-            # If such argument is mandatory, ...
-            if (( arg_count_max == arg_count_min )) {
-                true
-            # Else, such argument is optional.
-            } else {
-                true
-            }
-        # Else, such argument is mandatory.
-        } else {
-            true
-        }
-
-        # If such argument follows a variadic argument list, such argument
-        # cannot be reliably indexed by its positive index (i.e., relative to
-        # the start of such argument list). Since such argument can, however,
-        # be reliably indexed by its negative index (i.e., relative to the end
-        # of such argument list), replace the former with the latter.
-        #
-        # Happily, such conversion applies equally well regardless of whether
-        # such variadic argument is optional or mandatory.
-        if (( arg_index > arg_index_variadic_first )) {
-            arg_index=$(( arg_index - arg_count_max - 1 ))
-        }
-
-        # Append such argument's index to the space-delimited
-        # string of all indices with such argument's type.
-        arg_type_to_indices[${arg_type}]+=" ${arg_index}"
-    }
 
     # Name of the function validating the current argument type.
     local arg_type_tester
@@ -850,81 +682,239 @@ function ::declare_func_stop_parse_args() {
     # pointer indirection; the latter are customary arguments.
     integer arg_type_is_var_type
 
-    # For each pertinent argument type and corresponding space-delimited string
-    # of all indices of arguments of such type passed to such function,
-    # validate all such arguments to be of such type.
-    local        arg_indices
-    for arg_type arg_indices ("${(kv@)arg_type_to_indices}") {
-        # If such argument is a string referring to another variable's name,
-        # validate the latter to exist *AND* be of the expected type. For
-        # efficiency, match such type with hard-coded character indices rather
-        # than match groups (e.g., via ':string:'(#b)(*)).
-        if [[ "${arg_type}" == ':string:'* ]] {
-            arg_type_tester=':is_var_'${arg_type[9,-1]}
-            arg_type_is_var_type=1
-        # Else if such argument type is prefixed by ":", validate such argument
-        # to be of such type stripped of such prefix. 
-        } elif [[ "${arg_type}" == ':'${~operable_name_char_class} ]] {
-            arg_type_tester=':is_'${arg_type[2,-1]}
-            arg_type_is_var_type=0
-        # Else, validate such argument to be of such type.
-        } else {
-            arg_type_tester=':is_'${arg_type}
-            arg_type_is_var_type=0
-        }
+    #FIXME: Huzzah! We've uncovered an elegant way of implementing optional
+    #arguments: simply wrap *EVERYTHING* relating to argument type validation
+    #below in an outer loop resembling:
+    #
+    #integer arg_count
+    #for     arg_count ({${arg_count_min}..${arg_count_max}}) {
+    #    ...
+    #}
+    #
+    #*NOTHING* else changes. Given such structure, we intuit that there should
+    #be no need for dynamically declared map variables and such. Retaining the
+    #current logic and variables *SHOULD* suffice. "Hey, ho! Off and away we go."
 
-        # If such function does *NOT* exist, throw a custom exception.
-        :is_func "${arg_type_tester}" || ::die_of_func_prototype\
-            'argument type '${arg_type}' unrecognized (i.e., function '${arg_type_tester}'() not found)'
+    #FIXME: Document me.
+    integer arg_count
+    for     arg_count ({${arg_count_min}..${arg_count_max}}) {
+        #FIXME: Arguably, all interior logic here could be shifted into a new
+        #private utility function.
 
-        # Begin such validation by calling such function with such argument
-        # values. Ideally, such validation would pass such exception message
-        # directly to the appropriate exception handler (e.g.,
-        # :die_unless_var_int_of_cause()). In practice, however, such message
-        # depends on which argument failed such validation and hence can only be
-        # constructed *AFTER* finding such argument.
-        #
-        # Delimit each such index by '"${' and '}"' (e.g., convert "1 3 4" to
-        # '"${1}" "${3}" "${4}"). Such operation must *NOT* be double-quoted.
-        # See "README.dev" for further details. Dismantled, this is:
-        #
-        # * "=", splitting such indices on whitespace.
-        # * "(#m)*", capturing the current index to string global ${MATCH}.
-        check_arg_types+='
-    '${arg_type_tester}' '${${=arg_indices}//(#m)*/\"\${${MATCH}}\"}' || {
-        integer arg_index
-        for     arg_index ('${arg_indices}') {
-            '${arg_type_tester}' "${@[${arg_index}]}" || '
-        
-        # If such tester tests variable rather than value types, tailor such
-        # exception message to variable types. There exist two cases to
-        # distinguish here:
-        #
-        # 1. Such variable does not exist.
-        # 2. Such variable does exist but is of a different type.
-        if (( arg_type_is_var_type )) {
-            die_arg_var_type_prefix=':die "Function ${funcstack[1]}() expected argument ${arg_index} referencing variable of type '${arg_type[8,-1]}' but variable \$\{${@[${arg_index}]}\} '
+        # Construct code validation of such type to the string of all
+        # validation for such function.
+        local arg_index
+        for   arg_index arg_type arg_is_optional arg_is_variadic (
+            "${args_index_type_optional_variadic[@]}") {
+            #FIXME: How to implement optional and variadic argument indices? Hmm.
+            #
+            # [optiona]
+            # arg_min_count = 2
+            # arg_max_count = 4
+            # arg_optional_count = 2 = arg_max_count - arg_min_count
+            #
+            #   ? ?
+            # 1 2 3 4
+            # to check 2, this suffices: "(( # >= 3 ))"
+            # to check 3, this suffices: "(( # == 4 ))"
+            #
+            # [optiona]
+            # arg_min_count = 5
+            # arg_max_count = 5
+            # arg_optional_count = 0 = arg_max_count - arg_min_count
+            #
+            # {non-optional case}
+            # arg_max_count = 5
+            # #             = 9
+            # 1 2  3 4 5 6 7   8  9 (true indices in reality)
+            # 1 2  3           4  5 (fake indices here)
+            # 1 2 [3 4 5 ...] -2 -1 (desired indices to be rewritten to)
+            # 3-5-1=-3
+            #
+            # {optional case}
+            # arg_max_count = 5
+            # 1 2  3           4  5
+            # 1 2 [3 4 5 ...] -2 -1
+            # ...hmm; looks the same as above, eh?
+            #
+            #If variadic argument present, all indices following such argument
+            #should be negative rather than positive. However, this can only be
+            #achieved *AFTER* parsing such arguments. To do so, we'll need to
+            #preserve the index of the variadic argument in the iteration above
+            #-- say, as ${arg_index_variadic_first}. Easily done, at least.
+            #
+            #Seems sensible, no?
+            #
+            #Of course, the above assumes such variadic argument to be nonoptional.
+            #If optional, things change somewhat -- not substantially, but they
+            #*DO* change. Contemplate.
+            #FIXME: Right. Optional arguments are best handled by dynamically
+            #declaring argument count-specific variants of map
+            #${arg_type_to_indices}: e.g.,
+            #
+            # if (( arg_is_optional )) {
+            #     local args_list_name="arg_type_to_indices_if_args_${arg_index}_or_more"
+            #     local -A ${args_list_name}
+            #     ...
+            # }
+            #
+            #Actually, such lists should be declared by the prior iteration. Then
+            #test here whether "(( args_is_optional ))", implying at least one
+            #optional argument to exist. If this is the case, then *ALL*
+            #non-optional arguments preceding the first optional argument need to
+            #be appended to the appropriate key values of *ALL* such lists (since,
+            #of course, such non-optional arguments must be unconditionally
+            #validated regardless of how many arguments were passed).
 
-            #FIXME: The type printed above is a high-level zeshy-specific type;
-            #The type printed below is a low-level zsh-specific type.
-            #Naturally, the latter should be converted to the former.
-
-            check_arg_types+='{
-                if { :is_var } {
-                    '${die_arg_var_type_prefix}'has type ${(tP)@[${arg_index}]} and value:"$''\n''"${@[${arg_index}]}"
+            # If such argument is optional, ...
+            if (( arg_is_optional )) {
+                true
+            # Else if such argument is variadic, ...
+            } elif (( arg_is_variadic )) {
+                # If such argument is mandatory, index all arguments in the range
+                # of such variadic argument list, beginning with such positive
+                # index and ending with the negative index of the last argument in
+                # such list. See below for related logic.
+                if (( arg_count_max == arg_count_min )) {
+                    arg_index="@[${arg_index},"$(( arg_index - arg_count_max - 1 ))']'
+                # Else, such argument is optional.
                 } else {
-                    '${die_arg_var_type_prefix}'not found."
+                    #FIXME: Document me.
+                    args_map_name="arg_type_to_indices_if_args_${arg_count_max}_or_more"
+                    local -A ${args_map_name}
                 }
-            }'
-        # Else, tailor such exception message to value types.
-        } else {
-            check_arg_types+=':die "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_type}' but received:"$''\n''"${@[${arg_index}]}"'
+            # Else, such argument is mandatory.
+            #
+            # If such argument follows a variadic argument list, such argument
+            # cannot be reliably indexed by its positive index (i.e., relative to
+            # the start of such argument list). Since such argument can, however,
+            # be reliably indexed by its negative index (i.e., relative to the end
+            # of such argument list), replace the former with the latter.
+            #
+            # Since the negative sign "-" conflicts with parameter expansion
+            # syntax, negative indices may only be referenced by indexing canonical
+            # list global ${@} or ${argv} with such index.
+            #
+            # Happily, such conversion applies equally well regardless of whether
+            # such variadic argument is optional or mandatory.
+            } elif (( arg_index > arg_index_variadic_first )) {
+                arg_index='@['$(( arg_index - arg_count_max - 1 ))']'
+            }
+
+            # Append such argument's index to the space-delimited
+            # string of all indices with such argument's type.
+            arg_type_to_indices[${arg_type}]+=" ${arg_index}"
         }
 
-        # End such exception message and such validation.
-        check_arg_types+='$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}'
-    }
-}'
+        # For each pertinent argument type and corresponding space-delimited string
+        # of all indices of arguments of such type passed to such function,
+        # validate all such arguments to be of such type.
+        local        arg_indices
+        for arg_type arg_indices ("${(kv@)arg_type_to_indices}") {
+            # If such argument is a string referring to another variable's name,
+            # validate the latter to exist *AND* be of the expected type. For
+            # efficiency, match such type with hard-coded character indices rather
+            # than match groups (e.g., via ':string:'(#b)(*)).
+            if [[ "${arg_type}" == ':string:'* ]] {
+                arg_type_tester=':is_var_'${arg_type[9,-1]}
+                arg_type_is_var_type=1
+            # Else if such argument type is prefixed by ":", validate such argument
+            # to be of such type stripped of such prefix. 
+            } elif [[ "${arg_type}" == ':'${~operable_name_char_class} ]] {
+                arg_type_tester=':is_'${arg_type[2,-1]}
+                arg_type_is_var_type=0
+            # Else, validate such argument to be of such type.
+            } else {
+                arg_type_tester=':is_'${arg_type}
+                arg_type_is_var_type=0
+            }
+
+            # If such function does *NOT* exist, throw a custom exception.
+            :is_func "${arg_type_tester}" || ::die_of_func_prototype\
+                'argument type '${arg_type}' unrecognized (i.e., function '${arg_type_tester}'() not found)'
+
+            # Begin such validation by calling such function with such argument
+            # values. Ideally, such validation would pass such exception message
+            # directly to the appropriate exception handler (e.g.,
+            # :die_unless_var_int_of_cause()). In practice, however, such message
+            # depends on which argument failed such validation and hence can only be
+            # constructed *AFTER* finding such argument.
+            #
+            # Delimit each such index by '"${' and '}"' (e.g., convert "1 3 4" to
+            # '"${1}" "${3}" "${4}"). Such operation must *NOT* be double-quoted.
+            # See "README.dev" for further details. Dismantled, this is:
+            #
+            # * "=", splitting such indices on whitespace.
+            # * "(#m)*", capturing the current index to string global ${MATCH}.
+
+            #FIXME: Excissively verbose, particularly when replicated across
+            #*EVERY* single zeshy function. Encapsulate all functionality following
+            #the first "||" below with new exception handlers resembling
+            #::die_of_func_prototype(). However, such handlers should accept
+            #function names rather than prototypes; given the former, such handlers
+            #may losslessly obtain the latter by calling the corresponding setter.
+            #FIXME: O.K.; we've now drafted
+            #::die_unless_func_args_with_indices_pass_type_tester() below. Call
+            #such function here.
+
+            check_arg_types+='
+        '${arg_type_tester}' '${${=arg_indices}//(#m)*/\"\${${MATCH}}\"}' || {
+            # List of all argument indices to be tested. Unlike
+            # ${arg_indices_string}, such list consists only of integers.
+            local -a arg_indices
+
+            # Convert the passed list of 
+
+            # Iterate arguments by index until finding the first failing argument.
+            # Such indices encompass both index ranges (e.g., "@[3,-1]") and
+            # negative indices (e.g., "@[-1]" and hence are *NOT* strictly
+            # integers.
+            local arg_index
+            for   arg_index ('${arg_indices}') {
+                # Strip "@[" and "]" delimiters, if found.
+                arg_index="${${arg_index#@\[}%]}"
+
+                # If such index is comma-separated, split such index into two
+                # indices signifying an index range and iteratively test all
+                # arguments in such range.
+                if [[ "${arg_index}" == (#b)([^,]##),(*) ]] {
+                    for arg_index ({${match[1]}..${match[2]}}) {
+                        .
+                    }
+                # Else, such index is a single integer. Test such argument.
+                } else {
+                    '${arg_type_tester}' "${@[${arg_index}]}" || '
+            
+            # If such tester tests variable rather than value types, tailor such
+            # exception message to variable types. There exist two cases to
+            # distinguish here:
+            #
+            # 1. Such variable does not exist.
+            # 2. Such variable does exist but is of a different type.
+            if (( arg_type_is_var_type )) {
+                die_arg_var_type_prefix=':die "Function ${funcstack[1]}() expected argument ${arg_index} referencing variable of type '${arg_type[8,-1]}' but variable \$\{${@[${arg_index}]}\} '
+
+                #FIXME: The type printed above is a high-level zeshy-specific type;
+                #The type printed below is a low-level zsh-specific type.
+                #Naturally, the latter should be converted to the former.
+
+                check_arg_types+='{
+                    if { :is_var } {
+                        '${die_arg_var_type_prefix}'has type ${(tP)@[${arg_index}]} and value:"$''\n''"${@[${arg_index}]}"
+                    } else {
+                        '${die_arg_var_type_prefix}'not found."
+                    }
+                }'
+            # Else, tailor such exception message to value types.
+            } else {
+                check_arg_types+=':die "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_type}' but received:"$''\n''"${@[${arg_index}]}"'
+            }
+
+            # End such exception message and such validation.
+            check_arg_types+='$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}'
+        }
+    }'
+        }
     }
 
     # Substring prefixing argument count-specific exception messages.
@@ -932,6 +922,9 @@ function ::declare_func_stop_parse_args() {
 
     # Substring suffixing argument count-specific exception messages.
     local die_arg_count_suffix='."$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}'$''\n\n''"Arguments passed:"$''\n''"${*}"'
+
+    #FIXME: Excissively verbose, particularly when replicated across
+    #*EVERY* single zeshy function. See above for further details.
 
     # Validate the number of arguments passed to such function.
     #
@@ -961,6 +954,99 @@ function ::declare_func_stop_parse_args() {
 function ::die_of_func_prototype() {
     (( # == 1 )) || :die 'Expected one exception message.'
     :die 'Function '${ZESHY_DECLARE_FUNC_NAMES__[1]}'()'$(::get_parcel_preposition)' '${1}$':\n\n'${ZESHY_DECLARE_FUNC_PROTOTYPE__}
+}
+
+#FIXME: Call above.
+#FIXME: Document me.
+# :void ::die_unless_func_args_with_indices_pass_type_tester(
+#     :string:func func_name,
+#     :string func_arg1, ...,
+#     :string func_arg_indices,
+#     :string:func type_tester_name)
+function ::die_unless_func_args_pass_type_tester() {
+    # Validate sanity.
+    (( # >= 4 )) || :die\
+        'Expected one function name, one or more arguments, one argument indices string, and one type tester function name.'
+    local\
+        func_name="${1}"\
+        func_arg_indices="${@[-2]}"\
+        type_tester_name="${@[-1]}"\
+        func_prototype
+    :die_unless_func "${type_tester_name}"
+
+    # Shift and pop such arguments off. See shift_arg() and pop_args_2() for
+    # further details.
+    argv[1]=()
+    argv[-2,-1]=()
+
+    #FIXME: Definitely non-ideal. Such low-level details should be handled by a
+    #new setter managing such effluvia for us -- say,
+    #:set_string_to_func_prototype(),
+    #:set_string_to_global_prototype(), and so on. For now, just implement the
+    #former function. Should be readily doable, based on the logic below.
+
+    # Function prototype.
+    local func_prototype_setter_name="${ZESHY_HELP_SETTER_NAME_PREFIX}func_prototype:${func_name}"
+    :die_unless_func "${func_prototype_setter_name}"
+    "${func_prototype_setter_name}" func_prototype
+
+    # List of all argument indices to be tested. While the passed space-
+    # delimited string contains both integers and "@["- and "]"-delimited
+    # integers and ","-delimited innteger ranges, such list contains only
+    # integers.
+    local -a arg_indices
+
+    # Convert such space-delimited string to such list.
+    local arg_index
+    for   arg_index ('${arg_indices}') {
+
+    # Iterate arguments by index until finding the first failing argument.
+    # Such indices encompass both index ranges (e.g., "@[3,-1]") and
+    # negative indices (e.g., "@[-1]" and hence are *NOT* strictly
+    # integers.
+    local arg_index
+    for   arg_index ('${arg_indices}') {
+        # Strip "@[" and "]" delimiters, if found.
+        arg_index="${${arg_index#@\[}%]}"
+
+        # If such index is comma-separated, split such index into two
+        # indices signifying an index range and iteratively test all
+        # arguments in such range.
+        if [[ "${arg_index}" == (#b)([^,]##),(*) ]] {
+            for arg_index ({${match[1]}..${match[2]}}) {
+                .
+            }
+        # Else, such index is a single integer. Test such argument.
+        } else {
+            '${arg_type_tester}' "${@[${arg_index}]}" || '
+    
+    # If such tester tests variable rather than value types, tailor such
+    # exception message to variable types. There exist two cases to
+    # distinguish here:
+    #
+    # 1. Such variable does not exist.
+    # 2. Such variable does exist but is of a different type.
+    if (( arg_type_is_var_type )) {
+        die_arg_var_type_prefix=':die "Function ${funcstack[1]}() expected argument ${arg_index} referencing variable of type '${arg_type[8,-1]}' but variable \$\{${@[${arg_index}]}\} '
+
+        #FIXME: The type printed above is a high-level zeshy-specific type;
+        #The type printed below is a low-level zsh-specific type.
+        #Naturally, the latter should be converted to the former.
+
+        check_arg_types+='{
+            if { :is_var } {
+                '${die_arg_var_type_prefix}'has type ${(tP)@[${arg_index}]} and value:"$''\n''"${@[${arg_index}]}"'
+            } else {
+                '${die_arg_var_type_prefix}'not found."
+            }
+        }'
+    # Else, tailor such exception message to value types.
+    } else {
+        check_arg_types+=':die "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_type}' but received:"$''\n''"${@[${arg_index}]}"'
+    }
+
+    # End such exception message and such validation.
+    check_arg_types+='$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}
 }
 
 #FIXME: In liue of unit tests...
@@ -1091,6 +1177,145 @@ function declare_function_with_stdin() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: Document me, if still used.
+    # local args_map_name
+
+    #FUXME: Actually, the following iteration appears to be unnecessary. We can
+    #probably embed the following statement in the prior iteration:
+    #
+    #    arg_type_to_indices[${arg_type}]+=" ${arg_index}"
+    #
+    #However, to support optional and variadic arguments, we'll probably want
+    #to embed delimiting characters indicating the current argument index in
+    #the above string value to be either optional and variadic. For example,
+    #optional argument indices could be indicated as follows:
+    #
+    #    arg_type_to_indices[${arg_type}]+=" ${arg_index}?"
+    #
+    #Variadic argument indices could be indicated as follows:
+    #
+    #    arg_type_to_indices[${arg_type}]+=" ${arg_index}."
+    #
+    #Dead simple. Both time- and space-efficient to parse. So, let's do that.
+
+    #FUXME: Implement me as commented above. We'll likely want to:
+    #
+    #* Append all such code to string local ${func_preamble},
+    #  defined by the caller.
+    #* If such type:
+    #  * Matches glob ":string:(#b)([a-zA-Z0-9-_])", call
+    #    :die_unless_var_${match[1]}_of_cause().
+    #  * Matches glob ":(#b)([a-zA-Z0-9-_])", call
+    #    :die_unless_${match[1]}_of_cause(). Throw an exception
+    #    here if such exception handler does not exist.
+    #* How do we handle optional arguments? Right. By the above
+    #  guarantee, an argument list cannot contain both optional
+    #  and variadic arguments. Given that, if the current
+    #  argument is optional, simply assume no variadicity (on
+    #  good faith) and... What? Hmm; right. For now, since the
+    #  function will almost certainly be setting such optional
+    #  value to its default if unpassed, we'll probably want
+    #  to (within such appended code, of course):
+    #  * Test whether such argument was passed by checking the
+    #    number of passed arguments. That's easily enough
+    #    tested for functions with only one optional argument,
+    #    of course, but for functions accepting more than one,
+    #    the algorithm becomes a bit more complex. In any case,
+    #    we won't know the maximum number of arguments until
+    #    *AFTER* parsing, suggesting we'll probably want to
+    #    append to a list local for each optional argument
+    #    type (to be handled after iteration). Say, append the
+    #    name, type, and index of such argument as three
+    #    separate list items, then iterate such list
+    #    three-at-a-time? Seems tolerable enough.
+    #  * In any case, if such test implies such argument to
+    #    have been passed, validate such argument's type; else,
+    #    assume the default value the function itself supplies
+    #    to be of the correct type. (Sane assumption, in most
+    #    cases. Yay!)
+    #* Don't forget to handle variadic arguments! (Ugh.)
+    #  We'll probably only be able to handle type validation
+    #  for such arguments *AFTER* parsing all arguments and
+    #  hence determining how many (if any) arguments follow
+    #  such variadic list. Unctuous, but not infeasible. See
+    #  the discussion above for optional arguments. Probably a
+    #  similar post-iteration implementation, we should think.
+    #FUXME: Actually, for efficiency, perform low-level raw
+    #string indexing with hard-coded indices rather than
+    #capturing match groups with "(#b)" above. Happily, this
+    #also has the beneficial side-effect of preserving
+    #${match}, which may prove essential later.
+
+                    #FUXME: Obsolete.
+                    # # if such argument is variadic, note such fact.
+                    # if (( arg_is_variadic )) {
+                    #     args_index_type_optional_variadic+=( "${arg_max_count}" 1 0 )
+                    # # Else if such argument is optional, note such fact.
+                    # } elif (( arg_is_optional )) {
+                    #     args_index_type_optional_variadic+=( "${arg_max_count}" 0 1 )
+                    # }
+
+            # If such argument is optional, note such function to accept at
+            # least one optional argument. Perform such test *AFTER* the
+            # variadic-specific logic above possibly adjusts such boolean.
+            # if (( arg_is_optional )) {
+            #     args_is_optional=1
+            # }
+
+                # If such argument is both variadic *AND* optional, ignore the
+                # latter fact. This barefaced kludge prevents validation below
+                # from throwing an exception due to such function accepting
+                # both variadic and optional arguments. In general, there
+                # exists no reliable means of distinguishing such arguments
+                # apart, constituting a fatal error. In this case, however,
+                # assuming the variadic argument to also be the only optional
+                # argument, there exists no conflict between the two, in which
+                # case condition is genuinely ignorable.
+                # if (( arg_is_optional )) {
+                #     arg_is_optional=0
+                # }
+
+ # For
+                # simplicity, print only the first function name in such
+                # exception message.
+    #FUXME: Utterly horrid. Good God; the hacks we employed both here and
+    #above. Excise this away by returning to what we had before: just perform
+    #such test twice, once when the current argument is variadic and  once when
+    #the current argument is optional. Dramatically more elegant. *sigh*
+
+    # If such function accepts both optional and variadic arguments, there
+    # exists no general-purpose means of distinguishing the two for *ANY*
+    # purposes (let alone for argument validation coded below). Since this
+    # signifies a fatal error, throw an exception.
+    #
+    # We maintain booleans for tracking whether such function accepts variadic
+    # but *NOT* optional arguments. Happily, testing whether the minimum and
+    # maximum number of arguments such function accepts suffices to test
+    # whether such function accepts optional arguments.
+    #
+    # While such test *COULD* be tested for above with multiple discrete tests
+    # (e.g., if the current argument is optional, testing for prior variadic
+    # arguments, and the inverse if the current argument is variadic), the
+    # current approach is considerably more intelligible.
+    # if (( args_is_variadic && arg_count_min != arg_count_max )) {
+    #     ::die_of_func_prototype 'accepts both optional and variadic arguments'
+    # }
+
+# arg_index_start arg_index_end
+            # Test such argument(s).
+
+                # args_map_name="args_index_type_optional_variadic_if_args_${arg_count_max}_or_more"
+    #FUXME: Documentation unsurprisingly obsolete, as is this list's name.
+    #Resurrect the prior list's name and documentation from the wastelands.
+
+    # Map from argument index to a character signifying optional metadata
+    # associated with such argument:
+    #
+    # * "?", signifying such argument to be optional.
+    # * ".", signifying such argument to be variadic.
+
+#, each
+    # item of whuch signifies the expected :
         #FUXME: Hmm; such operation works, but how and where? Well, we suppose
         #we'll need to shift back such map appending back here. *sigh*
 
@@ -1102,7 +1327,7 @@ function declare_function_with_stdin() {
 
         #FUXME: We need to strip "?" and "." characters optionally suffixing
         #such indices from such string of indices prior to munging it below.
-        # arg_index_to_state.
+        # args_index_type_optional_variadic.
 
     #FUXME: Obsolete.
     # List of argument-specific metadata for all arguments with types other
@@ -1131,9 +1356,9 @@ function declare_function_with_stdin() {
                     #the following be preferable:
                     #
                     # if (( arg_is_optional )) {
-                    #     arg_index_to_state[${arg_index}]='?'
+                    #     args_index_type_optional_variadic[${arg_index}]='?'
                     # } elif (( arg_is_variadic )) {
-                    #     arg_index_to_state[${arg_index}]='.'
+                    #     args_index_type_optional_variadic[${arg_index}]='.'
                     # }
                     #
                     #Then, just efficiently check such list item below. That
