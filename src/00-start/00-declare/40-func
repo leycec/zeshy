@@ -137,6 +137,8 @@ defining, other functions).
 #    :void my_func(^:string my_string, :int my_int)
 #    :void my_func(&:string my_string, :int my_int)
 #    :void my_func(|:string my_string, :int my_int)
+#    :void my_func(\:string my_string, :int my_int)
+#    :void my_func(/:string my_string, :int my_int)
 #    :void my_func(@:string my_string, :int my_int)
 #    :void my_func(>:string my_string, :int my_int)
 #    :void my_func(<:string my_string, :int my_int)
@@ -185,6 +187,59 @@ defining, other functions).
 #in math jargon to denote derivative variables, which localized variables
 #arguably are. Wow! There's a fairly compelling justification, if ever we heard
 #one. And we've heard a few now.
+#FIXME: After deep and reasonably lengthy contemplation, we've decided upon a
+#syntactic technique hereafter referred to as "relaxation directives" --
+#each consisting of the same single character and prefixing the syntactic
+#element they "relax." What do we mean "relax"? Simple: they instruct our
+#parser to relax what it would customarily do and *NOT* do that thing. To
+#prevent semantic ambiguity and simplify lexical parsing (e.g., with the "?"
+#suffixing argument names), all relaxation directives *PREFIX* their syntactic
+#element. Horever, we haven't quite fixed upon a character; examples include:
+#
+#    :void my_func(`:string `my_string `= 'yumyum', :int my_int)
+#    :void my_func(^:string ^my_string ^= 'yumyum', :int my_int)
+#    :void my_func(*:string *my_string *= 'yumyum', :int my_int)
+#    :void my_func(?:string ?my_string ?= 'yumyum', :int my_int)
+#    :void my_func(/:string /my_string /= 'yumyum', :int my_int)
+#    :void my_func(|:string |my_string |= 'yumyum', :int my_int)
+#    :void my_func(%:string %my_string %= 'yumyum', :int my_int)
+#    :void my_func(#:string #my_string #= 'yumyum', :int my_int)
+#    :void my_func(~:string ~my_string ~= 'yumyum', :int my_int)
+#    :void my_func(!:string !my_string != 'yumyum', :int my_int)
+#
+#While "!" is nice, when used with "!=", it implies a negative constraint
+#(e.g., that such function throws an exception if such argument equals such
+#string). Hence, prefer something else.
+#
+#O.K.; "*" is probably the most compelling prefix character. In PCREs, such
+#character implies "0 or more"; here, it simply implies "0". Hmmm... Right.
+#That's not quite aligned at all, is it?
+#
+#O.K.; "`" really remains an extraordinarily compelling choice here. A few
+#meager reasons why:
+#
+#* It's probably the most aesthetically unobtrusive choice. Which is exactly
+#  what we we want in this case, since relaxation directives are more-or-less
+#  internal optimization concerns of negligible concern to end users.
+#* It's also the most syntactically unobtrusive choice. We don't use "`"
+#  anywhere within the codebase, leaving such character free for use here.
+#* It's an appropriate prefix.
+#
+#And there you have it.
+#
+#That said, "^" remains a compelling choice as well, for similar reasons and
+#due to implying "not" or "negation" somewhat more clearly than "`" due to its
+#association with binary XOR operations. (Actually, that clearly has nothing to
+#do with negation, so ignore that one.)
+#
+#Hmm. Nah; "^" is somewhat too loud and already used extensively in the
+#codebase for alternative purposes. Let's run with "`"!
+#FIXME: Implementing the above change requires another run-through the
+#codebase, replacing existing usage of "?" with "`". Not a significant concern,
+#of course, so we'll need to run-through anyway to implement delocalization.
+#So, when we're at the point where we're ready to delocalize, also implement
+#the above. Yeah: yay!
+
 #FIXME: As an aside, it *IS* feasible to reliably localize strings indirectly
 #referring to variable names. Just employ a new "{"- and "}"-delimited syntax,
 #inspired by CLI aliases: e.g.,
@@ -766,16 +821,26 @@ function ::declare_func_stop_parse_args() {
             arg_type_to_indices[${arg_type}]+=" ${arg_index}"
         }
 
-        #FIXME: Document me.
+        # If such function accepts at least one optional argument, subsequent
+        # argument type validation assumes such function's caller passed the
+        # current number of arguments. Prefix such validation by an if
+        # conditional guaranteeing such assumption.
         if (( args_is_optional )) {
             check_arg_types+=$'\n''    '
 
+            # If passed the minimum number of arguments, start such if
+            # conditional. (While we could just as well invert such logic,
+            # such logic is optimized for the presumably common case of the
+            # caller *NOT* passing optional arguments.)
             if (( arg_count == arg_count_min )) {
                 check_arg_types+='if (( # == '${arg_count}' )) {'
+            # Else if passed the maximum number of arguments, end such if
+            # conditional.
             } elif (( arg_count == arg_count_max )) {
-                check_arg_types+='else {'
+                check_arg_types+='} else {'
+            # Else, extend such if conditional.
             } else {
-                check_arg_types+='elif (( # == '${arg_count}' )) {'
+                check_arg_types+='} elif (( # == '${arg_count}' )) {'
             }
         }
 
@@ -834,7 +899,7 @@ function ::declare_func_stop_parse_args() {
             #mention simplifying everything a tad.
 
             check_arg_types+='
-        '${arg_type_tester}' '${${=arg_indices}//(#m)*/\"\${${MATCH}}\"}' || {
+        '${arg_type_tester}' '${arg_indices}' || {
             # List of all argument indices to be tested. Unlike
             # ${arg_indices_string}, such list consists only of integers.
             local -a arg_indices
@@ -952,84 +1017,82 @@ function ::die_unless_func_args_pass_type_tester() {
         'Expected one function name, one or more arguments, one argument indices string, and one type tester function name.'
     local\
         func_name="${1}"\
-        func_arg_indices="${@[-2]}"\
-        type_tester_name="${@[-1]}"\
+        arg_indices_string="${@[-2]}"\
+        arg_type_tester_name="${@[-1]}"\
         func_prototype
-    :die_unless_func "${type_tester_name}"
+    :die_unless_func "${arg_type_tester_name}"
 
     # Shift and pop such arguments off. See shift_arg() and pop_args_2() for
     # further details.
     argv[1]=()
     argv[-2,-1]=()
 
-    #FIXME: Definitely non-ideal. Such low-level details should be handled by a
-    #new setter managing such effluvia for us -- say,
-    #:set_string_to_func_prototype(),
-    #:set_string_to_global_prototype(), and so on. For now, just implement the
-    #former function. Should be readily doable, based on the logic below.
-
-    # Function prototype.
-    local func_prototype_setter_name="${ZESHY_HELP_SETTER_NAME_PREFIX}func_prototype:${func_name}"
-    :die_unless_func "${func_prototype_setter_name}"
-    "${func_prototype_setter_name}" func_prototype
-
     # List of all argument indices to be tested. While the passed space-
-    # delimited string contains both integers and "@["- and "]"-delimited
-    # integers and ","-delimited innteger ranges, such list contains only
-    # integers.
+    # delimited string contains only "@["- and "]"-delimited integers and
+    # innteger ranges, this list contains only actual integers.
     local -a arg_indices
 
-    # Convert such space-delimited string to such list.
-    local arg_index
-    for   arg_index ('${arg_indices}') {
+    # Get such function's prototype.
+    :set_string_to_func_prototype func_prototype "${func_name}"
+
+    # Convert such space-delimited string to such list. Dismantled, this is:
+    # 
+    # * 
+    local arg_index_string
+    for   arg_index_string (${(z)arg_indices_string}) {
+        # Strip such string of "${@[" and "]}" delimiters.
+        arg_index_string="${${arg_index#\$\{@\[}%]\}}"
+
+        # If the result is comma-separated, such result signifies a range of
+        # argument indices. Append all such indices to such list.
+        if [[ "${arg_index_string}" == (#b)([^,]##),(*) ]] {
+            arg_indices+=( {${match[1]}..${match[2]}} )
+        # Else, such result is a single index. Append such index to such list.
+        } else {
+            arg_indices+=${arg_index_string}
+        }
+    }
 
     # Iterate arguments by index until finding the first failing argument.
     # Such indices encompass both index ranges (e.g., "@[3,-1]") and
     # negative indices (e.g., "@[-1]" and hence are *NOT* strictly
     # integers.
     local arg_index
-    for   arg_index ('${arg_indices}') {
-        # Strip "@[" and "]" delimiters, if found.
-        arg_index="${${arg_index#@\[}%]}"
+    for   arg_index ("${arg_indices}") {
+        # Ensure such argument index actually is.
+        :die_unless_int "${arg_index}"
 
-        # If such index is comma-separated, split such index into two
-        # indices signifying an index range and iteratively test all
-        # arguments in such range.
-        if [[ "${arg_index}" == (#b)([^,]##),(*) ]] {
-            for arg_index ({${match[1]}..${match[2]}}) {
-                .
-            }
-        # Else, such index is a single integer. Test such argument.
-        } else {
-            '${arg_type_tester}' "${@[${arg_index}]}" || '
-    
-    # If such tester tests variable rather than value types, tailor such
-    # exception message to variable types. There exist two cases to
-    # distinguish here:
-    #
-    # 1. Such variable does not exist.
-    # 2. Such variable does exist but is of a different type.
-    if (( arg_type_is_var_type )) {
-        die_arg_var_type_prefix=':die "Function ${funcstack[1]}() expected argument ${arg_index} referencing variable of type '${arg_type[8,-1]}' but variable \$\{${@[${arg_index}]}\} '
+        # Test such argument.
+        "${arg_type_tester_name}" "${@[${arg_index}]}" || {
+            # If such tester tests variable rather than value types, tailor such
+            # exception message to variable types. There exist two cases to
+            # distinguish here:
+            #
+            # 1. Such variable does not exist.
+            # 2. Such variable does exist but is of a different type.
+            if [[ "${arg_type_tester_name}" == ':is_var_'* ]] {
+                die_arg_var_type_prefix=':die "Function ${funcstack[1]}() expected argument ${arg_index} referencing variable of type '${arg_type[8,-1]}' but variable \$\{${@[${arg_index}]}\} '
 
-        #FIXME: The type printed above is a high-level zeshy-specific type;
-        #The type printed below is a low-level zsh-specific type.
-        #Naturally, the latter should be converted to the former.
+                #FIXME: The type printed above is a high-level zeshy-specific type;
+                #The type printed below is a low-level zsh-specific type.
+                #Naturally, the latter should be converted to the former.
 
-        check_arg_types+='{
-            if { :is_var } {
-                '${die_arg_var_type_prefix}'has type ${(tP)@[${arg_index}]} and value:"$''\n''"${@[${arg_index}]}"'
+                check_arg_types+='{
+                    if { :is_var } {
+                        '${die_arg_var_type_prefix}'has type ${(tP)@[${arg_index}]} and value:"$''\n''"${@[${arg_index}]}"'
+                    } else {
+                        '${die_arg_var_type_prefix}'not found."
+                    }
+                }'
+            # Else, tailor such exception message to value types.
             } else {
-                '${die_arg_var_type_prefix}'not found."
+                check_arg_types+=':die "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_type}' but received:"$''\n''"${@[${arg_index}]}"'
             }
-        }'
-    # Else, tailor such exception message to value types.
-    } else {
-        check_arg_types+=':die "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_type}' but received:"$''\n''"${@[${arg_index}]}"'
-    }
 
-    # End such exception message and such validation.
-    check_arg_types+='$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}
+            # End such exception message and such validation.
+            check_arg_types+='$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}"
+        }
+    }
 }
 
 #FIXME: In liue of unit tests...
@@ -1160,6 +1223,33 @@ function declare_function_with_stdin() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+        # Strip "@[" and "]" delimiters, if found.
+        # arg_index="${${arg_index#@\[}%]}"
+
+        # # If such index is comma-separated, split such index into two
+        # # indices signifying an index range and iteratively test all
+        # # arguments in such range.
+        # if [[ "${arg_index}" == (#b)([^,]##),(*) ]] {
+        #     for arg_index ({${match[1]}..${match[2]}}) {
+        #         .
+        #     }
+        # # Else, such index is a single integer. Test such argument.
+        # } else {
+
+    #FUXME: Definitely non-ideal. Such low-level details should be handled by a
+    #new setter managing such effluvia for us -- say,
+    #:set_string_to_func_prototype(),
+    #:set_string_to_global_prototype(), and so on. For now, just implement the
+    #former function. Should be readily doable, based on the logic below.
+    # local func_prototype_setter_name="${ZESHY_HELP_SETTER_NAME_PREFIX}func_prototype:${func_name}"
+    # :die_unless_func "${func_prototype_setter_name}"
+    # "${func_prototype_setter_name}" func_prototype
+
+        #     check_arg_types+='
+        # '${arg_type_tester}' '${${=arg_indices}//(#m)*/\"\${${MATCH}}\"}' || {
+
+ # enabling such validation only if the caller passed the
+        # current number of arguments.
     # 1 if the current argument type is a variable type (i.e., the type of the
     # variable to which such argument's value refers, such as ":string:int")
     # and 0 if such type is a value type (i.e., the type of such argument's
