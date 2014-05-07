@@ -687,7 +687,6 @@ function ::declare_func_stop() {
     # Validate sanity.
     (( ! # )) || :die 'Expected no arguments.'
     local func_preamble
-    integer arg_count_min=0 arg_count_max=0
 
     # If any such variable is either undefined or of unexpected type, throw an
     # exception. See :die_unless_var_string(), :die_unless_var_map(), and
@@ -786,33 +785,6 @@ function ::declare_func_stop_parse_args() {
     # Validate sanity.
     (( ! # )) || :die 'Expected no arguments.'
 
-    # List of argument-specific metadata for all arguments whose types are to
-    # be programmatically validated (excluding of type ":string", requiring no
-    # such validation). Such validation typically depends on the maximum number
-    # of arguments accepted by such function, a quantity available only *AFTER*
-    # parsing all such arguments. Such parsing thus appends this list by such
-    # metadata, which post-parsing then converts into such validation. Such
-    # metadata comprises a conceptual 4-tuple
-    # (${arg_index} ${arg_type} ${arg_is_optional} ${arg_is_variadic}).
-    local -a args_index_type_optional_variadic
-
-    # Map from argument type to a space-delimited string of the indices of all
-    # arguments of such type.
-    local -A arg_type_to_indices
-
-    # 1 if the current argument is optional and 0 otherwise.
-    integer arg_is_optional
-
-    # 1 if the current argument is variadic and 0 otherwise.
-    integer arg_is_variadic
-
-    # 1 if such function accepts at least one optional argument and 0
-    # otherwise.
-    integer args_is_optional=0
-
-    # 1 if such function accepts one variadic argument list and 0 otherwise.
-    integer args_is_variadic=0
-
     #FIXME: Replace with the equivalent globals declared above.
 
     # Human-readable names of canonical list global ${match} indices. While
@@ -859,180 +831,88 @@ function ::declare_func_stop_parse_args() {
     # argument and hence function to be variadic.
     integer -r arg_match_index_is_variadic=8
 
-    # If such argument string is *NOT* the empty string, such function accepts
-    # at least one argument. In such case, parse such arguments.
-    if [[ -n "${ZESHY_DECLARE_FUNC_ARGS__}" ]] {
-        # Compile such PCRE. For efficiency, avoid optionally optimizing such
-        # PCRE by calling pcre_study(). (Ad-hoc profiling suggests such
-        # optimization to consume more time than it saves.) See
-        # for_string_text_matching_pcre:() for further details.
-        pcre_compile -- "${ZESHY_PROTOTYPE_RUNNABLE_ARGS_NEXT_PCRE}"
-        # print -r "${ZESHY_DECLARE_FUNC_NAMES__[1]} args: ${ZESHY_DECLARE_FUNC_ARGS__}"
+    # Parse the minimum and maximum number of arguments such function accepts
+    # *BEFORE* parsing such arguments. All reasonably sane implementations of
+    # argument parsing require such numbers (e.g., to reliably index and expand
+    # optional and variadic arguments and arguments following such arguments).
+    #
+    # Superficially, this appears to necessitate two parse passes over the
+    # argument list: the first pass obtaining such numbers and the second pass
+    # actually parsing such arguments. In practice, however, careful choices in
+    # runnable prototype syntax reduce the first pass to efficient string
+    # munging operations requiring *NO* explicit iteration. Indeed, note that:
+    #
+    # * Omitting single- and double-quoted strings, each "," in an argument
+    #   list suggests such function to accept one more mandatory argument.
+    # * Omitting single- and double-quoted strings, each "?" and "=" in an
+    #   argument list suggests such function to accept one more optional
+    #   argument.
+    # * Each mandatory argument increases the maximum number of arguments such
+    #   function accepts by one.
+    # * Each optional argument reduces the minimum number of arguments such
+    #   function accepts by one.
+    #
+    # Efficiently determining such numbers thus reduces to counting the number
+    # of unquoted ",", "?", and "=" characters in such argument list.
+    #
+    # Unfortunately, while such determination *IS* demonstrably efficient,
+    # conforming to the algorithm implemented below requires reparsing the
+    # argument list once for each optional (but *NOT* variadic) argument such
+    # function accepts. (Why? Because each additional optional argument implies
+    # such function to accept one additional possible number of arguments and
+    # each such number necessitates distinct code validation and hence
+    # algorithmic handling here.)
+    #
+    # Unfortunately, eliminating such reparsing would require persisting a list
+    # of argument metadata during the first and only pass for subsequent lookup
+    # (as detailed below), itself imposing non-negligible inefficiencies. The
+    # question then reduces to: which is less efficient, reparsing each
+    # argument multiple times or parsing such arguments into a list only once?
+    #
+    # To answer this question, consider the common case. If most or even many
+    # zeshy functions accepted optional arguments and hence required such
+    # reparsing, such reparsing would indeed be non-ideal. In practice, few
+    # zeshy functions accept optional arguments (due to readability and
+    # writability concerns associated with such arguments). Since the common
+    # case imposes no argument reparsing, reparsing poses no imposition.
+    #
+    # Note that the above two parse passes are technically invertable by
+    # parsing all arguments into a list of all argument in the first pass and
+    # iterating over such list in the second. In practice, the infrastructure
+    # required by such iteration imposes significant space and time costs.
+    #
+    # For example, consider the following "inverted" implementation:
+    #
+    #    local -a args_metadata
+    #    while {
+    #        pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY_DECLARE_FUNC_ARGS__}"
+    #    } {
+    #        ...
+    #        args_metadata+=(
+    #            "${arg_count_max}"
+    #            "${match[${arg_match_index_type}]}"
+    #            "${arg_is_optional}"
+    #            "${arg_is_variadic}" )
+    #    }
 
-        # Parse each such argument into canonical list global ${match}, whose
-        # indices we localize as human-readable integers above.
-        local ZPCRE_OP='0 0'
-        while {
-            pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY_DECLARE_FUNC_ARGS__}"
-        } {
-            # Since the current argument may (but not necessarily) be passed,
-            # increment the maximum argument count.
-            arg_count_max+=1
+    #    for arg_count ({${arg_count_min}..${arg_count_max}}) {
+    #        ...
+    #        for arg_index arg_type arg_is_optional arg_is_variadic (
+    #            "${args_metadata[@]}") {
+    #            ...
+    #        }
+    #        ...
+    #    }
 
-            # If such argument is *NOT* variadic (i.e., was *NOT* suffixed by
-            # an ellipse), note such fact. Test this condition *BEFORE* testing
-            # whether such argument is optional, to prevent the latter's
-            # enabling of boolean ${args_is_optional} when such argument is
-            # both variadic and optional from triggering an exception here.
-            if [[ -z "${match[${arg_match_index_is_variadic}]-}" ]] {
-                arg_is_variadic=0
-            # Else, such argument is variadic.
-            #
-            # If a prior argument is optional, throw an exception. Such case
-            # implies such function to accept one or more optional arguments
-            # *AND* one or more variadic argument lists of arbitrary count,
-            # implying there exists no general means of deciding which such
-            # argument a passed string was intended to correspond to.
-            } elif (( args_is_optional )) {
-                ::die_of_func_prototype\
-                    'accepts both optional and variadic arguments'
-            # If a prior argument is also variadic, throw an exception.  Such
-            # case implies such function to accept two or more variadic
-            # argument lists of arbitrary count, implying there exists no
-            # general means of deciding which such list a passed string was
-            # intended to belong to.
-            } elif (( args_is_variadic )) {
-                ::die_of_func_prototype\
-                    'accepts two or more variadic argument lists'
-            # Else, such argument is validly variadic. Note such fact and such
-            # function to accept one variadic argument list.
-            } else {
-                arg_is_variadic=1
-                args_is_variadic=1
-            }
-
-            # If such argument is mandatory (i.e., was neither suffixed by an
-            # eroteme *OR* a default value), note such fact and increment the
-            # minimum argument count.
-            if [[ -z "${match[${arg_match_index_is_optional}]-}${match[${arg_match_index_value}]-}" ]] {
-                arg_is_optional=0
-                arg_count_min+=1
-            # Else, such argument is optional.
-            #
-            # If such argument is suffixed by both an eroteme *AND* default
-            # value, throw an exception. While either implies such argument to
-            # be optional, each implies distinct, conflicting semantics.
-            } elif [[\
-                -z "${match[${arg_match_index_is_optional}]-}" ||
-                -z "${match[${arg_match_index_value}]-}" ]] ||\
-               ::die_of_func_prototype\
-                   'argument '${match[arg_match_index_name]}' suffixed by both "?" and "="'
-            # If a prior argument is also variadic, throw an exception,
-            # explicitly ignoring the valid case that the current argument is
-            # both variadic and optional. See above for further details.
-            } elif (( args_is_variadic && ! arg_is_variadic )) {
-                ::die_of_func_prototype\
-                    'accepts both optional and variadic arguments'
-            # Else, such argument is validly optional. Note such fac and such
-            # function to accept at least one optional argument.
-            } else {
-                arg_is_optional=1
-                args_is_optional=1
-            }
-
-            #FIXME: Generalize to support localization as well. Since
-            #localization and validation share the same ultimate desires here
-            #(namely, appending to list ${args_index_type_optional_variadic}),
-            #this would probably be simplified by logic resembling:
-            #
-            #    arg_type_is_validated=$((
-            #        ${#match[${arg_match_index_type_is_unvalidated}]} ))
-            #    arg_is_localized=$((
-            #        1 - ${#match[${arg_match_index_is_unlocalized}]} ))
-            #
-            #    if (( arg_type_is_validated || arg_is_localized )) {
-            #        args_metadata+=(
-            #            "${arg_count_max}"
-            #            "${match[${arg_match_index_name}]}"
-            #            "${match[${arg_match_index_type}]}"
-            #            "${arg_is_optional}"
-            #            "${arg_is_variadic}"
-            #            "${arg_is_localized}"
-            #            "${arg_type_is_validated}"
-            #        )
-            #    }
-            #
-            #As the above example implies, rename such list local to simply
-            #${args_metadata}. (Judicious.)
-            #
-            #Reasonably clever; no extraneous if conditionals required. Wait;
-            #the first doesn't quite work, as we need to prevent validation of
-            #":string" types. So:
-            #
-            #    if [[ -z "${match[${arg_match_index_type_is_unvalidated}]}" &&
-            #             "${match[${arg_match_index_type}]}" != ':string' ]] {
-            #        arg_type_is_validated=1
-            #    } else {
-            #        arg_type_is_validated=0
-            #    }
-            #FIXME: Actually, ${args_index_type_optional_variadic} is hideous.
-            #We can obviate both such list *AND* the following iteration
-            #requiring such list by instead appending directly to keys of map
-            #${arg_type_to_indices} here. To do so sanely, however, we *NEED*
-            #to know the maximum number of arguments. We can accomplish this by
-            #parsing such argument list twice: once without grouping and
-            #optimized so as to match only unquoted "," as significant for
-            #argument counting purposes, and the second actually parsing each
-            #argument. However, to conform to the algorithm implemented below,
-            #we would need to reperform such second round of argument parsing
-            #a number of times equal to the number of optional arguments
-            #accepted by such function.
-            #
-            #While such reparsing would be nonideal if the common case in zeshy
-            #were functions accepting numerous optional arguments, the actual
-            #common case in zeshy is the opposite: functions accepting at most
-            #one (and typically no) optional arguments. Given that, there will
-            #be *NO* reparsing in the common case. Indeed, such an approach
-            #should dramatically improve the efficiency of the common case by
-            #eliminating the need both to append an excrutiating number of
-            #strings to list ${args_index_type_optional_variadic} *AND* to
-            #iterate over such list.
-            #
-            #Note as well that the first parse can be dramatically optimized by
-            #matching with a different (and hopefully much simplified) PCRE:
-            #one performing no grouping and effectively matching only single-
-            #and double-quoted strings (to ignore the nonsignificant commas
-            #embedded in such strings) *AND* commas outside of such strings.
-            #Indeed, such PCRE needn't actually match any argument syntax or
-            #structure, since the following parse pass will do so already.
-            #
-            #But it's *NOT* simply efficiency, though that is a dreaded
-            #concern: it's elegance, or the lack thereof. The current approach
-            #is horribly inelegant, requiring ever more strings be continually
-            #appended to and parsed from such list. Let's do away with too fell
-            #birds by one bright stone, shall we?
-
-            # If such argument's type is *NOT* to be ignored (i.e., is to be
-            # validated), validate such type. To avoid overriding canonical
-            # list global ${match} with matches captured below, do so *AFTER*
-            # performing all other argument parsing above.
-            if [[ -z "${match[${arg_match_index_type_is_unvalidated}]}" ]] {
-                # If such type is *NOT* ":string", validate such type. (Since
-                # all arguments are untyped scalars from the low-level zsh
-                # perspective, there exists no validation to be performed for
-                # arguments of type ":string".)
-                [[ "${match[${arg_match_index_type}]}" == ':string' ]] || 
-                    args_index_type_optional_variadic+=(
-                        "${arg_count_max}"
-                        "${match[${arg_match_index_type}]}"
-                        "${arg_is_optional}"
-                        "${arg_is_variadic}" )
-            }
-        }
-    }
-
-    #FIXME: Arguably shift everything below to a separate function.
     #FIXME: How many of the variables below are still requisite?
+
+    # Map from argument type to a space-delimited string of the indices of all
+    # arguments of such type.
+    local -A arg_type_to_indices
+
+    # Canonical string global ${ZPCRE_OP}, localized to avoid overwriting
+    # either global or caller-specific versions of such variable.
+    local ZPCRE_OP
 
     # Code validating the number of arguments passed to such function.
     local check_arg_count
@@ -1046,11 +926,32 @@ function ::declare_func_stop_parse_args() {
     # Substring prefixing argument variable type-specific exception messages.
     local die_arg_var_type_prefix
 
+    # Argument list with all single- and double-quoted strings removed,
+    # preventing subsequent parsing from erroneously counting ignorable ",",
+    # "?", and "=" characters in such strings.
+    local func_args_sans_quotes="${ZESHY_DECLARE_FUNC_ARGS__//(\'([^\']|\'\')#\'|\"(\\\"|[^\"])#\")}"
+    
+    # Argument list reduced to all remaining "," characters, whose string
+    # length plus one is the maximum number of arguments such function accepts.
+    local func_args_commas="${func_args_sans_quotes//[^,]##}"
+    
+    # Argument list reduced to all remaining "?" and "=" characters, whose
+    # string length subtracted from the prior maximum is the minimum number of
+    # arguments such function accepts.
+    local func_args_equals="${func_args_sans_quotes//[^?=]##}"
+
+    # Such minimum and maximum number.
+    integer arg_count_max=$(( ${#func_args_commas} + 1 ))
+    integer arg_count_min=$(( arg_count_max - ${#func_args_equals} ))
+
     # Number of optional arguments required by the current argument count
     # below. If such function accepts no optional arguments, this number
     # remains 0; else, this number varies between the maximum and minimum
     # number of arguments such function accepts.
     integer arg_count_optional
+
+    # Index of the current argument in the argument list.
+    integer arg_index
 
     # Non-positive integer (i.e., strictly less than or equal to 0) by which to
     # offset the current argument index below. If such function accepts no
@@ -1059,8 +960,23 @@ function ::declare_func_stop_parse_args() {
     # argument count. (See below for gritty details.)
     integer arg_index_offset
 
+    # 1 if the current argument is optional and 0 otherwise.
+    integer arg_is_optional
+
+    # 1 if the current argument is variadic and 0 otherwise.
+    integer arg_is_variadic
+
+    # 1 if a prior argument was optional and 0 otherwise.
+    integer arg_was_optional
+
     # 1 if a prior argument was variadic and 0 otherwise.
     integer arg_was_variadic
+
+    # For efficiency, compile such PCRE. See for_string_text_matching_pcre:()
+    # for further details.
+    pcre_compile -- "${ZESHY_PROTOTYPE_RUNNABLE_ARGS_NEXT_PCRE}"
+    pcre_study
+    # print -r "${ZESHY_DECLARE_FUNC_NAMES__[1]} args: ${ZESHY_DECLARE_FUNC_ARGS__}"
 
     # For each possible number of arguments between the minimum and maximum
     # established above, define code validating the types of all passed
@@ -1073,81 +989,148 @@ function ::declare_func_stop_parse_args() {
         # Revert local variables declared above specific to the following loop.
         arg_count_optional=$(( arg_count - arg_count_min ))
         arg_index_offset=0
+        arg_was_optional=0
         arg_was_variadic=0
 
-        # Define such map by parsing the previously defined 4-tuple list of all
-        # relevant argument metadata.
-        local arg_index
-        for   arg_index arg_type arg_is_optional arg_is_variadic (
-            "${args_index_type_optional_variadic[@]}") {
+        # Parse each such argument into canonical list global ${match}, whose
+        # indices we localize as human-readable integers above.
+        ZPCRE_OP='0 0'
+        while {
+            pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY_DECLARE_FUNC_ARGS__}"
+        } {
+            # If such argument is neither optionalized or defaulted, such
+            # argument is non-optional and hence mandatory. Note such fact.
+            if [[ -z "${match[${arg_match_index_is_optional}]-}${match[${arg_match_index_value}]-}" ]] {
+                arg_is_optional=0
+            # Else, such argument is optional.
+            #
+            # If the current argument count admits no additional optional
+            # arguments. ignore such argument.
+            } elif (( ! arg_count_optional )) {
+                # Decrement the argument index offset. Prior iteration
+                # assigned each argument an index under the assumption that
+                # all optional arguments are passed. However, the current
+                # argument count implies the current optional argument to
+                # *NOT* be passed, implying all subsequent argument indices
+                # to be one larger than previously assumed. Correct this!
+                arg_index_offset+=-1
 
-            # If such argument is optional, ...
-            if (( arg_is_optional )) {
-                # If the current argument count permits no additional optional
-                # arguments. ignore such argument.
-                (( arg_count_optional )) || {
-                    # Decrement the argument index offset. Prior iteration
-                    # assigned each argument an index under the assumption that
-                    # all optional arguments are passed. However, the current
-                    # argument count implies the current optional argument to
-                    # *NOT* be passed, implying all subsequent argument indices
-                    # to be one larger than previously assumed. Correct this!
-                    arg_index_offset+=-1
+                # Skip to the next argument.
+                continue
+            # Else, the current argument count admits such optional argument.
+            #
+            # If a prior argument is variadic, throw an exception. Explicitly
+            # ignore the valid case that the current argument is both variadic
+            # and optional. See above for further details.
+            } elif (( arg_was_variadic )) {
+                ::die_of_func_prototype\
+                    'accepts both optional and variadic arguments'
+            # Else, such argument is validly optional.
+            } else {
+                # Note such fact.
+                arg_is_optional=1
 
-                    # Skip to the next argument.
-                    continue
-                }
-
-                # Else, such argument count supports such argument. Decrement
-                # such count, implying such count to now support one less
-                # subsequent optional argument. (The current optional argument
-                # "consumes" one of the available optional argument "slots"
-                # permitted by such count.)
+                # Decrement the current optional argument count, implying such
+                # count to subsequently support one less optional argument.
+                # (The current optional argument "consumes" one of the
+                # available optional argument "slots" permitted by such count.)
                 arg_count_optional+=-1
             }
 
             # Decrement such argument index by such offset. See above!
             arg_index+=${arg_index_offset}
 
-            # If such argument is variadic, index such argument and all
-            # subsequent optional variadic arguments with an argument range
-            # starting at the current positive index and ending at the negative
-            # index of the last such argument. See below for related logic.
-            if (( arg_is_variadic )) {
-                arg_index=${arg_index}','$(( arg_index - arg_count_max - 1 ))
+            # If such argument is *NOT* variadic (i.e., was *NOT* suffixed by
+            # an ellipse), handle such argument. Do so *AFTER* decrementing
+            # such argument index and hence testing whether such argument is
+            # optional, as we further munge such index below.
+            if [[ -z "${match[${arg_match_index_is_variadic}]-}" ]] {
+                # Note such fact.
+                arg_is_variadic=0
 
-                # Note such fact for testing by subsequent iteration.
-                arg_was_variadic=1
-            # Else if such argument follows a variadic argument, such argument
-            # cannot be reliably indexed by its positive index (i.e., relative
-            # to the start of such argument list). Since such argument can,
-            # however, be reliably indexed by its negative index (i.e.,
-            # relative to the end of such argument list), replace the former
-            # with the latter.
+                # If such argument follows a variadic argument, such argument
+                # cannot be reliably indexed by its positive index (i.e.,
+                # relative to the start of such argument list). Since such
+                # argument can, however, be reliably indexed by its negative
+                # index (i.e., relative to the end of such argument list),
+                # replace the former with the latter.
+                #
+                # Happily, such conversion applies regardless of whether such
+                # variadic argument was optional or mandatory.
+                if (( arg_was_variadic )) {
+                    arg_index=$(( arg_index - arg_count_max - 1 ))
+                }
+            # Else, such argument is variadic.
             #
-            # Since the negative sign "-" conflicts with parameter expansion
-            # syntax, negative indices may only be referenced by indexing canonical
-            # list global ${@} or ${argv} with such index.
-            #
-            # Happily, such conversion applies equally well regardless of whether
-            # such variadic argument was optional or mandatory.
+            # If a prior argument is also variadic, throw an exception. Such
+            # case implies such function to accept two or more variadic
+            # argument lists of arbitrary count, implying there exists no
+            # general means of deciding which such list a passed string was
+            # intended to belong to.
             } elif (( arg_was_variadic )) {
-                arg_index=$(( arg_index - arg_count_max - 1 ))
-            # Else such argument precedes a variadic argument if any, In such
-            # case, such argument is reliably indexable by its positive index
-            # and hence requires no adjustment,
+                ::die_of_func_prototype\
+                    'accepts two or more variadic argument lists'
+            # If a prior argument is optional, throw an exception. Such case
+            # implies such function to accept one or more optional arguments
+            # *AND* one or more variadic argument lists of arbitrary count,
+            # implying there exists no general means of deciding which such
+            # argument a passed string was intended to correspond to.
+            #
+            # Test such condition *AFTER* testing whether a prior argument is
+            # variadic. If such function accepts an optional variadic argument
+            # following a prior variadic argument, the prior exception is more
+            # explanatory than this exception.
+            } elif (( arg_was_optional )) {
+                ::die_of_func_prototype\
+                    'accepts both optional and variadic arguments'
+            # Else, such argument is validly variadic.
+            } else {
+                # Note such fact.
+                arg_is_variadic=1
+
+                # Index such argument and all subsequent optional variadic
+                # arguments with an argument range starting at the current
+                # positive index and ending at the negative index of the last
+                # such argument. See above for related logic.
+                arg_index=${arg_index}','$(( arg_index - arg_count_max - 1 ))
             }
+
+            #FIXME: For efficiency, shift "arg_was_variadic=1" immediately
+            #above.
+
+            # If such argument was optional and/or variadic, notify subsequent
+            # parse iterations of such fact. For safety, set such booleans
+            # *AFTER* all possible tests of such booleans above.
+            if (( arg_is_optional )) { arg_was_optional=1 }
+            if (( arg_is_variadic )) { arg_was_variadic=1 }
 
             # Append such index to the space-separated and parameter expansion-
             # delimited string of all indices of such argument's type.
-            arg_type_to_indices[${arg_type}]+=' "${@['${arg_index}']}"'
+            arg_type_to_indices[${match[${arg_match_index_type}]}]+=' "${@['${arg_index}']}"'
+
+            # If such argument's type is *NOT* to be ignored (i.e., is to be
+            # validated), validate such type. To avoid overriding canonical
+            # list global ${match} with matches captured below, do so *AFTER*
+            # performing all other argument parsing above.
+            if [[ -z "${match[${arg_match_index_type_is_unvalidated}]}" ]] {
+                #FIXME: Combine these two conditions. Yes!
+
+                # If such type is *NOT* ":string", validate such type. (Since
+                # all arguments are untyped scalars from the low-level zsh
+                # perspective, there exists no validation to be performed for
+                # arguments of type ":string".)
+                if [[ "${match[${arg_match_index_type}]}" != ':string' ]] {
+                    #FIXME: Do something here!
+                    true
+                }
+            }
         }
 
         # If such function accepts at least one optional argument, subsequent
         # argument type validation assumes such function's caller passed the
         # current number of arguments. Prefix such validation by an if
         # conditional guaranteeing such assumption.
-        if (( args_is_optional )) {
+        if (( arg_was_optional )) {
             # Indent the following if conditional.
             check_arg_types+=$'\n''    '
 
@@ -1202,7 +1185,7 @@ function ::declare_func_stop_parse_args() {
 
         # If such function accepts at least one optional argument and hence
         # prefixed such validation by an if conditional, end such conditional.
-        if (( args_is_optional )) {
+        if (( arg_was_optional )) {
             check_arg_types+=$'\n''    }'
         }
     }
@@ -1217,7 +1200,7 @@ function ::declare_func_stop_parse_args() {
     #
     # If such function is variadic, such function accepts a countably
     # infinite number of arguments only bounded below by such minimum.
-    if (( args_is_variadic )) {
+    if (( arg_was_variadic )) {
         check_arg_count='(( # >= '${arg_count_min}' )) || ::die_of_func_args_count_not_exceeding "${@}" ${#} '${arg_count_min}
     # Else, such function is non-variadic, in which case such function
     # accepts a number of arguments bounded by such minimum and maximum.
@@ -1364,6 +1347,535 @@ function declare_function_with_stdin() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+                #FUXME: Obsolete.
+                # # Note such function to accept one variadic argument list.
+                # args_is_variadic=1
+
+            #FUXME: Obsolete.
+            # } elif (( args_is_variadic && ! arg_is_variadic )) {
+                #FUXME: Obsolete.
+                # Note such function to accept at least one optional argument.
+                # args_is_optional=1
+
+        #FUXME: Reverting these strikes us as... overkill. Contemplate
+        #excising both.
+        #FUXME: Obsolete.
+        # Technically, ${args_is_optional} need *NOT* be reverted here; since
+        # ${args_is_variadic} must be, however, revert both for orthogonality.
+        # ${args_is_variadic} must be reverted as such boolean tracks whether a
+        # prior argument was variadic rather than merely whether such function
+        # accepts a variadic argument list.
+        # args_is_optional=0
+        # args_is_variadic=0
+
+    #FUXME: Unconvinced we still require these, given the greater utility of
+    #${arg_was_optional} and ${arg_was_variadic}. Contemplate excising.
+
+    # # 1 if such function accepts at least one optional argument and 0
+    # # otherwise.
+    # integer args_is_optional
+
+    # # 1 if such function accepts one variadic argument list and 0 otherwise.
+    # integer args_is_variadic
+
+            #FUXME: This condition no longer behaves as expected, as the first
+            #conditional above sets ${args_is_variadic} if the *CURRENT*
+            #argument is variadic (not merely if a prior argument is variadic).
+            #While we could hack about this with an additional boolean local,
+            #what's really called for here is to:
+            #
+            #* Replace the immediately prior "if (( arg_is_variadic )) {"
+            #  conditional with the variadic conditional far above, which
+            #  seamlessly corrects such issue in the proper manner. However,
+            #  doing so also complicates validation (e.g., to prevent functions
+            #  from accepting both variadic and optional arguments).
+            #* The solution then is to cease performing such validation within
+            #  this loop but far above outside *ALL* iteration. Can we actually
+            #  efficiently do this? The answer, of course, is yes.
+            #  Specifically:
+            #  * Set ${args_is_optional} in the manner shown above.
+            #  * Set ${args_is_variadic} by globbing ${func_args_sans_quotes},
+            #    which already provides us the quoteless argument list, for:
+            #    *(#b)('? '#|)', '#'...'. Wait. Globs don't work here, alas, as
+            #    we require a nongreedy match. Instead, match
+            #    ${func_args_sans_quotes} against the PCRE:
+            #    '^.*?(\?\s*+)?,\s*+\.\.\..*$'. O.K.; that definitely works. If
+            #    such PCRE matches, then:
+            #    * Set ${args_is_variadic} to 1.
+            #    * Additionally, if "(( ! ${#match} ))", then such function
+            #      erroneously accepts at least one optional argument and one
+            #      non-optional variadic argument. In such case, throw an
+            #      exception. (Excised from similar logic above.)
+            #FUXME: Or perhaps not? While that *WOULD* work, we're somewhat
+            #wary about yet another parse pass over the argument list. Instead,
+            #perhaps we should contemplate the changes required to make this
+            #work as is. Oh; right. Just restore ${arg_was_variadic}. We note
+            #that we'd need to do that *ANYWAY*, so... no loss.
+
+    #FUXME: Unsure whether we still desire this. Contemplate.
+    # If the minimum and maximum number of arguments such function accepts
+    # differ, such function accepts at least one optional argument. Note this.
+    # if (( arg_count_min != arg_count_max )) {
+    #     args_is_optional=1
+    # }
+
+            #FUXME: Actually, such test is unnecessary. Simply modify such PCRE
+            #to match *EITHER* an eroteme *OR* equals sign suffixing an
+            #argument name but not both. This is trivially simple, thankfully.
+
+            # Else, such argument is optional.
+            #
+            # If such argument is suffixed by both an eroteme *AND* default
+            # value, throw an exception. While either implies such argument to
+            # be optional, each implies distinct, conflicting semantics.
+            # } elif [[\
+            #     -z "${match[${arg_match_index_is_optional}]-}" ||
+            #     -z "${match[${arg_match_index_value}]-}" ]] ||\
+            #     ::die_of_func_prototype\
+            #         'argument '${match[arg_match_index_name]}' suffixed by both "?" and "="'
+
+            #FUXME: This and the following test, as well as the setting of
+            #${args_is_variadic}, 
+
+            #FUXME: Generalize to support localization as well. Since
+            #localization and validation share the same ultimate desires here
+            #(namely, appending to list ${args_index_type_optional_variadic}),
+            #this would probably be simplified by logic resembling:
+            #
+            #    arg_type_is_validated=$((
+            #        1 - ${#match[${arg_match_index_type_is_unvalidated}]} ))
+            #    arg_is_localized=$((
+            #        1 - ${#match[${arg_match_index_is_unlocalized}]} ))
+            #
+            #    if (( arg_type_is_validated || arg_is_localized )) {
+            #        args_metadata+=(
+            #            "${arg_count_max}"
+            #            "${match[${arg_match_index_name}]}"
+            #            "${match[${arg_match_index_type}]}"
+            #            "${arg_is_optional}"
+            #            "${arg_is_variadic}"
+            #            "${arg_is_localized}"
+            #            "${arg_type_is_validated}"
+            #        )
+            #    }
+            #
+            #As the above example implies, rename such list local to simply
+            #${args_metadata}. (Judicious.)
+            #
+            #Reasonably clever; no extraneous if conditionals required. Wait;
+            #the first doesn't quite work, as we need to prevent validation of
+            #":string" types. So:
+            #
+            #    if [[ -z "${match[${arg_match_index_type_is_unvalidated}]}" &&
+            #             "${match[${arg_match_index_type}]}" != ':string' ]] {
+            #        arg_type_is_validated=1
+            #    } else {
+            #        arg_type_is_validated=0
+            #    }
+            #FUXME: Actually, ${args_index_type_optional_variadic} is hideous.
+            #We can obviate both such list *AND* the following iteration
+            #requiring such list by instead appending directly to keys of map
+            #${arg_type_to_indices} here. To do so sanely, however, we *NEED*
+            #to know the maximum number of arguments. We can accomplish this by
+            #parsing such argument list twice: once without grouping and
+            #optimized so as to match only unquoted "," as significant for
+            #argument counting purposes, and the second actually parsing each
+            #argument. However, to conform to the algorithm implemented below,
+            #we would need to reperform such second round of argument parsing
+            #a number of times equal to the number of optional arguments
+            #accepted by such function.
+            #
+            #While such reparsing would be nonideal if the common case in zeshy
+            #were functions accepting numerous optional arguments, the actual
+            #common case in zeshy is the opposite: functions accepting at most
+            #one (and typically no) optional arguments. Given that, there will
+            #be *NO* reparsing in the common case. Indeed, such an approach
+            #should dramatically improve the efficiency of the common case by
+            #eliminating the need both to append an excrutiating number of
+            #strings to list ${args_index_type_optional_variadic} *AND* to
+            #iterate over such list.
+            #
+            #Note as well that the first parse can be dramatically optimized by
+            #matching with a different (and hopefully much simplified) PCRE:
+            #one performing no grouping and effectively matching only single-
+            #and double-quoted strings (to ignore the nonsignificant commas
+            #embedded in such strings) *AND* commas outside of such strings.
+            #Actually, that's not quite true: we need to match commas,
+            #erotemes, and equals signs, the latter two of which help us
+            #calculate the minimum argument count, which we also need under
+            #such refactoring. That said, such PCRE needn't actually match any
+            #real argument syntax or structure, since the subsequent parse pass
+            #will do so already.
+            #
+            #But it's *NOT* simply efficiency, though that is a dreaded
+            #concern: it's elegance, or the lack thereof. The current approach
+            #is horribly inelegant, requiring ever more strings be continually
+            #appended to and parsed from such list. Let's do away with too fell
+            #birds by one bright stone, shall we?
+            #FUXME: Wooh. Just realized we don't even need to use PCRE matching
+            #to count character instances in a string; we should be able to use
+            #glob-driven global string replacement ala:
+            #
+            #    # Argument list with all single- and double-quoted strings
+            #    # removed, preventing subsequent parsing from erroneously
+            #    # counting ignorable ",", "?", and "=" characters
+            #    # embedded in single- and double-quoted strings.
+            #    local func_args_sans_quotes="${ZESHY_DECLARE_FUNC_ARGS__//('([^']|'')#'|\"([^\"]|\\\")#\")}"
+            #
+            #    # Argument list reduced to all remaining "," characters, whose
+            #    # string length plus one offers the maximum number of arguments
+            #    # such function accepts.
+            #    local func_args_commas="${func_args_sans_quotes//[^,]##}"
+            #
+            #    # Argument list reduced to all remaining "?" and "=" characters,
+            #    # whose string length subtracted from such maximum number 
+            #    # offers the minimum number of arguments such function accepts.
+            #    local func_args_equals="${func_args_sans_quotes//[^?=]##}"
+            #    # Minimum and maximum number of arguments such function accepts.
+            #    arg_count_max=$(( ${#func_args_commas} + 1 ))
+            #    arg_count_min=$(( arg_count_max - ${#func_args_equals} ))
+            #
+            #Good Lord. Not a single instance of explicit iteration to be
+            #found. Go, go, go!
+
+    #FUXME: Such condition is already implied by ${args_is_variadic},
+    #suggesting we should simply excise this boolean in favor of that.
+    # 1 if a prior argument was variadic and 0 otherwise.
+    # integer arg_was_variadic
+
+    #FUXME: Arguably shift everything below to a separate function.
+
+    # Compile such PCRE. For efficiency, avoid optionally optimizing such
+    # PCRE by calling pcre_study(). (Ad-hoc profiling suggests such
+    # optimization to consume more time than it saves.) See
+    # for_string_text_matching_pcre:() for further details.
+    # pcre_compile -- "${ZESHY_PROTOTYPE_RUNNABLE_ARGS_NEXT_PCRE}"
+
+    # Parse each such argument into canonical list global ${match}, whose
+    # indices we localize as human-readable integers above.
+    # local ZPCRE_OP='0 0'
+    # while {
+    #     pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY_DECLARE_FUNC_ARGS__}"
+    # } {
+    #     # Since the current argument may (but not necessarily) be passed,
+    #     # increment the maximum argument count.
+    #     arg_count_max+=1
+
+    #     # If such argument is *NOT* variadic (i.e., was *NOT* suffixed by
+    #     # an ellipse), note such fact. Test this condition *BEFORE* testing
+    #     # whether such argument is optional, to prevent the latter's
+    #     # enabling of boolean ${args_is_optional} when such argument is
+    #     # both variadic and optional from triggering an exception here.
+    #     if [[ -z "${match[${arg_match_index_is_variadic}]-}" ]] {
+    #         arg_is_variadic=0
+    #     # Else, such argument is variadic.
+    #     #
+    #     # If a prior argument is optional, throw an exception. Such case
+    #     # implies such function to accept one or more optional arguments
+    #     # *AND* one or more variadic argument lists of arbitrary count,
+    #     # implying there exists no general means of deciding which such
+    #     # argument a passed string was intended to correspond to.
+    #     } elif (( args_is_optional )) {
+    #         ::die_of_func_prototype\
+    #             'accepts both optional and variadic arguments'
+    #     # If a prior argument is also variadic, throw an exception.  Such
+    #     # case implies such function to accept two or more variadic
+    #     # argument lists of arbitrary count, implying there exists no
+    #     # general means of deciding which such list a passed string was
+    #     # intended to belong to.
+    #     } elif (( args_is_variadic )) {
+    #         ::die_of_func_prototype\
+    #             'accepts two or more variadic argument lists'
+    #     # Else, such argument is validly variadic. Note such fact and such
+    #     # function to accept one variadic argument list.
+    #     } else {
+    #         arg_is_variadic=1
+    #         args_is_variadic=1
+    #     }
+
+    #     # If such argument is mandatory (i.e., was neither suffixed by an
+    #     # eroteme *OR* a default value), note such fact and increment the
+    #     # minimum argument count.
+    #     if [[ -z "${match[${arg_match_index_is_optional}]-}${match[${arg_match_index_value}]-}" ]] {
+    #         arg_is_optional=0
+    #         arg_count_min+=1
+    #     # Else, such argument is optional.
+    #     #
+    #     # If such argument is suffixed by both an eroteme *AND* default
+    #     # value, throw an exception. While either implies such argument to
+    #     # be optional, each implies distinct, conflicting semantics.
+    #     } elif [[\
+    #         -z "${match[${arg_match_index_is_optional}]-}" ||
+    #         -z "${match[${arg_match_index_value}]-}" ]] ||\
+    #        ::die_of_func_prototype\
+    #            'argument '${match[arg_match_index_name]}' suffixed by both "?" and "="'
+    #     # If a prior argument is also variadic, throw an exception,
+    #     # explicitly ignoring the valid case that the current argument is
+    #     # both variadic and optional. See above for further details.
+    #     } elif (( args_is_variadic && ! arg_is_variadic )) {
+    #         ::die_of_func_prototype\
+    #             'accepts both optional and variadic arguments'
+    #     # Else, such argument is validly optional. Note such fac and such
+    #     # function to accept at least one optional argument.
+    #     } else {
+    #         arg_is_optional=1
+    #         args_is_optional=1
+    #     }
+
+    #     #FUXME: Generalize to support localization as well. Since
+    #     #localization and validation share the same ultimate desires here
+    #     #(namely, appending to list ${args_index_type_optional_variadic}),
+    #     #this would probably be simplified by logic resembling:
+    #     #
+    #     #    arg_type_is_validated=$((
+    #     #        ${#match[${arg_match_index_type_is_unvalidated}]} ))
+    #     #    arg_is_localized=$((
+    #     #        1 - ${#match[${arg_match_index_is_unlocalized}]} ))
+    #     #
+    #     #    if (( arg_type_is_validated || arg_is_localized )) {
+    #     #        args_metadata+=(
+    #     #            "${arg_count_max}"
+    #     #            "${match[${arg_match_index_name}]}"
+    #     #            "${match[${arg_match_index_type}]}"
+    #     #            "${arg_is_optional}"
+    #     #            "${arg_is_variadic}"
+    #     #            "${arg_is_localized}"
+    #     #            "${arg_type_is_validated}"
+    #     #        )
+    #     #    }
+    #     #
+    #     #As the above example implies, rename such list local to simply
+    #     #${args_metadata}. (Judicious.)
+    #     #
+    #     #Reasonably clever; no extraneous if conditionals required. Wait;
+    #     #the first doesn't quite work, as we need to prevent validation of
+    #     #":string" types. So:
+    #     #
+    #     #    if [[ -z "${match[${arg_match_index_type_is_unvalidated}]}" &&
+    #     #             "${match[${arg_match_index_type}]}" != ':string' ]] {
+    #     #        arg_type_is_validated=1
+    #     #    } else {
+    #     #        arg_type_is_validated=0
+    #     #    }
+    #     #FUXME: Actually, ${args_index_type_optional_variadic} is hideous.
+    #     #We can obviate both such list *AND* the following iteration
+    #     #requiring such list by instead appending directly to keys of map
+    #     #${arg_type_to_indices} here. To do so sanely, however, we *NEED*
+    #     #to know the maximum number of arguments. We can accomplish this by
+    #     #parsing such argument list twice: once without grouping and
+    #     #optimized so as to match only unquoted "," as significant for
+    #     #argument counting purposes, and the second actually parsing each
+    #     #argument. However, to conform to the algorithm implemented below,
+    #     #we would need to reperform such second round of argument parsing
+    #     #a number of times equal to the number of optional arguments
+    #     #accepted by such function.
+    #     #
+    #     #While such reparsing would be nonideal if the common case in zeshy
+    #     #were functions accepting numerous optional arguments, the actual
+    #     #common case in zeshy is the opposite: functions accepting at most
+    #     #one (and typically no) optional arguments. Given that, there will
+    #     #be *NO* reparsing in the common case. Indeed, such an approach
+    #     #should dramatically improve the efficiency of the common case by
+    #     #eliminating the need both to append an excrutiating number of
+    #     #strings to list ${args_index_type_optional_variadic} *AND* to
+    #     #iterate over such list.
+    #     #
+    #     #Note as well that the first parse can be dramatically optimized by
+    #     #matching with a different (and hopefully much simplified) PCRE:
+    #     #one performing no grouping and effectively matching only single-
+    #     #and double-quoted strings (to ignore the nonsignificant commas
+    #     #embedded in such strings) *AND* commas outside of such strings.
+    #     #Actually, that's not quite true: we need to match commas,
+    #     #erotemes, and equals signs, the latter two of which help us
+    #     #calculate the minimum argument count, which we also need under
+    #     #such refactoring. That said, such PCRE needn't actually match any
+    #     #real argument syntax or structure, since the subsequent parse pass
+    #     #will do so already.
+    #     #
+    #     #But it's *NOT* simply efficiency, though that is a dreaded
+    #     #concern: it's elegance, or the lack thereof. The current approach
+    #     #is horribly inelegant, requiring ever more strings be continually
+    #     #appended to and parsed from such list. Let's do away with too fell
+    #     #birds by one bright stone, shall we?
+    #     #FUXME: Wooh. Just realized we don't even need to use PCRE matching
+    #     #to count character instances in a string; we should be able to use
+    #     #glob-driven global string replacement ala:
+    #     #
+    #     #    # Argument list with all single- and double-quoted strings
+    #     #    # removed, preventing subsequent parsing from erroneously
+    #     #    # counting ignorable ",", "?", and "=" characters
+    #     #    # embedded in single- and double-quoted strings.
+    #     #    local func_args_sans_quotes="${ZESHY_DECLARE_FUNC_ARGS__//('([^']|'')#'|\"([^\"]|\\\")#\")}"
+    #     #
+    #     #    # Argument list reduced to all remaining "," characters, whose
+    #     #    # string length plus one offers the maximum number of arguments
+    #     #    # such function accepts.
+    #     #    local func_args_commas="${func_args_sans_quotes//[^,]##}"
+    #     #
+    #     #    # Argument list reduced to all remaining "?" and "=" characters,
+    #     #    # whose string length subtracted from such maximum number 
+    #     #    # offers the minimum number of arguments such function accepts.
+    #     #    local func_args_equals="${func_args_sans_quotes//[^?=]##}"
+    #     #    # Minimum and maximum number of arguments such function accepts.
+    #     #    arg_count_max=$(( ${#func_args_commas} + 1 ))
+    #     #    arg_count_min=$(( arg_count_max - ${#func_args_equals} ))
+    #     #
+    #     #Good Lord. Not a single instance of explicit iteration to be
+    #     #found. Go, go, go!
+
+    #     # If such argument's type is *NOT* to be ignored (i.e., is to be
+    #     # validated), validate such type. To avoid overriding canonical
+    #     # list global ${match} with matches captured below, do so *AFTER*
+    #     # performing all other argument parsing above.
+    #     if [[ -z "${match[${arg_match_index_type_is_unvalidated}]}" ]] {
+    #         # If such type is *NOT* ":string", validate such type. (Since
+    #         # all arguments are untyped scalars from the low-level zsh
+    #         # perspective, there exists no validation to be performed for
+    #         # arguments of type ":string".)
+    #         [[ "${match[${arg_match_index_type}]}" == ':string' ]] || 
+    #             args_index_type_optional_variadic+=(
+    #                 "${arg_count_max}"
+    #                 "${match[${arg_match_index_type}]}"
+    #                 "${arg_is_optional}"
+    #                 "${arg_is_variadic}" )
+    #     }
+    # }
+
+    # #FUXME: Arguably shift everything below to a separate function.
+    # #FUXME: How many of the variables below are still requisite?
+
+    # # Code validating the number of arguments passed to such function.
+    # local check_arg_count
+    # 
+    # # Code validating the types of arguments passed to such function.
+    # local check_arg_types
+
+    # # Name of the function validating the current argument type.
+    # local arg_type_tester
+
+    # # Substring prefixing argument variable type-specific exception messages.
+    # local die_arg_var_type_prefix
+
+    # # Number of optional arguments required by the current argument count
+    # # below. If such function accepts no optional arguments, this number
+    # # remains 0; else, this number varies between the maximum and minimum
+    # # number of arguments such function accepts.
+    # integer arg_count_optional
+
+    # # Non-positive integer (i.e., strictly less than or equal to 0) by which to
+    # # offset the current argument index below. If such function accepts no
+    # # optional arguments, this integer remains 0; else, this integer is
+    # # decremented once for each optional argument rejected by the current
+    # # argument count. (See below for gritty details.)
+    # integer arg_index_offset
+
+    # # 1 if a prior argument was variadic and 0 otherwise.
+    # integer arg_was_variadic
+
+    # # For each possible number of arguments between the minimum and maximum
+    # # established above, define code validating the types of all passed
+    # # arguments when the caller passes that number of arguments.
+    # integer arg_count
+    # for     arg_count ({${arg_count_min}..${arg_count_max}}) {
+    #     # Clear such map. See :clear_map() for further details.
+    #     set -A arg_type_to_indices
+
+    #     # Revert local variables declared above specific to the following loop.
+    #     arg_count_optional=$(( arg_count - arg_count_min ))
+    #     arg_index_offset=0
+    #     arg_was_variadic=0
+
+    #     # Define such map by parsing the previously defined 4-tuple list of all
+    #     # relevant argument metadata.
+    #     local arg_index
+    #     for   arg_index arg_type arg_is_optional arg_is_variadic (
+    #         "${args_index_type_optional_variadic[@]}") {
+
+    #         # If such argument is optional, ...
+    #         if (( arg_is_optional )) {
+    #             # If the current argument count permits no additional optional
+    #             # arguments. ignore such argument.
+    #             (( arg_count_optional )) || {
+    #                 # Decrement the argument index offset. Prior iteration
+    #                 # assigned each argument an index under the assumption that
+    #                 # all optional arguments are passed. However, the current
+    #                 # argument count implies the current optional argument to
+    #                 # *NOT* be passed, implying all subsequent argument indices
+    #                 # to be one larger than previously assumed. Correct this!
+    #                 arg_index_offset+=-1
+
+    #                 # Skip to the next argument.
+    #                 continue
+    #             }
+
+    #             # Else, such argument count supports such argument. Decrement
+    #             # such count, implying such count to now support one less
+    #             # subsequent optional argument. (The current optional argument
+    #             # "consumes" one of the available optional argument "slots"
+    #             # permitted by such count.)
+    #             arg_count_optional+=-1
+    #         }
+
+    #         # Decrement such argument index by such offset. See above!
+    #         arg_index+=${arg_index_offset}
+
+    #         # If such argument is variadic, index such argument and all
+    #         # subsequent optional variadic arguments with an argument range
+    #         # starting at the current positive index and ending at the negative
+    #         # index of the last such argument. See below for related logic.
+    #         if (( arg_is_variadic )) {
+    #             arg_index=${arg_index}','$(( arg_index - arg_count_max - 1 ))
+
+    #             # Note such fact for testing by subsequent iteration.
+    #             arg_was_variadic=1
+    #         # Else if such argument follows a variadic argument, such argument
+    #         # cannot be reliably indexed by its positive index (i.e., relative
+    #         # to the start of such argument list). Since such argument can,
+    #         # however, be reliably indexed by its negative index (i.e.,
+    #         # relative to the end of such argument list), replace the former
+    #         # with the latter.
+    #         #
+    #         # Since the negative sign "-" conflicts with parameter expansion
+    #         # syntax, negative indices may only be referenced by indexing canonical
+    #         # list global ${@} or ${argv} with such index.
+    #         #
+    #         # Happily, such conversion applies equally well regardless of whether
+    #         # such variadic argument was optional or mandatory.
+    #         } elif (( arg_was_variadic )) {
+    #             arg_index=$(( arg_index - arg_count_max - 1 ))
+    #         # Else such argument precedes a variadic argument if any, In such
+    #         # case, such argument is reliably indexable by its positive index
+    #         # and hence requires no adjustment,
+    #         }
+
+    #         # Append such index to the space-separated and parameter expansion-
+    #         # delimited string of all indices of such argument's type.
+    #         arg_type_to_indices[${arg_type}]+=' "${@['${arg_index}']}"'
+    #     }
+
+    # integer arg_count_min=0 arg_count_max=0
+
+    # List of argument-specific metadata for all arguments whose types are to
+    # be programmatically validated (excluding of type ":string", requiring no
+    # such validation). Such validation typically depends on the maximum number
+    # of arguments accepted by such function, a quantity available only *AFTER*
+    # parsing all such arguments. Such parsing thus appends this list by such
+    # metadata, which post-parsing then converts into such validation. Such
+    # metadata comprises a conceptual 4-tuple
+    # (${arg_index} ${arg_type} ${arg_is_optional} ${arg_is_variadic}).
+    # local -a args_index_type_optional_variadic
+
+    # decide how
+    # best to index optional and variadic arguments 
+    #
+    # , runnable
+    # argument parsing requires.
+    #
+    #FUXME: Obsolete.
+    # If such argument string is *NOT* the empty string, such function accepts
+    # at least one argument. In such case, parse such arguments.
+    # if [[ -n "${ZESHY_DECLARE_FUNC_ARGS__}" ]] {
+
     # Current argument type's optional eroteme (i.e., "?"), signifying that
     # such function's definition should *NOT* be prefixed by a call to an
     # exception handler throwing an exception if such argument violates the
@@ -1532,7 +2044,7 @@ function declare_function_with_stdin() {
     #:set_string_to_func_prototype(),
     #:set_string_to_global_prototype(), and so on. For now, just implement the
     #former function. Should be readily doable, based on the logic below.
-    # local func_prototype_setter_name="${ZESHY_HELP_SETTER_NAME_PREFIX}func_prototype:${func_name}"
+    # local func_prototype_setter_name="${ZESHY_HELP_SETTER_NAME_PREFUX}func_prototype:${func_name}"
     # :die_unless_func "${func_prototype_setter_name}"
     # "${func_prototype_setter_name}" func_prototype
 
@@ -2307,7 +2819,7 @@ function declare_function_with_stdin() {
 #             }
 #         }
 # 
-#         #FIXME: This is fairly lame. See @{*-alias} for commentary.
+#         #FUXME: This is fairly lame. See @{*-alias} for commentary.
 # 
 #         # Add such function to the current parcel.
 #         add_parcel_function "${ZESHY_PARCEL_NAME}" "${func_name__dfwpban}"
