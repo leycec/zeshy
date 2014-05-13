@@ -762,11 +762,18 @@ function ::func_.stop_parse_prototype() {
     # Code localizing and/or validating arguments passed to such function.
     local code_args_local_or_valid
 
-    # Space-delimited string of all expansions of arguments to be validated.
-    local arg_expansions
+    # String prefixing each line of such code with indentation appropriate to
+    # the current outermost indentation level (i.e., of code nested directly in
+    # the current function body).
+    local code_indentation_outer
 
-    # Space-delimited string of all expansions of arguments to be localized.
-    local arg_definitions
+    # String prefixing each line of such code with indentation appropriate to
+    # the current innermost indentation level (i.e., of code nested directly in
+    # the current if conditional of the current function body).
+    local code_indentation_inner
+    
+    # Space-delimited string of all expansions of arguments to be validated.
+    local arg_values
 
     # Current argument name, type, and subtype.
     local arg_name arg_type arg_subtype
@@ -823,6 +830,19 @@ function ::func_.stop_parse_prototype() {
     # 1 if a prior argument was variadic and 0 otherwise.
     integer arg_was_variadic
 
+    # 1 if at least one argument is optional and 0 otherwise.
+    integer args_is_optional=$(( arg_count_min != arg_count_max ))
+
+    # Code indentation prefixes. If at least one argument is optional, all
+    # localization and validation code will be embedded within if conditionals
+    # rather than directly within the function body; in such case, indent such
+    # code by one additional level of indentation.
+    code_indentation_outer=$'\n''    '
+    code_indentation_inner=${code_indentation_outer}
+    if (( args_is_optional )) {
+        code_indentation_inner+='    '
+    }
+
     # For efficiency, compile such PCRE. See for_string_text_matching_pcre:()
     # for further details.
     pcre_compile -- "${ZESHY_PROTOTYPE_RUNNABLE_ARGS_NEXT_PCRE}"
@@ -856,16 +876,85 @@ function ::func_.stop_parse_prototype() {
                 arg_is_optional=0
             # Else, such argument is optional.
             #
-            # If the current argument count admits no additional optional
-            # arguments. ignore such argument.
+            # If the current argument count supports no additional optional
+            # arguments, the current optional argument is unpassed.
             } elif (( ! arg_count_optional )) {
-                # Decrement the argument index offset. Prior iteration
-                # assigned each argument an index under the assumption that
-                # all optional arguments are passed. However, the current
-                # argument count implies the current optional argument to
-                # *NOT* be passed, implying all subsequent argument indices
-                # to be one larger than previously assumed. Correct this!
+                # Since such argument is unpassed and hence has no assigned
+                # index at function call time, decrement all subsequent
+                # argument indices by one.
                 arg_index_offset+=-1
+
+                #FIXME: Insufficient. Before skipping to the next argument, 
+                #instead:
+                #
+                #* Test whether the current optional argument was assigned a
+                #  default value.
+                #* If so, append:
+                #  * An assignment of such argument to such value...
+                #  * To a (possibly new?) string or map local.
+                #
+                #The antler-mantled devil is the details, however. First, we
+                #need to resolve the order in which we perform such defaulting:
+                #do we default unpassed arguments *BEFORE* performing
+                #localization and validation? That would certainly seem to be
+                #the simplest implementation, but arguably *NOT* the most
+                #efficient. Why? Because that order implies we need to perform
+                #in-place modification of ${argv} list items. Now, when the
+                #optional arguments to be defaulted are the absolute last
+                #arguments, such modification simply appends to such list and
+                #hence is arguably inefficient; in all other cases, however,
+                #we'd need to either:
+                #
+                #* Shift all arguments following such unpassed arguments to the
+                #  right in ${argv} -- which is neither simple *OR* efficient.
+                #* Call set(), replacing the current argument list entirely.
+                #  While considerably simpler, it's that much less efficient.
+                #
+                #The alternative, of course, is to:
+                #
+                #* Append an appropriate entry to map
+                #  ${arg_definers_to_definitions}, assigning such local to such
+                #  default value (rather than the customary indexed argument
+                #  expansion performed below).
+                #
+                #O.K.; that's pretty much the obvious thing to do. It's both
+                #simple and efficient, requiring no modification to either
+                #${argv} or logic below.
+                #FIXME: Wait. No, merely appending to
+                #${arg_definers_to_definitions} fails. Why? Because:
+                #
+                #* The assignments implied by such map are performed *AFTER*
+                #  validating argument values. But we *REALLY* want default
+                #  values to be validated (particularly if such values embed
+                #  command substitutions).
+                #* Which brings us to... command substitutions. For simplicity,
+                #  ${arg_definers_to_definitions} assumes all assignments
+                #  implied by key-value pairs *ALWAYS* succeed -- which, of
+                #  course, will *NOT* be the case for default values embedding
+                #  command substitutions.
+                #
+                #Hmm. Honestly, the set() approach *DOES* seem to be the
+                #simplest, when one takes into account both localization and
+                #validation. Perhaps more importantly, adopting such approach
+                #should reduce the amount of preamble code output for functions
+                #accepting defaulted arguments. Why? Because, under such
+                #approach, we need to no longer treat defaulted arguments as
+                #optional, thus reducing the number of possible argument
+                #counts. Indeed, under such approach, only optionalized
+                #arguments increase such number, reducing if conditional
+                #fan-out below.
+                #
+                #Hmm; or perhaps not? If one considers it, the set() approach
+                #really does introduce considerably more complexity than it
+                #erases. We *REALLY* want a
+                #${arg_definers_to_definitions}-style approach. Now, we *CAN*
+                #reuse such map to safely *DECLARE* defaulted arguments; we
+                #just can't use such map to safely *DEFINE* defaulted
+                #arguments. To accomplish the latter, we'll simply need to
+                #append to a new newline-delimited *STRING* local
+                #${arg_defaults}. Sweet, no?
+
+                # If specified, assign such argument a default value.
 
                 # Skip to the next argument.
                 continue
@@ -963,6 +1052,10 @@ function ::func_.stop_parse_prototype() {
             if (( arg_is_optional )) { arg_was_optional=1 }
             if (( arg_is_variadic )) { arg_was_variadic=1 }
 
+            #FIXME: If such type is nonscalar (e.g., prefixed by either ":list"
+            #or ":map"), we need to throw an exception. Argument values are, by
+            #definition, *ONLY* scalar.
+
             # Argument name and type, localized for efficient reuse below.
             arg_name=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME}]}
             arg_type=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE}]}
@@ -984,7 +1077,7 @@ function ::func_.stop_parse_prototype() {
                 # If such type is *NOT* the name of an existing alias, throw an
                 # exception. See :is_alias_simple() for details.
                 (( ${+aliases[${arg_definer}]} )) || ::die_of_func_prototype\
-                    'argument ${'${arg_name}'} variable type '${arg_type}' unrecognized (i.e., alias '${arg_type}'() undefined)'
+                    'argument ${'${arg_name}'} type '${arg_type}' unrecognized (i.e., alias '${arg_type}'() undefined)'
 
                 # Map such alias name to such argument definition.
                 arg_definer_to_definitions[${arg_definer}]+=' '${arg_name}'="${'${arg_index}'}"'
@@ -1006,40 +1099,6 @@ function ::func_.stop_parse_prototype() {
                 # efficiency, obtain such type with raw string indices rather
                 # than globbed match groups (e.g., ':string:'(#b)(*)).
                 if [[ "${arg_type}" == ':string:'* ]] {
-                    #FIXME: Insufficient. Before applying parameter expansion
-                    #flag "(P"), we *MUST* guarantee such argument to refer to
-                    #a valid variable. Since simply appending to
-                    #${arg_tester_to_values} does *NOT* guarantee this, we
-                    #require yet another map local:
-                    #${arg_var_tester_to_expansions}. This, in turn, implies we
-                    #should rename "arg_tester" everywhere here to
-                    #"arg_tester".
-                    #FIXME: Actually, even that fails to suffice. We clearly
-                    #*CANNOT* combine "(P)" with ranged indices (e.g.,
-                    #"${@[2,-2]}"). Experimental use suggests that, in such
-                    #cases, zsh fails to print an error or report failure, but
-                    #instead simply returns the value of the variable referred
-                    #to by the first such index. Clearly, this is terrible. To
-                    #avoid such edge cases, prohibit function arguments
-                    #satisfying all of the following edge case constraints:
-                    #indirect, subtyped, variadic arguments: e.g.,
-                    #
-                    #    :void err(:string:int+positive my_int1, ...)
-                    #
-                    #Such arguments are fairly edge case, anyway. Technically,
-                    #we *COULD* programmatically validate such variables by
-                    #manually iterating such arguments...
-                    #FIXME: Wait. We've just devised an efficient workaround,
-                    #which is fairly awesome:
-                    #
-                    #* For all indirect, subtyped, variadic arguments (i.e.,
-                    #  just test "(( arg_is_variadic ))" here, suffix
-                    #  ${arg_index} by '//(#m)*/${(P)MATCH}', ensuring such
-                    #  argument indices are expanded as follows:
-                    #    "${@[2,-2]//(#m)*/${(P)MATCH}}"
-                    #
-                    #Excrutiatingly clever. Huzzah!
-
                     # If such argument is subtyped, such subtype constraints
                     # the value of the variable such argument refers to rather
                     # than such variable's type. In contrast to the customary
@@ -1140,35 +1199,21 @@ function ::func_.stop_parse_prototype() {
             }
         }
 
-        #FIXME: Inefficient. Surely a simpler test presents itself?
-
-        # If at least one such argument is to be localized and/or validated, do
-        # so; else, avoid such logic.
+        # If localizing and/or validating at least one such argument, do
+        # so. Technically, there exist three possible map locals to be tested
+        # here: the two tested below and ${arg_var_tester_to_values}, *NOT*
+        # tested below. Since prior logic guarantees ${arg_tester_to_values} to
+        # be nonempty whenever ${arg_var_tester_to_values} is nonempty,
+        # however, the latter need *NOT* be explicitly tested here.
         if (( ${#arg_definer_to_definitions} +\
-              ${#arg_tester_to_values} +\
-              ${#arg_var_tester_to_values} )) {
-            #FIXME: Erroneous test. During the first iteration of argument
-            #counts for functions accepting optional arguments, no optional
-            #arguments will be enabled, in which case the conditional below
-            #fails when it *SHOULD* succeed. What we *REALLY* want to test is
-            #just "(( arg_count_min != arg_count_max ))" instead. That said, to
-            #avoid repetitious tests, we really want to encapsulate such
-            #outcome in a new boolean local declared and defined far above as
-            #follows:
-            #
-            #    integer args_is_optional=$(( arg_count_min != arg_count_max ))
-            #
-            #Then, tust such integer here and below as follows:
-            #
-            #    if (( args_is_optional )) {
-
+              ${#arg_tester_to_values} )) {
             # If such function accepts at least one optional argument, subsequent
             # argument type validation assumes such function's caller passed the
             # current number of arguments. Prefix such validation by an if
             # conditional guaranteeing such assumption.
-            if (( arg_was_optional )) {
+            if (( args_is_optional )) {
                 # Indent the following if conditional.
-                code_args_local_or_valid+=$'\n''    '
+                code_args_local_or_valid+=${code_indentation_outer}
 
                 # If passed the minimum number of arguments, start such if
                 # conditional. (While we could just as well invert such logic,
@@ -1186,46 +1231,39 @@ function ::func_.stop_parse_prototype() {
                 }
             }
 
-            #FIXME: Replicate such logic for both ${arg_definer_to_definitions}
-            #and ${arg_var_tester_to_values}, iterating ${arg_tester_to_values}
-            #*BEFORE* ${arg_var_tester_to_values} *BEFORE*
-            #${arg_definer_to_definitions}. Order is quite important here.
+            # For efficiency, combine the following two related iterations:
+            #
+            # * For each function name and corresponding string expanding all
+            #   arguments validated by calling such function (i.e., key-value
+            #   pairs of map ${arg_tester_to_values}), do so.
+            # * For each function name and corresponding string expanding all
+            #   variables referred to by arguments and validated by calling
+            #   such function (i.e., key-value pairs of map
+            #   ${arg_var_tester_to_values}), do so. While the first iteration
+            #   validates such variables as existing and of the expected type,
+            #   this iteration validates the values such variables expand to
+            #   and hence must be performed *AFTER* the first iteration.
+            for arg_tester arg_values (
+                "${(kv@)arg_tester_to_values}"
+                "${(kv@)arg_var_tester_to_values}") {
+                code_args_local_or_valid+=${code_indentation_inner}${arg_tester}${arg_values}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${arg_values}''' '${(q)arg_tester}
+            }
 
-            # For each argument tester function name and corresponding string
-            # expanding all arguments validated by calling such function, do so.
-            for arg_tester arg_expansions ("${(kv@)arg_tester_to_values}") {
-                #FIXME: Indentation is conditional here. The current
-                #indentation is appropriate *ONLY* if the current argument
-                #count requires a wrapping if conditional; else, such
-                #indendation is too much. We probably want a new string local
-                #${code_indentation_inner} to correct this. Given the above changes,
-                #boolean ${args_is_optional} indicates whether or not we
-                #require one or two levels of indentation *BEFORE* iterating
-                #anything, implying ${code_indentation_inner} may be set as a
-                #string constant *BEFORE* such iteration *AFTER* setting such
-                #boolean ala:
-                #
-                #     code_indentation_inner=$'\n''    '
-                #     if (( args_is_optional )) {
-                #         code_indentation_outer=${code_indentation_inner}
-                #         code_indentation_inner+='    '
-                #     }
-                #
-                #Elegant, no? Note that new string local
-                #${code_indentation_outer} is only ever expanded by functions
-                #accepting optional arguments, justifying the logic above.
-                #
-                #Then replace the current code below with:
-                #
-                #     code_args_local_or_valid+=${code_indentation_inner}${arg_tester}${arg_expansions}' || ::func.die_unless_arg_expansions_pass_tester "${@}" '''${arg_expansions}''' '${(q)arg_tester}
-
-                code_args_local_or_valid+=$'\n''        '${arg_tester}${arg_expansions}' || ::func.die_unless_arg_expansions_pass_tester "${@}" '''${arg_expansions}''' '${(q)arg_tester}
+            # For each alias name and corresponding string localizing arguments
+            # into locals declared by expanding such alias, do so *AFTER*
+            # prior iteration validates all such arguments. Since such
+            # localization consists only of simple string assignments (e.g.,
+            # 'my_var="${1}"') and hence is guaranteed to succeed, no exception
+            # handling is required.
+            for arg_definer arg_values (
+                "${(kv@)arg_definer_to_definitions}") {
+                code_args_local_or_valid+=${code_indentation_inner}${arg_definer}${arg_values}
             }
 
             # If such function accepts at least one optional argument and hence
             # prefixed such validation by an if conditional, end such conditional.
-            if (( arg_was_optional )) {
-                code_args_local_or_valid+=$'\n''    }'
+            if (( args_is_optional )) {
+                code_args_local_or_valid+=${code_indentation_outer}'}'
             }
         }
     }
@@ -1387,6 +1425,114 @@ function declare_function_with_stdin() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# -- aside from the observation that we
+                #no longer want to skip straightaway to the next argument. Oh,
+                #we?
+                # Decrement the argument index offset. Prior iteration
+                # assigned each argument an index under the assumption that
+                # all optional arguments are passed. However, the current
+                # argument count implies the current optional argument to
+                # *NOT* be passed, implying all subsequent argument indices
+                # to be one larger than previously assumed. Correct this!
+
+            # In
+            # such case,  or
+            # otherwise ignore such argument.
+
+                    #FUXME: Insufficient. Before applying parameter expansion
+                    #flag "(P"), we *MUST* guarantee such argument to refer to
+                    #a valid variable. Since simply appending to
+                    #${arg_tester_to_values} does *NOT* guarantee this, we
+                    #require yet another map local:
+                    #${arg_var_tester_to_expansions}. This, in turn, implies we
+                    #should rename "arg_tester" everywhere here to
+                    #"arg_tester".
+                    #FUXME: Actually, even that fails to suffice. We clearly
+                    #*CANNOT* combine "(P)" with ranged indices (e.g.,
+                    #"${@[2,-2]}"). Experimental use suggests that, in such
+                    #cases, zsh fails to print an error or report failure, but
+                    #instead simply returns the value of the variable referred
+                    #to by the first such index. Clearly, this is terrible. To
+                    #avoid such edge cases, prohibit function arguments
+                    #satisfying all of the following edge case constraints:
+                    #indirect, subtyped, variadic arguments: e.g.,
+                    #
+                    #    :void err(:string:int+positive my_int1, ...)
+                    #
+                    #Such arguments are fairly edge case, anyway. Technically,
+                    #we *COULD* programmatically validate such variables by
+                    #manually iterating such arguments...
+                    #FUXME: Wait. We've just devised an efficient workaround,
+                    #which is fairly awesome:
+                    #
+                    #* For all indirect, subtyped, variadic arguments (i.e.,
+                    #  just test "(( arg_is_variadic ))" here, suffix
+                    #  ${arg_index} by '//(#m)*/${(P)MATCH}', ensuring such
+                    #  argument indices are expanded as follows:
+                    #    "${@[2,-2]//(#m)*/${(P)MATCH}}"
+                    #
+                    #Excrutiatingly clever. Huzzah!
+
+        #FUXME: O.K.; so, we still need to handle default values. Lookin' good
+        #on pretty much everything else, but the time already invested in this
+        #*DOES* somewhat astonish the rabid-eyed mind.
+
+    # Space-delimited string of all expansions of arguments to be localized.
+    # local arg_definitions
+
+            #FUXME: Replicate such logic for both ${arg_definer_to_definitions}
+            #and ${arg_var_tester_to_values}, iterating ${arg_tester_to_values}
+            #*BEFORE* ${arg_var_tester_to_values} *BEFORE*
+            #${arg_definer_to_definitions}. Order is quite important here.
+
+ # Hence,
+            # perform only attempt
+            # to expand such variables here *AFTER* performing such iteration.
+                #FUXME: Indentation is conditional here. The current
+                #indentation is appropriate *ONLY* if the current argument
+                #count requires a wrapping if conditional; else, such
+                #indendation is too much. We probably want a new string local
+                #${code_indentation_inner} to correct this. Given the above changes,
+                #boolean ${args_is_optional} indicates whether or not we
+                #require one or two levels of indentation *BEFORE* iterating
+                #anything, implying ${code_indentation_inner} may be set as a
+                #string constant *BEFORE* such iteration *AFTER* setting such
+                #boolean ala:
+                #
+                #     code_indentation_inner=$'\n''    '
+                #     if (( args_is_optional )) {
+                #         code_indentation_outer=${code_indentation_inner}
+                #         code_indentation_inner+='    '
+                #     }
+                #
+                #Elegant, no? Note that new string local
+                #${code_indentation_outer} is only ever expanded by functions
+                #accepting optional arguments, justifying the logic above.
+                #
+                #Then replace the current code below with:
+                #
+                #     code_args_local_or_valid+=${code_indentation_inner}${arg_tester}${arg_values}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${arg_values}''' '${(q)arg_tester}
+
+            #FUXME: Erroneous test. During the first iteration of argument
+            #counts for functions accepting optional arguments, no optional
+            #arguments will be enabled, in which case the conditional below
+            #fails when it *SHOULD* succeed. What we *REALLY* want to test is
+            #just "(( arg_count_min != arg_count_max ))" instead. That said, to
+            #avoid repetitious tests, we really want to encapsulate such
+            #outcome in a new boolean local declared and defined far above as
+            #follows:
+            #
+            #    integer args_is_optional=$(( arg_count_min != arg_count_max ))
+            #
+            #Then, test such integer here and below as follows:
+            #
+            #    if (( args_is_optional )) {
+
+        #FUXME: Inefficient. Surely a simpler test presents itself?
+        # if (( ${#arg_definer_to_definitions} +\
+        #       ${#arg_tester_to_values} +\
+        #       ${#arg_var_tester_to_values} )) {
+
             #FUXME: Given such changes, we will only be testing existing
             #boolean ${arg_was_optional} in *ONE* place. Is there no better
             #way?
@@ -2259,8 +2405,8 @@ function declare_function_with_stdin() {
     # argv[-2,-1]=()
 
     #         # List of all argument indices to be tested. Unlike
-    #         # ${arg_expansions_string}, such list consists only of integers.
-    #         local -a arg_expansions
+    #         # ${arg_values_string}, such list consists only of integers.
+    #         local -a arg_values
 
     #         # Convert the passed list of 
 
@@ -2269,7 +2415,7 @@ function declare_function_with_stdin() {
     #         # negative indices (e.g., "@[-1]" and hence are *NOT* strictly
     #         # integers.
     #         local arg_index
-    #         for   arg_index ('${arg_expansions}') {
+    #         for   arg_index ('${arg_values}') {
     #             # Strip "@[" and "]" delimiters, if found.
     #             arg_index="${${arg_index#@\[}%]}"
 
@@ -2335,7 +2481,7 @@ function declare_function_with_stdin() {
             #function names rather than prototypes; given the former, such handlers
             #may losslessly obtain the latter by calling the corresponding setter.
             #FUXME: O.K.; we've now drafted
-            #::func.die_unless_arg_expansions_pass_tester() below. Call
+            #::func.die_unless_arg_values_pass_tester() below. Call
             #such function here.
             #FUXME: If you consider it, there's no genuine reason not to simply
             #delimit such indices by "${" and "}" in the prior iteration above
@@ -2381,7 +2527,7 @@ function declare_function_with_stdin() {
     # "${func_prototype_setter_name}" func_prototype
 
         #     code_args_local_or_valid+='
-        # '${arg_tester}' '${${=arg_expansions}//(#m)*/\"\${${MATCH}}\"}' || {
+        # '${arg_tester}' '${${=arg_values}//(#m)*/\"\${${MATCH}}\"}' || {
 
  # enabling such validation only if the caller passed the
         # current number of arguments.
@@ -2783,7 +2929,7 @@ function declare_function_with_stdin() {
     # against such prototype constraints parsed above.
     # Whitespace-delimited string of all argument expansions to be passed to
     # the current argument type validator (e.g., '"${1}" "${3}" "${4}").
-    # local arg_expansions
+    # local arg_values
 
         #FUXME: Combine this and the subsequent assignment, ideally later.
 
@@ -2793,7 +2939,7 @@ function declare_function_with_stdin() {
         #
         # * "=", splitting such indices on whitespace.
         # * "(#m)*", capturing the current index to string global ${MATCH}.
-        # arg_expansions=${${=arg_expansions}//(#m)*/\"\${${MATCH}}\"}
+        # arg_values=${${=arg_values}//(#m)*/\"\${${MATCH}}\"}
 
             # code_args_local_or_valid+='''Function ${funcstack[1]}() argument ${arg_index} references variable ${''${@[${arg_index}]}''} either not found or not of expected type '${arg_type[8,-1]}'.'''
         # "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_type}' but received:"$''\n''"${@[${arg_index}]}"$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}'
@@ -2840,10 +2986,10 @@ function declare_function_with_stdin() {
         #
         # * "=", splitting such indices on whitespace.
         # * "(#m)*", capturing the current index to string global ${MATCH}.
-        # arg_expansions=${${=arg_expansions}//(#m)*/\"\${${MATCH}}\"}
+        # arg_values=${${=arg_values}//(#m)*/\"\${${MATCH}}\"}
 
         # Append code calling such function with each such arguments.
-        # code_args_local_or_valid+=$'\n'${arg_type_checker}' '${arg_expansions}
+        # code_args_local_or_valid+=$'\n'${arg_type_checker}' '${arg_values}
 
         #FUXME: Inefficient in the common case there exist multiple
         #arguments of the same type to be tested. Ideally, we want only a
@@ -2855,7 +3001,7 @@ function declare_function_with_stdin() {
     # Map from function names validating variable types to space-delimited
     # strings listing the indices of all arguments to be validated by such
     # function.
-    # local -A var_type_checker_to_arg_expansions
+    # local -A var_type_checker_to_arg_values
 
         # arg_name\
         # arg_type\
