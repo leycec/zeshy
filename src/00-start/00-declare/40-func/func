@@ -67,7 +67,7 @@ defining, other functions).
 #
 #  Subtypes should be readily generalizable as follows:
 #
-#  * If there exists a runnable with name ":die_unless_${arg_type#:}", pass
+#  * If there exists a runnable with name ":die_unless_${arg_subtype_local#:}", pass
 #    such argument to such runnable in the preamble for such function.
 #  * Of course, subtypes should be subject to suffixing erotemes as well.
 #
@@ -715,7 +715,7 @@ function ::func_.stop_parse_prototype() {
 
     #    for arg_count ({${arg_count_min}..${arg_count_max}}) {
     #        ...
-    #        for arg_index arg_type arg_is_optional arg_is_variadic (
+    #        for arg_index arg_subtype_local arg_is_optional arg_is_variadic (
     #            "${args_metadata[@]}") {
     #            ...
     #        }
@@ -770,8 +770,8 @@ function ::func_.stop_parse_prototype() {
     # Space-delimited string of all expansions of arguments to be validated.
     local arg_values
 
-    # Current argument name, type, and subtype.
-    local arg_name arg_type arg_subtype
+    # Current argument name, type, and subtypes.
+    local arg_name arg_subtype_local arg_subtype_major arg_subtype_minor
 
     # Name of the alias localizing the current argument.
     local arg_definer
@@ -865,6 +865,37 @@ function ::func_.stop_parse_prototype() {
         while {
             pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY_DECLARE_FUNC_ARGS__}"
         } {
+            # For efficiency and readability, localize argument match metadata.
+            arg_name=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME}]}
+            arg_type=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE}]}
+            arg_subtype_local=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}]}
+            arg_is_indirect=${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_INDIRECT}]}
+
+            # Since such metadata *ALWAYS* has length greater than 1 if
+            # matched, this assigns such boolean non-boolean integers. Due to
+            # the manner with which zsh interprets tests resembling "((
+            # arg_is_variadic ))", such trivialities are ignorable.
+            arg_is_variadic=${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_VARIADIC}]-}
+
+            # If such argument is indirect (i.e., refers to a variable by
+            # name), default such local subtype to ":string". (By PCRE design,
+            # such subtype is guaranteed to be the empty string and hence
+            # safely replaceable by a sane default.)
+            if (( arg_is_indirect )) {
+                arg_subtype_local=':string'
+            #FIXME: Condense the conditional below here.
+
+            # Else, such argument is direct.
+            } else {
+                # If such argument's local subtype is nonscalar (i.e., list or
+                # map), throw an exception. By zsh mandate, arguments are
+                # *ALWAYS* passed as untyped strings and hence cannot
+                # encapsulate nonscalar data without indirection.
+                [[ "${arg_subtype_local}" != ':'('list'|'map') ]] ||
+                    ::func_.die_of_cause_arg_type_direct\
+                        'nonscalar, but zsh only supports scalar argument types'
+            }
+
             # If such argument is neither optionalized or defaulted, such
             # argument is non-optional and hence mandatory. Note such fact.
             if [[ -z "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_OPTIONAL}]-}${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_VALUE}]-}" ]] {
@@ -948,6 +979,47 @@ function ::func_.stop_parse_prototype() {
                 #arguments. To accomplish the latter, we'll simply need to
                 #append to a new newline-delimited *STRING* local
                 #${arg_defaults}. Sweet, no?
+                #FIXME: We've given this a meager amount of thought. The above
+                #is absolutely correct. It seems increasingly clear we also
+                #want to invert the order in which we perform
+                #declarations+definitions and validations: e.g.,
+                #
+                #    # Instead of this... (which obviously doesn't work!)
+                #    :string.die_unless_nonempty "${1}" "${2}" "${3}"
+                #    :string arg1="${1}" arg2="${2}" arg3
+                #    arg3="default"
+                #
+                #    # ...we want this.
+                #    :string arg1="${1}" arg2="${2}" arg3
+                #    arg3="default"
+                #    :string.die_unless_nonempty "${1}" "${2}" "${arg3}"
+                #FIXME: Wait. The above doesn't quite work either, if such
+                #defaulted argument is either an integer or float. Hmm. We
+                #*REALLY* want something resembling:
+                #
+                #    # ...we want this.
+                #    :int arg1="${1}" arg2="${2}" arg3
+                #    arg3="default"
+                #    :int.die_unless_nonzero "${1}" "${2}" "${arg3}"
+                #
+                #Oh, wait. That *DOES* work; we just need to be careful. If
+                #all function arguments are strings, we *COULD* safely pass
+                #such validation tester arguments expanded by name rather than
+                #value: e.g.,
+                #
+                #    :int.die_unless_nonzero "${arg1}" "${arg2}" "${arg3}"
+                #
+                #In all other cases, however, the *ONLY* arguments that may be
+                #safely expanded by name are those explicitly defaulted.
+                #FIXME: If such argument is only optional, continuing to the
+                #next argument is always appropriate here. In such case, if the
+                #current argument doesn't support such argument, such argument
+                #will be neither localized or validated, which seems not merely
+                #appropriate but necessary. Else if such argument is merely
+                #defaulted (whether in a relaxed manner or not), we'll need to
+                #soldier on and:
+                #
+                #* If validating such argument, expand such argument by name.
 
                 # If specified, assign such argument a default value.
 
@@ -959,7 +1031,7 @@ function ::func_.stop_parse_prototype() {
             # ignore the valid case that the current argument is both variadic
             # and optional. See above for further details.
             } elif (( arg_was_variadic )) {
-                ::func_.die_of_cause\
+                ::func_.die_of_cause_arg_variadic\
                     'accepts both optional and variadic arguments'
             # Else, such argument is validly optional.
             } else {
@@ -980,10 +1052,7 @@ function ::func_.stop_parse_prototype() {
             # an ellipse), handle such argument. Do so *AFTER* decrementing
             # such argument index and hence testing whether such argument is
             # optional, as we further munge such index below.
-            if [[ -z "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_VARIADIC}]-}" ]] {
-                # Note such fact.
-                arg_is_variadic=0
-
+            if (( arg_is_variadic )) {
                 # If such argument follows a variadic argument, such argument
                 # cannot be reliably indexed by its positive index (i.e.,
                 # relative to the start of such argument list). Since such
@@ -1011,7 +1080,7 @@ function ::func_.stop_parse_prototype() {
             # general means of deciding which such list a passed string was
             # intended to belong to.
             } elif (( arg_was_variadic )) {
-                ::func_.die_of_cause\
+                ::func_.die_of_cause_arg_variadic\
                     'accepts two or more variadic arguments'
             # If a prior argument is optional, throw an exception. Such case
             # implies such function to accept one or more optional arguments
@@ -1024,13 +1093,10 @@ function ::func_.stop_parse_prototype() {
             # following a prior variadic argument, the prior exception is more
             # explanatory than this exception.
             } elif (( arg_was_optional )) {
-                ::func_.die_of_cause\
+                ::func_.die_of_cause_arg_variadic\
                     'accepts both optional and variadic arguments'
             # Else, such argument is validly variadic.
             } else {
-                # Note such fact.
-                arg_is_variadic=1
-
                 # Index such argument and all subsequent optional variadic
                 # arguments with an argument range starting at the current
                 # positive index and ending at the negative index of the last
@@ -1047,237 +1113,180 @@ function ::func_.stop_parse_prototype() {
             if (( arg_is_optional )) { arg_was_optional=1 }
             if (( arg_is_variadic )) { arg_was_variadic=1 }
 
-            # Argument name and type, localized for efficient reuse below.
-            arg_name=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME}]}
-            arg_type=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE}]}
-
-            #FIXME: Define a new exception handler
-            #::func_.die_of_cause_argument_type() and call such handler
-            #everywhere below in place of the current logic.
-
-            # If such type is nonscalar (i.e., list or map), throw an
-            # exception. By definition, argument types are *ALWAYS* scalar.
-            [[ "${arg_type}" != ':'('list'|'map')('_'*|) ]] ||
-                ::func_.die_of_cause_arg_type\
-                    'nonscalar, but zsh only supports scalar argument types (e.g., `:bool`, `:char`, `:float`, `:int`, `:string`)'
-
             # If localizing such argument (i.e., if such argument name is
-            # unrelaxed), note such fact by appending an initialization of such
-            # name to such value to the appropriate type-specific string.
+            # unrelaxed), do so.
             if [[ -z "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]}" ]] {
-                # If such argument is a string referring to another variable's name,
-                # localize such argument merely as a string.
-                if [[ "${arg_type}" == ':string:'* ]] {
-                    arg_definer=':string'
-                # Else, such argument is a scalar value. Localize such value to
-                # be of such type.
-                } else {
-                    arg_definer=${arg_type}
-                }
-
-                # If such type is *NOT* the name of an existing alias, throw an
-                # exception. See :is_alias_simple() for details.
-                (( ${+aliases[${arg_definer}]} )) || 
+                # Note that if such argument is indirect, prior logic ensures
+                # such argument's local subtype to be ":string".
+                #
+                # If such subtype is *NOT* the name of an existing alias, throw
+                # an exception. See :is_alias_simple() for details.
+                (( ${+aliases[${arg_subtype_local}]} )) ||
                     ::func_.die_of_cause_arg_type\
-                        'unrecognized, requiring undefined alias '${arg_definer}'() to locally declare such argument'
+                        'local subtype '${arg_subtype_local}' unrecognized (i.e., alias '${arg_subtype_local}'() locally declaring such argument undefined)'
 
-                # Map such alias name to such argument definition.
-                arg_definer_to_definitions[${arg_definer}]+=' '${arg_name}'="${'${arg_index}'}"'
+                # Map such subtype to a statement copying such argument's value
+                # to a local variable of the same name.
+                arg_definer_to_definitions[${arg_subtype_local}]+=' '${arg_name}'="${'${arg_index}'}"'
             }
 
             # If validating such argument (i.e., if such argument type is
-            # unrelaxed and unequal to ":string"), note such fact by appending
-            # an expansion of such argument to the appropriate type-specific
-            # string. Technically, *ALL* function arguments are untyped scalars
-            # and hence strings, implying no validation to be required for
-            # arguments of type ":string".
+            # unrelaxed and unequal to ":string"), do so. Since *ALL* function
+            # arguments are technically untyped scalars and hence strings,
+            # arguments of type ":string" are *ALWAYS* inherently valid.
             if [[ -z "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]}" &&
-                  "${arg_type}" != ':string' ]] {
-                #FIXME: As expected, "+"-style subtypes are insufficient.
-                #Consider how one would validate a string argument referring to
-                #a function. In such case, ":string/func" fails, as there
-                #exists no function :string.is_func(). We thus require a new
-                #syntactic element implying function :func.is() instead. And
-                #for that, "/" clearly applies: e.g.,
-                #
-                #    :void ::var.die_unless_passes_tester(
-                #        :string/var var_name1, ...,
-                #        :string/func tester_name,
-                #        :string/alias_simple alias_name)
-                #
-                #Given that we now have two validation-specific "types",
-                #abandon the current "subtype" nomenclature in favor of:
-                #
-                #* The "/"-prefixed major type. If unspecified, such type
-                #  defaults to the portion of such type preceding the "+" if
-                #  any (e.g., the ":string" in ":string+glob").
-                #* The "+"-prefixed minor type.
-                #
-                #What's awesome about this is that major and minor types can be
-                #elegantly combined in the expected way: e.g.,
-                #
-                #    :void ::test(:string/var+nonempty var_name)
-                #
-                #Hence, "/" and "+" are both essential syntax. Neither
-                #obsoletes or obviates the other. Make it so, please!
-                #FIXME: Hey, it gets even better! The above syntax clearly
-                #obsoletes our existing (and frankly rather kludgy) handling of
-                #variable indirection. Specifically, arguments of type
-                #":string/var+${var_type}" clearly obsolete prior type
-                #":string:${var_type}". Hence, do away with *ALL* ":string:"
-                #handling below. However, note that repeating ":string/var+"
-                #everywhere in list- and map-centric function prototypes will
-                #get old fairly quickly. We might consider a new argument type
-                #prefix: ":*", shorthand for ":string/var+". Hence, the
-                #following prototypes are equivalent:
-                #
-                #    :void ::handle(:string/var+char char_name+__h)
-                #    :void ::handle(:*char char_name+__h)
-                #    :void ::handle(*:char char_name+__h)
-                #    :void ::handle(:char *char_name+__h)
-                #
-                #Well, three choices anyway. Contemplate a bit further.
-                #FIXME: O.K.; C adopted "char *p" syntax to imply that "*p" is
-                #the manner with which you access the data such pointer refers
-                #to. In zeshy, however, we have no pointers, so that doesn't
-                #apply; moreover, we've always thought such syntax to be
-                #inherently irrational, in that the "*" modifies the type of
-                #such variable and hence should be associated with such type
-                #rather than such pointer name. Hence, either ":*char" or
-                #"*:char" would be appropriate here. Indeed, for the same
-                #reason, "*:char" is probably the most appropriate choice.
-                #(Adopting C syntax would also be in poor taste here, as that
-                #would tacitly imply zeshy to support pointers, which it
-                #clearly does not.)
-                #
-                #However, "*:char" has one additional advantage over ":*char":
-                #the former supports custom user-defined types leveraging a
-                #user-specific prefix (e.g., "*@bytes"), whereas the latter
-                #obstructs such use. Right then! We shay go with:
-                #
-                #    :void ::handle(*:char char_name+__h)
-                #FIXME: If both "*" and a major subtype are specified, throw an
-                #exception. That is to say, prohibit the second argument here:
-                #
-                #    :void ::handle(:int number, :char/var char_name+__h)
+                "${arg_type}" != ':string' ]] {
+                # Such argument's major and minor validation-specific subtypes.
+                arg_subtype_major=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]}
+                arg_subtype_minor=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MINOR}]}
 
-                # Major and minor argument subtypes, localized for efficient
-                # reuse below.
-                arg_subtype_major="${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]}"
-                arg_subtype_minor="${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MINOR}]}"
+                # If such argument is indirect, such subtype applies to
+                # the value of the variable such argument refers to rather
+                # than such variable's type. In contrast to the customary
+                # case (in which we validate only such argument's value),
+                # this necessitates we validate both such argument's value
+                # (i.e., such variable's type) *AND* such variable's value.
+                #
+                # There exist two principal means of doing so:
+                #
+                # 1. Create one new function
+                #    "var.is_${subtype_major}_${subtype_minor}" for each
+                #    existing function
+                #    "${subtype_major}.is_${subtype_minor}" (e.g.,
+                #    a new function var.is_int_positive() corresponding to
+                #    existing function int.is_positive()). This has the
+                #    minor advantage of requiring no changes to the logic
+                #    below, but has the uncomfortably distinct disadvantage
+                #    of effectively doubling the number of tester
+                #    functions in the core zeshy codebase.
+                # 2. Call the existing function
+                #    "${subtype_major}.is_${subtype_minor}" with such
+                #    variable's value by directly passing such argument
+                #    expanded by parameter expansion flag "(P)". This has
+                #    the minor disadvantage of requiring we duplicate logic
+                #    validating such argument's value below to also
+                #    validating such variable's value here, but the
+                #    comfortably distinct advantage of requiring no
+                #    significant changes to the core zeshy codebase.
+                #
+                # Three pence for the grizzly gentleman in the well-bearded
+                # coat if you can guess which approach we adopted.
+                #
+                # For simplicity, validate such variable's value *BEFORE*
+                # validating such argument's value (i.e., such variable's
+                # type). While such validation could be performed in either
+                # order, this order simplifies such logic substantially.
+                if (( arg_is_indirect )) {
+                    # Name of the function validating such variable's value.
+                    arg_tester=':'${arg_subtype_major]}'.is_'
 
-                # If such argument is a string referring to another variable's name,
-                # validate the latter to exist *AND* be of the expected type.
-                # To implement the latter, validate such argument by calling a
-                # function :string.${arg_subtype_major}.
-                if [[ "${arg_subtype_major}" == 'var' ]] {
-                    # If such argument type is *NOT* ":string", throw an
-                    # exception. While integer arguments could technically
-                    # refer to variables whose names are themselves integers,
-                    # such edge-case seems both implausible and error-prone. In
-                    # practice, only strings refer to other variables.
-                    [[ "${arg_type}" == ':string' ]] ||
+                    # If such argument has a minor subtype, suffix such function.
+                    [[ -z "${arg_subtype_minor}" ]] ||
+                        arg_tester+='_'${arg_subtype_minor}
+
+                    # If such function does *NOT* exist, throw an
+                    # exception. For efficiency, inline such test. See
+                    # :func.is() for further details.
+                    (( ${+functions[${arg_tester}]} )) ||
                         ::func_.die_of_cause_arg_type\
-                            'not a string but indirectly refers to variables by name; consider prefixing such type by "*" or ":string/var" instead'
+                            'unvalidatable (i.e., function '${arg_tester}'() validating variables referred to by such argument undefined)'
 
-                    # If such argument is subtyped, such subtype constraints
-                    # the value of the variable such argument refers to rather
-                    # than such variable's type. In contrast to the customary
-                    # case (in which we validate only such argument's value),
-                    # this necessitates we validate both such argument's value
-                    # (i.e., such variable's type) *AND* such variable's value.
-                    # In turn, this necessitates we duplicate the logic
-                    # validating such argument's value below to also validate
-                    # such variable's value here.
+                    # Map such function name to such variable expansion.
                     #
-                    # Since such variable's type
-                    # must also be 
+                    # If such argument is variadic, such argument implies
+                    # an indirectly subtyped variadic argument list (e.g.,
+                    # as ":void func(:string:int+nonzero int1, ...)").
+                    # Unfortunately, such edge case provokes a subtle
+                    # contradiction:
                     #
-                    # Given this, such argument
-                    # must be expanded with parameter expansion flag "(P)"
-                    # rather than as is, requiring 
-                    if [[ -n "${arg_subtype}" ]] {
-                        # Name of the function validating such variable values.
-                        arg_tester=${arg_type[9,-1]}'.is_'${arg_subtype}
+                    # * Expanding variadic arguments requires use of ranged
+                    #   indices ("${@[2,-2]}").
+                    # * Expanding indirect arguments requires use of
+                    #   parameter expansion flag "(P)" ("${(P)2}").
 
-                        # If such function does *NOT* exist, throw an
-                        # exception. For efficiency, inline such test. See
-                        # :func.is() for further details.
-                        (( ${+functions[${arg_tester}]} )) ||
-                            ::func_.die_of_cause_arg_type\
-                                'unrecognized, requiring undefined function '${arg_tester}'() to validate the variable such argument refers to'
-
-                        # Map such function name to such variable expansion.
-                        #
-                        # If such argument is variadic, such argument implies
-                        # an indirectly subtyped variadic argument list (e.g.,
-                        # as ":void func(:string:int+nonzero int1, ...)").
-                        # Unfortunately, such edge case provokes a subtle
-                        # contradiction:
-                        #
-                        # * Expanding variadic arguments requires use of ranged
-                        #   indices ("${@[2,-2]}").
-                        # * Expanding indirect arguments requires use of
-                        #   parameter expansion flag "(P)" ("${(P)2}").
-
-                        # * Parameter expansion flag "(P)" only non-
-                        #   erroneously applies to single rather than ranged
-                        #   expansions (e.g., to "${(P)2}" rather than
-                        #   "${(P)@[2,-2]}"), Technically, zsh *DOES* silently
-                        #   permit "(P)" to be used in conjunction with ranged
-                        #   expansions, but in such case only expands to the
-                        #   value of the variable referred to by the first such
-                        #   index -- which, ultimately, is of little use.
-                        #
-                        # Syllogism (i.e., logic puzzle) enthusiasts will be
-                        # quick to note the implication above. Happily, such
-                        # conundrum is efficiently correctable by detecting
-                        # such edge case and, in such case, performing global
-                        # string replacement to iteratively replace all
-                        # argument values in such range by the values of the
-                        # variables the former refer to instead (e.g.,
-                        # expanding the indices ranging @[2,-2] as
-                        # "${@[2,-2]//(#m)*/${(P)MATCH}}" rather than
-                        # "${(P)@[2,-2]}"). Dismantled, this is:
-                        #
-                        # * "(#m)", enabling canonical string global ${MATCH}.
-                        # * "*", capturing the name of the variable referred to
-                        #   by the current argument to ${MATCH}.
-                        # * "${(P)MATCH}", expanding to such variable's value.
-                        if (( arg_is_variadic )) {
-                            arg_var_tester_to_values[${arg_tester}]+=' "${(P)'${arg_index}'//(#m)*/${(P)MATCH}}"'
-                        # Else, such argument is non-variadic and hence refers
-                        # to a single variable. In such case, parameter
-                        # expansion flag "(P)" may be applied per usual.
-                        } else {
-                            arg_var_tester_to_values[${arg_tester}]+=' "${(P)'${arg_index}'}"'
-                        }
-                    }
-
-                    # Name of the function validating such argument values. For
-                    # simplicity, use the same string local as above to do so.
-                    # To avoid complications, redefine such local *AFTER*
-                    # possibly defining such local above.
-                    arg_tester=':var.is_type_'${arg_type[9,-1]}
-                # Else, such argument is a scalar value. Validate such value to
-                # be of such type.
-                } else {
-                    arg_tester=${arg_type}'.is'
-
-                    # If such argument is subtyped, suffix such function name
-                    # by such subtype.
-                    if [[ -n "${arg_subtype}" ]] {
-                        arg_tester+='_'${arg_subtype}
+                    # * Parameter expansion flag "(P)" only non-
+                    #   erroneously applies to single rather than ranged
+                    #   expansions (e.g., to "${(P)2}" rather than
+                    #   "${(P)@[2,-2]}"), Technically, zsh *DOES* silently
+                    #   permit "(P)" to be used in conjunction with ranged
+                    #   expansions, but in such case only expands to the
+                    #   value of the variable referred to by the first such
+                    #   index -- which, ultimately, is of little use.
+                    #
+                    # Syllogism (i.e., logic puzzle) enthusiasts will be quick
+                    # to note the implication above. Happily, such conundrum is
+                    # efficiently correctable by detecting such edge case and,
+                    # in such case, performing global string replacement to
+                    # iteratively replace all argument values in such range by
+                    # the values of the variables the former refer to instead
+                    # (e.g., expanding the indices ranging @[2,-2] as
+                    # "${@[2,-2]//(#m)*/${(P)MATCH}}" rather than
+                    # "${(P)@[2,-2]}"). Dismantled, this is:
+                    #
+                    # * "(#m)", enabling canonical string global ${MATCH}.
+                    # * "*", capturing the name of the variable referred to
+                    #   by the current argument to ${MATCH}.
+                    # * "${(P)MATCH}", expanding to such variable's value.
+                    if (( arg_is_variadic )) {
+                        arg_var_tester_to_values[${arg_tester}]+=' "${(P)'${arg_index}'//(#m)*/${(P)MATCH}}"'
+                    # Else, such argument is non-variadic and hence refers to a
+                    # single variable. In such case, parameter expansion flag
+                    # "(P)" may be applied per usual.
+                    } else {
+                        arg_var_tester_to_values[${arg_tester}]+=' "${(P)'${arg_index}'}"'
                     }
                 }
+
+                # Now validate such argument's value.
+                #
+                # If such argument has a major subtype, verify such subtype.
+                #
+                # Specifically, if such argument is *NOT* indirect but such
+                # major subtype is "var", such argument is actually indirect.
+                # While indirection is usually specified by type indirective
+                # "*", type prefix ":string/var" also suffices.
+                #
+                # If such argument is additionally *NOT* locally declared as a
+                # string, throw an exception. While integer arguments could
+                # technically refer to variables whose names are themselves
+                # integers, such edge-case seems both implausible and fragile.
+                if [[ -n "${arg_subtype_major}" ]] {
+                    if [[ "${arg_subtype_major}" == 'var' &&
+                          "${arg_subtype_local}" != ':string' ]] {
+                        ::func_.die_of_cause_arg_type_direct\
+                            'refers to variables by name but not locally declared as a string'
+                    }
+                # Else, such argument has no major subtype. Since such subtype
+                # is required for validation...
+                } elif {
+                    # ...if such argument is indirect, convert such major and
+                    # minor subtypes to their standard format for direct
+                    # arguments (e.g., from "*:int" to ":string/var+int"),
+                    # simplifying validation below.
+                    if (( arg_is_indirect )) {
+                        arg_subtype_minor=${arg_subtype_major}
+                        arg_subtype_major='var'
+                    # ...else, default such major subtype to such local
+                    # subtype, stripped of ":" prefix if any.
+                    } else {
+                        arg_subtype_major=${arg_subtype_local#:}
+                    }
+                }
+
+                # Name of the function validating such argument's value.
+                arg_tester=':'${arg_subtype_major}'.is'
+
+                # If such argument has a minor subtype, suffix such function.
+                [[ -z "${arg_subtype_minor}" ]] ||
+                    arg_tester+='_'${arg_subtype_minor}
 
                 # If such function does *NOT* exist, throw an exception.  For
                 # efficiency, inline such test. See :func.is() for details.
                 (( ${+functions[${arg_tester}]} )) ||
                     ::func_.die_of_cause_arg_type\
-                        'unrecognized, requiring undefined function '${arg_tester}'() to validate such argument'
+                        'unvalidatable (i.e., function '${arg_tester}'() validating such argument undefined)'
 
-                # Map such function name to such argument expansion.
+                # Map such function name to such argument's expansion.
                 arg_tester_to_values[${arg_tester}]+=' "${'${arg_index}'}"'
             }
         }
@@ -1509,9 +1518,442 @@ function declare_function_with_stdin() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#  Only strings may reasonably refer to variables.
+                # If such argument indirectly refers to another variable,
+                # validate such variable's value as described above.
+                # Since subsequent logic *WILL* validate such variable's
+                # type, avoid doing so here.
+                #FUXME: Wait. We nearly fell down the rabbit hole. Actually,
+                #O.K.; we kind of already did. Here's the trick, you see: we
+                #don't *CARE* about longhand indirection (e.g.,
+                #":string/var+int") after performing the above validation. The
+                #logic below *ONLY* applies to shorthand indirection, since
+                #only shorthand syntax permits such variable's value to be
+                #validated as well. *sigh* Right. Well, what can you do, eh?
+                #Excise everything *NOT* related to "(( arg_is_indirect ))"
+                #below.
+
+                # If such argument is *NOT* indirect but such major subtype is
+                # "var", such argument is actually indirect. While indirection
+                # is typically specified with the type indirective "*", the
+                # type prefix ":string/var" also suffices to imply indirection.
+                # In such case, convert the latter to the former.
+                # if (( ! arg_is_indirect )) &&
+                #    [[ "${arg_subtype_major}" == 'var' &&
+                #       -n "${arg_subtype_minor}" ]] {
+                #     # If such argument is *NOT* locally declared as a string,
+                #     # throw an exception. While integer arguments could
+                #     # technically refer to variables whose names are integers,
+                #     # such edge-case seems equally implausible and fragile.
+                #     # (Only strings may reasonably refer to variables.)
+                #     [[ "${arg_subtype_local}" == ':string' ]] ||
+                #         ::func_.die_of_cause_arg_type_direct\
+                #             'refers to variables by name but not locally declared as a string'
+                # }
+
+                #FUXME: Everything below requires substantial simplification.
+                # if [[ -n "${arg_subtype_minor}" ]] {
+                #     #FUXME: Incorrect. Invert this by shifting such logic
+                #     #below. Then excise this entire conditional. (Yes!)
+
+                #     # Convert the current type to the equivalent shorthand
+                #     # for variable indirection (e.g., from
+                #     # ":string/var+int" to "*:int"), parsed below. As such
+                #     # shorthand is considerably more common than such
+                #     # longhand, the latter defers to the former.
+                #     arg_subtype_major=${arg_subtype_minor}
+                #     arg_subtype_minor=
+                #     arg_is_indirect=1
+                # }
+
+                    # Having validated such variable's value above, prepare
+                    # to validate such variable's type below by rewriting
+                    # the current shorthand type
+                    #
+                    # Convert the current shorthand type to the equivalent shorthand
+                    # for variable indirection (e.g., from
+                    # ":string/var+int" to "*:int"), parsed below. As such
+                    # shorthand is considerably more common than such
+                    # longhand, the latter defers to the former.
+                    # arg_subtype_major=${arg_subtype_minor}
+                    # arg_subtype_minor=
+                    # match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_INDIRECT}]='*'
+
+                # name by such subtype.
+#by setting such major subtype to "var" and such minor
+                    # subtype to such major subtype 
+                    #FUXME: Totally and horribly awry. We actually need to
+                    #*ALWAYS* set arg_subtype_major='var' when
+                    #"(( arg_is_indirect ))"; clearly, however, that overwrites
+                    #the current major subtype. *sigh*
+                    #
+                    #While there are any number of reasonable solutions here,
+                    #the simplest at the moment appears to be:
+                    #
+                    #* Revise such PCREs as follows:
+                    #
+                    #  local pcre_arg_type_unstarred_grouped=${pcre_empty_group}${pcre_operable_type_grouped}${pcre_operable_name_slashed_optional_grouped}${pcre_operable_name_plussed_optional_grouped}${pcre_empty_group}
+                    #  local pcre_arg_type_starred_grouped=${pcre_star_optional_grouped}${pcre_empty_group}${pcre_empty_group}${pcre_operable_type_grouped}${pcre_operable_name_plussed_optional_grouped}
+                    #* We've added yet another index above, as you might
+                    #  notice. For direct arguments, we add an empty trailing
+                    #  group; for indirect arguments, such group will be set
+                    #  to, say, the "positive" in indirect argument type
+                    #  "*:string+positive".
+                    #* In @{*-pcre}, define a new match index corresponding to
+                    #  such trailing group -- say,
+                    #  ${arg_subtype_minor_indirect} or some such?
+                    #* Such logic *SHOULD* vastly simplify things here. In
+                    #  particular, defaulting arg_subtype_major='var' as we do
+                    #  below then becomes safe.
+                    #FUXME: Actually, while the above *DOES* technically work,
+                    #it's a bit heavy-handed. Well, really; we've already
+                    #defined so many capture groups; it's not entirely clear
+                    #that yet another demonstrably improves matters. Instead,
+                    #just note that
+                    #${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]
+                    #*ALWAYS* retains the current major subtype. So, it doesn't
+                    #particularly matter if we overwrite ${arg_subtype_major}
+                    #here. That said, it is still somewhat silly. We probably
+                    #do want to revert this to the prior order, in which case
+                    #overwriting ${arg_subtype_major} is perfectly acceptable.
+                    #*HOWEVER*, note that since we forcibly set...
+                    #FUXME: O.K.; this *SHOULD* be reasonably worky now.
+
+                # arg_tester=${arg_subtype_major}'.is'
+
+                # #FUXME: Something went awry here. *sigh*
+                # # Name of the function validating such argument values. For
+                # # simplicity, use the same string local as above to do so.
+                # # To avoid complications, redefine such local *AFTER*
+                # # possibly defining such local above.
+                # arg_tester=':var.is_type_'${arg_subtype_local[9,-1]}
+
+                # # Such argument's major subtype, defaulting to such argument's
+                # # type if unspecified.
+                # arg_subtype_major=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]}
+
+                # # Such argument's minor subtype, defaulting to the empty string
+                # # if unspecified.
+                # arg_subtype_minor=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MINOR}]}
+
+                # } elif [[ -z "${arg_subtype_major}" ]] {
+                # a string referring to a variable by name
+                # via the longhand ":string/var" rather than equivalent
+                # shorthand "*", convert the former to the latter.
+
+                #FUXME: Actually, this is incorrect too. Why? Indirection, as
+                #always! We need to validate a type "*:char+ascii" first with
+                #:var.die_unless_char() and then with :char.die_unless_ascii().
+                #One begins to suspect that the prior order *WAS* superior.
+                #*sigh*
+
+                #FUXME: Optimize me.
+                # If such argument is a string referring to another variable's name,
+                # validate the latter to exist *AND* be of the expected type.
+                # To implement the latter, validate such argument by calling a
+                # function :string.${arg_subtype_major}.
+                # } elif [[ "${arg_subtype_major}" == 'var' ]] {
+                #     # If such argument type is *NOT* ":string", throw an
+                #     # exception. While integer arguments could technically
+                #     # refer to variables whose names are themselves integers,
+                #     # such edge-case seems both implausible and error-prone. In
+                #     # practice, only strings refer to other variables.
+                #     [[ "${arg_subtype_local}" == ':string' ]] ||
+                #         ::func_.die_of_cause_arg_type\
+                #             'not a string but indirectly refers to variables by name; consider prefixing such type by "*" or ":string/var" instead'
+                # }
+
+                        # # Else, such argument has no minor subtype declaring
+                        # # the type of the variable referred to. Since
+                        # # indirection requires such type and hence is
+                        # # inapplicable here, throw an exception encouraging
+                        # # such argument's to merely be rewritten.
+                        # } else {
+                        #     ::func_.die_of_cause_arg_type\
+                        #         'refers to variables by name but not locally declared as a string; consider revising such argument into a string referring to a '${arg_subtype_local#:}' (e.g., from "'${arg_type}'" to "'${arg_type_target}'")'
+                        # }
+
+                #FUXME: The "(e.g.," below is rather silly. To be genuinely
+                #explanatory, such parenthesis should explicitly state the
+                #*ENTIRE* source and target types -- not simply their prefixes.
+                #See a similar example below; grep for:
+                #
+                #    [[ "${arg_subtype_local}" == ':string' ]] || {
+                #FUXME: Indeed, given the similarity between the two messages,
+                #we arguably want a new ::func_.die_of_cause_arg_direct()
+                #exception handler called in both instances.
+                            # ::func_.die_of_cause_arg_type_direct\
+                            #     'refers to variables by name but not locally declared as a string; consider revising such argument into a string referring to a '${arg_subtype_local#:}' by prefixing such type by "*" (e.g., from "'${arg_type}'" to "'${arg_type_target}'")'
+
+                # If such argument has a major subtype implying such argument
+                # to be a string referring to a variable by name *AND* any
+                # minor subtype, validate such variable to exist *AND* be of the
+                # expected type. If such argument satisfies the first but not
+                # second condition, rely on subsequent function testing to
+                # ensure such variable 
+
+# To implement the latter, validate such
+                # argument by calling a function :string.${arg_subtype_major}.
+#or ":string/var" instead
+            # Else, such argument is direct.
+            #
+            # If such argument's  is and hence locally declared as its
+            # local subtype. If such subtype is nonscalar (i.e., list or map),
+            # throw an exception. By zsh mandate, arguments are *ALWAYS* passed
+            # as untyped strings and hence cannot encapsulate nonscalar data.
+
+                # if [[ -n "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_INDIRECT}]}" ]] {
+#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_INDIRECT}]='*'
+                #FUXME: Cursory examination of the code below suggests we
+                #probably no longer need ${arg_subtype_major} or
+                #${arg_subtype_minor} -- at least, not here. Optimize away.
+
+                # Such argument's major subtype, defaulting to such argument's
+                # type if unspecified.
+                # arg_subtype_major=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]}
+
+                # # If unspecified, default such subtype...
+                # if [[ -z "${arg_subtype_major}" ]] {
+                #     # ...if such argument is indirect, to "var".
+                #     if (( arg_is_indirect )) {
+                #         arg_subtype_major='var'
+                #     # ...else, to such local subtype stripped of prefixing ":".
+                #     } else {
+                #         arg_subtype_major=${arg_subtype_local#:}
+                #     }
+                # }
+
+                # # Such argument's minor subtype, defaulting to the empty string
+                # # if unspecified.
+                # arg_subtype_minor=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MINOR}]}
+
+                # # Name of the function validating such argument.
+                # arg_tester=${arg_subtype_major}'.is'
+
+                # # If such argument has a minor subtype, suffix such function
+                # # name by such subtype.
+                # if [[ -n "${arg_subtype_minor}" ]] {
+                #     arg_tester+='_'${arg_subtype_minor}
+                # }
+
+                # arg_subtype_major=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]-${arg_subtype_local}}
+                #FUXME: Document me. A bit hackish, frankly. We should probably
+                #just initialize ${arg_subtype_major} above.
+                # match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]='var'
+
+                # # If unspecified, default such subtype to such local subtype.
+                # if [[ -z "${arg_subtype_major}" ]] {
+                #     arg_subtype_major=${arg_subtype_local}
+                # # Else, such subtype was specified. If such type was prefixed
+                # # by a type indirective (i.e., "*"),  throw an exception
+                # }
+
+                        # 'unrecognized, requiring undefined function '${arg_tester}'() to validate such argument'
+                                # 'unrecognized, requiring undefined function '${arg_tester}'() to validate the variable such argument refers to'
+                # # Name of the alias locally declaring such argument.
+                # arg_definer=${arg_subtype_local}
+
+                # # If such type is *NOT* the name of an existing alias, throw an
+                # # exception. See :is_alias_simple() for details.
+                # (( ${+aliases[${arg_definer}]} )) || 
+                #     ::func_.die_of_cause_arg_type\
+                #         'unrecognized, requiring undefined alias '${arg_definer}'() to locally declare such argument'
+
+                # # Map such alias name to such argument definition.
+                # arg_definer_to_definitions[${arg_definer}]+=' '${arg_name}'="${'${arg_index}'}"'
+
+            #FUXME: Ugh. The logic becomes fairly convoluted fairly quickly.
+            #Honestly, we probably want to handwave all such subtleties away by
+            #refining the PCRE to capture match groups much more strictly here.
+
+            #     # If such argument indirectly refers to a variable by name,
+            #     # locally declare such argument as a string.
+            #     if (( arg_is_indirect )) {
+            #         arg_subtype_local
+            #     }
+
+                #FUXME: If both "*" and a major subtype are specified, throw an
+                #exception. That is to say, prohibit the second argument here:
+                #
+                #    :void ::handle(:int number, *:char/var char_name+__h)
+
+            # unrelaxed and unequal to ":string"), note such fact by appending
+            # an expansion of such argument to the appropriate type-specific
+            # string. Technically, *ALL* function arguments are untyped scalars
+#append an initialization of such name to such value
+            # to the appropriate type-specific string.
+            # Convert the string length of the corresponding matched metadata to a boolean.  
+            #FUXME: Localize above.
+            # arg_subtype_major=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]}
+            # arg_subtype_minor=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]}
+
+                # Note such fact.
+                # arg_is_variadic=1
+
+            # if [[ -z "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_VARIADIC}]-}" ]] {
+            #     # Note such fact.
+            #     arg_is_variadic=0
+
+                # # If such argument is a string referring to another variable's name,
+                # # localize such argument merely as a string.
+                # if [[ "${arg_subtype_local}" == ':string:'* ]] {
+                #     arg_definer=':string'
+                # # Else, such argument is a scalar value. Localize such value to
+                # # be of such type.
+                # } else {
+
+            #FUXME: Obsolete by refactored logic below. Excise entirely.
+                # # Format such exception message in terms of such argument's
+                # # current type and name. See above for further details.
+                # local\
+                #     arg_type_target='*:list'\
+                #     arg_name_target=${arg_name%%<->##}
+                # if (( arg_is_optional )) {
+                #     arg_type_target+='+nonempty'
+                # }
+
+                # # Throw such exception.
+                # ::func_.die_of_cause\
+                #     'accepts both optional and variadic arguments; consider converting the variadic argument list starting with argument ${'${arg_name}'} into a string indirectly referring to a list (e.g., from "'${arg_type}' '${arg_name}', ..." to "'${arg_type_target}' '${arg_name_target}'"'
+
+                # Format such exception message in terms of such argument's
+                # current type and name.
+
+                # Argument type and name to recommend such argument be
+                # refactored as, stripping all suffixing digits from such name.
+                # Dismantled, this is:
+                #
+                # * "%%", greedily removing the longest matching suffix.
+                # * "<->##", matching one or more digits.
+                # local\
+                #     arg_type_target='*:list'\
+                #     arg_name_target=${arg_name%%<->##}
+
+                # # If such argument is *NOT* optional, constrain such list to
+                # # contain at least one item.
+                # if (( arg_is_optional )) {
+                #     arg_type_target+='+nonempty'
+                # }
+
+                # # Throw such exception.
+                # ::func_.die_of_cause\
+                #     'accepts two or more variadic arguments; consider converting the variadic argument list beginning with argument ${'${arg_name}'} into a string indirectly referring to a list (e.g., from "'${arg_type}' '${arg_name}', ..." to "'${arg_type_target}' '${arg_name_target}'"'
+
+                # ::func_.die_of_cause\
+                #     'accepts two or more variadic arguments'
+
+            #FUXME: Rename:
+            #
+            #* ${arg_subtype_local} to ${arg_subtype_local}.
+            #* ${arg_type_full} to ${arg_type}.
+
+            #FUXME: Define a new exception handler
+            #::func_.die_of_cause_argument_type() and call such handler
+            #everywhere below in place of the current logic.
+
+                    # 'nonscalar, but zsh only supports scalar argument types; consider converting such type to "*'${arg_subtype_local}'"'
+# (e.g., `:bool`, `:char`, `:float`, `:int`, `:string`)
+
+            # [[ "${arg_subtype_local}" != ':'('list'|'map')('_'*|) ]] ||
+                    # 'nonscalar, but zsh only supports scalar argument types (e.g., `:bool`, `:char`, `:float`, `:int`, `:string`)'
+
+                #FUXME: As expected, "+"-style subtypes are insufficient.
+                #Consider how one would validate a string argument referring to
+                #a function. In such case, ":string/func" fails, as there
+                #exists no function :string.is_func(). We thus require a new
+                #syntactic element implying function :func.is() instead. And
+                #for that, "/" clearly applies: e.g.,
+                #
+                #    :void ::var.die_unless_passes_tester(
+                #        :string/var var_name1, ...,
+                #        :string/func tester_name,
+                #        :string/alias_simple alias_name)
+                #
+                #Given that we now have two validation-specific "types",
+                #abandon the current "subtype" nomenclature in favor of:
+                #
+                #* The "/"-prefixed major type. If unspecified, such type
+                #  defaults to the portion of such type preceding the "+" if
+                #  any (e.g., the ":string" in ":string+glob").
+                #* The "+"-prefixed minor type.
+                #
+                #What's awesome about this is that major and minor types can be
+                #elegantly combined in the expected way: e.g.,
+                #
+                #    :void ::test(:string/var+nonempty var_name)
+                #
+                #Hence, "/" and "+" are both essential syntax. Neither
+                #obsoletes or obviates the other. Make it so, please!
+                #FUXME: Hey, it gets even better! The above syntax clearly
+                #obsoletes our existing (and frankly rather kludgy) handling of
+                #variable indirection. Specifically, arguments of type
+                #":string/var+${var_type}" clearly obsolete prior type
+                #":string:${var_type}". Hence, do away with *ALL* ":string:"
+                #handling below. However, note that repeating ":string/var+"
+                #everywhere in list- and map-centric function prototypes will
+                #get old fairly quickly. We might consider a new argument type
+                #prefix: ":*", shorthand for ":string/var+". Hence, the
+                #following prototypes are equivalent:
+                #
+                #    :void ::handle(:string/var+char char_name+__h)
+                #    :void ::handle(:*char char_name+__h)
+                #    :void ::handle(*:char char_name+__h)
+                #    :void ::handle(:char *char_name+__h)
+                #
+                #Well, three choices anyway. Contemplate a bit further.
+                #FUXME: O.K.; C adopted "char *p" syntax to imply that "*p" is
+                #the manner with which you access the data such pointer refers
+                #to. In zeshy, however, we have no pointers, so that doesn't
+                #apply; moreover, we've always thought such syntax to be
+                #inherently irrational, in that the "*" modifies the type of
+                #such variable and hence should be associated with such type
+                #rather than such pointer name. Hence, either ":*char" or
+                #"*:char" would be appropriate here. Indeed, for the same
+                #reason, "*:char" is probably the most appropriate choice.
+                #(Adopting C syntax would also be in poor taste here, as that
+                #would tacitly imply zeshy to support pointers, which it
+                #clearly does not.)
+                #
+                #However, "*:char" has one additional advantage over ":*char":
+                #the former supports custom user-defined types leveraging a
+                #user-specific prefix (e.g., "*@bytes"), whereas the latter
+                #obstructs such use. Right then! We shay go with:
+                #
+                #    :void ::handle(*:char char_name+__h)
+
+                        #FUXME: Right. Now that we've properly implemented major
+                        #and minor subtypes, we no longer need to special-case
+                        #this. Consider the following:
+                        #
+                        #* Replace the entire following block of logic with
+                        #  simply the following:
+                        #
+                        # # Convert the current type to the equivalent
+                        # # shorthand for variable indirection (e.g., from
+                        # # ":string/var+int" to "*:int"), parsed below. Since
+                        # # such shorthand is considerably more common than
+                        # # such longhand, the latter defers to the former.
+                        # arg_subtype_major=${arg_subtype_minor}
+                        # arg_subtype_minor=
+                        # match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_INDIRECT}]='*'
+                        #
+                        #* Shift the entire following block of logic into a new
+                        #  if conditional performed *AFTER* the current
+                        #  if conditional, resembling:
+                        #
+                        # if [[ -n "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_INDIRECT}]}" ]] {
+                        #     ...
+                        # }
+
+                        #FUXME: Erroneous. Yay!
+                    # Since such variable's type
+                    # must also be 
+
+                # Major and minor argument subtypes, localized for efficient
+                # reuse below.
                     # ::func_.die_of_cause\
-                    # 'argument ${'${arg_name}'} type '${arg_type}$([[ -z "${arg_subtype}" ]] || print -r -- '+'${arg_subtype})' unrecognized (i.e., function '${arg_tester}'() undefined)'
-                            # 'argument ${'${arg_name}'} type '${arg_type[9,-1]}$([[ -z "${arg_subtype}" ]] || print -r -- '+'${arg_subtype})' unrecognized (i.e., function '${arg_tester}'() undefined)'
+                    # 'argument ${'${arg_name}'} type '${arg_subtype_local}$([[ -z "${arg_subtype}" ]] || print -r -- '+'${arg_subtype})' unrecognized (i.e., function '${arg_tester}'() undefined)'
+                            # 'argument ${'${arg_name}'} type '${arg_subtype_local[9,-1]}$([[ -z "${arg_subtype}" ]] || print -r -- '+'${arg_subtype})' unrecognized (i.e., function '${arg_tester}'() undefined)'
 
                     #FUXME: Ugh. Need a new argument exception handler.
             #FUXME: If such type is nonscalar (e.g., prefixed by either ":list"
@@ -1522,7 +1964,7 @@ function declare_function_with_stdin() {
                 # validate the latter to exist *AND* be of the expected type. For
                 # efficiency, obtain such type with raw string indices rather
                 # than globbed match groups (e.g., ':string:'(#b)(*)).
-                # if [[ "${arg_type}" == ':string:'* ]] {
+                # if [[ "${arg_subtype_local}" == ':string:'* ]] {
 
     #FUXME: Correct comment in line with ${arg_definer_to_definitions}.
     # Map from argument variable type (i.e., the type of the variable referred
@@ -1659,7 +2101,7 @@ function declare_function_with_stdin() {
     # arguments of such type to be programmatically validated.
 
                     #FUXME: Document me.
-                    # arg_type=${arg_type[9,-1]}
+                    # arg_subtype_local=${arg_subtype_local[9,-1]}
 
                     #FUXME: Insufficient. Such argument must be expanded with
                     #parameter expansion flag "(P)" below, implying we require
@@ -1729,7 +2171,7 @@ function declare_function_with_stdin() {
             #  ${arg_tester_to_values}.
             #* Rename map ${arg_tester_to_values} to
             #  ${arg_tester_to_indices_valid}.
-            #* Key such map with ${arg_tester} rather than ${arg_type}.
+            #* Key such map with ${arg_tester} rather than ${arg_subtype_local}.
             #* Revise this iteration accordingly.
             #
             #We'll probably want to shift the test of whether such function
@@ -1737,14 +2179,14 @@ function declare_function_with_stdin() {
             #allows us to construct considerably more useful exception
             #messages. (Or perhaps not? We *COULD* theoretically "de-parse"
             #${arg_tester} into what the corresponding
-            #"${arg_type}+${arg_subtype} would have been above. But that does
+            #"${arg_subtype_local}+${arg_subtype} would have been above. But that does
             #seem rather... well, fragile. Probably avoid that for now, we
             #should think.)
 
             # # If such type contains a null character, split such type on such
             # # character into such argument's actual type and subtype.
-            # if [[ "${arg_type}" == (#b)(*)$'\0'(*) ]] {
-            #     arg_type="${match[1]}"
+            # if [[ "${arg_subtype_local}" == (#b)(*)$'\0'(*) ]] {
+            #     arg_subtype_local="${match[1]}"
             #     arg_subtype="${match[2]}"
             # # Else, such type is already such argument's actual type.
             # } else {
@@ -1758,13 +2200,13 @@ function declare_function_with_stdin() {
             # # validate the latter to exist *AND* be of the expected type. For
             # # efficiency, match such type with hard-coded character indices rather
             # # than match groups (e.g., via ':string:'(#b)(*)).
-            # if [[ "${arg_type}" == ':string:'* ]] {
-            #     arg_tester=':'${arg_type[9,-1]}':is'
+            # if [[ "${arg_subtype_local}" == ':string:'* ]] {
+            #     arg_tester=':'${arg_subtype_local[9,-1]}':is'
             # # Else, such argument is a scalar value. Assuming such type to be
             # # prefixed by ":", validate such argument to be of such type
             # # stripped of such prefix.
             # } else {
-            #     arg_tester=':'${arg_type[2,-1]}'.is'
+            #     arg_tester=':'${arg_subtype_local[2,-1]}'.is'
             # }
 
             # # If such argument is subtyped, suffix such tester by such subtype.
@@ -1774,7 +2216,7 @@ function declare_function_with_stdin() {
 
             # # If such function does *NOT* exist, throw a custom exception.
             # :func.is "${arg_tester}" || ::func_.die_of_cause\
-            #     'argument type '${arg_type}' unrecognized (i.e., function '${arg_tester}'() undefined)'
+            #     'argument type '${arg_subtype_local}' unrecognized (i.e., function '${arg_tester}'() undefined)'
 
                 #FUXME: Not quite. We need to test for argument types matching
                 #":string:"* and reduce such types to merely ":string". Simple,
@@ -1783,7 +2225,7 @@ function declare_function_with_stdin() {
 
 #, the latter specific to validation
                 # Name of the alias localizing such argument.
-                # arg_definer=${arg_type}
+                # arg_definer=${arg_subtype_local}
     # Name of the alias localizing the current argument.
     # local arg_definer
 
@@ -1803,11 +2245,11 @@ function declare_function_with_stdin() {
                 # # expansion to such type and subtype. For generality, delimit
                 # # the two by a null character.
                 # if [[ -n "${arg_subtype}" ]] {
-                #     arg_tester_to_values[${arg_type}$'\0'${arg_subtype}]+=' "${@['${arg_index}']}"'
+                #     arg_tester_to_values[${arg_subtype_local}$'\0'${arg_subtype}]+=' "${@['${arg_index}']}"'
                 # # Else, such argument only has a type. Map such expansion to
                 # # only such type.
                 # } else {
-                #     arg_tester_to_values[${arg_type}]+=' "${@['${arg_index}']}"'
+                #     arg_tester_to_values[${arg_subtype_local}]+=' "${@['${arg_index}']}"'
                 # }
 
                 # # If such argument is subtyped, suffix such tester by such subtype.
@@ -1822,22 +2264,22 @@ function declare_function_with_stdin() {
                 # # expansion to such type and subtype. For generality, delimit
                 # # the two by a null character.
                 # if [[ -n "${arg_subtype}" ]] {
-                #     arg_tester_to_values[${arg_type}$'\0'${arg_subtype}]+=' "${@['${arg_index}']}"'
+                #     arg_tester_to_values[${arg_subtype_local}$'\0'${arg_subtype}]+=' "${@['${arg_index}']}"'
                 # # Else, such argument only has a type. Map such expansion to
                 # # only such type.
                 # } else {
-                #     arg_tester_to_values[${arg_type}]+=' "${@['${arg_index}']}"'
+                #     arg_tester_to_values[${arg_subtype_local}]+=' "${@['${arg_index}']}"'
                 # }
 
-            # } elif [[ "${arg_type}" == ':'${~operable_name_char_class} ]] {
-            #     arg_tester=':'${arg_type[2,-1]}'.is'
+            # } elif [[ "${arg_subtype_local}" == ':'${~operable_name_char_class} ]] {
+            #     arg_tester=':'${arg_subtype_local[2,-1]}'.is'
             # # Else, validate such argument to be of such type.
             # } else {
-            #     arg_tester=':'${arg_type}'.is'
+            #     arg_tester=':'${arg_subtype_local}'.is'
             # }
 
                 # [[ -z "${arg_subtype}" ]] || ::func_.die_of_cause\
-                #     'argument type '${arg_type}'+'${arg_subtype}' '
+                #     'argument type '${arg_subtype_local}'+'${arg_subtype}' '
 
         # validate all such arguments to be of such type.
             # note such fact by appending
@@ -1864,7 +2306,7 @@ function declare_function_with_stdin() {
             #* Append to such map local here (if unrelaxed, of course).
             #* Rename ${arg_tester_to_values} to ${arg_tester_to_values_valid}.
             #* For efficiency, localize the current argument type here: e.g.,
-            #  arg_type="${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}"
+            #  arg_subtype_local="${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}"
 
 #FUXME: Redeclare as global constants, once we fix @{compile} (...or was it @{wain}?)
 #to support global constants again: e.g.,
@@ -1927,7 +2369,7 @@ function declare_function_with_stdin() {
             #FUXME: Since most arguments will be at least localized or
             #validated, localize such type here: e.g.,
             #
-            # arg_type="${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}"
+            # arg_subtype_local="${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}"
 
                 #FUXME: Obsolete.
                 # # Note such function to accept one variadic argument list.
@@ -2370,7 +2812,7 @@ function declare_function_with_stdin() {
     #     # Define such map by parsing the previously defined 4-tuple list of all
     #     # relevant argument metadata.
     #     local arg_index
-    #     for   arg_index arg_type arg_is_optional arg_is_variadic (
+    #     for   arg_index arg_subtype_local arg_is_optional arg_is_variadic (
     #         "${args_index_type_optional_variadic[@]}") {
 
     #         # If such argument is optional, ...
@@ -2432,7 +2874,7 @@ function declare_function_with_stdin() {
 
     #         # Append such index to the space-separated and parameter expansion-
     #         # delimited string of all indices of such argument's type.
-    #         arg_tester_to_values[${arg_type}]+=' "${@['${arg_index}']}"'
+    #         arg_tester_to_values[${arg_subtype_local}]+=' "${@['${arg_index}']}"'
     #     }
 
     # integer arg_count_min=0 arg_count_max=0
@@ -2444,7 +2886,7 @@ function declare_function_with_stdin() {
     # parsing all such arguments. Such parsing thus appends this list by such
     # metadata, which post-parsing then converts into such validation. Such
     # metadata comprises a conceptual 4-tuple
-    # (${arg_index} ${arg_type} ${arg_is_optional} ${arg_is_variadic}).
+    # (${arg_index} ${arg_subtype_local} ${arg_is_optional} ${arg_is_variadic}).
     # local -a args_index_type_optional_variadic
 
     # decide how
@@ -2541,7 +2983,7 @@ function declare_function_with_stdin() {
     #         # 1. Such variable does not exist.
     #         # 2. Such variable does exist but is of a different type.
     #         if (( arg_type_is_var_type )) {
-    #             die_arg_var_type_prefix=':die "Function ${funcstack[1]}() expected argument ${arg_index} referencing variable of type '${arg_type[8,-1]}' but variable \$\{${@[${arg_index}]}\} '
+    #             die_arg_var_type_prefix=':die "Function ${funcstack[1]}() expected argument ${arg_index} referencing variable of type '${arg_subtype_local[8,-1]}' but variable \$\{${@[${arg_index}]}\} '
 
     #             #FUXME: The type printed above is a high-level zeshy-specific type;
     #             #The type printed below is a low-level zsh-specific type.
@@ -2556,7 +2998,7 @@ function declare_function_with_stdin() {
     #             }'
     #         # Else, tailor such exception message to value types.
     #         } else {
-    #             code_args_local_or_valid+=':die "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_type}' but received:"$''\n''"${@[${arg_index}]}"'
+    #             code_args_local_or_valid+=':die "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_subtype_local}' but received:"$''\n''"${@[${arg_index}]}"'
     #         }
 
     #         # End such exception message and such validation.
@@ -2831,18 +3273,18 @@ function declare_function_with_stdin() {
     #FUXME: Actually, the following iteration appears to be unnecessary. We can
     #probably embed the following statement in the prior iteration:
     #
-    #    arg_tester_to_values[${arg_type}]+=" ${arg_index}"
+    #    arg_tester_to_values[${arg_subtype_local}]+=" ${arg_index}"
     #
     #However, to support optional and variadic arguments, we'll probably want
     #to embed delimiting characters indicating the current argument index in
     #the above string value to be either optional and variadic. For example,
     #optional argument indices could be indicated as follows:
     #
-    #    arg_tester_to_values[${arg_type}]+=" ${arg_index}?"
+    #    arg_tester_to_values[${arg_subtype_local}]+=" ${arg_index}?"
     #
     #Variadic argument indices could be indicated as follows:
     #
-    #    arg_tester_to_values[${arg_type}]+=" ${arg_index}."
+    #    arg_tester_to_values[${arg_subtype_local}]+=" ${arg_index}."
     #
     #Dead simple. Both time- and space-efficient to parse. So, let's do that.
 
@@ -3028,7 +3470,7 @@ function declare_function_with_stdin() {
 
                     # # Append such argument's index to the space-delimited
                     # # string of all indices with such argument's type.
-                    # arg_tester_to_values[${arg_type}]+=" ${arg_index}${arg_index_suffix}"
+                    # arg_tester_to_values[${arg_subtype_local}]+=" ${arg_index}${arg_index_suffix}"
 
     # against such prototype constraints parsed above.
     # Whitespace-delimited string of all argument expansions to be passed to
@@ -3045,8 +3487,8 @@ function declare_function_with_stdin() {
         # * "(#m)*", capturing the current index to string global ${MATCH}.
         # arg_values=${${=arg_values}//(#m)*/\"\${${MATCH}}\"}
 
-            # code_args_local_or_valid+='''Function ${funcstack[1]}() argument ${arg_index} references variable ${''${@[${arg_index}]}''} either not found or not of expected type '${arg_type[8,-1]}'.'''
-        # "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_type}' but received:"$''\n''"${@[${arg_index}]}"$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}'
+            # code_args_local_or_valid+='''Function ${funcstack[1]}() argument ${arg_index} references variable ${''${@[${arg_index}]}''} either not found or not of expected type '${arg_subtype_local[8,-1]}'.'''
+        # "Function ${funcstack[1]}() expected argument ${arg_index} of type '${arg_subtype_local}' but received:"$''\n''"${@[${arg_index}]}"$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}'
 # '$''\n\n''"Argument ${arg_index}:"$''\n''"${@[${arg_index}]}"
 
 #(i.e., rejected by function '${arg_tester}'())
@@ -3108,7 +3550,7 @@ function declare_function_with_stdin() {
     # local -A var_type_checker_to_arg_values
 
         # arg_name\
-        # arg_type\
+        # arg_subtype_local\
             #FUXME: Do we still require ${arg_is_optional}?
 
                 #FUXME: Nonsensical hack. Just add a new boolean
@@ -3136,14 +3578,14 @@ function declare_function_with_stdin() {
 
     #FUXME: Hmm; why don't we also define ${args_is_variadic} here too?
 
-                # # arg_type="${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}"
+                # # arg_subtype_local="${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}"
 
                 # # If such type is *NOT* ":string", validate such type. (Since
                 # # all arguments are untyped scalars from the low-level zsh
                 # # perspective, there exists no validation to be performed for
                 # # arguments of type ":string".)
                 # if [[ "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}" != ':string' ]] {
-                # # if [[ "${arg_type}" != ':string' ]] {
+                # # if [[ "${arg_subtype_local}" != ':string' ]] {
                 #     arg_names_types+=(
                 #         "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_name}]}"
                 #         "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}" )
@@ -3157,10 +3599,10 @@ function declare_function_with_stdin() {
                 #         # If such argument is a string referring to another
                 #         # variable's name, validate that such variable exists
                 #         # *AND* is of the expected type.
-                #         if [[ "${arg_type}" ==\
+                #         if [[ "${arg_subtype_local}" ==\
                 #             ':string:'${~operable_name_char_class} ]] {
                 #             # Name of the function performing such tests.
-                #             test_func_name=":die_unless_var_${arg_type[9,-1]}_of_cause"
+                #             test_func_name=":die_unless_var_${arg_subtype_local[9,-1]}_of_cause"
                 #             :func.die_unless "${test_func_name}"
 
                 #             # test_arg_types+=""
