@@ -124,6 +124,14 @@ function ::func_.parse_args() {
     # Code validating the number of arguments passed to such function.
     local code_arg_count
 
+    # Code defaulting defaultable arguments *NOT* passed to such function for
+    # all possible argument counts.
+    local code_args_default
+
+    # Code defaulting defaultable arguments *NOT* passed to such function for
+    # the current argument count.
+    local code_args_default_current
+
     # Code localizing and/or validating arguments passed to such function.
     local code_args_local_or_valid
 
@@ -188,16 +196,6 @@ function ::func_.parse_args() {
     # string, implying unconditional success.)
     local args_is_defaultable_tester
 
-    # Newline-delimited string of all assignments of unpassed defaultable
-    # arguments to default values: e.g.,
-    #
-    #     problem="The problem is not to find the answer."
-    #     answer="It’s to face the answer."
-    #
-    # Since delimiting such assignments by newline suffices, prefer appending
-    # such assignments to a string rather than list (for efficiency).
-    local args_definitions_default
-
     # Space-delimited string of all expansions of arguments to be validated.
     local args_expansions
 
@@ -215,8 +213,19 @@ function ::func_.parse_args() {
     # arguments such function accepts.
     local func_args_equals="${func_args_sans_quotes//[^?=]##}"
 
-    # Such minimum and maximum number.
+    #FIXME: Can we not simply increment ${arg_count} instead? That could be
+    #mildly dangerous, of course, so examine the codebase carefully.
+
+    # Current argument count *AFTER* adding all unpassed defaultable arguments
+    # to the current argument list, initialized to their default values.
+    integer arg_count_after_default
+
+    # Maximum number of arguments (i.e., number of mandatory *AND* optional
+    # arguments such function accepts).
     integer arg_count_max=$(( ${#func_args_commas} + 1 ))
+
+    # Minimum number of arguments (i.e., number of mandatory arguments such
+    # function accepts).
     integer arg_count_min=$(( arg_count_max - ${#func_args_equals} ))
 
     # Number of optional arguments required by the current argument count
@@ -235,17 +244,24 @@ function ::func_.parse_args() {
     # and 0 otherwise.
     integer arg_is_indirect
 
-    # 1 if such argument will be localized in such function's preamble or
-    # 0 otherwise. Since all arguments are localized by default, this boolean
-    # only expands to 0 for arguments with explicitly relaxed names.
+    # 1 if the current argument will be localized by such function's preamble
+    # or 0 otherwise. Since all arguments are localized by default, this is
+    # only 0 for arguments with explicitly relaxed names.
     integer arg_is_localized
+
+    # 1 if the current argument will be validated by such function's preamble
+    # or 0 otherwise. Since all arguments are validated by default, this is
+    # only 0 for arguments with explicitly relaxed types *OR* type ":string"
+    # (which by definition are *ALWAYS* valid).
+    integer arg_is_validated
 
     # 1 if the current argument is variadic and 0 otherwise.
     integer arg_is_variadic
 
-    # 1 if a prior argument was optional (i.e., either defaulted *OR*
-    # optionalized) and 0 otherwise.
-    integer arg_was_optional
+    #FIXME: Such boolean is excisable by the same approach with which we
+    #obsoleted ${arg_was_optional}: namely, globbing the raw argument list for
+    #a substring matching ",[ $'\n']#...". That said, that *IS* somewhat more
+    #difficult to reliably and efficiently glob for. Contemplate.
 
     # 1 if a prior argument was variadic and 0 otherwise.
     integer arg_was_variadic
@@ -284,6 +300,18 @@ function ::func_.parse_args() {
     # For each possible number of arguments between the minimum and maximum
     # established above, define code validating the types of all passed
     # arguments when the caller passes that number of arguments.
+    #
+    # By design, iterate from the minimum to maximum number of arguments rather
+    # than the converse. Why? In a word: defaults. Unpassed defaultable
+    # arguments must be assigned default values in a rightmost manner (i.e.,
+    # the rightmost defaultable argument in a function prototype must be
+    # defaulted first, then the next rightmost defaultable argument, and so on
+    # until all unpassed defaultable arguments have been defaulted). By
+    # iterating from the minimum to maximum number of arguments, we allow the
+    # algorithm below to iteratively "mark" leftmost defaultable arguments as
+    # passed until the current argument count indicates all such arguments to
+    # have been passed, at which point all remaining defaultable arguments are
+    # unpassed and hence assigned default values in a rightmost manner.
     integer arg_count
     for     arg_count ({${arg_count_min}..${arg_count_max}}) {
         # Clear such maps. See :clear_map() for further details.
@@ -291,11 +319,11 @@ function ::func_.parse_args() {
         set -A arg_tester_to_expansions
 
         # Revert local variables declared above specific to the following loop.
+        arg_count_after_default=${arg_count}
         arg_count_optional=$(( arg_count - arg_count_min ))
         arg_index=0
-        arg_was_optional=0
         arg_was_variadic=0
-        args_definitions_default=
+        code_args_default_current=
 
         # Parse each such argument into canonical list global ${match}, whose
         # indices we localize as human-readable integers above.
@@ -308,6 +336,8 @@ function ::func_.parse_args() {
             arg_type=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE}]}
             arg_subtype_local=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}]}
             arg_default_value=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE}]}
+
+            #FIXME: Are all the following booleans still requisite?
 
             # Likewise, localize boolean-specific argument match metadata.  For
             # efficiency, initialize each such boolean to the length of the
@@ -325,6 +355,10 @@ function ::func_.parse_args() {
             # Localize such argument *UNLESS* such name is relaxed.
             arg_is_localized=$((
                 1 - ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]} ))
+
+            # Validate such argument *UNLESS* such type is relaxed.
+            arg_is_validated=$((
+                1 - ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]} ))
 
             # Increment the current argument index.
             arg_index+=1
@@ -350,24 +384,103 @@ function ::func_.parse_args() {
                     'nonscalar, but zsh only supports scalar argument types'
             }
 
+            # If such argument is defaultable and hence optional...
+            if (( ${#arg_default_value} )) {
+                # If the number of optional arguments the current argument
+                # count accepts is positive, the current optional argument has
+                # effectively been "passed". In such case, decrement such
+                # number by 1, implying such count to now accept one less
+                # optional argument. (The current optional argument "consumes"
+                # one available optional argument "slot" under such count.)
+                if (( arg_count_optional )) {
+                    arg_count_optional+=-1
+                # Else, such argument is unpassed.
+                #
+                # If defaulting such argument (i.e., if such default value is
+                # unrelaxed), do so.
+
+                #FIXME: Close, but no e-cigar. While this test is appropriate,
+                #we need an "} else {" branch whose body is *IDENTICAL* to that
+                #of the "} elif (( arg_is_absentable )) {" branch below.
+                #Clearly, the two should be unified. The simplest way is
+                #probably as follows:
+                #
+                #} else {
+                #    arg_is_absentable=1
+                #}
+                #
+                #Then, convert such "} elif (( arg_is_absentable )) {" branch
+                #to a new "if (( arg_is_absentable )) {" conditional.
+
+                } elif (( ! ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE_IS_RELAXED}]} )) {
+                    # Increment the current argument count to reflect the
+                    # insertion of such argument's default value into the
+                    # current argument list.
+                    arg_count_after_default+=1
+
+                    # If such argument is the last explicit argument such
+                    # function accepts (ignoring all subsequent optional
+                    # variadic list arguments), efficiently append such
+                    # argument's default value to the current argument list.
+                    if (( arg_index == arg_count_max )) {
+                        code_args_default_current+='argv+='${arg_default_value}
+                    # Else if such argument is the first explicit argument such
+                    # function accepts, inefficiently replace the current
+                    # argument list with one in which the indices of all other
+                    # explicit arguments are increased by 1 and the first index
+                    # of such list is set to such argument's default value.
+                    } elif (( arg_index == 1 )) {
+                        code_args_default_current+='argv=( '${arg_default_value}' "${@}" )'
+                    # Else such argument is neither the first or last explicit
+                    # argument such function accepts and hence is both preceded
+                    # *AND* succeeded by at least one such argument. In such
+                    # case, an efficient alternative to replacing the current
+                    # argument list presents itself: append such argument's
+                    # default value to the prior argument. (Yes, this works.)
+                    } else {
+                        code_args_default_current+='argv['$(( arg_index - 1 ))']+='${arg_default_value}
+                    }
+                }
+            # Else if such argument is absentable and hence optional...
+            } elif (( arg_is_absentable )) {
+                # If such argument is passed, handle such case. See above for
+                # related logic.
+                if (( arg_count_optional )) {
+                    arg_count_optional+=-1
+                # Else, such argument is unpassed.
+                } else {
+                    #FIXME: Document me.
+                    arg_is_localized=0
+                    arg_is_validated=0
+
+                    # Since unpassed arguments cannot be indexed, assign the
+                    # next argument such index instead. To permit prior logic
+                    # to access the index such argument would have had if
+                    # passed (e.g., to insert a default value for such argument
+                    # into the current argument list when unpassed), decrement
+                    # such index *AFTER* performing all prior logic.
+                    arg_index+=-1
+                }
+            }
+
+            #FIXME: Since these two cases no longer share any code (aside from
+            #the easly replicable line "arg_count_optional+=-1"), split them
+            #here into two top-level if conditional branches. Yay!
+            #FIXME: Obsolete. See above!
+
             # If such argument is either absentable or defaultable, such
             # argument is optional. Note such fact.
             if (( arg_is_absentable + ${#arg_default_value} )) {
                 # If the current argument count supports at least one more
                 # optional argument, such argument has been passed.
                 if (( arg_count_optional )) {
-                    # If a prior argument is variadic, throw an exception. Note
-                    # we ignore the valid case that the current argument is
-                    # both variadic and absentable (e.g., ":int arg1?, ...").
-                    (( ! arg_was_variadic )) ||
-                        ::func_.die_of_cause_arg_variadic\
-                            'accepts both optional and variadic arguments'
-
                     # Decrement the current optional argument count, implying such
                     # count to subsequently support one less optional argument.
                     # (The current optional argument "consumes" one of the
                     # available optional argument "slots" permitted by such count.)
                     arg_count_optional+=-1
+                #FIXME: Compact the following two conditional branches.
+
                 # Else the current argument count supports no additional
                 # optional arguments, implying such argument to be unpassed.
                 } else {
@@ -375,26 +488,79 @@ function ::func_.parse_args() {
                     # assigned an unrelaxed default value), do so.
                     if (( ${#arg_default_value} &&
                         ! ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE_IS_RELAXED}]} )) {
-                        #FIXME: Actually, the approach pursued below should
-                        #*ALSO* suffice in this case as well. Hence, we want to
-                        #implement such approach if either:
-                        #
-                        #* Such argument is *NOT* localized.
-                        #* Such argument is variadic.
-                        #
-                        #The two cases are similar, because (of course)
-                        #variadic arguments are *NOT* localized. Yay!
-
-                        # If such argument is *NOT* localized, throw an
-                        # exception.
-                        #
-                        # While we *MAY* support non-localized defaultable
-                        # arguments in the future, doing so now would impose
-                        # complexities and inefficiencies for little gain.
-                        (( arg_is_localized )) ||  ::func_.die_of_cause\
-                            'argument ${'${arg_name}'} assigned a default value; consider either eliminating such assignment or refactoring such argument to be non-variadic'
-
                         #FIXME: Document me.
+                        #FIXME: Actually, since this is more general than our
+                        #current defaulting technique, there's no sensible
+                        #reason we can't use this approach to default *ALL*
+                        #unpassed defaultable arguments -- not simply those
+                        #also variadic. Although the resulting logic will not
+                        #be quite as efficient, default arguments should only
+                        #ever be used in cases where efficiency doesn't
+                        #terribly matter anyway (e.g., front-facing CLI
+                        #aliases). The tangible benefits in both generality and
+                        #simplicity make this a more than worthwhile tradeoff.
+                        #FIXME: So. The current approach *DOES* appear to
+                        #generalize pleasantly, but also produces overly
+                        #verbose and inefficient code for functions accepting
+                        #two or more defaultable arguments. Which is mildly
+                        #disconcerting. Clearly, we need some means of
+                        #compacting multiple assignments together. For example:
+                        #
+                        #* If the first argument is defaultable and unpassed
+                        #  *AND* there exist any other defaultable, unpassed
+                        #  arguments, then since we have to replace the entire
+                        #  argument list anyway, we'd might as well compact the
+                        #  second default value assignment into the first:
+                        #  e.g.,
+                        #
+                        #    # For a function with prototype:
+                        #    # :void :yum(
+                        #    #     :string x = 'yay',
+                        #    #     :int j, :int k, :int l,
+                        #    #     :string y = 'yay',
+                        #    #     :int a, :int b, :int c)
+                        #    # ...we might want a preamble containing:
+                        #    if (( # == 6 )) {
+                        #        code_args_local_or_valid+='argv=( '${arg_default_value_x}' "${@[1,3]}" "${arg_default_value_y}" "${@[4,6]}" )'
+                        #    } elif (( # == 7 )) {
+                        #        code_args_local_or_valid+='argv[4]+="${arg_default_value_y}"
+                        #    }
+                        #
+                        #Brutal. There's clearly a way to identify and handle
+                        #such cases; now, we just have to doctor it up.
+                        #FIXME: O.K.; to reasonably implement this, we'll want
+                        #a new string local ${code_args_default} to which we
+                        #append here rather than to ${code_args_local_or_valid}.
+                        #Ensure that we:
+                        #
+                        #* Reset 'code_args_default=' each loop iteration.
+                        #* Test '[[ -n "${code_args_default}" ]]' far below; if
+                        #  such test succeeds, then and only then append
+                        #  ${code_args_local_or_valid} by ${code_args_default}.
+                        #  As the above example demonstrates, we test for the
+                        #  current argument count exactly. We do *NOT* need an
+                        #  "else" branch (indeed, that would be quite
+                        #  counterproductive); we do, however, need to track
+                        #  whether this is the first such branch. Fortunately,
+                        #  the latter is trivial by simply noting whether or
+                        #  not '[[ -n "${code_args_default}" ]]'.
+                        #* Moreover, *ALL* such branches must clearly be
+                        #  emitted before subsequent logic. This suggests,
+                        #  clearly, that we actually need *TWO* new string
+                        #  locals:
+                        #  * ${code_args_default_current}, containing only the
+                        #    set of all "argv"-specific commands for the
+                        #    current argument count. Reset such string each
+                        #    loop iteration.
+                        #  * ${code_args_default}, containing *ALL* such
+                        #    default value-specific logic. Do *NOT* reset such
+                        #    string each loop iteration. Expand such string
+                        #    into ${func_preamble} at the end of this function.
+
+                        # Increment the current argument count to reflect the
+                        # insertion of such argument's default value into the
+                        # current argument list.
+                        arg_count_after_default+=1
 
                         # If such argument is also variadic, ...
                         if (( arg_is_variadic )) {
@@ -407,7 +573,7 @@ function ::func_.parse_args() {
                             # append such argument's default value to the
                             # current argument list.
                             if (( arg_index == arg_count_max )) {
-                                code_args_local_or_valid+='argv+='${arg_default_value}
+                                code_args_default_current+='argv+='${arg_default_value}
                             # Else if such argument is the first explicit argument
                             # such function accepts, inefficiently replace the
                             # current argument list with one in which the
@@ -415,7 +581,7 @@ function ::func_.parse_args() {
                             # increased by 1 and the first index of such list
                             # is set to such argument's default value.
                             } elif (( arg_index == arg_count_max )) {
-                                code_args_local_or_valid+='argv=( '${arg_default_value}' "${@}" )'
+                                code_args_default_current+='argv=( '${arg_default_value}' "${@}" )'
                             # Else such argument is neither the first or last
                             # explicit argument such function accepts and hence
                             # is both preceded *AND* succeeded by at least one
@@ -425,87 +591,12 @@ function ::func_.parse_args() {
                             # default value to the prior argument.
                             # (Astonishingly, this actually works.)
                             } else {
-                                code_args_local_or_valid+='argv['$(( arg_index - 1 ))']+='${arg_default_value}
+                                code_args_default_current+='argv['$(( arg_index - 1 ))']+='${arg_default_value}
                             }
 
                             # Terminate such conditional.
                             code_args_local_or_valid+=${code_indentation_outer}'}'
                         }
-
-                        #FIXME: Actually, as the description below suggests,
-                        #this won't be terribly difficult to support at all.
-                        #Specifically:
-                        #
-                        #* If such defaultable argument is also variadic,
-                        #  prepend ${code_args_local_or_valid} with an
-                        #  additional if conditional (probably with only a
-                        #  single branch) testing whether such argument was
-                        #  passed or not.
-                        #* If unpassed, the body of such conditional should
-                        #  directly modify the argument list to interpose such
-                        #  argument's default value directly into the current
-                        #  argument list as follows:
-                        #  * If such argument is the last argument, efficiently
-                        #    append such default value to such list with:
-                        #    argv+="${arg_default_value}"
-                        #  * Else, inefficiently inject such default value into
-                        #    the appropriate position of such list. This should
-                        #    require at least two commands:
-                        #    1. Shift all subsequent arguments down by one
-                        #       index. Does something like the following
-                        #       actually work? We strongly doubt it, but
-                        #       certainly worth a lucky try. Yes, it does!
-                        #       Huzzah: e.g.,
-                        #       argv[${arg_index},-1]=( "${@[${arg_index}]}" )
-                        #    2. Inject such default value into the proper
-                        #       index: e.g.,
-                        #       argv[${arg_index}]="${arg_default_value}"
-                        #    Actually, given such operations, we *CAN* combine
-                        #    them into the following single efficient command:
-                        #
-                        #    argv[$(( arg_index - 1 ))]+="${arg_default_value}"
-                        #
-                        #    Wait! That works for all indices except the first,
-                        #    of course, which requires an inefficient but still
-                        #    compact single command: e.g.,
-                        #
-                        #    argv=( "${arg_default_value}" "${@}" )
-                        #
-                        #In the above examples, note that ${arg_index} has
-                        #probably already been decremented by 1 and hence
-                        #incorrect. Handle this... erhm, "appropriately": e.g.,
-                        #    argv[${arg_index}]+="${arg_default_value}"
-
-
-                        # If such argument is also variadic, throw an
-                        # exception. While assigning the first argument of an
-                        # unpassed variadic list a default value is feasible,
-                        # doing so imposes hitherto unaddressed complexities;
-                        # given the conditional logic below, we would need to
-                        # prepend ${code_args_local_or_valid} with an
-                        # additional if conditional (probably with only a
-                        # single branch) testing whether 
-                        #
-                        # e.g.,
-                        #
-                        # * Why permit only the first argument of such a list
-                        #
-                        # While we *MAY* support variadiac defaultable
-                        # arguments in the future, doing so now would impose
-                        # complexities and inefficiencies for little gain.
-                        (( ! arg_is_variadic )) || ::func_.die_of_cause\
-                            'variadic argument ${'${arg_name}'} assigned a default value; consider either eliminating such assignment or refactoring such argument to be non-variadic'
-
-                        #FIXME: Actually, only do this if we're also localizing
-                        #such argument. If we're *NOT*, we have no choice but
-                        #to treat such assignment as if relaxed.
-                        #FIXME: Oh, yes -- and we clearly need to handle
-                        #relaxation as well.
-
-                        # Append an assignment of such argument to such default
-                        # value to the newline-delimited string of such
-                        # assignments.
-                        args_definitions_default+=${code_indentation_outer}${arg_name}'='${arg_default_value}
 
                         # Expand such argument after such assignment by name.
                         arg_name_expansion=${arg_name}
@@ -516,6 +607,14 @@ function ::func_.parse_args() {
                     # exist and hence be neither localizable or validatable. To
                     # guarantee this, skip to the next argument entirely.
                     } else {
+                        # Since unpassed arguments cannot be indexed, assign the
+                        # next argument such index instead. To permit prior logic
+                        # to access the index such argument would have had if
+                        # passed (e.g., to insert a default value for such argument
+                        # into the current argument list when unpassed), decrement
+                        # such index *AFTER* performing all prior logic.
+                        arg_index+=-1
+
                         #FIXME: Erroneous. In particular, we need to ensure
                         #argument-specific booleans are set in the expected way
                         #(e.g., ${arg_was_variadic}, ${arg_was_optional}) --
@@ -535,17 +634,23 @@ function ::func_.parse_args() {
                         #the former, orthogonality suggests we'll probably end
                         #up requiring the latter at some point anyway. So it
                         #costs us little to nothing to go ahead and define it.
+                        #FIXME: Actually, we *SHOULD* just be able to literally
+                        #continue to the next argument here. If we're currently
+                        #unable to do so, that indicates an overly complex and
+                        #logically cumbersome algorithm - which, obviously,
+                        #should be addressed anyway. A few thoughts on how to
+                        #make this possible:
+                        #
+                        #* Shift the variadicity conditional below *ABOVE* the
+                        #  current optionality conditional.
+                        #* Document why we do so.
+                        #
+                        #And...that should be it? Unlikely, but possible. Grok
+                        #the codebase a deeper to see if we haven't missed
+                        #anything too elephantine.
 
                         continue
                     }
-
-                    # Since unpassed arguments cannot be indexed, assign the
-                    # next argument such index instead. To permit prior logic
-                    # to access the index such argument would have had if
-                    # passed (e.g., to insert a default value for such argument
-                    # into the current argument list when unpassed), decrement
-                    # such index *AFTER* performing all prior logic.
-                    arg_index+=-1
                 }
             }
 
@@ -578,30 +683,56 @@ function ::func_.parse_args() {
                     arg_name_expansion='@['$(( arg_index - arg_count_max - 1 ))']'
                 }
             # Else, such argument is variadic.
-            #
-            # If a prior argument is also variadic, throw an exception. Such
-            # case implies such function to accept two or more variadic
-            # argument lists of arbitrary count, implying there exists no
-            # general means of deciding which such list a passed string was
-            # intended to belong to.
-            } elif (( arg_was_variadic )) {
-                ::func_.die_of_cause_arg_variadic\
-                    'accepts two or more variadic arguments'
-            # If a prior argument is optional, throw an exception. Such case
-            # implies such function to accept one or more optional arguments
-            # *AND* one or more variadic argument lists of arbitrary count,
-            # implying there exists no general means of deciding which such
-            # argument a passed string was intended to correspond to.
-            #
-            # Test such condition *AFTER* testing whether a prior argument is
-            # variadic. If such function accepts an optional variadic argument
-            # following a prior variadic argument, the prior exception is more
-            # explanatory than this exception.
-            } elif (( arg_was_optional )) {
-                ::func_.die_of_cause_arg_variadic\
-                    'accepts both optional and variadic arguments'
-            # Else, such argument is validly variadic.
             } else {
+                # If a prior argument is also variadic, throw an exception.
+                # Such case implies such function to accept two or more
+                # variadic argument lists of arbitrary count, implying there
+                # exists no general means of deciding which such list a passed
+                # string was intended to belong to.
+                (( ! arg_was_variadic )) || ::func_.die_of_cause_arg_variadic\
+                    'accepts two or more variadic arguments'
+
+                # If another argument is optional, throw an exception. Such case
+                # implies such function to accept one or more optional arguments
+                # *AND* one or more variadic argument lists of arbitrary count,
+                # implying there exists no general means of deciding which such
+                # argument a passed string was intended to correspond to.
+                #
+                # Test such condition *AFTER* testing whether a prior argument is
+                # variadic. If such function accepts an optional variadic argument
+                # following a prior variadic argument, the prior exception is more
+                # explanatory than this exception.
+                #
+                # The test that follows is an extreme optimization of:
+                #
+                #    if (( args_is_optional )) && {
+                #       (( ! arg_is_optional )) ||
+                #       (( arg_count_max - arg_count_min > 1 )) } { ... }
+                #
+                # As such logic implies, testing whether such function accepts
+                # at least one optional argument is insufficient. Such argument
+                # could in fact be the current variadic argument, a valid edge
+                # case we explicitly support. Hence, also test whether the
+                # current variadic argument is optional. If so, test whether
+                # any other argument is optional (as implied by the number of
+                # optional arguments being greater than 1, thus ignoring the
+                # current validly optional variadic argument).
+                #
+                # To understand why the above test reduces to the optimization
+                # below, recall that:
+                #
+                # * ${arg_is_optional} is 1 if the current variadic argument is
+                #   optional and 0 otherwise.
+                # * (( arg_count_max - arg_count_min )) is 1 if the current
+                #   variadic argument is optional and 0 otherwise.
+                # 
+                # In either case, subtracting either from the other *ALWAYS*
+                # results in 0; in any other case, the same subtraction *NEVER*
+                # results in 0. Hence, such test suffices. (Convenient.)
+                (( ! arg_is_optional - arg_count_max - arg_count_min )) ||
+                    ::func_.die_of_cause_arg_variadic\
+                        'accepts both optional and variadic arguments'
+
                 # Notify subsequent parse iterations of such fact. For safety,
                 # set such boolean *AFTER* all tests of such boolean above.
                 arg_was_variadic=1
@@ -613,37 +744,51 @@ function ::func_.parse_args() {
                 arg_name_expansion='@['${arg_index}','$(( arg_index - arg_count_max - 1 ))']'
             }
 
-            #FIXME: Optimizable by shifting above?
-
-            # If such argument was optional and/or variadic, notify subsequent
-            # parse iterations of such fact. For safety, set such boolean
-            # *AFTER* all tests of such boolean above.
-            if (( arg_is_absentable + arg_is_defaultable )) {
-                arg_was_optional=1
-            }
-
             # If localizing such argument, do so.
             if (( arg_is_localized )) {
-                # Note that if such argument is indirect, prior logic ensures
-                # such argument's local subtype to be ":string".
-                #
-                # If such subtype is *NOT* the name of an existing alias, throw
-                # an exception. See :is_alias_simple() for details.
-                (( ${+aliases[${arg_subtype_local}]} )) ||
-                    ::func_.die_of_cause_arg_type\
-                        'local subtype '${arg_subtype_local}' unrecognized (i.e., alias '${arg_subtype_local}'() locally declaring such argument undefined)'
+                # If such such argument is *NOT* variadic, localize such
+                # argument as a new local scalar variable.
+                if (( ! arg_was_variadic )) {
+                    # Note that if such argument is indirect, prior logic ensures
+                    # such argument's local subtype to be ":string".
+                    #
+                    # If such subtype is *NOT* the name of an existing alias, throw
+                    # an exception. See :is_alias_simple() for details.
+                    (( ${+aliases[${arg_subtype_local}]} )) ||
+                        ::func_.die_of_cause_arg_type\
+                            'local subtype '${arg_subtype_local}' unrecognized (i.e., alias '${arg_subtype_local}'() locally declaring such argument undefined)'
 
-                # If such argument is non-defaulted, such argument is passed.
-                # In such case, map such subtype to a definition copying such
-                # argument value to a local variable.
-                if (( ! ${#arg_default_value} )) {
-                    arg_declarer_to_declarations[${arg_subtype_local}]+=' '${arg_name}'="${'${arg_name_expansion}'}"'
-                # Else, such argument is defaulted and hence unpassed.  Since
-                # subsequent logic defaults such argument, declare such
-                # argument as a local variable initialized to either (depending
-                # on type) the empty string, 0, or 0.0.
+                    # If such argument is non-defaulted, such argument is passed.
+                    # In such case, map such subtype to a definition copying such
+                    # argument value to a local variable.
+                    if (( ! ${#arg_default_value} )) {
+                        arg_declarer_to_declarations[${arg_subtype_local}]+=' '${arg_name}'="${'${arg_name_expansion}'}"'
+                    # Else, such argument is defaulted and hence unpassed.  Since
+                    # subsequent logic defaults such argument, declare such
+                    # argument as a local variable initialized to either (depending
+                    # on type) the empty string, 0, or 0.0.
+                    } else {
+                        arg_declarer_to_declarations[${arg_subtype_local}]+=' '${arg_name}
+                    }
+                #FIXME: Implement me. To do so sanely:
+                #
+                #* Declare new string local ${code_args_local_variadic} above.
+                #* Clear such string each argument count iteration.
+                #* Since there exists at most one variadic argument each
+                #  such iteration, set such string in the conditional branch
+                #  below to code performing all required pop and shift
+                #  operations. Since we know the current argument index and
+                #  count, this should be perfectly feasible.
+                #* Unconditionally expand such string into
+                #  ${code_args_local_or_}.
+                #FIXME: Note a mild optimization, as well:
+                #"if (( arg_count == 1 )) {", then we don't need to pop or
+                #shift anything. Nice.
+
+                # Else such such argument is variadic and hence cannot be
+                # localized as a new local scalar variable. Instead, reduce the
+                # current argument list to only such variadic arguments.
                 } else {
-                    arg_declarer_to_declarations[${arg_subtype_local}]+=' '${arg_name}
                 }
             }
 
@@ -651,8 +796,7 @@ function ::func_.parse_args() {
             # unrelaxed and unequal to ":string"), do so. Since *ALL* function
             # arguments are technically untyped scalars and hence strings,
             # arguments of type ":string" are *ALWAYS* inherently valid.
-            if [[ -z "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]}" &&
-                "${arg_type}" != ':string' ]] {
+            if (( arg_is_validated )) && [[ "${arg_type}" != ':string' ]] {
                 # Such argument's major and minor validation-specific subtypes.
                 arg_subtype_major=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]}
                 arg_subtype_minor=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MINOR}]}
@@ -808,6 +952,54 @@ function ::func_.parse_args() {
             }
         }
 
+        # If defaulting at least one argument for the current argument count...
+        if [[ -n "${code_args_default_current}" ]] {
+            # If defaulting at least one argument for a prior argument count,
+            # there already exists an if conditional doing so. In such case,
+            # continue such conditional with a new branch.
+            if [[ -n "${code_args_default}" ]] {
+                code_args_default+=${code_indentation_outer}
+            # Else, no such conditional exists, so begin one anew.
+            } else {
+                code_args_default+=${code_indentation_outer}
+            }
+
+            #FIXME: Incorporate ${args_is_defaultable_tester} logic from below.
+
+            code_args_default+=${code_args_default_current}${code_indentation_outer}'}'
+        }
+
+        #    if (( # == 6 )) {
+        #        code_args_local_or_valid+='argv=( '${arg_default_value_x}' "${@[1,3]}" "${arg_default_value_y}" "${@[4,6]}" )'
+        #    } elif (( # == 7 )) {
+        #        code_args_local_or_valid+='argv[4]+="${arg_default_value_y}"
+        #    }
+        #
+        #Brutal. There's clearly a way to identify and handle
+        #such cases; now, we just have to doctor it up.
+        #FIXME: O.K.; to reasonably implement this, we'll want
+        #a new string local ${code_args_default} to which we
+        #append here rather than to ${code_args_local_or_valid}.
+        #Ensure that we:
+        #
+        #* Reset 'code_args_default=' each loop iteration.
+        #* Test '[[ -n "${code_args_default}" ]]' far below; if
+        #  such test succeeds, then and only then append
+        #  ${code_args_local_or_valid} by ${code_args_default}.
+        #  As the above example demonstrates, we test for the
+        #  current argument count exactly. We do *NOT* need an
+        #  "else" branch (indeed, that would be quite
+        #  counterproductive); we do, however, need to track
+        #  whether this is the first such branch. Fortunately,
+        #  the latter is trivial by simply noting whether or
+        #  not '[[ -n "${code_args_default}" ]]'.
+
+        #FIXME: The current test is insufficient. Specifically, this:
+        #    if (( ${#arg_declarer_to_declarations} +\
+        #          ${#arg_tester_to_expansions} )) {
+        #...should also include a test of "+ ${#code_args_local_variadic}" or
+        #some such. *yawn morosely*
+
         # If localizing and/or validating at least one such argument, do
         # so. Technically, there exist three possible map locals to be tested
         # here: the two tested below and ${arg_var_tester_to_expansions}, *NOT*
@@ -830,7 +1022,7 @@ function ::func_.parse_args() {
                 # maximum argument count allows no optional and hence no
                 # default arguments, do *NOT* test
                 # ${args_is_defaultable_tester} as below.
-                if (( arg_count == arg_count_max )) {
+                if (( arg_count_after_default == arg_count_max )) {
                     code_args_local_or_valid+=' else {'
                 # Else we are parsing less than such number of arguments.
                 } else {
@@ -852,12 +1044,17 @@ function ::func_.parse_args() {
                     # 2. The maximum number of non-variadic arguments and hence
                     #    passed at least such optional variadic argument, which
                     #    the branch above suffices to test.
-                    if (( arg_count == arg_count_min )) {
-                        code_args_local_or_valid+='if (( # == '${arg_count}' ))'
+                    if (( arg_count_after_default == arg_count_min )) {
+                        code_args_local_or_valid+='if (( # == '${arg_count_after_default}' ))'
                     # Else, extend such if conditional in a similar manner.
                     } else {
-                        code_args_local_or_valid+=' elif (( # == '${arg_count}' ))'
+                        code_args_local_or_valid+=' elif (( # == '${arg_count_after_default}' ))'
                     }
+
+                    #FIXME: This *MUST* be shifted above to where we now handle
+                    #argument defaults in a better generalized manner.
+                    #FIXME: Moreover, string local ${args_definitions_default}
+                    #should now be excised.
 
                     # If such function only conditionally accepts default
                     # arguments *AND* the current argument count accepts at
@@ -868,10 +1065,258 @@ function ::func_.parse_args() {
                         code_args_local_or_valid+=' { '${args_is_defaultable_tester}' }'
                     }
 
+                    #FIXME: If some such argument is variadic *AND* passed, we
+                    #need to emit code *HERE* popping all prior non-variadic
+                    #arguments and shifting all subsequent non-variadic
+                    #arguments off the argument list. The problem is that we
+                    #don't have the index of such variadic argument here. This
+                    #is probably easiest corrected by converting
+                    #${arg_was_variadic} from a boolean into the nonzero index
+                    #of such argument if present or 0 otherwise.
+                    #FIXME: There's another subtler problem as well: we only
+                    #want to pop and shift arguments if *ALL* such arguments
+                    #have been localized. If even a single such argument has
+                    #*NOT* been localized, it would make little sense to pop
+                    #and shift only some of the arguments (i.e., the localized
+                    #ones), as the function body would still in that case be
+                    #unable to expand such variadic argument list as "${@}".
+                    #
+                    #Hence, we need some means of tracking whether or not all
+                    #non-variadic arguments were localized. Since we have
+                    #existing means, we'll need to gin up
+                    #yet-another-arg-count-integer:
+                    #
+                    #    integer arg_count_localized
+                    #
+                    #Such integer can be efficiently incremented each argument
+                    #count iteration as follows:
+                    #
+                    #    arg_count_localized+=$(( arg_is_localized ))
+                    #
+                    #Wait. Simpler way. We only require a new boolean:
+                    #
+                    # # 1 if at least one non-variadic argument is *NOT*
+                    # # localized and 0 otherwise (i.e., if all such arguments
+                    # # are localized).
+                    # integer arg_was_unlocalized
+                    #
+                    # Or perhaps such boolean's opposite? Whichever's simpler!
+
                     # Terminate the current branch of such if conditional.
                     code_args_local_or_valid+=' {'
                 }
             }
+
+            # For efficiency, combine the following two related iterations:
+            #
+            # * For each function name and corresponding string expanding all
+            #   arguments validated by calling such function (i.e., key-value
+            #   pairs of map ${arg_tester_to_expansions}), do so.
+            # * For each function name and corresponding string expanding all
+            #   variables referred to by arguments and validated by calling
+            #   such function (i.e., key-value pairs of map
+            #   ${arg_var_tester_to_expansions}), do so. While the first iteration
+            #   validates such variables as existing and of the expected type,
+            #   this iteration validates the values such variables expand to
+            #   and hence must be performed *AFTER* the first iteration.
+            for arg_tester args_expansions (
+                "${(kv@)arg_tester_to_expansions}"
+                "${(kv@)arg_var_tester_to_expansions}") {
+                code_args_local_or_valid+=${code_indentation_inner_if_nested_or_outer}${arg_tester}${args_expansions}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${args_expansions}''' '${(q)arg_tester}
+            }
+
+            # For each alias name and corresponding string localizing arguments
+            # into locals declared by expanding such alias, do so. By design,
+            # such declarations consist only of simple string assignments
+            # *ALWAYS* succeeding and hence requiring no exception handling
+            # (e.g., 'my_var="${1}"'). For efficiency, iterate only by keys
+            # (rather than by both keys and values).
+            for arg_declarer ("${(k@)arg_declarer_to_declarations}") {
+                code_args_local_or_valid+=${code_indentation_inner_if_nested_or_outer}${arg_declarer}${arg_declarer_to_declarations[${arg_declarer}]}
+            }
+
+            # If such function accepts at least one optional argument and hence
+            # prefixed such validation by an if conditional, end such conditional.
+            if (( args_is_optional )) {
+                code_args_local_or_valid+=${code_indentation_outer}'}'
+            }
+        }
+    }
+
+    # Substring prefixing argument count-specific exception messages.
+    local die_arg_count_prefix=' || :die "Function ${funcstack[1]}() expected '
+
+    # Substring suffixing argument count-specific exception messages.
+    local die_arg_count_suffix='."$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}'$''\n\n''"Arguments passed:"$''\n''"${*}"'
+
+    # Validate the number of arguments passed to such function.
+    #
+    # If such function is variadic, such function accepts a countably
+    # infinite number of arguments only bounded below by such minimum.
+    if (( arg_was_variadic )) {
+        code_arg_count=${code_indentation_outer}'(( # >= '${arg_count_min}' )) || ::func.die_of_arg_count_not_exceeding "${@}" '${arg_count_min}
+    # Else, such function is non-variadic, in which case such function
+    # accepts a number of arguments bounded by such minimum and maximum.
+    #
+    # If such minimum and maximum are equal, simplify such test as such.
+    } elif (( arg_count_min == arg_count_max )) {
+        code_arg_count=${code_indentation_outer}'(( # == '${arg_count_min}' )) || ::func.die_of_arg_count_not_equaling "${@}" '${arg_count_min}
+    # Else, such minimum and maximum are unequal.
+    } else {
+        code_arg_count=${code_indentation_outer}'(( '${arg_count_min}' <= # && # <= '${arg_count_max}' )) || ::func.die_of_arg_count_not_ranging "${@}" '${arg_count_min}' '${arg_count_max}
+    }
+
+    # String expanded at the start of such function's body, thus localizing and
+    # validing arguments *BEFORE* all user-defined logic.
+    #
+    # Strip a prefixing newline from such preamble, if any. While it would
+    # clearly be preferable to avoid emitting such newline in the first place,
+    # such newline has two possible sources (either ${code_args_default} or
+    # ${code_arg_count}, depending on whether at least one unpassed argument is
+    # defaulted) and hence is non-trivially removable. This is much simpler.
+    func_preamble=${${:-${code_args_default}${code_arg_count}${code_args_local_or_valid}}#$'\n'}
+    # print -r "${func_name} preamble: ${func_preamble}"$'\n\n'
+}
+
+# --------------------( WASTELANDS                         )--------------------
+                        #FUXME: Actually, the approach pursued below should
+                        #*ALSO* suffice in this case as well. Hence, we want to
+                        #implement such approach if either:
+                        #
+                        #* Such argument is *NOT* localized.
+                        #* Such argument is variadic.
+                        #
+                        #The two cases are similar, because (of course)
+                        #variadic arguments are *NOT* localized. Yay!
+
+                        # # If such argument is *NOT* localized, throw an
+                        # # exception.
+                        # #
+                        # # While we *MAY* support non-localized defaultable
+                        # # arguments in the future, doing so now would impose
+                        # # complexities and inefficiencies for little gain.
+                        # (( arg_is_localized )) ||  ::func_.die_of_cause\
+                        #     'argument ${'${arg_name}'} assigned a default value; consider either eliminating such assignment or refactoring such argument to be non-variadic'
+
+                        # # If such argument is also variadic, throw an
+                        # # exception. While assigning the first argument of an
+                        # # unpassed variadic list a default value is feasible,
+                        # # doing so imposes hitherto unaddressed complexities;
+                        # # given the conditional logic below, we would need to
+                        # # prepend ${code_args_local_or_valid} with an
+                        # # additional if conditional (probably with only a
+                        # # single branch) testing whether 
+                        # #
+                        # # e.g.,
+                        # #
+                        # # * Why permit only the first argument of such a list
+                        # #
+                        # # While we *MAY* support variadiac defaultable
+                        # # arguments in the future, doing so now would impose
+                        # # complexities and inefficiencies for little gain.
+                        # (( ! arg_is_variadic )) || ::func_.die_of_cause\
+                        #     'variadic argument ${'${arg_name}'} assigned a default value; consider either eliminating such assignment or refactoring such argument to be non-variadic'
+
+                    #FUXME: Silly. Since we now know beforehand whether there
+                    #exists an optional argument, this is removable; instead,
+                    #just test where we handle variadic-specific logic:
+                    #
+                    #    (( ! args_is_optional )) || ::func_.die_of_cause_arg_variadic\
+                    #         'accepts both optional and variadic arguments'
+
+                    # If a prior argument is variadic, throw an exception. Note
+                    # we ignore the valid case that the current argument is
+                    # both variadic and absentable (e.g., ":int arg1?, ...").
+                    # (( ! arg_was_variadic )) ||
+                    #     ::func_.die_of_cause_arg_variadic\
+                    #         'accepts both optional and variadic arguments'
+
+# - precisely as tested for here
+                # Then such test reduces to either:
+                #
+                # * "(( arg_count_max - arg_count_min == 1 ))", if the
+                #   current variadic argument is optional.
+                # * "(( arg_count_max - arg_count_min == 0 ))", if the
+                #   current variadic argument is mandatory.
+
+                # if (( args_is_optional &&\
+                      # arg_count_max - arg_count_min - arg_is_optional > 1 )) {
+                # if (( arg_count_max - arg_count_min >= 2 ))
+
+            #FUXME: Erhm; there *IS* no boolean local ${arg_is_defaultable}, at
+            #the moment. Honestly, do we even still require
+            #${arg_was_optional}?
+            #FUXME: Optimizable by shifting above?
+
+    # # 1 if a prior argument was optional (i.e., either defaulted *OR*
+    # # optionalized) and 0 otherwise.
+    # integer arg_was_optional
+
+    #     arg_was_optional=0
+
+    #         # If such argument was optional and/or variadic, notify subsequent
+    #         # parse iterations of such fact. For safety, set such boolean
+    #         # *AFTER* all tests of such boolean above.
+    #         if (( arg_is_absentable + arg_is_defaultable )) {
+    #             arg_was_optional=1
+    #         }
+
+            # # Else, such argument is variadic.
+            # #
+            # # If a prior argument is also variadic, throw an exception. Such
+            # # case implies such function to accept two or more variadic
+            # # argument lists of arbitrary count, implying there exists no
+            # # general means of deciding which such list a passed string was
+            # # intended to belong to.
+            # } elif (( arg_was_variadic )) {
+            #     ::func_.die_of_cause_arg_variadic\
+            #         'accepts two or more variadic arguments'
+            # # If a prior argument is optional, throw an exception. Such case
+            # # implies such function to accept one or more optional arguments
+            # # *AND* one or more variadic argument lists of arbitrary count,
+            # # implying there exists no general means of deciding which such
+            # # argument a passed string was intended to correspond to.
+            # #
+            # # Test such condition *AFTER* testing whether a prior argument is
+            # # variadic. If such function accepts an optional variadic argument
+            # # following a prior variadic argument, the prior exception is more
+            # # explanatory than this exception.
+            # } elif (( arg_was_optional )) {
+            #     ::func_.die_of_cause_arg_variadic\
+            #         'accepts both optional and variadic arguments'
+            # # Else, such argument is validly variadic.
+
+ # Alternatively, since it's clear this is only an
+        #optimization concern and a mild one at that, we should probably simply
+        #excise such conditional.
+            #FUXME: Due to the "! arg_is_variadic" constraint below, this is
+            #probably shiftable into the prior conditional, no?
+            #FUXME: Actually, even this condition isn't *QUITE* sufficient. We
+            #also want to avoid localizing unpassed absentable arguments, for
+            #obvious reasons (e.g., to ensure unpassed arguments are
+            #distinguishable from the empty string, 0, and 0.0). This probably
+            #ties into our currently erroneous use of "continue" above; oh,
+            #right. In the above case, we simply coerce "arg_is_localized=0",
+            #suggesting we should probably do the same (for both orthogonality
+            #and consistency) when "(( arg_is_variadic ))".
+
+                        #FUXME: And another subtle point: after implementing
+                        #such conditional logic, the size of the current
+                        #argument list is increased by 1 for each defaulted
+                        #argument, implying that the ${code_args_local_or_valid}-
+                        #based conditional below will be testing the wrong
+                        #argument count. Happily, this is easily correctable by
+                        #maintaining a new argument count incremented by 1 here
+                        #for each defaulted argument:
+                        #
+                        #    integer arg_count_after_default
+
+                        #FUXME: The right idea; however, we need to be doing
+                        #just the *OPPOSITE*. If the current argument is both
+                        #unpassed *AND* undefaulted (which can occur due to any
+                        #number of root causes, such as being absentable *OR*
+                        #being relaxedly defaultable), we need to:
+                        # arg_count_after_default-=1
 
             # For each alias name and corresponding string localizing arguments
             # into locals declared by expanding such alias, do so *BEFORE*
@@ -907,70 +1352,98 @@ function ::func_.parse_args() {
             #
             # For efficiency, iterate only by keys (rather than by both keys
             # and values).
-            for arg_declarer ("${(k@)arg_declarer_to_declarations}") {
-                code_args_local_or_valid+=${code_indentation_inner_if_nested_or_outer}${arg_declarer}${arg_declarer_to_declarations[${arg_declarer}]}
-            }
+
+            #FUXME: Excise. See above.
 
             # Assign unpassed defaultable arguments default values *BEFORE*
             # subsequent iteration validates such arguments.
-            code_args_local_or_valid+=${args_definitions_default}
+            # code_args_local_or_valid+=${args_definitions_default}
 
-            # For efficiency, combine the following two related iterations:
-            #
-            # * For each function name and corresponding string expanding all
-            #   arguments validated by calling such function (i.e., key-value
-            #   pairs of map ${arg_tester_to_expansions}), do so.
-            # * For each function name and corresponding string expanding all
-            #   variables referred to by arguments and validated by calling
-            #   such function (i.e., key-value pairs of map
-            #   ${arg_var_tester_to_expansions}), do so. While the first iteration
-            #   validates such variables as existing and of the expected type,
-            #   this iteration validates the values such variables expand to
-            #   and hence must be performed *AFTER* the first iteration.
-            for arg_tester args_expansions (
-                "${(kv@)arg_tester_to_expansions}"
-                "${(kv@)arg_var_tester_to_expansions}") {
-                code_args_local_or_valid+=${code_indentation_inner_if_nested_or_outer}${arg_tester}${args_expansions}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${args_expansions}''' '${(q)arg_tester}
-            }
+    #FUXME: Improve commentary.
 
-            # If such function accepts at least one optional argument and hence
-            # prefixed such validation by an if conditional, end such conditional.
-            if (( args_is_optional )) {
-                code_args_local_or_valid+=${code_indentation_outer}'}'
-            }
-        }
-    }
+    # If defaulting at least one argument, delimit that from subsequent logic
+    # by a newline.
+    # if [[ -n "${code_args_default}" ]] {
+    #     code_args_default+=$'\n'
+    # }
 
-    # Substring prefixing argument count-specific exception messages.
-    local die_arg_count_prefix=' || :die "Function ${funcstack[1]}() expected '
+                        #FUXME: Actually, only do this if we're also localizing
+                        #such argument. If we're *NOT*, we have no choice but
+                        #to treat such assignment as if relaxed.
+                        #FUXME: Oh, yes -- and we clearly need to handle
+                        #relaxation as well.
 
-    # Substring suffixing argument count-specific exception messages.
-    local die_arg_count_suffix='."$''\n\n''"Function prototype:"$''\n'''${(qq)ZESHY_DECLARE_FUNC_PROTOTYPE__}'$''\n\n''"Arguments passed:"$''\n''"${*}"'
+                        # Append an assignment of such argument to such default
+                        # value to the newline-delimited string of such
+                        # assignments.
+                        # args_definitions_default+=${code_indentation_outer}${arg_name}'='${arg_default_value}
 
-    # Validate the number of arguments passed to such function.
+    # Newline-delimited string of all assignments of unpassed defaultable
+    # arguments to default values: e.g.,
     #
-    # If such function is variadic, such function accepts a countably
-    # infinite number of arguments only bounded below by such minimum.
-    if (( arg_was_variadic )) {
-        code_arg_count='(( # >= '${arg_count_min}' )) || ::func.die_of_arg_count_not_exceeding "${@}" '${arg_count_min}
-    # Else, such function is non-variadic, in which case such function
-    # accepts a number of arguments bounded by such minimum and maximum.
+    #     problem="The problem is not to find the answer."
+    #     answer="It’s to face the answer."
     #
-    # If such minimum and maximum are equal, simplify such test as such.
-    } elif (( arg_count_min == arg_count_max )) {
-        code_arg_count='(( # == '${arg_count_min}' )) || ::func.die_of_arg_count_not_equaling "${@}" '${arg_count_min}
-    # Else, such minimum and maximum are unequal.
-    } else {
-        code_arg_count='(( '${arg_count_min}' <= # && # <= '${arg_count_max}' )) || ::func.die_of_arg_count_not_ranging "${@}" '${arg_count_min}' '${arg_count_max}
-    }
+    # Since delimiting such assignments by newline suffices, prefer appending
+    # such assignments to a string rather than list (for efficiency).
+    # local args_definitions_default
 
-    # String expanded by the caller at the start of such function's body, thus
-    # performing the above validation *BEFORE* all other function logic.
-    func_preamble="${code_arg_count}${code_args_local_or_valid}"
-    # print -r "${func_name} preamble: ${func_preamble}"$'\n\n'
-}
+        # args_definitions_default=
 
-# --------------------( WASTELANDS                         )--------------------
+#[[ -z "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]}"
+                        #FUXME: The above example brings up a subtle point:
+                        #when some but not all multiple defaultable arguments
+                        #are unpassed, decide which such arguments to default
+                        #and which *NOT* to default in a rightmost manner
+                        #(i.e., default rightmost defaultable arguments first).
+                        #Do we currently do this? Suspicions say, "wat."
+
+# This should substantially (hopefully!)
+                        #simplify logic elsewhere as well.
+                        #FUXME: Actually, as the description below suggests,
+                        #this won't be terribly difficult to support at all.
+                        #Specifically:
+                        #
+                        #* If such defaultable argument is also variadic,
+                        #  prepend ${code_args_local_or_valid} with an
+                        #  additional if conditional (probably with only a
+                        #  single branch) testing whether such argument was
+                        #  passed or not.
+                        #* If unpassed, the body of such conditional should
+                        #  directly modify the argument list to interpose such
+                        #  argument's default value directly into the current
+                        #  argument list as follows:
+                        #  * If such argument is the last argument, efficiently
+                        #    append such default value to such list with:
+                        #    argv+="${arg_default_value}"
+                        #  * Else, inefficiently inject such default value into
+                        #    the appropriate position of such list. This should
+                        #    require at least two commands:
+                        #    1. Shift all subsequent arguments down by one
+                        #       index. Does something like the following
+                        #       actually work? We strongly doubt it, but
+                        #       certainly worth a lucky try. Yes, it does!
+                        #       Huzzah: e.g.,
+                        #       argv[${arg_index},-1]=( "${@[${arg_index}]}" )
+                        #    2. Inject such default value into the proper
+                        #       index: e.g.,
+                        #       argv[${arg_index}]="${arg_default_value}"
+                        #    Actually, given such operations, we *CAN* combine
+                        #    them into the following single efficient command:
+                        #
+                        #    argv[$(( arg_index - 1 ))]+="${arg_default_value}"
+                        #
+                        #    Wait! That works for all indices except the first,
+                        #    of course, which requires an inefficient but still
+                        #    compact single command: e.g.,
+                        #
+                        #    argv=( "${arg_default_value}" "${@}" )
+                        #
+                        #In the above examples, note that ${arg_index} has
+                        #probably already been decremented by 1 and hence
+                        #incorrect. Handle this... erhm, "appropriately": e.g.,
+                        #    argv[${arg_index}]+="${arg_default_value}"
+
                         #FUXME: While such code does appear to work here, would
                         #it not be more logically consistent to shift it below
                         #where we append to ${code_args_local_or_valid}
