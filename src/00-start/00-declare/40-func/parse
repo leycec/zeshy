@@ -121,19 +121,17 @@ function ::func_.parse_args() {
     # either global or caller-specific versions of such variable.
     local ZPCRE_OP
 
-    # Code validating the number of arguments passed to such function.
-    local code_arg_count
-
-    # Code defaulting defaultable arguments *NOT* passed to such function for
-    # all possible argument counts.
-    local code_args_default
-
     # Code defaulting defaultable arguments *NOT* passed to such function for
     # the current argument count.
     local code_args_default_current
 
-    # Code localizing and/or validating arguments passed to such function.
+    # Code localizing and/or validating arguments passed to such function for
+    # all possible argument counts.
     local code_args_local_or_valid
+
+    # Code localizing and/or validating arguments passed to such function for
+    # the current argument count.
+    local code_args_local_or_valid_current
 
     # Code localizing variadic arguments passed to such function by removing
     # all non-variadic arguments from the current argument list and hence
@@ -141,6 +139,16 @@ function ::func_.parse_args() {
     # arguments may only be removed from such list *AFTER* localizing such
     # arguments, separate such code into different string locals.
     local code_args_local_variadic
+
+    #FIXME: In hindsight, significant overkill. Since zsh output already
+    #indents function bodies as desired, it's only essential that we prefix
+    #each line as follows to ensure proper lexical behavior:
+    #
+    # local code_indent=' '
+    # local code_indent_newlined=$'\n'' '
+    #
+    #And that's it. Replace all ${code_indent*} locals below with the
+    #dramatically simpler pair above.
 
     # Single level of indentation.
     local code_indent=$'\t'
@@ -162,6 +170,8 @@ function ::func_.parse_args() {
 
     # Current argument name.
     local arg_name
+
+    #FIXME: Rename -- say, to ${arg_parameter}.
 
     # String with which to expand the current argument if such argument is
     # expandable or the empty string otherwise. Possible values include:
@@ -329,6 +339,7 @@ function ::func_.parse_args() {
         arg_count_after_default=${arg_count}
         arg_count_optional=$(( arg_count - arg_count_min ))
         arg_index=0
+        code_args_local_or_valid_current=
         code_args_default_current=
         code_args_local_variadic=
 
@@ -553,26 +564,11 @@ function ::func_.parse_args() {
                     # an exception. See :is_alias_simple() for details.
                     (( ${+aliases[${arg_subtype_local}]} )) ||
                         ::func_.die_of_cause_arg_type\
-                            'local subtype '${arg_subtype_local}' unrecognized (i.e., alias '${arg_subtype_local}'() locally declaring such argument undefined)'
+                            'local subtype '${arg_subtype_local}' unrecognized (i.e., alias '${arg_subtype_local}'() localizing such argument undefined)'
 
                     # Map such subtype to a definition assigning such argument
                     # value to a local variable of the same name.
                     arg_declarer_to_declarations[${arg_subtype_local}]+=' '${arg_name}'="${'${arg_name_expansion}'}"'
-                #FIXME: Implement me. To do so sanely:
-                #
-                #* Declare new string local ${code_args_local_variadic} above.
-                #* Clear such string each argument count iteration.
-                #* Since there exists at most one variadic argument each
-                #  such iteration, set such string in the conditional branch
-                #  below to code performing all required pop and shift
-                #  operations. Since we know the current argument index and
-                #  count, this should be perfectly feasible.
-                #* Unconditionally expand such string into
-                #  ${code_args_local_or_}.
-                #FIXME: Note a mild optimization, as well:
-                #"if (( arg_count == 1 )) {", then we don't need to pop or
-                #shift anything. Nice.
-
                 # Else such argument is variadic, signifying an arbitrary
                 # number of such arguments. Since such arguments are
                 # unavailable until function call time and hence *NOT*
@@ -768,23 +764,336 @@ function ::func_.parse_args() {
             }
         }
 
-        # If defaulting at least one argument for the current argument count...
+        # If defaulting at least one argument for the current argument count,
+        # do so. Since subsequent localization and validation code assumes all
+        # such arguments to already have been defaulted, guarantee this by
+        # prefixing such function's preamble by such defaults.
         if [[ -n "${code_args_default_current}" ]] {
-            # Indent the if conditional branch emitted below.
-            code_args_default+=${code_indent}
-
-            # If defaulting at least one argument for a prior argument count,
-            # there already exists an if conditional doing so. In such case,
-            # continue such conditional with another branch.
-            if [[ -n "${code_args_default}" ]] {
-                code_args_default+=' el'
+            # If no argument has yet been defaulted, open a new if conditional.
+            if [[ -z "${func_preamble}" ]] {
+                func_preamble=${code_indent}
+            # Else at least one argument has been defaulted, implying an if
+            # conditional doing so has already been opened. Continue such
+            # conditional with a new branch.
+            } else {
+                func_preamble+=' el'
             }
 
             # Default such arguments only for the current argument count.
-            code_args_default+='if (( # == '${arg_count}' )) {'${code_args_default_current}${code_indent_outer}'}'
+            func_preamble+='if (( # == '${arg_count}' )) {'${code_args_default_current}${code_indent_outer}'}'
         }
 
-        #FIXME: Such test does work, but is becoming increasingly fragile,
+        # For efficiency, combine the following two related iterations:
+        #
+        # * For each function name and corresponding string expanding all
+        #   arguments validated by calling such function (i.e., key-value
+        #   pairs of map ${arg_tester_to_expansions}), do so.
+        # * For each function name and corresponding string expanding all
+        #   variables referred to by arguments and validated by calling
+        #   such function (i.e., key-value pairs of map
+        #   ${arg_var_tester_to_expansions}), do so. While the first iteration
+        #   validates such variables as existing and of the expected type,
+        #   this iteration validates the values such variables expand to
+        #   and hence must be performed *AFTER* the first iteration.
+        for arg_tester args_expansions (
+            "${(kv@)arg_tester_to_expansions}"
+            "${(kv@)arg_var_tester_to_expansions}") {
+            code_args_local_or_valid_current+=${code_indent_inner_if_nested_or_outer}${arg_tester}${args_expansions}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${args_expansions}''' '${(q)arg_tester}
+        }
+
+        # For each alias name and corresponding string localizing arguments
+        # into locals declared by expanding such alias, do so. By design,
+        # such declarations consist only of simple string assignments
+        # *ALWAYS* succeeding and hence requiring no exception handling
+        # (e.g., 'my_var="${1}"'). For efficiency, iterate only by keys
+        # (rather than by both keys and values).
+        for arg_declarer ("${(k@)arg_declarer_to_declarations}") {
+            code_args_local_or_valid_current+=${code_indent_inner_if_nested_or_outer}${arg_declarer}${arg_declarer_to_declarations[${arg_declarer}]}
+        }
+
+        # If localizing a variadic argument, do so *AFTER* localizing
+        # non-variadic arguments. Since localizing the former removes *ALL* of
+        # the latter from the current argument list, only do so *AFTER* all of
+        # the latter have been copied from such list into local variables.
+        if [[ -n "${code_args_local_variadic}" ]] {
+            # If at least one non-variadic argument is unlocalized, throw
+            # an exception. Removing such arguments from the current argument
+            # list would prevent subsequent code from expanding such arguments.
+            (( ! arg_was_unlocalized )) || ::func_.die_of_cause\
+                'variadic argument unlocalizable due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing such prefix from all non-variadic argument names'
+
+            # Localize such variadic argument.
+            code_args_local_or_valid_current+=${code_args_local_variadic}
+        }
+
+        # If localizing and/or validating at least one argument, do so.
+        if [[ -n "${code_args_local_or_valid_current}" ]] {
+            # If such function accepts no optional arguments, such function
+            # *ALWAYS* accepts the same number of arguments, implying such code
+            # to *NOT* need embedding in an if conditional testing such number.
+            if (( ! args_is_optional )) {
+                code_args_local_or_valid+=${code_args_local_or_valid_current}
+            # Else such function accepts at least one optional argument and
+            # hence accepts a variable number of arguments, implying such code
+            # to need embedding in an if conditional testing such number.
+            } else {
+                # If the current argument count is the maximum, terminate the
+                # current if conditional with a last branch. Since the prior branch
+                # of such conditional already ended on "}", omit such prefix here.
+                if (( arg_count_after_default == arg_count_max )) {
+                    code_args_local_or_valid+=' else'
+                # Else the current argument count is less than the maximum.
+                } else {
+                    # If the current argument count is the minimum, initiate a
+                    # new if conditional. Curiously, note that such test
+                    # implicitly accounts for variadicity. Why? Consider. If
+                    # one argument is variadic, then by the prior constraints
+                    # such argument must also be the *ONLY* optional argument
+                    # such function accepts. There then exist only two cases
+                    # with respect to the number of arguments such function
+                    # accepts. Either such function is passed:
+                    #
+                    # 1. The minimum number of arguments and hence *NOT* passed
+                    #    such optional variadic argument, which the branch
+                    #    below suffices to test.
+                    # 2. The maximum number of non-variadic arguments and hence
+                    #    passed at least such optional variadic argument, which
+                    #    the branch above suffices to test.
+                    if (( arg_count_after_default == arg_count_min )) {
+                        code_args_local_or_valid+=${code_indent_outer}
+                    # Else the current argument count is more than the minimum.
+                    # Continue the current if conditional with a new branch.
+                    } else {
+                        code_args_local_or_valid+=' el'
+                    }
+
+                    # Test such branch.
+                    code_args_local_or_valid+='if (( # == '${arg_count_after_default}' ))'
+                }
+
+                # Implement such branch's body.
+                code_args_local_or_valid+=' {'${code_args_local_or_valid_current}${code_indent_outer}'}'
+            }
+        }
+    }
+
+    # If defaulting arguments, customize such code for interpolation below.
+    if [[ -n "${func_preamble}" ]] {
+        # Name of the alias or function testing at runtime whether the current
+        # function call conditionally accepts unpassed defaultable arguments
+        # (e.g., only when called directly from the command line) or the empty
+        # string if such function *ALWAYS* accepts such arguments.
+        local args_is_defaultable_tester=${ZESHY_DECLARE_FUNC_ATTRS__[default_args_if]-}
+
+        # If only conditionally accepting such arguments, do so only when such
+        # condition succeeds at runtime.
+        if [[ "${args_is_defaultable_tester}" ]] {
+            # If such alias or function does *NOT* exist, throw an exception.
+            # See :alias_simple.is() and :func.is().
+            (( ${+aliases[${args_is_defaultable_tester}]} +
+               ${+functions[${args_is_defaultable_tester}]} )) ||
+               ::func_.die_of_cause 'attribute "default_args_if" alias or function '${args_is_defaultable_tester}'() undefined'
+
+            # Default such arguments only if such condition succeeds.
+            func_preamble=${code_indent}'if { '${args_is_defaultable_tester}' } {'${code_indent_outer}${func_preamble}${code_indent_outer}'}'
+        }
+
+        # Delimit such code from subsequent code by a newline.
+        func_preamble+=$'\n'
+    }
+
+    # Validate the number of arguments passed to such function.
+    #
+    # If such function is variadic, such function accepts a countably
+    # infinite number of arguments only bounded below by such minimum.
+    if (( arg_was_variadic )) {
+        func_preamble+=${code_indent}'(( # >= '${arg_count_min}' )) || ::func.die_of_arg_count_not_exceeding "${@}" '${arg_count_min}
+    # Else, such function is non-variadic, in which case such function
+    # accepts a number of arguments bounded by such minimum and maximum.
+    #
+    # If such minimum and maximum are equal, simplify such test as such.
+    } elif (( arg_count_min == arg_count_max )) {
+        func_preamble+=${code_indent}'(( # == '${arg_count_min}' )) || ::func.die_of_arg_count_not_equaling "${@}" '${arg_count_min}
+    # Else, such minimum and maximum are unequal.
+    } else {
+        func_preamble+=${code_indent}'(( '${arg_count_min}' <= # && # <= '${arg_count_max}' )) || ::func.die_of_arg_count_not_ranging "${@}" '${arg_count_min}' '${arg_count_max}
+    }
+
+    # If localizing and/or validating arguments, do so.
+    if [[ -n "${code_args_local_or_valid}" ]] {
+        # Delimit such code from subsequent user-defined code by a newline.
+        func_preamble+=${code_args_local_or_valid}$'\n'
+    }
+    print -r "${func_name} preamble: ${func_preamble}"$'\n\n'
+}
+
+# --------------------( WASTELANDS                         )--------------------
+        #FUXME: Obsolete. Excise.
+
+    #     # If localizing and/or validating at least one such argument, do
+    #     # so. Technically, there exist three possible map locals to be tested
+    #     # here: the two tested below and ${arg_var_tester_to_expansions}, *NOT*
+    #     # tested below. Since prior logic guarantees ${arg_tester_to_expansions} to
+    #     # be nonempty whenever ${arg_var_tester_to_expansions} is nonempty,
+    #     # however, the latter need *NOT* be explicitly tested here.
+    #     if (( ${#arg_declarer_to_declarations} +\
+    #           ${#arg_tester_to_expansions} +\
+    #           ${#code_args_local_variadic} )) {
+    #         # If such function accepts at least one optional argument, subsequent
+    #         # argument type validation assumes such function's caller passed the
+    #         # current number of arguments. Prefix such validation by an if
+    #         # conditional guaranteeing such assumption.
+    #         if (( args_is_optional )) {
+    #             # Indent the following if conditional.
+    #             code_args_local_or_valid_current+=${code_indent_outer}
+
+    #             # If parsing the maximum number of arguments, end the current if
+    #             # conditional. Since the prior branch of such conditional
+    #             # already ended on "}", omit such delimiter here. Since the
+    #             # maximum argument count allows no optional and hence no
+    #             # default arguments, do *NOT* test
+    #             # ${args_is_defaultable_tester} as below.
+    #             if (( arg_count_after_default == arg_count_max )) {
+    #                 code_args_local_or_valid_current+=' else {'
+    #             # Else we are parsing less than such number of arguments.
+    #             } else {
+    #                 # If parsing more than the minimum number of arguments,
+    #                 # continue the current if conditional with a new branch.
+    #                 #
+    #                 # Curiously, note that such test implicitly accounts for
+    #                 # variadicity. Why? Consider. If one argument is variadic,
+    #                 # then by the prior constraints such argument must also be
+    #                 # the *ONLY* optional argument such function accepts.
+    #                 # There then exist only two cases with respect to the
+    #                 # number of arguments such function accepts. Either such
+    #                 # function is passed:
+    #                 #
+    #                 # 1. The minimum number of arguments and hence *NOT* passed
+    #                 #    such optional variadic argument, which the branch
+    #                 #    below suffices to test.
+    #                 # 2. The maximum number of non-variadic arguments and hence
+    #                 #    passed at least such optional variadic argument, which
+    #                 #    the branch above suffices to test.
+    #                 if (( arg_count_after_default > arg_count_min )) {
+    #                     code_args_local_or_valid_current+=' el'
+    #                 }
+
+    #                 # Complete the current branch of such if conditional.
+    #                 code_args_local_or_valid_current+='if (( # == '${arg_count_after_default}' )) {'
+    #             }
+    #         }
+
+    #         # For efficiency, combine the following two related iterations:
+    #         #
+    #         # * For each function name and corresponding string expanding all
+    #         #   arguments validated by calling such function (i.e., key-value
+    #         #   pairs of map ${arg_tester_to_expansions}), do so.
+    #         # * For each function name and corresponding string expanding all
+    #         #   variables referred to by arguments and validated by calling
+    #         #   such function (i.e., key-value pairs of map
+    #         #   ${arg_var_tester_to_expansions}), do so. While the first iteration
+    #         #   validates such variables as existing and of the expected type,
+    #         #   this iteration validates the values such variables expand to
+    #         #   and hence must be performed *AFTER* the first iteration.
+    #         for arg_tester args_expansions (
+    #             "${(kv@)arg_tester_to_expansions}"
+    #             "${(kv@)arg_var_tester_to_expansions}") {
+    #             code_args_local_or_valid+=${code_indent_inner_if_nested_or_outer}${arg_tester}${args_expansions}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${args_expansions}''' '${(q)arg_tester}
+    #         }
+
+    #         # For each alias name and corresponding string localizing arguments
+    #         # into locals declared by expanding such alias, do so. By design,
+    #         # such declarations consist only of simple string assignments
+    #         # *ALWAYS* succeeding and hence requiring no exception handling
+    #         # (e.g., 'my_var="${1}"'). For efficiency, iterate only by keys
+    #         # (rather than by both keys and values).
+    #         for arg_declarer ("${(k@)arg_declarer_to_declarations}") {
+    #             code_args_local_or_valid+=${code_indent_inner_if_nested_or_outer}${arg_declarer}${arg_declarer_to_declarations[${arg_declarer}]}
+    #         }
+
+    #         # If localizing a variadic argument, do so.
+    #         if [[ -n "${code_args_local_variadic}" ]] {
+    #             # If at least one non-variadic argument is unlocalized, throw
+    #             # an exception. Since variadic arguments are localized by
+    #             # removing *ALL* non-variadic arguments from the current
+    #             # argument list, doing so when at least one such argument is
+    #             # unlocalized and hence uncopied into a local variable would
+    #             # prevent subsequent code from accessing such argument.
+    #             (( ! arg_was_unlocalized )) || ::func_.die_of_cause\
+    #                 'variadic argument unlocalizable due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing such prefix from all non-variadic argument names'
+
+    #             # Localize such variadic argument.
+    #             code_args_local_or_valid+=${code_args_local_variadic}
+    #         }
+
+    #         # If such function accepts at least one optional argument and hence
+    #         # prefixed such validation by an if conditional, end such conditional.
+    #         if (( args_is_optional )) {
+    #             code_args_local_or_valid+=${code_indent_outer}'}'
+    #         }
+    #     }
+    # }
+
+            # Since variadic arguments are localized by
+            # removing *ALL* non-variadic arguments from the current
+            # argument list, doing so when at least one such argument is
+            # unlocalized and hence uncopied into a local variable would
+            # prevent subsequent code from accessing such argument.
+
+    # String expanded at the start of such function's body, thus localizing and
+    # validing arguments *BEFORE* all user-defined logic.
+    # func_preamble+=${code_args_local_or_valid}
+
+    #FUXME: For a similar reason, we don't actually need a separate string
+    #local ${code_arg_count} either. Instead, append ${func_preamble} directly.
+
+    # Code validating the number of arguments passed to such function.
+    # local code_arg_count
+
+        # If such function only conditionally accepts default arguments (e.g.,
+        # only when called directly from the command line), default such
+        # arguments only if such condition succeeds.
+        # if (( ${+ZESHY_DECLARE_FUNC_ATTRS__[default_args_if]} )) {
+
+#reporting success when such
+            # function accepts default arguments.
+    #FUXME: If one considers it, we don't actually require
+    #${code_args_default}. Instead, since ${code_args_default} *ALWAYS*
+    #prefixes ${func_preamble}, simply:
+    #
+    #* Operate directly on ${func_preamble} instead.
+    #* Excise ${code_args_default}.
+    #* Rename ${code_args_default_current} to ${code_args_default}.
+
+    # Code defaulting defaultable arguments *NOT* passed to such function for
+    # all possible argument counts.
+    # local code_args_default
+
+        # such code should *ALWAYS* prefixes such function preamble,
+                #FUXME: Implement me. To do so sanely:
+                #
+                #* Declare new string local ${code_args_local_variadic} above.
+                #* Clear such string each argument count iteration.
+                #* Since there exists at most one variadic argument each
+                #  such iteration, set such string in the conditional branch
+                #  below to code performing all required pop and shift
+                #  operations. Since we know the current argument index and
+                #  count, this should be perfectly feasible.
+                #* Unconditionally expand such string into
+                #  ${code_args_local_or_}.
+                #FUXME: Note a mild optimization, as well:
+                #"if (( arg_count == 1 )) {", then we don't need to pop or
+                #shift anything. Nice.
+
+            # Indent the if conditional branch emitted below.
+            # code_args_default+=${code_indent}
+
+            # there already exists an if conditional doing so. In such case,
+            # continue such conditional with a new branch.
+            # If defaulting at least one argument for a prior argument count,
+            # there already exists an if conditional doing so. In such case,
+            # continue such conditional with a new branch.
+        #FUXME: Such test does work, but is becoming increasingly fragile,
         #inefficient, and cumbersome. It may be preferable, at some point, to:
         #
         #* Declare a new string local ${code_args_local_or_valid_current}.
@@ -803,173 +1112,34 @@ function ::func_.parse_args() {
         #args_is_optional )) {" tests below -- and should, in general, produce
         #somewhat more streamlined code.
 
-        # If localizing and/or validating at least one such argument, do
-        # so. Technically, there exist three possible map locals to be tested
-        # here: the two tested below and ${arg_var_tester_to_expansions}, *NOT*
-        # tested below. Since prior logic guarantees ${arg_tester_to_expansions} to
-        # be nonempty whenever ${arg_var_tester_to_expansions} is nonempty,
-        # however, the latter need *NOT* be explicitly tested here.
-        if (( ${#arg_declarer_to_declarations} +\
-              ${#arg_tester_to_expansions} +\
-              ${#code_args_local_variadic} )) {
-            # If such function accepts at least one optional argument, subsequent
+                # Indent the following if conditional.
+                # code_args_local_or_valid+=${code_indent_outer}
+
+                    # if (( arg_count_after_default > arg_count_min )) {
+                    #     code_args_local_or_valid+=' el'
+                    # } else {
+                    #     ${code_indent_outer}
+                    # }
+
+            # subsequent
             # argument type validation assumes such function's caller passed the
             # current number of arguments. Prefix such validation by an if
             # conditional guaranteeing such assumption.
-            if (( args_is_optional )) {
-                # Indent the following if conditional.
-                code_args_local_or_valid+=${code_indent_outer}
+            # *NOT* conditionally dependent on the current argument count
+            # and hence .
 
-                # If parsing the maximum number of arguments, end the current if
-                # conditional. Since the prior branch of such conditional
-                # already ended on "}", omit such delimiter here. Since the
-                # maximum argument count allows no optional and hence no
-                # default arguments, do *NOT* test
-                # ${args_is_defaultable_tester} as below.
-                if (( arg_count_after_default == arg_count_max )) {
-                    code_args_local_or_valid+=' else {'
-                # Else we are parsing less than such number of arguments.
-                } else {
-                    # If parsing the minimum number of arguments, start such if
-                    # conditional. Avoid delimiting such conditional yet, as
+                    # if (( arg_count_after_default == arg_count_min )) {
+                    #     code_args_local_or_valid_current+='if (( # == '${arg_count_after_default}' ))'
+                    # # Else, extend such if conditional in a similar manner.
+                    # } else {
+                    #     code_args_local_or_valid_current+=' elif (( # == '${arg_count_after_default}' ))'
+                    # }
+
+#Avoid delimiting such conditional yet, as
                     # subsequent logic may interpose additional tests.
-                    #
-                    # Curiously, note that such test implicitly accounts for
-                    # variadicity. Why? Consider. If one argument is variadic,
-                    # then by the prior constraints such argument must also be
-                    # the *ONLY* optional argument such function accepts.
-                    # There then exist only two cases with respect to the
-                    # number of arguments such function accepts. Either such
-                    # function is passed:
-                    #
-                    # 1. The minimum number of arguments and hence *NOT* passed
-                    #    such optional variadic argument, which the branch
-                    #    below suffices to test.
-                    # 2. The maximum number of non-variadic arguments and hence
-                    #    passed at least such optional variadic argument, which
-                    #    the branch above suffices to test.
-                    if (( arg_count_after_default == arg_count_min )) {
-                        code_args_local_or_valid+='if (( # == '${arg_count_after_default}' ))'
-                    # Else, extend such if conditional in a similar manner.
-                    } else {
-                        code_args_local_or_valid+=' elif (( # == '${arg_count_after_default}' ))'
-                    }
-
                     # Terminate the current branch of such if conditional.
-                    code_args_local_or_valid+=' {'
-                }
-            }
+                    # code_args_local_or_valid+=' {'
 
-            # For efficiency, combine the following two related iterations:
-            #
-            # * For each function name and corresponding string expanding all
-            #   arguments validated by calling such function (i.e., key-value
-            #   pairs of map ${arg_tester_to_expansions}), do so.
-            # * For each function name and corresponding string expanding all
-            #   variables referred to by arguments and validated by calling
-            #   such function (i.e., key-value pairs of map
-            #   ${arg_var_tester_to_expansions}), do so. While the first iteration
-            #   validates such variables as existing and of the expected type,
-            #   this iteration validates the values such variables expand to
-            #   and hence must be performed *AFTER* the first iteration.
-            for arg_tester args_expansions (
-                "${(kv@)arg_tester_to_expansions}"
-                "${(kv@)arg_var_tester_to_expansions}") {
-                code_args_local_or_valid+=${code_indent_inner_if_nested_or_outer}${arg_tester}${args_expansions}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${args_expansions}''' '${(q)arg_tester}
-            }
-
-            # For each alias name and corresponding string localizing arguments
-            # into locals declared by expanding such alias, do so. By design,
-            # such declarations consist only of simple string assignments
-            # *ALWAYS* succeeding and hence requiring no exception handling
-            # (e.g., 'my_var="${1}"'). For efficiency, iterate only by keys
-            # (rather than by both keys and values).
-            for arg_declarer ("${(k@)arg_declarer_to_declarations}") {
-                code_args_local_or_valid+=${code_indent_inner_if_nested_or_outer}${arg_declarer}${arg_declarer_to_declarations[${arg_declarer}]}
-            }
-
-            # If localizing a variadic argument, do so.
-            if [[ -n "${code_args_local_variadic}" ]] {
-                # If at least one non-variadic argument is unlocalized, throw
-                # an exception. Since variadic arguments are localized by
-                # removing *ALL* non-variadic arguments from the current
-                # argument list, doing so when at least one such argument is
-                # unlocalized and hence uncopied into a local variable would
-                # prevent subsequent code from accessing such argument.
-                (( ! arg_was_unlocalized )) || ::func_.die_of_cause\
-                    'variadic argument unlocalizable due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing such prefix from all non-variadic argument names'
-
-                # Localize such variadic argument.
-                code_args_local_or_valid+=${code_args_local_variadic}
-            }
-
-            # If such function accepts at least one optional argument and hence
-            # prefixed such validation by an if conditional, end such conditional.
-            if (( args_is_optional )) {
-                code_args_local_or_valid+=${code_indent_outer}'}'
-            }
-        }
-    }
-
-    #FIXME: If one considers it, we don't actually require
-    #${code_args_default}. Instead, since ${code_args_default} *ALWAYS*
-    #prefixes ${func_preamble}, simply:
-    #
-    #* Operate directly on ${func_preamble} instead.
-    #* Excise ${code_args_default}.
-    #* Rename ${code_args_default_current} to ${code_args_default}.
-
-    # If defaulting arguments, customize such code for interpolation below.
-    if [[ -n "${code_args_default}" ]] {
-        # If such function only conditionally accepts default arguments (e.g.,
-        # only when called directly from the command line), default such
-        # arguments only if such condition succeeds.
-        if (( ${+ZESHY_DECLARE_FUNC_ATTRS__[default_args_if]} )) {
-            # Name of the alias or function reporting success when such
-            # function accepts default arguments.
-            local args_is_defaultable_tester=${ZESHY_DECLARE_FUNC_ATTRS__[default_args_if]}
-
-            # If such alias or function does *NOT* exist, throw an exception.
-            # See :alias_simple.is() and :func.is() for further details.
-            (( ${+aliases[${args_is_defaultable_tester}]} +
-               ${+functions[${args_is_defaultable_tester}]} )) ||
-               ::func_.die_of_cause 'attribute "default_args_if" alias or function '${args_is_defaultable_tester}'() undefined'
-
-            # Default such arguments only if such condition succeeds.
-            code_args_default=${code_indent}'if { '${args_is_defaultable_tester}' } {'${code_indent_outer}${code_args_default}${code_indent_outer}'}'
-        }
-
-        # Delimit such code from subsequent code by a newline.
-        code_args_default+=$'\n'
-    }
-
-    #FIXME: For a similar reason, we don't actually need a separate string
-    #local ${code_arg_count} either. Instead, append ${func_preamble} directly.
-
-    # Validate the number of arguments passed to such function.
-    #
-    # If such function is variadic, such function accepts a countably
-    # infinite number of arguments only bounded below by such minimum.
-    if (( arg_was_variadic )) {
-        code_arg_count=${code_indent}'(( # >= '${arg_count_min}' )) || ::func.die_of_arg_count_not_exceeding "${@}" '${arg_count_min}
-    # Else, such function is non-variadic, in which case such function
-    # accepts a number of arguments bounded by such minimum and maximum.
-    #
-    # If such minimum and maximum are equal, simplify such test as such.
-    } elif (( arg_count_min == arg_count_max )) {
-        code_arg_count=${code_indent}'(( # == '${arg_count_min}' )) || ::func.die_of_arg_count_not_equaling "${@}" '${arg_count_min}
-    # Else, such minimum and maximum are unequal.
-    } else {
-        code_arg_count=${code_indent}'(( '${arg_count_min}' <= # && # <= '${arg_count_max}' )) || ::func.die_of_arg_count_not_ranging "${@}" '${arg_count_min}' '${arg_count_max}
-    }
-
-    # String expanded at the start of such function's body, thus localizing and
-    # validing arguments *BEFORE* all user-defined logic.
-    func_preamble=${code_args_default}${code_arg_count}${code_args_local_or_valid}
-    # print -r "${func_name} preamble: ${func_preamble}"$'\n\n'
-}
-
-# --------------------( WASTELANDS                         )--------------------
                     #FUXME: If some such argument is variadic *AND* passed, we
                     #need to emit code *HERE* popping all prior non-variadic
                     #arguments and shifting all subsequent non-variadic
