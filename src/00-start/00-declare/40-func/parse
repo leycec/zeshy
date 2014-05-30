@@ -29,11 +29,41 @@ function ::func_.stop() {
     # Validate sanity.
     (( ! # )) || :die 'Expected no arguments.'
 
-    # If any such global is either undefined or of unexpected type, this call
-    # was *NOT* preceded by a call to ::func_.start() - so throw an exception.
-    :var.die_unless_type_string ZESHY_DECLARE_FUNC_PROTOTYPE__ ZESHY_DECLARE_FUNC_ARGS__
-    :var.die_unless_type_map  ZESHY_DECLARE_FUNC_ATTRS__
-    :var.die_unless_type_list ZESHY_DECLARE_FUNC_NAMES__
+    #FIXME: We declare *ALOT* of locals here, thus allocating and deallocating
+    #storage for all such locals on each function declaration. Arguably, such
+    #locals would be better defined in @{compile} and then forcefully reset
+    #here, a substantially faster operation than such large-scale reallocation.
+    #This has a number of immediate beneficial side effects, including:
+    #
+    #* ${code_prefix} need no longer be declared as a global -- and, in fact,
+    #  would require no refactoring whatsoever.
+    #* In truth, we shouldn't even need to reset any such locals here. Why?
+    #  Because *WE ALREADY DO SO* on each argument count iteration. Nice!
+    #  * After examination, the only locals definitively requiring
+    #    reinitialization are:
+    #
+    #    args_is_string_glob=0
+    #    args_is_unlocalized=0
+    #
+    #* While reallocating scalar variables probably isn't terribly costing,
+    #  reallocating the following three non-scalar maps almost certainly is.
+    #  Avoiding such reallocation alone makes the effort worthwhile.
+    #
+    #That said, when we do so, we'll need to rename all such locals into
+    #pseudo-globals: e.g., from
+    #${arg_declarer_to_declarations} to
+    #${ZESHY_FUNC_ARG_DECLARER_TO_DECLARATIONS__}. In short, prefix each local
+    #name by "ZESHY_FUNC_" and suffix by "__".
+    #FIXME: Indeed, the prior discussion applies equally well to the globals
+    #declared below. Convert all such globals to similar locals; all told, this
+    #should *DRAMATICALLY* reduce nonscalar variable reallocations, which is
+    #(probably!) exceptionally critical to obtaining tolerable performance.
+
+    (( ${+ZESHY_DECLARE_FUNC_PROTOTYPE__} +\
+       ${+ZESHY_DECLARE_FUNC_ARGS__} +\
+       ${+ZESHY_DECLARE_FUNC_ATTRS__} +\
+       ${+ZESHY_DECLARE_FUNC_NAMES__} )) || :die\
+       'Alias "}:func"() not preceded by function :func_() or alias ":func{"().'
 
     # Map from the name of an alias defining variables of a certain type
     # (e.g., ":string") to the space-delimited string assigning one local
@@ -69,12 +99,18 @@ function ::func_.stop() {
     # *BEFORE* user-defined logic.
     local func_preamble
 
-    #FIXME: Rename to ${func_callback}.
+    #FIXME: Arguably, we've defined 4 redundant locals easily replaceable by a
+    #single new string local entitled ${runnable_name}. These are:
+    #
+    #* ${func_callback}.
+    #* ${arg_declarer}.
+    #* ${arg_tester}.
+    #* ${args_is_defaultable_tester}.
 
     # Name of the callback function such function is to be registered with if
     # such prototype specifies function attribute "callback" or the empty
     # string otherwise.
-    local callback_name
+    local func_callback
 
     # Code defaulting defaultable arguments *NOT* passed to such function for
     # the current argument count.
@@ -97,6 +133,8 @@ function ::func_.stop() {
 
     #FIXME: Refactor as a global constant declared above. Any other constants
     #to be extracted? Probably not, but worth a glimmer.
+    #FIXME: Actually, see above! We simply need to shift all such local
+    #variable declarations to @{compile} instead.
 
     # String prefixing each line of code. Since zsh internally reformats *ALL*
     # functions with proper indentation, omit indentation from such prefix.
@@ -114,14 +152,6 @@ function ::func_.stop() {
     #   non-defaulted arguments preceding the first variadic argument (if any).
     # * A range of integers (e.g., "the "@[2,-2]" in "${@[2,-2]}"), expanding
     #   all variadic arguments.
-    # * Such argument's name (e.g., the "zod" in "${zod}"), expanding all
-    #   defaulted, localized arguments.
-    #
-    # Since non-localized arguments are only validatable by expanding such
-    # arguments by their index in the argument list, we prefer to expand all
-    # arguments by their index if present in such list. This includes all
-    # passed arguments but *NOT* unpassed defaulted arguments, which being
-    # unpassed are only expandable by their local variable name if localized.
     local arg_param
 
     # Current argument type and subtypes.
@@ -203,8 +233,8 @@ function ::func_.stop() {
     #        ...
     #        args_metadata+=(
     #            "${arg_count_max}"
-    #            "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_type}]}"
-    #            "${arg_is_absentable}"
+    #            "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE}]}"
+    #            "${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_ABSENTABLE}]}"
     #            "${arg_is_variadic}" )
     #    }
     #
@@ -219,29 +249,35 @@ function ::func_.stop() {
 
     # Argument list with all single- and double-quoted strings removed,
     # preventing subsequent parsing from erroneously counting ignorable ",",
-    # "?", and "=" characters in such strings.
-    local func_args_sans_quotes="${ZESHY_DECLARE_FUNC_ARGS__//(\'([^\']|\'\')#\'|\"(\\\"|[^\"])#\")}"
+    # "?", and "=" characters in such strings. Since the syntax with which
+    # single quotes are escaped in single-quoted strings and double quotes in
+    # double-quoted strings differ, such glob matches such escapes differently.
+    local arg_list_sans_quotes="${ZESHY_DECLARE_FUNC_ARGS__//(\'([^\']|\'\')#\'|\"(\\\"|[^\"])#\")}"
 
-    # Argument list reduced to all remaining "," characters, whose string
-    # length plus one is the maximum number of arguments such function accepts.
-    local func_args_commas="${func_args_sans_quotes//[^,]##}"
+    # Maximum number of arguments (i.e., number of mandatory *AND* optional
+    # arguments such function accepts), equivalent to the number of ","
+    # characters in such argument list plus one. Such number excludes all
+    # optional arguments in a variadic argument list except the first; since
+    # there exists no maximum number of such optional arguments, such arguments
+    # must be counted manually at function call time. Dismantled, this is:
+    #
+    # * "//[^,]##", removing all non-comma characters from such argument list.
+    #   Commas unequivocally delimit arguments, permitting efficient counting.
+    integer arg_count_max=$(( ${#${arg_list_sans_quotes//[^,]##}} + 1 ))
 
-    # Argument list reduced to all remaining "?" and "=" characters, whose
-    # string length subtracted from the prior maximum is the minimum number of
-    # arguments such function accepts.
-    local func_args_equals="${func_args_sans_quotes//[^?=]##}"
+    # Minimum number of arguments (i.e., number of mandatory arguments such
+    # function accepts), equivalent to the maximum number of arguments minus
+    # the number of "?" and "=" characters in such argument list plus one.
+    # Dismantled, this is:
+    #
+    # * "//[^?=]##", removing all characters except question marks and equal
+    #   signs from such argument list. (Both unequivocally denote optional
+    #   arguments, permitting efficient counting.)
+    integer arg_count_min=$(( arg_count_max - ${#${arg_list_sans_quotes//[^?=]##}} ))
 
     # Current argument count *AFTER* adding all unpassed defaultable arguments
     # to the current argument list, initialized to their default values.
     integer arg_count_after_default
-
-    # Maximum number of arguments (i.e., number of mandatory *AND* optional
-    # arguments such function accepts).
-    integer arg_count_max=$(( ${#func_args_commas} + 1 ))
-
-    # Minimum number of arguments (i.e., number of mandatory arguments such
-    # function accepts).
-    integer arg_count_min=$(( arg_count_max - ${#func_args_equals} ))
 
     # Number of optional arguments required by the current argument count
     # below. If such function accepts no optional arguments, this number
@@ -252,63 +288,22 @@ function ::func_.stop() {
     # Index of the current argument in the argument list.
     integer arg_index
 
-    # 1 if the current argument is absentable and 0 otherwise.
-    integer arg_is_absentable
-
     # 1 if the current argument indirectly refers to another variable by name
     # and 0 otherwise.
     integer arg_is_indirect
 
-    # 1 if the current argument will be localized by such function's preamble
-    # or 0 otherwise. Since all arguments are localized by default, this is
-    # only 0 for arguments with explicitly relaxed names.
-    integer arg_is_localized
-
-    # 1 if the current argument will be validated by such function's preamble
-    # or 0 otherwise. Since all arguments are validated by default, this is
-    # only 0 for arguments with explicitly relaxed types *OR* type ":string"
-    # (which by definition are *ALWAYS* valid).
-    integer arg_is_validated
-
     # 1 if the current argument is variadic and 0 otherwise.
     integer arg_is_variadic
-
-    # 1 if at least one non-variadic argument is unlocalized and 0 otherwise
-    # (i.e., if all such arguments are localized).
-    integer arg_was_unlocalized
-
-    #FIXME: Such boolean is excisable by the same approach with which we
-    #obsoleted ${arg_was_optional}: namely, globbing the raw argument list for
-    #a substring matching ",[ $'\n']#...". That said, that *IS* somewhat more
-    #difficult to reliably and efficiently glob for. Contemplate.
 
     # 1 if a prior argument was variadic and 0 otherwise.
     integer arg_was_variadic
 
-    #FIXME: Rename to ${args_is_glob}.
-
     # 1 if at least one argument is a string glob and 0 otherwise.
-    integer func_was_arg_glob
+    integer args_is_glob
 
-    # 1 if at least one argument is optional and 0 otherwise.
-    integer args_is_optional=$(( arg_count_min != arg_count_max ))
-
-    # If such such function accepts at least one optional argument...
-    if (( args_is_optional )) {
-        # If such function only conditionally defaults arguments (e.g., only
-        # when called directly from the command line), ensure this.
-        if (( ${+ZESHY_DECLARE_FUNC_ATTRS__[default_args_if]} )) {
-            # Name of the alias or function reporting success when such
-            # function accepts default arguments.
-            args_is_defaultable_tester=${ZESHY_DECLARE_FUNC_ATTRS__[default_args_if]}
-
-            # If such alias or function does *NOT* exist, throw an exception.
-            # See :alias_simple.is() and :func.is() for further details.
-            (( ${+aliases[${args_is_defaultable_tester}]} +
-               ${+functions[${args_is_defaultable_tester}]} )) ||
-               ::func_.die_of_cause 'attribute "default_args_if" alias or function '${args_is_defaultable_tester}'() undefined'
-        }
-    }
+    # 1 if at least one non-variadic argument is unlocalized and 0 otherwise
+    # (i.e., if all such arguments are localized).
+    integer args_is_unlocalized
 
     # For efficiency, compile such PCRE. See for_string_text_matching_pcre:()
     # for further details.
@@ -333,6 +328,8 @@ function ::func_.stop() {
     # unpassed and hence assigned default values in a rightmost manner.
     integer arg_count
     for     arg_count ({${arg_count_min}..${arg_count_max}}) {
+        #FIXME: Are all the following locals still requisite?
+
         # Clear such maps. See :clear_map() for further details.
         set -A arg_declarer_to_declarations
         set -A arg_tester_to_expansions
@@ -351,13 +348,19 @@ function ::func_.stop() {
         while {
             pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY_DECLARE_FUNC_ARGS__}"
         } {
+            #FIXME: Are all the following locals still requisite?
+
             # For efficiency and readability, localize argument match metadata.
             arg_name=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME}]}
             arg_type=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE}]}
             arg_subtype_local=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}]}
-            arg_default_value=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE}]}
 
-            #FIXME: Are all the following booleans still requisite?
+            #FIXME: O.K.; if a default value is indeed set, we only ever expand
+            #such value twice below for the current argument -- implying we
+            #should excise such local and simply expand such string manually
+            #wherever we require it.
+
+            arg_default_value=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE}]}
 
             # Likewise, localize boolean-specific argument match metadata.  For
             # efficiency, initialize each such boolean to the length of the
@@ -368,17 +371,8 @@ function ::func_.stop() {
             # have length greater than 1 if matched and hence are *NOT*
             # strictly boolean. Happily, due to the way zsh interprets tests of
             # the form "(( arg_is_variadic ))", such caveat is ignorable.
-            arg_is_absentable=${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_ABSENTABLE}]}
             arg_is_indirect=${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_INDIRECT}]}
             arg_is_variadic=${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_VARIADIC}]-}
-
-            # Localize such argument *UNLESS* such name is relaxed.
-            arg_is_localized=$((
-                1 - ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]} ))
-
-            # Validate such argument *UNLESS* such type is relaxed.
-            arg_is_validated=$((
-                1 - ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]} ))
 
             # Increment the current argument index.
             arg_index+=1
@@ -388,8 +382,8 @@ function ::func_.stop() {
             # such subtype is guaranteed to be the empty string and hence
             # safely replaceable by a sane default.)
             if (( arg_is_indirect )) {
-                #FIXME: If such argument defines a local subtype unequal to
-                #":string", throw an exception.
+                #FIXME: If such argument defines *ANY* local subtype, throw an
+                #exception before overwriting such subtype here.
 
                 arg_subtype_local=':string'
             # Else, such argument is direct.
@@ -397,7 +391,7 @@ function ::func_.stop() {
             # If such argument is a string glob, notify the caller such
             # function accepts at least one such argument.
             } elif [[ "${arg_type}" == ':string+glob' ]] {
-                func_was_arg_glob=1
+                args_is_glob=1
             # Else if such argument's local subtype is nonscalar (i.e., list or
             # map), throw an exception. By zsh mandate, arguments are
             # *ALWAYS* passed as untyped strings and hence cannot
@@ -454,7 +448,7 @@ function ::func_.stop() {
                 #
                 # The test that follows is an extreme optimization of:
                 #
-                #    if (( args_is_optional )) && {
+                #    if (( arg_count_max != arg_count_min )) && {
                 #       (( ! arg_is_optional )) ||
                 #       (( arg_count_max - arg_count_min > 1 )) } { ... }
                 #
@@ -467,8 +461,8 @@ function ::func_.stop() {
                 # optional arguments being greater than 1, thus ignoring the
                 # current validly optional variadic argument).
                 #
-                # To understand why the above test reduces to the optimization
-                # below, recall that:
+                # To understand why the test above reduces to the optimization
+                # below, recall:
                 #
                 # * ${arg_is_optional} is 1 if the current variadic argument is
                 #   optional and 0 otherwise.
@@ -478,6 +472,20 @@ function ::func_.stop() {
                 # In either case, subtracting either from the other *ALWAYS*
                 # results in 0; in any other case, the same subtraction *NEVER*
                 # results in 0. Hence, such test suffices. (Convenient.)
+
+                #FIXME: There's only one problem here: we longer define
+                #${arg_is_optional}! We'll need, therefore, to refactor this
+                #into... well, something. Fortunately, we shouldn't need to
+                #account for relaxation; we *SHOULD*, however, need to detect
+                #both absentable and defaultable syntax: e.g.,
+                #
+                # (( ! (\
+                #     ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE}]} +\
+                #     ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_ABSENTABLE}]})\
+                #     - arg_count_max - arg_count_min )) ||
+                #
+                #Fairly intense, but the eyeballs suggest that should work.
+
                 (( ! arg_is_optional - arg_count_max - arg_count_min )) ||
                     ::func_.die_of_cause_arg_variadic\
                         'accepts both optional and variadic arguments'
@@ -546,7 +554,7 @@ function ::func_.stop() {
                     continue
                 }
             # Else if such argument is absentable and hence also optional...
-            } elif (( arg_is_absentable )) {
+            } elif (( ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_ABSENTABLE}]} )) {
                 # If such argument is passed, handle such case. See above.
                 if (( arg_count_optional )) {
                     arg_count_optional+=-1
@@ -558,13 +566,13 @@ function ::func_.stop() {
             }
 
             # If localizing such argument, do so.
-            if (( arg_is_localized )) {
-                # If such argument is *NOT* variadic, localize such
-                # argument as a new local scalar variable.
+            if (( ! ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]} )) {
+                # If such argument is *NOT* variadic, localize such argument in
+                # the expected way (i.e., via a local scalar variable).
                 if (( ! arg_is_variadic )) {
-                    # Note that if such argument is indirect, prior logic ensures
+                    # Note that if such argument is indirect, prior logic ensured
                     # such argument's local subtype to be ":string".
-                    #
+
                     # If such subtype is *NOT* the name of an existing alias, throw
                     # an exception. See :is_alias_simple() for details.
                     (( ${+aliases[${arg_subtype_local}]} )) ||
@@ -606,14 +614,15 @@ function ::func_.stop() {
                 }
             # Else, note at least one argument to be unlocalized.
             } else {
-                arg_was_unlocalized=1
+                args_is_unlocalized=1
             }
 
             # If validating such argument (i.e., if such argument type is
             # unrelaxed and unequal to ":string"), do so. Since *ALL* function
             # arguments are technically untyped scalars and hence strings,
             # arguments of type ":string" are *ALWAYS* inherently valid.
-            if (( arg_is_validated )) && [[ "${arg_type}" != ':string' ]] {
+            if (( ! ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]} )) &&
+               [[ "${arg_type}" != ':string' ]] {
                 # Such argument's major and minor validation-specific subtypes.
                 arg_subtype_major=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]}
                 arg_subtype_minor=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_MINOR}]}
@@ -820,7 +829,7 @@ function ::func_.stop() {
             # If at least one non-variadic argument is unlocalized, throw
             # an exception. Removing such arguments from the current argument
             # list would prevent subsequent code from expanding such arguments.
-            (( ! arg_was_unlocalized )) || ::func_.die_of_cause\
+            (( ! args_is_unlocalized )) || ::func_.die_of_cause\
                 'variadic argument unlocalizable due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing such prefix from all non-variadic argument names'
 
             # Localize such variadic argument.
@@ -829,10 +838,16 @@ function ::func_.stop() {
 
         # If localizing and/or validating at least one argument, do so.
         if [[ -n "${code_args_local_or_valid_current}" ]] {
+            #FIXME: Insufficient test. To be honest, we may have no means of
+            #reliably testing this at the moment. Such test needs to treat
+            #unrelaxed defaultable arguments as mandatory rather than optional;
+            #such arguments will have been defaulted if unpassed and hence
+            #guaranteed to be passed, ensuring such arguments to be mandatory.
+
             # If such function accepts no optional arguments, such function
             # *ALWAYS* accepts the same number of arguments, implying such code
             # to *NOT* need embedding in an if conditional testing such number.
-            if (( ! args_is_optional )) {
+            if (( arg_count_min == arg_count_max )) {
                 code_args_local_or_valid+=${code_args_local_or_valid_current}
             # Else such function accepts at least one optional argument and
             # hence accepts a variable number of arguments, implying such code
@@ -982,19 +997,16 @@ function ::func_.stop() {
         # all calls to such function by "noglob" to prevent zsh from expanding
         # such arguments as file globs. To do so, define a simple alias of the
         # same name shadowing all calls to such function in such manner.
-        if (( func_was_arg_glob )) {
+        if (( args_is_glob )) {
             :define_alias_simple "${func_name}" "noglob ${(q)func_name}"
         }
 
-        # If such function is attributed, handle such attributes.
-        if (( ${#ZESHY_DECLARE_FUNC_ATTRS__} )) {
-            # If such function is to be called back (i.e., called on some
-            # subsequent event), register such callback.
-            if (( ${+ZESHY_DECLARE_FUNC_ATTRS__[callback]} )) {
-                callback_name='func.callback_'${ZESHY_DECLARE_FUNC_ATTRS__[callback]}
-                :func.die_unless "${callback_name}"
-                "${callback_name}" "${func_name}"
-            }
+        # If such function is to be called back (i.e., called on some
+        # subsequent event), register such callback.
+        if (( ${+ZESHY_DECLARE_FUNC_ATTRS__[callback]} )) {
+            func_callback='func.callback_'${ZESHY_DECLARE_FUNC_ATTRS__[callback]}
+            :func.die_unless "${func_callback}"
+            "${func_callback}" "${func_name}"
         }
 
         #FIXME: This is fairly lame. See @{*-alias} for commentary.
@@ -1019,6 +1031,100 @@ function ::func_.stop() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: Such boolean is excisable by the same approach with which we
+    #obsoleted ${arg_was_optional}: namely, globbing the raw argument list for
+    #a substring matching ",[ $'\n']#...". Indeed, since we only need to detect
+    #the existence of any such substring without regard to how many such
+    #substrings exist, no counting is required, reducing such operation to an
+    #efficient glob. Right. While this is almost certainly the way to go, give
+    #the algorithm a once-over below to confirm intuitions.
+    #FUXME: Oh, wait. Yes, we *DO* need to count such instances. O.K.; just
+    #stick with the current implementation, one should think.
+
+    # 1 if the current argument will be localized by such function's preamble
+    # or 0 otherwise. Since all arguments are localized by default, this is
+    # only 0 for arguments with explicitly relaxed names.
+    # integer arg_is_localized
+
+    #         # Localize such argument *UNLESS* such name is relaxed.
+    #         arg_is_localized=$((
+    #             ! ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]} ))
+
+    # 1 if the current argument will be validated by such function's preamble
+    # or 0 otherwise. Since all arguments are validated by default, this is
+    # only 0 for arguments with explicitly relaxed types *OR* type ":string"
+    # (which by definition are *ALWAYS* valid).
+    # integer arg_is_validated
+
+            # Validate such argument *UNLESS* such type is relaxed.
+            # arg_is_validated=$((
+            #     ! ${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]} ))
+
+    # 1 if the current argument is absentable and 0 otherwise.
+    # integer arg_is_absentable
+            # arg_is_absentable=${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_ABSENTABLE}]}
+
+    # 1 if at least one argument is optional and 0 otherwise.
+    # integer args_is_optional=$(( arg_count_min != arg_count_max ))
+
+    # If such such function accepts at least one optional argument...
+    # if (( args_is_optional )) {
+    #     # If such function only conditionally defaults arguments (e.g., only
+    #     # when called directly from the command line), ensure this.
+    #     if (( ${+ZESHY_DECLARE_FUNC_ATTRS__[default_args_if]} )) {
+    #         # Name of the alias or function reporting success when such
+    #         # function accepts default arguments.
+    #         args_is_defaultable_tester=${ZESHY_DECLARE_FUNC_ATTRS__[default_args_if]}
+
+    #         # If such alias or function does *NOT* exist, throw an exception.
+    #         # See :alias_simple.is() and :func.is() for further details.
+    #         (( ${+aliases[${args_is_defaultable_tester}]} +
+    #            ${+functions[${args_is_defaultable_tester}]} )) ||
+    #            ::func_.die_of_cause 'attribute "default_args_if" alias or function '${args_is_defaultable_tester}'() undefined'
+    #     }
+    # }
+
+    #That said, that *IS* somewhat more
+    #difficult to reliably and efficiently glob for. Contemplate.
+    #FUXME: The following two locals are only expanded in one place each and
+    #hence *SHOULD* be replaceable by in-place expansions. However, will use of
+    #"#" complicate matters here?
+
+    # # Argument list reduced to all remaining "," characters, whose string
+    # # length plus one is the maximum number of arguments such function accepts.
+    # local arg_list_commas="${arg_list_sans_quotes//[^,]##}"
+
+    # # Argument list reduced to all remaining "?" and "=" characters, whose
+    # # string length subtracted from the prior maximum is the minimum number of
+    # # arguments such function accepts.
+    # local arg_list_erotemes_and_equals="${arg_list_sans_quotes//[^?=]##}"
+
+    # # Maximum number of arguments (i.e., number of mandatory *AND* optional
+    # # arguments such function accepts).
+    # integer arg_count_max=$(( ${#arg_list_commas} + 1 ))
+
+    # # Minimum number of arguments (i.e., number of mandatory arguments such
+    # # function accepts).
+    # integer arg_count_min=$(( arg_count_max - ${#arg_list_erotemes_and_equals} ))
+
+    # If any such global is either undefined or of unexpected type, this call
+    # was *NOT* preceded by a call to ::func_.start() - so throw an exception.
+    # :var.die_unless_type_string ZESHY_DECLARE_FUNC_PROTOTYPE__ ZESHY_DECLARE_FUNC_ARGS__
+    # :var.die_unless_type_map  ZESHY_DECLARE_FUNC_ATTRS__
+    # :var.die_unless_type_list ZESHY_DECLARE_FUNC_NAMES__
+
+        # If such function is attributed, handle such attributes.
+        # if (( ${#ZESHY_DECLARE_FUNC_ATTRS__} )) {
+
+    # * Such argument's name (e.g., the "zod" in "${zod}"), expanding all
+    #   defaulted, localized arguments.
+    #
+    # Since non-localized arguments are only validatable by expanding such
+    # arguments by their index in the argument list, we prefer to expand all
+    # arguments by their index if present in such list. This includes all
+    # passed arguments but *NOT* unpassed defaulted arguments, which being
+    # unpassed are only expandable by their local variable name if localized.
+
     # will subsequently throw
     # an exception if called prior to :func_().
 
@@ -1166,7 +1272,7 @@ function ::func_.stop() {
     #             # argument list, doing so when at least one such argument is
     #             # unlocalized and hence uncopied into a local variable would
     #             # prevent subsequent code from accessing such argument.
-    #             (( ! arg_was_unlocalized )) || ::func_.die_of_cause\
+    #             (( ! args_is_unlocalized )) || ::func_.die_of_cause\
     #                 'variadic argument unlocalizable due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing such prefix from all non-variadic argument names'
 
     #             # Localize such variadic argument.
@@ -1319,7 +1425,7 @@ function ::func_.stop() {
                     # # 1 if at least one non-variadic argument is *NOT*
                     # # localized and 0 otherwise (i.e., if all such arguments
                     # # are localized).
-                    # integer arg_was_unlocalized
+                    # integer args_is_unlocalized
                     #
                     # Maintaining such boolean should be a relative cinch.
 
