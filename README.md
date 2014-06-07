@@ -5,7 +5,7 @@ zeshy
 
 **`zeshy` is currently in a non-compiling state** -- which is to say, broken.
 
-Recent feature improvements to the core language (e.g., function prototype-driven programmatic code generation) have proven slippier to implement than initially surmised. Much, *much* slippier. (Think 80's-era ["Slippery When Wet"](https://www.youtube.com/watch?v=CXvN82-qSAc) slippy. Re*aaa*l slippy.)
+Recent feature improvements to the core language (e.g., function prototype-driven programmatic code generation) have proven slippier to implement than initially surmised. Much, *much* slippier. (Think 80's-era ["Slippery When Wet"](https://www.youtube.com/watch?v=CXvN82-qSAc) slippy. *Real* slippy.)
 
 Until such issues, regressions, unintended consequences, and code calamities have been resolved and the codebase concretely solidified, we *strongly* discourage installing, using, or otherwise mandhandling `zeshy`. It's simply unready.
 
