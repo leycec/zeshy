@@ -5,13 +5,13 @@ zeshy
 
 **`zeshy` is currently in a non-compiling state** -- which is to say, broken.
 
-Recent feature improvements to the core language (e.g., function prototype-driven programmatic code generation) have proven... slippier to implement than first surmised. Much, *much* slippier. Think 80's-era ["Slippery When Wet"](https://www.youtube.com/watch?v=CXvN82-qSAc) slippy. (*Real* slippy.)
+Recent feature improvements to the core language (e.g., function prototype-driven programmatic code generation) have proven... slippier to implement than initially surmised. Much, *much* slippier. (Think 80's-era ["Slippery When Wet"](https://www.youtube.com/watch?v=CXvN82-qSAc) slippy. Real slippy.)
 
-Until such issues, regressions, unintended consequences, and code calamities have been resolved and the codebase concretely solidified, we *strongly* discourage installing, using, or otherwise mandhandling `zeshy`. It's simply *not* ready.
+Until such issues, regressions, unintended consequences, and code calamities have been resolved and the codebase concretely solidified, we *strongly* discourage installing, using, or otherwise mandhandling `zeshy`. It's simply unready.
 
 Over three years, 600 commits, and endless all-nighters later, a first-draft implementation remains the loftiest, hallucinatorily inconceivablest ideal it ever was: pleasant enough in principle, but unabashedly, brashly buggered in practice.
 
-Yet, for all its doleful inadequacies, `zeshy` *has* begun receiving attention. A smattering of stars here; a flurry of forks there. For these and every major and minor blessing by the open-source community, I [leycec](https://github.com/leycec) remain gratefully humbled.
+Yet, for all its doleful inadequacies, `zeshy` *has* begun receiving attention. A smattering of stars here; a flurry of forks there. For these and every major and minor blessing by the open-source community, I ([leycec](https://github.com/leycec)) remain gratefully humbled.
 
 Thank you.
 
