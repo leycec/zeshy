@@ -1,7 +1,9 @@
 zeshy
 ===========
 
-## An Open Letter to the Open-Source Community
+`zeshy` is a **dynamic high-level shell scripting language** both implemented *and* interpreted in pure `zsh`.
+
+## An Open Letter (to an Unlikely Readership)
 
 **`zeshy` is currently in a non-compiling state** -- which is to say, broken.
 
@@ -21,7 +23,7 @@ Thank you.
 
 `zeshy` is a:
 
-* **Dynamically recompiled shell scripting language** implemented in and running on `zsh`.
+* **Dynamically recompiled shell scripting language** both implemented *and* interpreted in pure `zsh`.
 * Drop-in replacement for `zsh` with out-of-the-box support for:
   * First- and third-party shell, prompt, and function themes and plugins.
   * Genuine exception handling.
