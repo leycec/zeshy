@@ -197,6 +197,15 @@ prototypes, typically as a prerequisite to processing function declarations).
 #
 #    typeset -g ZESHY__ALIAS_BLOCK_DECLARER=': ::zeshy'
 
+#FIXME: In reflection, there's no demonstrable reason to prohibit function
+#prototypes from requesting both defaultable and variadic arguments. After all,
+#Ruby supports heterogenous mixings of the two by simply binding defaultable
+#arguments to passed parameters with higher priority than binding variadic
+#arguments to passed parameters; that is, Ruby preferentially binds (in order
+#of decreasing priority): mandatory, defaultable, and variadic arguments. We
+#could certainly perform a similar preferential ordering, electing to bind all
+#available defaultable arguments *BEFORE* variadic arguments.
+
 #FIXME: If compiling an optimized zeshy build, disable argument count and
 #argument validation below. Do *NOT* disable argument defaulting or
 #localization, for obvious reasons.
@@ -309,6 +318,9 @@ by ::func_.stop().
 /---
 typeset -g ZESHY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT
 
+#FIXME: Improve documentation, now that we've generalized such code to also
+#possibly initialize a previously declared local list to such arguments.
+
 :global.document <<'/---'
 :string ZESHY__FUNC_CODE_ARGS_LOCAL_VARIADIC
 
@@ -354,29 +366,38 @@ typeset -g ZESHY__FUNC_ARG_PARAM
 :global.document <<'/---'
 :string ZESHY__FUNC_ARG_SUBTYPE_LOCAL
 
-Mandatory *local subtype* (e.g., the `:string` in `^:string/file+readable`) for
-the current argument. This private global is intended to be referenced _only_
-by ::func_.stop().
+Current argument's mandatory *local subtype* (e.g., the `:string` in
+`^:string/file+readable`). This private global is intended to be referenced
+_only_ by ::func_.stop().
 /---
 typeset -g ZESHY__FUNC_ARG_SUBTYPE_LOCAL
 
 :global.document <<'/---'
 :string ZESHY__FUNC_ARG_SUBTYPE_MAJOR
 
-Optional *major subtype* (e.g., the `:file` in `^:string/file+readable`) for
-the current argument. This private global is intended to be referenced _only_
-by ::func_.stop().
+Current argument's optional *major subtype* (e.g., the `file` in
+`^:string/file+readable`). This private global is intended to be referenced
+_only_ by ::func_.stop().
 /---
 typeset -g ZESHY__FUNC_ARG_SUBTYPE_MAJOR
 
 :global.document <<'/---'
 :string ZESHY__FUNC_ARG_SUBTYPE_MINOR
 
-Optional *minor subtype* (e.g., the `:readable` in `^:string/file+readable`)
-for the current argument. This private global is intended to be referenced
+Current argument's optional *minor subtype* (e.g., the `readable` in
+`^:string/file+readable`). This private global is intended to be referenced
 _only_ by ::func_.stop().
 /---
 typeset -g ZESHY__FUNC_ARG_SUBTYPE_MINOR
+
+:global.document <<'/---'
+:string ZESHY__FUNC_ARG_NAME
+
+Current argument's localization-specific *name* if localizing such argument or
+the empty string otherwise. This private global is intended to be referenced
+_only_ by ::func_.stop().
+/---
+typeset -g ZESHY__FUNC_ARG_SUBNAME_MAJOR
 
 :global.document <<'/---'
 :string ZESHY__FUNC_ARG_LIST_SANS_QUOTES
@@ -407,14 +428,6 @@ This private global is intended to be referenced _only_ by ::func_.stop().
 integer -g ZESHY__FUNC_ARG_IS_VARIADIC
 
 :global.document <<'/---'
-:bool ZESHY__FUNC_ARG_WAS_VARIADIC
-
-Boolean expanding to 1 if a prior argument was variadic and 0 otherwise. This
-private global is intended to be referenced _only_ by ::func_.stop().
-/---
-integer -g ZESHY__FUNC_ARG_WAS_VARIADIC
-
-:global.document <<'/---'
 :bool ZESHY__FUNC_ARGS_IS_GLOB
 
 Boolean expanding to 1 if at least one function argument is a *glob* (i.e., has
@@ -435,6 +448,38 @@ and 0 otherwise (i.e., if all such arguments are localized). This private
 global is intended to be referenced _only_ by ::func_.stop().
 /---
 integer -g ZESHY__FUNC_ARGS_IS_UNLOCALIZED
+
+# ....................{ GLOBALS ~ private : enum           }....................
+:global.document <<'/---'
+:int ZESHY__FUNC_ARG_WAS_VARIADIC
+
+Enumeration-style integer describing whether a prior argument was variadic and
+if so how such argument will be localized in such function's body (if at all).
+This private global is intended to be referenced _only_ by ::func_.stop().
+
+== Valid Values ==
+
+If such integer expands to:
+
+* 0, no prior argument was variadic.
+* 1, a prior argument was variadic _and_ either unlocalized or localized to a
+  list local.
+* 2, a prior argument was variadic _and_ localized to the current argument list
+  by shifting and/or popping off all non-variadic arguments from such list.
+
+Such integer may be treated as a boolean expanding to 1 if a prior argument was
+variadic and 0 otherwise -- arguably, such integer's typical usage.
+/---
+integer -g ZESHY__FUNC_ARG_WAS_VARIADIC
+
+:global.document <<'/---'
+:int ZESHY__FUNC_ARG_WAS_VARIADIC_AS_ARGV
+
+Integer constant signifying that a prior argument was variadic _and_ localized
+to the current argument list. This private global is intended to be referenced
+_only_ by ::func_.stop().
+/---
+integer -g ZESHY__FUNC_ARG_WAS_VARIADIC_AS_ARGV=2
 
 # ....................{ GLOBALS ~ private : int            }....................
 :global.document <<'/---'
@@ -666,7 +711,7 @@ function ::func_.stop() {
 
         # Reset globals declared above specific to the following loop.
         ZESHY__FUNC_ARG_COUNT_DEFAULTED=0
-        ZESHY__FUNC_ARG_INDEX=0
+        ZESHY__FUNC_ARG_INDEX=1
         ZESHY__FUNC_ARG_WAS_VARIADIC=0
         ZESHY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT=
         ZESHY__FUNC_CODE_ARGS_LOCAL_VARIADIC=
@@ -683,21 +728,16 @@ function ::func_.stop() {
         while {
             pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__FUNC_ARGS}"
         } {
-            # Increment such argument index.
-            ZESHY__FUNC_ARG_INDEX+=1
-
-            # For efficiency and readability, localize argument match metadata.
+            # Localize *ONLY* that subset of argument match substrings expanded
+            # by two or more conditionals below.
             ZESHY__FUNC_ARG_IS_VARIADIC=${#match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_IS_VARIADIC}]}
-            ZESHY__FUNC_ARG_SUBTYPE_LOCAL=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}]}
 
             # If such local subtype is empty, PCRE design guarantees such
             # argument to indirectly refer to another variable by name,
             # implying such argument to be a string. Since numerous exception
             # handlers expect such subtype to be nonempty, do so *BEFORE*
             # calling such handlers below.
-            if [[ -z ${ZESHY__FUNC_ARG_SUBTYPE_LOCAL} ]]
-                ZESHY__FUNC_ARG_SUBTYPE_LOCAL=':string'
-            }
+            ZESHY__FUNC_ARG_SUBTYPE_LOCAL=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}]:-:string}
 
             # If such argument is *NOT* variadic...
             if (( ! ZESHY__FUNC_ARG_IS_VARIADIC )) {
@@ -801,6 +841,27 @@ function ::func_.stop() {
             # such length suffices to indicate whether a default value was
             # specified. Hence, no boolean ${arg_is_defaulted} is required.
             if [[ -n ${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE}]} ]] {
+                #FIXME: Actually, we *WILL* want to support defaulting of
+                #mandatory variadic arguments. Since our PCRE design implicitly
+                #prohibits absentable arguments from being defaulted, we
+                #needn't explicitly prohibit such case here. (Yay!)
+
+                # If such argument is both defaultable and variadic, throw an
+                # exception. While we *COULD* technically permit the first
+                # argument in a sublist of mandatory variadic arguments to be
+                # defaulted if unpassed, such functionality is already
+                # achievable by simply:
+                #
+                # * Converting such mandatory variadic argument into an
+                #   optional variadic argument.
+                # * Prefixing such argument by the desired defaultable
+                #   argument.
+                #
+                # Given that, we currently elect to make no change.
+                (( ! ZESHY__FUNC_ARG_IS_VARIADIC )) ||\
+                    ::func_.die_of_cause_arg_variadic\
+                        'accepts a defaultable variadic argument'
+
                 # If the number of optional arguments the current argument
                 # count accepts is positive, the current optional argument has
                 # effectively been "passed". In such case, decrement such
@@ -808,7 +869,7 @@ function ::func_.stop() {
                 # optional argument. (The current optional argument "consumes"
                 # one available optional argument "slot" under such count.)
                 if (( ZESHY__FUNC_ARG_COUNT_OPTIONABLE )) {
-                    ZESHY__FUNC_ARG_COUNT_OPTIONABLE+=-1
+                      ZESHY__FUNC_ARG_COUNT_OPTIONABLE+=-1
                 # Else, such argument is unpassed.
                 #
                 # If defaulting such argument (i.e., if such default value is
@@ -837,7 +898,8 @@ function ::func_.stop() {
                     # function accepts (ignoring all subsequent optional
                     # variadic list arguments), efficiently append such
                     # argument's default value to the current argument list.
-                    if (( ZESHY__FUNC_ARG_INDEX == ZESHY__FUNC_ARG_COUNT_MAX )) {
+                    if (( ZESHY__FUNC_ARG_INDEX ==\
+                          ZESHY__FUNC_ARG_COUNT_MAX )) {
                         ZESHY__FUNC_PREAMBLE+=${ZESHY__FUNC_CODE_PREFIX}'argv+='${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE}]}
                     # Else if such argument is the first explicit argument such
                     # function accepts, inefficiently replace the current
@@ -856,13 +918,12 @@ function ::func_.stop() {
                         ZESHY__FUNC_PREAMBLE+=${ZESHY__FUNC_CODE_PREFIX}'argv['$(( ZESHY__FUNC_ARG_INDEX - 1 ))']+='${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_DEFAULT_VALUE}]}
                     }
                 # Else, such unpassed argument is undefaulted and hence absent.
+                # In such case, skip to the next argument. Note that this
+                # implicitly prevents the current argument index from being
+                # incremented below, thus preserving such index for the next
+                # argument as desired. (Absent arguments are *NOT* in the
+                # current argument list and hence cannot be indexed.)
                 } else {
-                    # Absent arguments are *NOT* in the current argument list
-                    # and hence cannot be indexed. Preserve the current
-                    # argument index for the next argument.
-                    ZESHY__FUNC_ARG_INDEX+=-1
-
-                    # Skip to the next argument.
                     continue
                 }
             # Else if such argument is absentable and hence also optional...
@@ -872,13 +933,15 @@ function ::func_.stop() {
                     ZESHY__FUNC_ARG_COUNT_OPTIONABLE+=-1
                 # Else, such argument is unpassed. See above.
                 } else {
-                    ZESHY__FUNC_ARG_INDEX+=-1
                     continue
                 }
             }
 
             # If localizing such argument, do so.
             if [[ -z ${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]} ]] {
+                # Name of the local variable binding such argument.
+                ZESHY__FUNC_ARG_NAME=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBNAME_MAJOR}]:-${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBNAME_HELP}]}}${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBNAME_MINOR}]}
+
                 # If such argument is *NOT* variadic, localize such argument in
                 # the expected way (i.e., via a local scalar variable).
                 if (( ! ZESHY__FUNC_ARG_IS_VARIADIC )) {
@@ -907,14 +970,21 @@ function ::func_.stop() {
 
                     # Map such subtype to a definition assigning such argument
                     # value to a local variable of the same name.
-                    ZESHY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${ZESHY__FUNC_ARG_SUBTYPE_LOCAL}]+=' '${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME}]}${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME_SUFFIX}]}'="${'${ZESHY__FUNC_ARG_PARAM}'}"'
+                    ZESHY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${ZESHY__FUNC_ARG_SUBTYPE_LOCAL}]+=' '${ZESHY__FUNC_ARG_NAME}'="${'${ZESHY__FUNC_ARG_PARAM}'}"'
                 # Else such argument is variadic, signifying an arbitrary
                 # number of such arguments. Since such arguments are
                 # unavailable until function call time and hence *NOT*
                 # localizable at function definition time (i.e., now) as a
-                # hard-coded set of local variables, localize such arguments by
-                # reducing the current argument list to only such arguments.
-                } else {
+                # hard-coded set of local variables, such arguments must be
+                # localized into a list.
+                #
+                # If such argument name is either "@" or "argv" (signifying the
+                # current argument list), localize such arguments by reducing
+                # such list to only such variadic arguments.
+                } elif [[ ${ZESHY__FUNC_ARG_NAME} == ('@'|'argv') ]] {
+                    # Store such fact for subsequent testing.
+                    ZESHY__FUNC_ARG_WAS_VARIADIC=${ZESHY__FUNC_ARG_WAS_VARIADIC_AS_ARGV}
+
                     # If such argument is *NOT* the first argument, remove all
                     # prior arguments from the current argument list. Since zsh
                     # offers a simple builtin for removing prefixing but *NOT*
@@ -925,18 +995,32 @@ function ::func_.stop() {
 
                     # If such argument is *NOT* the last argument, remove all
                     # subsequent arguments from the current argument list.
-                    if (( ZESHY__FUNC_ARG_INDEX != ZESHY__FUNC_ARG_COUNT_MAX )) {
+                    if (( ZESHY__FUNC_ARG_INDEX !=\
+                          ZESHY__FUNC_ARG_COUNT_MAX )) {
                         # If such argument is the second-to-last argument,
                         # remove only the last argument. See pop_arg().
-                        if (( ZESHY__FUNC_ARG_INDEX + 1 == ZESHY__FUNC_ARG_COUNT_MAX )) {
+                        if (( ZESHY__FUNC_ARG_INDEX ==\
+                              ZESHY__FUNC_ARG_COUNT_MAX - 1 )) {
                             ZESHY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${ZESHY__FUNC_CODE_PREFIX}'argv[-1]=()'
                         # Else, such argument precedes the second-to-last
-                        # argument.  Remove all subsequent arguments with
+                        # argument. Remove all subsequent arguments with
                         # ranged indices. See shift_args_2().
                         } else {
                             ZESHY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${ZESHY__FUNC_CODE_PREFIX}'argv['$(( ZESHY__FUNC_ARG_INDEX - ZESHY__FUNC_ARG_COUNT_MAX ))',-1]=()'
                         }
                     }
+                # Else, such argument name is neither "@" or "argv". In such
+                # case, localize such argument by declaring a new list local
+                # with such name and initializing such list to only such
+                # variadic arguments.
+                } else {
+                    # Map the local list type ":list" to such argument's
+                    # declaration, but *NOT* definition. By zsh mandates,
+                    # lists cannot be defined at declaration time.
+                    ZESHY__FUNC_ARG_DECLARER_TO_DECLARATIONS[:list]+=' '${ZESHY__FUNC_ARG_NAME}
+
+                    # Initialize such list to all such variadic arguments.
+                    ZESHY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${ZESHY__FUNC_CODE_PREFIX}${ZESHY__FUNC_ARG_NAME}'=( "${'${ZESHY__FUNC_ARG_PARAM}'}" )'
                 }
             # Else, note at least one argument to be unlocalized.
             } else {
@@ -1096,10 +1180,16 @@ function ::func_.stop() {
                 # Map such function name to such argument's expansion.
                 ZESHY__FUNC_ARG_TESTER_TO_EXPANSIONS[${ZESHY__FUNC_RUNNABLE_NAME}]+=' "${'${ZESHY__FUNC_ARG_PARAM}'}"'
             }
+
+            # Increment such argument index in preparation for parsing the next
+            # argument *AFTER* parsing the current argument. For simplicity,
+            # increment such argument as the last rather than first loop
+            # statement. While feasible, the latter complicates logic above.
+            ZESHY__FUNC_ARG_INDEX+=1
         }
 
-        # If the current argument defaulted at least one argument, terminate
-        # the if conditional doing so.
+        # If the current argument count defaulted at least one argument,
+        # terminate the if conditional doing so.
         if (( ZESHY__FUNC_ARG_COUNT_DEFAULTED )) {
             ZESHY__FUNC_PREAMBLE+=${ZESHY__FUNC_CODE_PREFIX}'}'
         }
@@ -1135,14 +1225,21 @@ function ::func_.stop() {
 
         # If localizing a variadic argument, do so *AFTER* localizing
         # non-variadic arguments. Since localizing the former removes *ALL* of
-        # the latter from the current argument list, only do so *AFTER* all of
-        # the latter have been copied from such list into local variables.
+        # the latter from the current argument list when localizing to such
+        # list, only do so *AFTER* all non-variadic arguments have been copied
+        # from such list into local variables.
         if [[ -n ${ZESHY__FUNC_CODE_ARGS_LOCAL_VARIADIC} ]] {
-            # If at least one non-variadic argument is unlocalized, throw
-            # an exception. Removing such arguments from the current argument
-            # list would prevent subsequent code from expanding such arguments.
+            # Throw an exception if:
+            #
+            # * Localizing a variadic argument to the current argument list.
+            # * At least one non-variadic argument is unlocalized.
+            #
+            # Removing such arguments from the current argument list would
+            # prevent subsequent code from expanding such arguments!
+            [[ ${ZESHY__FUNC_ARG_WAS_VARIADIC} !=\
+               ${ZESHY__FUNC_ARG_WAS_VARIADIC_AS_ARGV} ]] ||
             (( ! ZESHY__FUNC_ARGS_IS_UNLOCALIZED )) || ::func_.die_of_cause\
-                'variadic argument unlocalizable due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing such prefix from all non-variadic argument names'
+                'variadic argument unlocalizable into ${@} due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing the "`" prefixing all non-variadic argument names'
 
             # Localize such variadic argument.
             ZESHY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${ZESHY__FUNC_CODE_ARGS_LOCAL_VARIADIC}
@@ -1357,6 +1454,105 @@ function ::func_.stop() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+            #FUXME: This only applies when popping and shifting. Ugh.
+
+# for the purposes of determining whether a prior argument was variadic -- such integer's customary usage.
+# Boolean expanding to 1 if a prior argument was variadic and 0 otherwise. 
+
+#FUXME: In regards to variadic arguments, permit function prototypes to specify
+#whether they would prefer such argument to be localized into:
+#
+#* ${@} (e.g., by shifting and popping all other arguments off the current
+#  argument list), by suffixing such argument's name by either "/@" or "/argv".
+#* A local list variable having such argument's name (e.g., by copying the
+#subset of such arguments from the current argument list into such local list),
+#  by *NOT* suffixing such argument's name by either "/@" or "/argv".
+#
+#Hence, the default should be to copy variadic arguments into a local list. As
+#an optimization, concerned functions can explicitly elect to retain such
+#arguments in the current argument list -- but this is *NOT* the default (for
+#numerous reasons, the most compelling of which besides sheer readability and
+#intelligibility is that retaining arguments in the current argument list only
+#applies when all other arguments are localized and hence is *NOT* a
+#general-purpose solution).
+
+                    #FUXME: Silly. It would be both more efficient and
+                    #algorithmically resilient to instead only ever increment
+                    #such index. Surely, this can be achieved by performing
+                    #such incrementation *AFTER* such continuation -- perhaps
+                    #at the very end of such iteration?
+
+                    # Absent arguments are *NOT* in the current argument list
+                    # and hence cannot be indexed. Preserve the current
+                    # argument index for the next argument.
+                    # ZESHY__FUNC_ARG_INDEX+=-1
+
+                #FUXME: Probably incorrect for absentable variadic arguments.
+
+            #FUXME: If the current argument is variadic and...
+            #  [[ ${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBNAME_MAJOR} ==\
+            #     ('@'|'argv') ]]
+            #...then perform the current shifting and popping to localize such
+            #argument; else, declare a new local list with the current argument
+            #name initialized by copying the appropriate range of arguments
+            #into such list.
+
+                    #FUXME: Uhm; what? We probably require a new global, merely
+                    #for the purpose of placing such initialization in the
+                    #proper place in the code emitted below.
+                    #FUXME: Variadic arguments can be absentable. Does this
+                    #handle that?
+#@['${ZESHY__FUNC_ARG_INDEX}','${ZESHY__FUNC_ARG_COUNT_MAX}']
+
+ # (e.g., either for
+            # efficiency or
+            # readability)
+            # If such local subtype is empty, PCRE design guarantees such
+            # argument to indirectly refer to another variable by name,
+            # implying such argument to be a string. Since numerous exception
+            # handlers expect such subtype to be nonempty, do so *BEFORE*
+            # calling such handlers below.
+            # if [[ -z ${ZESHY__FUNC_ARG_SUBTYPE_LOCAL} ]]
+            #     ZESHY__FUNC_ARG_SUBTYPE_LOCAL=':string'
+            # }
+
+    #FUXME: Globalize above.
+    # local ZESHY__FUNC_ARG_DEFINE_VARIADIC
+
+            #FUXME: Add support for
+            #${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBNAME_MAJOR}.
+
+# :global.document <<'/---'
+# :string ZESHY__FUNC_ARG_SUBNAME_MAJOR
+# 
+# Optional *major subname* (e.g., the `lsz` in `dimethylazetidide/lsz+lambda`)
+# for the current argument. This private global is intended to be referenced
+# _only_ by ::func_.stop().
+# /---
+# typeset -g ZESHY__FUNC_ARG_SUBNAME_MAJOR
+# 
+# :global.document <<'/---'
+# :string ZESHY__FUNC_ARG_SUBNAME_MINOR
+# 
+# Optional *minor subname* (e.g., the `lambda` in `dimethylazetidide/lsz+lambda`)
+# for the current argument. This private global is intended to be referenced
+# _only_ by ::func_.stop().
+# /---
+# typeset -g ZESHY__FUNC_ARG_SUBNAME_MINOR
+
+                #FUXME: Excise such globals here and above.
+
+                # Such argument's major and minor localization-specific
+                # subnames.
+                # ZESHY__FUNC_ARG_SUBNAME_MAJOR=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBNAME_MAJOR}]}
+                # ZESHY__FUNC_ARG_SUBNAME_MINOR=${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_SUBNAME_MINOR}]}
+
+# ${match[${ZESHY_RUNNABLE_ARG_MATCH_INDEX_NAME}]}${ZESHY__FUNC_ARG_SUBNAME_MINOR}
+
+            #FUXME: If such argument is both variadic and defaultable, an
+            #exception should be thrown. Do we currently do that? We suspect
+            #not, based on cursory inspection. Correct, yes!
+
                     #FUXME: Rather than manually prefixing such major subtype
                     #by ":" below, omit such prefix directly below and instead
                     #generalize the logic testing for the existence of such
