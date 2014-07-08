@@ -1,0 +1,416 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle *disk-backed key-value stores* (i.e., NoSQL-style databases storing only
+schemaless key-value pairs to disk). Since `zsh` currently lacks built-in
+support for such stores, this parcel emulates such support.
+/---
+
+#FIXME: Woh! Turns out, zsh *DOES* provide builtin access to gdbm key-value
+#stores via undocumented hidden module "zsh/db/gdbm" (provided gdbm support was
+#configured during zsh compilation). Lacking documentation, it's a bit unclear
+#exactly how to use it. In fact, the only documentation appears to be the
+#following threads from the committer for this feature on the zsh-workers list:
+#
+#    http://www.zsh.org/mla/workers/2008/msg00978.html
+#
+#Such module currently only exports two functions ztie() and zuntie(). As the
+#names suggest, the former associates an external file signifying a gdbm
+#database with a map global. Call and use it like this:
+#
+#    # Yes, the "-d db/gdbm" is mandatory.
+#    ztie -d db/gdbm -f /tmp/data.base hokeypokey
+#
+#    # Set database keys, creating such keys if not found.
+#    hokeypokey[horse]=buggy
+#    hokeypokey[apple]=pie
+#
+#    # Get database keys.
+#    print -l -- ${hokeypokey}
+#    print ${hokeypokey[horse]}
+#    print ${hokeypokey[apple]}
+#
+#    #FIXME: Odd syntax. Is that *REALLY* how one undefines map keys? *shudder*
+#    # Delete database keys.
+#    unset "hokeypokey[apple]"
+#
+#    # Iterate database keys.
+#    print -l -- ${(k)hokeypokey}
+#
+#Seriously! It's a bit hard to believe, but *NONE* of this has been documented.
+#It's bitrotting in the zsh codebase. Unbelievable, guys. This stuff is too good
+#to let languish.
+
+#FIXME: There exist fairly serious race conditions in the naive implementation,
+#should another running zeshy process attempt to read and/or write to the same
+#KVS store that the current zeshy process is also writing to. Solving this
+#clearly requires a lockfile. All write operations should first attempt to
+#obtain such lock. However, I can't imagine read operations would need to do the
+#same, yes? (And that could considerably slow down the implementation.)
+#FIXME: Hurrah! Module "zsh/system" provides builtin access to advisory POSIX
+#file locking ala:
+#
+## "run_code_with_lock()" is probably the preferable nomenclature, yes?
+## Yup! It's the only one that genuinely complies with existing nomenclature.
+## Actually, run_code_on_lock() seems vastly preferable (and slightly
+#shorter). Yay!
+#
+#run_code_on_lock() {
+#function run_code_after_acquiring_lock() {
+#function run_code_after_locking() {
+#function run_code_under_lock() {
+#function run_code_with_lock() {
+#function run_code_locked() {
+#   # Validate passed arguments. Since we explicitly create such file if
+#   # necessary below, do not bother validating such file.
+#   die_unless_args_2_or_more 'expected one command and one lock filename'
+#
+#   # Placeholder file with which to perform advisory locking.
+#   string lock_filename="${@[-1]}"
+#   pop_arg
+#
+#   # File descriptor encapsulating such lock.
+#   file_descriptor lock_file_descriptor
+#
+#   # Since flock() requires such file already exist, atomically ensure this.
+#   # Technically, another process could still delete such file after its
+#   # creation here but before its usage below for locking, inducing flock() to
+#   # fail with non-zero exit status. While regrettable, this technicality
+#   # remains both unlikely and unavoidable.
+#   make_file_if_not_found "${lock_filename}"
+#
+#   # Attempt to acquire such lock, failing after the specified number of
+#   # seconds if another process already acquired and refuses to relinquish such
+#   # lock.
+#   zsystem flock -t 4 -f lock_file_descriptor "${lock_filename}" | true and {
+#       if (( ${pipestatus[-2]} == 1 )) {
+#           :die "\"${lock_filename}\" not lockable"
+#       }
+#       elif (( ${pipestatus[-2]} == 2 )) {
+#           :die "\"${lock_filename}\" already locked by another process"
+#       }
+#   }
+#
+#   # Run such command.
+#   {
+#       run_code "${@}" and report_status
+#   # Relinquish such lock, even if such command throws an exception. Since zsh
+#   # guarantees "return" statements to invoke "always" blocks, this is safe.
+#   } always {
+#       zsystem flock -u lock_file_descriptor
+#   }
+#}
+#FIXME: Sweet, eh? The above function gives rise to code resembling:
+#
+#   ZESHY_KVS_DIR_LOCK_BASENAME='lock'
+#   function set_kvs_dir_key() {
+#       run_code_with_lock '
+#           # Do stuff here!
+#       ' "${kvs_dir}/${ZESHY_KVS_DIR_LOCK_BASENAME}"
+#   }
+
+#FIXME: We'll need to *NON-RECURSIVELY* remove all *PLAIN FILES* in each
+#such directory, first. Since this is potentially dangerous, I propose the
+#following tried-and-true solution:
+#
+#* Define function clear_kvs_dir() to source a previously serialized shell
+#  script "${dirname}/index" defining list ${kvs_dir_filenames}.
+#* Define function set_kvs_dir_key() defining such key and if such key has not
+#  been previously defined,
+#
+#This suggests a directory structure resembling:
+#
+#${kvs_dirname}/ # top directory
+#  index         # file
+#  store/        # subdirectory
+#    ${keyname}  # file
+#FIXME: Actually, I'm not terribly fond of this. Synchronization issues arise
+#with attempting to main a central "index" under multiple processes accessing
+#such index. It also introduces inefficiencies and all to solve a reasonably
+#simple problem: avoiding dangerous glob deletions. The solution is remarkably
+#simple, happily: prefix each keyname with a KVS-specific string constant
+#(e.g., ".kvs."). Naturally, the ".kvs." must be ignored when getting and
+#setting keynames -- but this is still a much more elegant solution than
+#maintaining an explicit index file.
+
+#FIXME: Since key names are stored as filenames, some care must be taken to
+#escape filesystem-reserved characters -- namely, "/" and "\0". (I believe those
+#are the only characters reserved by the filesystem, yes?) Actually, they can't
+#even be escaped -- they can't be included in filenames at all! This suggests we
+#need to encode filenames, which is fairly annoying. Ah, yes. Of course we need
+#to encode! "/" and "\0" aren't the only problematic substrings: "." and ".."
+#are also reserved, of course.
+#FIXME: O.K., we've now efficiently implemented this as function
+#encode_string_to_path_unix(). Great!
+
+#FIXME: Since filenames cannot contain nulls, the most efficient scheme for
+#structuring the index file is as a single null-separated string, each null-
+#delimited string signifying an indexed basename. This is substantially faster
+#than the shell script-oriented approach, which requires reserializing the
+#entire file on adding new keys. The null-oriented approach requires only a
+#single append to such file on adding new keys.
+#FIXME: Implement a new function set_list_to_file_text_split_on_null(),
+#used to deserialize such index files. This function is generally applicable;
+#for now, just place in component "variable/list/set". The implementation should
+#be avoid inefficient copies and hence should inline zeshy functions. Note that
+#the inverse of this function *DOESN'T* require a separate function devoted to
+#such operation, since appending a null-suffixed string to a text file leverages
+#existing functions. That said, we will require a new
+#append_file_text_with_string_or_write_if_not_found() function. The existing
+#append_file_text_with_string() function fails to write such file if not already
+#extant. (Simple; just use the ">>" operator.)
+
+#FIXME: Storing keys as files in a single directory has significant scaling
+#issues. While unlikely that I'll hit them anytime soon, it will probably merit
+#solving at some point. The solution is fairly simple, here. Split keys into
+#substrings of three or four characters and assign each such substring a new
+#subdirectory under "store/": e.g.,
+#
+#store/
+#  set_/
+#    stri/
+#      ing_/
+#        to_st/     # subdirectory
+#          ing      # actual file, signifying key ":string.set"
+#
+#While this requires significantly more inode lookups, such lookups should be
+#considerably faster than the one *EXTREMELY* slow lookup on the top-level
+#"store/" directory inode when stuffing all keys in the same directory. Indeed,
+#the following source suggests three character subdirectory names:
+#http://serverfault.com/questions/343351/max-files-per-directory-in-ext4
+#
+#Since such implementation is slightly more complex (particularly on unsetting
+#keys and clearing the store, which requires finding and removing empty
+#subdirectories), let's defer this one to another day.
+
+#FIXME: *WOOPS*. An obvious constraint on this entire affair is the maximum
+#filename length, which under "ext4" (and presumably similar filesystems) is
+#only 255 characters. That's right: 255. Now, that still accomodates most use
+#cases -- but certainly not all. This implies two additional top-level index
+#files -- say, "${kvs_dirname}/filename_to_key" and
+#"${kvs_dirname}/key_to_filename". Such files should only be used for keys
+#exceeding 255 bytes in length *AFTER* the above encoding for embedded null and
+#"/" characters. This implies that looking up key contents or whether or not a
+#key exists is not entirely. In particular, note that to avoid conflicts between
+#keys shorter than and keys longer than 255 bytes, we'll need to partition the
+#"store" subdirectory into two subdirectories. How about this:
+#
+#${kvs_dirname}/           # top directory
+#  index                   # file (null-delimited list)
+#  filename_to_key_long    # file (map)
+#  key_long_to_filename    # file (map)
+#  store_keys_short/       # subdirectory
+#    ${keyname}            # file
+#  store_keys_long/        # subdirectory
+#    ${keyname}            # file
+#
+#This brings up two notable questions: (a) how do you hash long keys into
+#filenames and vice versa and (b) how do you efficiently serialize such mapping?
+#I'll note that if we store the first... Ah. Wait. I have the solution, inspired
+#by the above lookup efficiency concerns. (Which, in hindsight, now seem pretty
+#negligible, eh?)
+#FIXME: Here we go. The following idea requires no extraneous index files and
+#retains near-constant lookup speeds for even keys exceeding 255 bytes in
+#length. How? It's fairly obvious, actually: split long keys into a chain of
+#subdirectories, each subdirectory filename with an in-order 255-byte chunk of
+#such key. You know you have the entire key when you have a file rather than a
+#subdirectory. Dead simple. It obviously becomes incrementally slower with each
+#255-byte chunk intermediary subdirectory, but probably not painfully slow so
+#long as keys exceeding 255 bytes in length are the exception rather than the
+#norm. So, how would the directory structure look? For the sake of example
+#sanity, suppose keys had to be chunked into 8-byte blocks. Then, assuming two
+#keys "tet" and "thefallofsaigontheliberationofsaigon", the directory structure
+#would resemble:
+#
+#${kvs_dirname}/           # top directory
+#  index                   # file (null-delimited list)
+#  store/                  # subdirectory
+#    tet                   # file
+#    thefallo/             # subdirectory
+#      fsaigont/           # subdirectory
+#        heliber/          # subdirectory
+#          ationofs/       # subdirectory
+#            aigon         # file
+#
+#It's really quite simple. In fact, it readily scales to a solution to the above
+#lookup efficiency problem: for greater lookup efficiency, simply reduce the
+#chunk size from 255 bytes to an arbitrary amount -- say, 16 bytes -- for at
+#least the first subdirectory. Or perhaps not. Let's not overcomplicate things
+#*JUST* yet.
+#FIXME: I will note that, as key lookup is no longer trivial, we should have a
+#utility function mapping from key to filename -- say,
+#convert_kvs_dir_key_to_filename(). I can imagine calling this function
+#*EVERYWHERE*. It's very essential.
+
+#FIXME: While directory-style KVSs are a reasonable solution and should
+#absolutely be retained for cross-platform purposes, compressed "dar"-style KVSs
+#are probably ultimately the most efficient solution -- at least for retrieval.
+#Naturally, such solution only applies to systems installing "dar"... which,
+#let's face it, is probably not terribly many. Nonetheless, the Linux ecosystem
+#might eventually see fit to phase "tar" out in favor of "dar", at which point
+#such solutions become considerably more useful.
+
+# ....................{ GLOBALS                            }....................
+:string_global ZESHY_KVS_DIR_INDEX_BASENAME='store' <<'/---'
+Basename of the key-value store file caching all keys for such store. Such cache
+improves safety by identifying spurious keys (i.e., keys _not_ added to the
+store by key-value globalality but by some external user or process), which
+such globalality avoids modifying or removing.
+/---
+
+:string_global ZESHY_KVS_DIR_STORE_BASENAME='store' <<'/---'
+Basename of the key-value store subdirectory storing key-value pairs. Each file
+of such subdirectory is a key-value pair whose key is its filename (technically,
+the hexadecimal decoding of its filename) and value is its file contents. Such
+subdirectory contains no subdirectories.
+/---
+
+# ....................{ TESTERS                            }....................
+#FIXME: Rename to :kvs.is().
+#FIXME: Implement the corresponding exception.
+
+declare_function_with_stdin <<'/---'
+[status = :bool] is_kvs_dir(:string dirname)
+
+Report success if the passed directory is an existing key-value store.
+/---
+function is_kvs_dir() {
+    # Validate passed arguments.
+    die_unless_arg 'expected one dirname'
+    string dirname="${1}"
+
+    # Test such directory.
+    is_dir_writable "${dirname}/${ZESHY_KVS_DIR_STORE_BASENAME}"
+}
+
+# ....................{ MAKERS                             }....................
+declare_function_with_stdin <<'/---'
+void make_kvs_dir(string dirname)
+
+Create a key-value store under the passed directory, structured as follows:
+
+* `${dirname}/${ZESHY_KVS_DIR_INDEX_BASENAME}`, the file caching all keys.
+* `${dirname}/${ZESHY_KVS_DIR_STORE_BASENAME}`, the subdirectory storing all
+  key-value pairs.
+/---
+function make_kvs_dir() {
+    # Validate passed arguments.
+    die_unless_arg 'expected one dirname'
+    string dirname="${1}"
+
+    # Create such directory structure, if not already.
+    make_dir_if_not_found "${dirname}/${ZESHY_KVS_DIR_STORE_BASENAME}"
+
+    # Verify such directory structure to be writable, if already extant.
+    die_unless_dir_writable "${dirname}"
+}
+
+# ....................{ SETTERS                            }....................
+declare_function_with_stdin <<'/---'
+void set_kvs_dir_key(string dirname, string key, string value)
+
+Set the passed non-empty key to the passed value in the key-value store at the
+passed directory.
+/---
+function set_kvs_dir_key() {
+    # Validate passed arguments.
+    die_unless_args_3\
+        'expected one dirname, one key, and one value'
+    string dirname="${1}" key="${2}" value="${3}" filename
+    die_unless_kvs_dir "${dirname}"
+    die_unless_string_nonempty "${key}" 'key empty'
+
+    #FIXME: Implement me!
+
+    # Set such key by creating a new file in such directory with basename such
+    # key and file text such value. For safety, escape forward slashes in such
+    # key (to avoid treating such slashes as directory separators).
+    filename="${dirname}/$(escape_string_dir_separator "${key}")"
+    if { :is_file "${filename}" } {
+        :die
+    } else {
+        :die
+    }
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#FUXME: Rename to "kvs", as "kvs_dir" is *MUCH* more sensible than
+#"key_value_store_dir". Then shift this component to "path/database/kvs/dir".
+#   die_unless_dir_writable "${dirname}/${ZESHY_KVS_DIR_STORE_BASENAME}"
+# If such directory already
+#exists and is non-empty or not writable by the current user, throw an exception.
+#   if { is_dir "${dirname}" } {
+#       die_unless_dir_empty    "${dirname}"
+#       die_unless_dir_writable "${dirname}"
+#   }
+
+#   die_if_dir_nonempty "${dirname}"
+
+#FUXME: O.K.; the only substrings that need be encoded are:
+#
+#* "/".
+#* "\0".
+#* "\x", the percent-encoding prefix in zsh, due to printf() implementation
+#  details. (See below.)
+#
+#The only strings that need be encoded are:
+#
+#* ".".
+#* "..".
+#
+#Since *nix filenames can adequately encode *ALL* other strings, percent-encoding
+#merely these suffices. Since we don't need to encode arbitrary characters, a
+#simple global regular string replacement should suffice: e.g.,
+#
+#string encode_string_to_path_unix() {
+#    die_unless_args 'expected at least one string'
+#    string pathname="${*}"
+#
+#    if is "${pathname}" == '.'|'..' si {
+#       pathname='\x2E'
+#       is "${pathname}" == '..' si and pathname="${pathname}${pathname}"
+#    } elif is "${pathname}" == *('/'|"${ZESHY_ASCII_NULL}"|'\x')* si {
+#       # Right. So we actually have to encode *ALL* "\" characters, not merely
+#       # "\" preceding "x" characters. Why? Because efficiently decoding such
+#       # strings below passes them through "echo -e", which recognizes all
+#       # escape codes. That's bad, in this case, because it implies "\"-prefixed
+#       # substrings (e.g., "\n") would be erroneously converted on decoding. So,
+#       # we escape all such substrings here to prevent erroroneous decoding.
+#       pathname="${${${${pathname//\//\x2F}//${ZESHY_ASCII_NULL}/\x00}//\\/\x5C}"
+##      pathname="${${${${pathname//\//\x2F}//${ZESHY_ASCII_NULL}/\x00}//\\x/\x5C\x78}"
+#    }
+#
+#    return_string "${pathname}"
+#}
+#
+#Its counterpart is *FAR* simpler:
+#
+#string decode_string_from_path_unix() {
+#    die_unless_arg 'expected one string'
+#    echo -e "${1}"
+#}
+#
+#Awesomeness.
+#FUXME: Intuition served correct: everyone pretty much uses percent encoding to
+#store filenames containing arbitrary characters. While I'm not convinced that
+#that's the most efficient scheme, it does work. What about Base64?
+#FUXME: O.K.; percent *DE*coding is astonishingly efficient in zsh:
+#    printf ${url_encoded_string//%/\\x}
+#That's it. Ridiculous, no? Apparently, printf() implicitly decodes all
+#"\x"-prefixed hexadecimal integers into the corresponding character, thus
+#implicitly supporting percent decoding *AFTER* replacing all percents with "\x".
+#FUXME: Ah. Of course, in this case, we're using "\x" encoding, so decoding
+#reduces to simply "printf ${key_filename}". That's it, which is great, as it
+#makes reads slightly faster. Oh, but not. We have to encode the passed key
+#string to such format, requiring iteration. Well, if the caller wanted
+#something fast, they should have used "dar"! ;}
+#FUXME: Do we ever actually need to decode key filenames? Probably not, sadly.
+#But it's nice to know that we can do so efficiently, should we require. Also,
+#note that both "echo -e ${key_filename}" and "printf ${key_filename}" suffice.
+#FUXME: Contemplate renaming... possibly to, say, make_kvs_dir() or
+#make_database_kvs_dir(). Hmmm; or not!
+    #FUXME: Implement and uncomment me.
+#   die_unless_dir_not_found_or_empty "${dirname}"

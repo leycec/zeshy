@@ -1,0 +1,352 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle *pathables* (i.e., external commands in the current shell's command hash
+table). `zsh` implicitly adds all executable files in the current user's ${PATH}
+to such table and hence registers such commands as pathables. Additionally,
+arbitrary files may be explicitly added to such table and hence registered as
+pathables at runtime without filesystem or ${PATH} modification by calling
+builtin hash().
+/---
+
+# ....................{ EXCEPTIONS                         }....................
+declare_function_with_stdin <<'/---'
+void die_unless_pathable(
+    string command_name,
+    string error_message =
+        "Command \"${command_name}\" not found (i.e., not in the current \${PATH\} or passed to hash()).")
+
+Throw an exception with the passed message unless the passed command is
+pathable. See is_pathable() for further details.
+/---
+function die_unless_pathable() {
+    die_unless_args_1_to_2\
+        'Expected one command name and optional error message.'
+    string command_name="${1}"
+    is_pathable "${command_name}" or
+        :die "${2-Command \"${command_name}\" not found (i.e., not in the current \${PATH\} or passed to hash()).}"   #"} <-- yet another Vim hack exhibiting ultimate suckage."
+}
+
+declare_function_with_stdin <<'/---'
+void die_unless_pathables(string command_name1, ...)
+
+Throw an exception with a stock message unless all passed commands are pathable.
+See is_pathable() for further details.
+/---
+function die_unless_pathables() {
+    die_unless_args 'Expected one or more command names.'
+    string command_name
+    for    command_name ("${@}") {
+        die_unless_pathable "${command_name}"
+    }
+}
+
+# ....................{ GETTERS                            }....................
+declare_function_with_stdin <<'/---'
+string get_pathable_path(string command_name)
+
+Get the absolute path of the passed command if pathable or throw an exception
+otherwise. See is_pathable() for further details.
+/---
+function get_pathable_path() {
+    die_unless_arg 'Expected one command name.'
+    string command_name="${1}"
+    get_pathable_path_if_found "${command_name}" or
+        die_unless_pathable "${command_name}"
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, status: bool] get_pathable_path_if_found(string command_name)
+
+Get the absolute path of the passed command if pathable or report failure
+otherwise. See is_pathable() for further details.
+/---
+function get_pathable_path_if_found() {
+    die_unless_arg 'Expected one command name.'
+    string command_name="${1}"
+    (( ${+commands[${command_name}]} )) and
+        :string.output "${commands[${command_name}]}"
+}
+
+# ....................{ GETTERS ~ first                    }....................
+declare_function_with_stdin <<'/---'
+string get_pathable_path_first(string command_name1, ...)
+
+Get the absolute path of the first pathable command in the passed list or throw
+an exception if no such command is pathable. See is_pathable() for further
+details.
+/---
+function get_pathable_path_first() {
+    die_unless_args 'Expected one or more command names.'
+    get_pathable_path_if_found_first "${@}" or die_unless_pathables "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, status: boolean] get_pathable_path_if_found_first(
+    string command_name1, ...)
+
+Get the absolute path of the first pathable command in the passed list or return
+failure if no such command is pathable. See is_pathable() for further details.
+/---
+function get_pathable_path_if_found_first() {
+    # Validate sanity.
+    die_unless_args 'Expected one or more command names.'
+    list pathnames
+
+    # Unfortunately, glob qualifiers accept only extant pathnames; hence, the
+    # following call always fails (unless the current working directory contains
+    # at least one of the passed commands as a path, in which case it
+    # erroneously succeeds):
+    #
+    #   get_path_matching_glob_qualifier_firsting_glob_qualifiers\
+    #       'found in $PATH' 'found in $PATH'\
+    #       'e{whence -cp $REPLY}' "${@}"
+    #
+    # Hence, we adopt a deep alternative. Dismantled, this is:
+    #
+    # * "${^@", expanding to each passed command name.
+    # * ":t", excluding all but the basenames of such names.
+    # * ":c", expanding to, for commands...
+    #   * ...in the current user's $PATH, the absolute path of such commands.
+    #   * ...otherwise, noop (i.e., the command name itself).
+    # * ":#[^/]*", excluding all non-absolute paths and hence command names
+    #   not in the current user's $PATH.
+    #
+    # See get_pathable_path() for further details.
+    pathnames=( ${${^@:t:c}:#[^/]*} )
+    is_list_nonempty pathnames and :string.output "${pathnames[1]}"
+}
+
+# ....................{ PRINTERS                           }....................
+#FIXME: Add color support. Yum!
+declare_function_with_stdin <<'/---'
+string print_pathable(string command_name1, ...)
+
+Print a human-readable synopsis of the passed pathable commands, typically
+including the absolute paths of such commands. If any such command is _not_
+pathable, an exception is thrown. See is_pathable() for further details.
+/---
+function print_pathable() {
+    # Validate sanity.
+    die_unless_args 'Expected one or more command names.'
+    die_unless_pathables "${@}"
+
+    # Print such commands.
+    string command_name
+    for    command_name ("${@}") {
+        print_message_heading "Command \"${command_name}\""
+
+        # If such command exists, print the absolute path of all instances of
+        # such path in the command hash table.
+        :string.output "${commands[${command_name}]}"
+    } | page_stdin
+}
+
+# ....................{ UPDATERS                           }....................
+#FIXME: It'd be great to do this implicitly every so often -- ideally, in the
+#background with lowest possible nice and ionice priorities immediately after
+#completing any command entered interactively at the prompt. But that's probably
+#much too often, as zsh really has *NO* means of "updating" the command hash
+#table without entirely rebuilding such table. This, in turns, implies that we
+#really only want to do this occasionally. One possible plan:
+#
+#* Maintain the mtime of the newest directory of all directories explicitly
+#  listed as elements of ${path} as a new integer global -- say,
+#  ${ZESHY_PATH_DIR_NEWEST_MTIME}. This is efficient to calculate, happily.
+#* Probably immediately *AFTER* displaying the prompt (to improve shell
+#  responsiveness), recalculate such global. Again, this should be efficient.
+#* If the value of such global has changed, then and only then rebuild the
+#  command hash table (as well as recompile zeshy, of course!).
+#
+#Right. Looks preety sweet. Fairly simple and very efficient. I think I like it.
+
+declare_function_with_stdin <<'/---'
+void update_pathables()
+
+Refresh the current shell's *command hash table* (i.e., internal map from
+command name to absolute path of such command). Specifically, replace the
+current contents of such table with mappings for all commands in the current
+user's ${PATH} and thus discard any mappings previously added by calling hash().
+/---
+function update_pathables() {
+    die_if_args
+    rehash
+}
+
+# --------------------( WASTELANDS                         )--------------------
+# :die "$(join_strings_readable: "${@}") not in the current \$PATH."
+    #FUXME: Actually, there should be a far simpler (and probably slightly
+    #more efficient) implementation:
+    #
+    #    if (( ${+commands[${command_name}]} )) {
+    #        return_string "${commands[${command_name}]}"
+    #    } else {
+    #        report_failure
+    #    }
+    #
+    #Nice!
+    # Get the absolute path of the command with the passed name. Dismantled,
+    # this is:
+    #
+    # * "1", expanding to the passed command name.
+    # * ":t", excluding all but the basename of such name. This prevents this
+    #   function from returning true when passed absolute paths not
+    #   corresponding to commands in the $PATH (e.g.,
+    #   "get_pathable_path_if_found /tmp").
+    # * ":c", expanding to the absolute path of such command.
+#   die_unless_arg 'Expected one command name.'
+#   string pathname="${1:t:c}"
+    # If such path is absolute and hence exists, return such path; else, fail.
+#   is_path_absolute "${pathname}" and return_string "${pathname}"
+
+    # Dismantled, this is:
+    #
+    # * "${1:c}", expanding to the absolute path of the passed command if such
+    #   command exists or only the passed command itself otherwise.
+    # * "is_path_executable", returning true if such path is executable.
+
+#   is_path_executable "${1:c}"
+#   if is_path_absolute "${command_pathname}"
+#   then :string.output "${command_pathname}"
+#   else report_failure
+#   fi
+
+#FUXME: Shift entire component to under "path/file". Much more intuitive,
+#considering globals ${path} and ${PATH} play such a core function in this
+#component.
+
+#FUXME: Rename this component to "installed". Commands are, more generally,
+#what we currently call "runnables". Hence, rename runnables to simply commands
+#(i.e., rename "runnable" to "command"). Then there are only variables and
+#commands.
+#FUXME: Rename to die_unless_command().
+#FUXME: Rename to is_command().
+#FUXME: Rename to die_unless_binary_executable_in_path().
+#FUXME: Rename to is_binary_executable_in_path().
+#FUXME: Rename to is_command_in_path().
+#FUXME: Rename to is_binary_executable_pathed().
+#   list dirnames_found; dirnames_found=( ${^@}(/) )
+#   for dirname ( "${dirnames_found[@]}" ) {
+#FUXME: Rename append_PATH_with_dir_if_found(), in keeping with other append_*()
+#names. Also quite a bit more explanatory.
+
+    # Validate sanity.
+#   typeset -U path
+#   print "path: ${path}"
+
+    # If no command has the passed name, print an error message and return
+    # failure. To permit the caller to recover, do not raise a fatal error.
+
+# ....................{ GETTERS ~ user                     }....................
+# string get_editor_path()
+#
+# Get the (not necessarily absolute) path of the current user's editor command
+# if set or a sane currently installed editor command, otherwise.
+#get_pager_path() {
+#    die_if_args
+#    print "${EDITOR}"
+#}
+
+# string get_pager_path()
+#
+# Get the (not necessarily absolute) path of the current user's pager command.
+#get_pager_path() {
+#    die_if_args
+#    print "${PAGER:-less}"
+#}
+
+#   if is_list_nonempty command_pathnames
+#   then print "${command_pathnames[1]}"
+#   else report_failure
+#   fi
+
+#e{whence -cp $REPLY}
+#    get_path_matching_glob_qualifier_firsting_glob_qualifiers\
+#        'found in $PATH' 'found in $PATH'\
+#        '(.)' "${^@}:t:c"
+#       'e(REPLY=${REPLY:c})' "${@}"
+#       'e{REPLY=$REPLY:t:c; [[ $REPLY == /* ]]}' "${@}"
+#       "e{REPLY=\$(get_pathable_path_if_found \"\$REPLY\")}" "${@}"
+#       "e{'is_pathable \$REPLY'}" "${@}"
+    # * "or true", preventing failure if at least one pathname is excluded.
+#   list pathnames; pathnames=( ${^@}(${glob_qualifiers}) ) or true
+#   eval "pathnames=( \${^@}(${glob_qualifiers}) ) or true"
+
+    # If the list of passed pathnames contains at least one writable pathname,
+    # print the first such match; otherwise, raise an exception.
+#   if is_list_nonempty pathnames
+#   then print "${pathnames[1]}"
+#   else report_failure
+#   fi
+
+#FUXME: *****WAIT*****. We can substantially improve every other function by
+#rewriting to the implementation of which_dir_writable(). Also, which_files()
+#should clearly simply defer to which_files_if_found() rather than
+#reimplementing the whole shebang.
+
+# * Compress which_commands() into which_command() and which_files() into
+#   which_file(). (Simplify life, yes? No justifiable reason not to, really.)
+
+# string which_commands(string command_name1, *command_name2, ...)
+#
+# Get the absolute path of the first command in the passed list of command names
+# found in the ${PATH} or raise an exception if no such command is found: e.g.,
+#
+#     >>> which_commands Council_of_Nicea Constantinople zsh
+#     /bin/zsh
+# 
+# This function is intended to automate selection of commands, in descending
+# order of preference. (In the above example, the hypothetical
+# "Council_of_Nicea" command would be selected before all following commands on
+# systems having the command.)
+#which_commands() {
+#    die_unless_args 'expected one command name'
+#    
+#    # Iteratively look for each command in the passed list.
+#    string command_path
+#    for command_name ("${@}") {
+#        if command_path="$(run_code_to_stdout which_command "${command_name}")"; then
+#            print "${command_path}"
+#            report_success
+#        fi
+#    }
+#    
+#    # Otherwise, no such command exists. Die? Die! Die.
+#    string command_names=$(join_join_list_prefixing_last_with ', ' 'or ' "\"${^@}\"")
+#    :die "neither ${command_names} found in \$PATH"
+#}
+
+#     >>> which_files '/the_ancient.one' '/the_king_in.yellow' '/tmp'
+#     /tmp#   die_unless_args 'expected at least one dirname'
+
+    # List of writable dirnames filtered from the list of passed pathnames.
+    # Dismantled, this is:
+    #
+    # * "${^@}", iteratively expanding to each passed pathname.
+    # * "(e{'...'}), excluding pathnames not matching the embedded test.
+    # * "or true", preventing failure if at least one pathname is excluded.
+#   list dirnames
+#        dirnames=( ${^@}(e{'[[ -d $REPLY && -w $REPLY ]]'}) ) or true
+
+    # If the list of passed pathnames contains at least one writable dirname,
+    # print the first such match; otherwise, raise an exception.
+#   if is_list_nonempty dirnames
+#   then print "${dirnames[1]}"
+#   else :die "neither $(join_join_list_prefixing_last_with ', ' 'or ' "\"${^@}\"") found"
+#   fi
+
+    # Dismantled, this is:
+    #
+    # * "autoload_paths_list_name", the name of the list listing all
+    #   directories to be searched for the passed autoload.
+    # * "(P)", expanding to such list.
+    # * "^", iteratively expanding to each such directory.
+    # * "/${autoload_name}", concatenating the passed autoload to each such
+    #   directory, producing a possible absolute path to such autoload.
+    # * "(N)", removing non-extant paths.
+    # * "(..)", listing all extant paths.
+#   list autoload_paths
+#   autoload_paths=( ${^${(P)autoload_paths_list_name}}/"${autoload_name}" )

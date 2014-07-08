@@ -1,0 +1,524 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+#FIXME: *UH OH*. As long suspected, I'm afraid code leveraging such
+#functionality currently suffers a *VERY* fatal error. I'm not terribly sure
+#whether the issue lives here or in page_stdin() -- but wherever it is, it
+#causes the current interactive shell to silently terminate. Which is terrible.
+#Sadly, it's also tremendously easy to trigger. Just run the following command
+#and hit <Ctrl-c>:
+#
+#    # Bam! Insta-shell death.
+#    >>> ll /usr/bin    # hit <Ctrl-c> now
+
+#FIXME: We currently call :string.set_to_stdin() in numerous such alias
+#expansions, where the approach below of simply calling :stdin.get() should prove
+#*MUCH* more efficient. Fix up the former to adopt the latter.
+
+#FIXME: Since zsh only permits one open coprocess at a time but fails to provide
+#any semblance of error handling for coprocesses (namely, to prevent opening a
+#coprocess when there's an unfinished coprocess still running), our
+#open_coprocess() and close_coprocess() aliases *ABSOLUTELY* need to be manually
+#monitoring coprocess state via global variables specific to the current shell
+#(ehrm; how do we prevent their importation by subshells? Ugh.) -- say, a
+#boolean global ${ZESHY_COPROCESS_IS_OPEN}. Specifically, open_coprocess()
+#should test such boolean before attempting to open the coprocess. If such
+#boolean is already true, open_coprocess() should throw an exception; else,
+#open_coprocess() should enable such boolean. Naturally, close_coprocess()
+#should effectively perform the inverse -- complete with exception throwing if
+#such boolean is false.
+#FIXME: O.K.; it's a bit hacky (understatement), but we *COULD* generalize such
+#boolean global into a list global ${ZESHY_SHELL_LEVEL_TO_IS_COPROCESSING} to be
+#indexed by zsh integer global ${SHLVL}: e.g.,
+#
+#    if (( ${ZESHY_SHELL_LEVEL_TO_IS_COPROCESSING[${SHLVL}]} )) {
+#       :die 'Shell coprocess already open.'
+#    }
+#    ${ZESHY_SHELL_LEVEL_TO_IS_COPROCESSING[${SHLVL}]}:catch"${ZESHY_BOOLEAN_TRUE}"
+#
+#This circumvents the above subshell inheritance issue. (Incidentally, if
+#there's a zsh hook called on subshell forking, that would also certainly do
+#it.) Not necessarily ideal, but if we fail to concoct anything better, the
+#above will work completely.
+
+:parcel <<'/---'
+Handle *coprocess* (i.e., subshells of the current shell with standard input and
+output attached to temporary anonymous FIFOs readable and writable only by the
+current shell) aliases.
+
+== Motivation ==
+
+Coprocesses generalize pipelines.
+
+`zsh` executes the last command of a pipeline in the current shell and all other
+commands of a pipeline in subshells of such shell. Since subshells cannot modify
+the current shell, only the last command of a pipeline is capable of modifying
+the current shell.
+
+By contrast, `zsh` executes the command sequence associated with a coprocess in
+a subshell of the current shell and all other commands writing to and reading
+from such coprocess in the current shell. Such inversion of control releases
+coprocesses from the main constraints imposed by pipelines, but at real cost:
+coprocesses are significantly more complex and fragile than the equivalent
+pipelines, rendering the former a Pyrrhic victory at best. 
+
+== See Also ==
+
+* [http://www.zsh.org/mla/users/2011/msg00095.html](Coprocess tutorial, redux),
+  the authoritative introduction to coprocesses. Since `zsh`\'s `man` and `info`
+  pages remain remarkably silent on the issue, such introduction also serves as
+  canonical documentation for coprocesses and comes recommended.
+/---
+
+# ....................{ DECLARERS                          }....................
+#FIXME: Add examples. Desperately needed, in this case. Coprocesses are rather
+#obtuse, it must be admitted.
+
+# Locally disable shell option "monitor" *ONLY* when such alias is expanded
+# within a function. If such alias is *NOT* expanded within a function,
+# disabling such option does so globally -- which, to be sure, is quite bad.
+#
+# Do *NOT* rename such alias to run_code_as_coprocess(). Such nomenclature
+# implies arguments to require quote-protection against evaluation -- which, of
+# course, is inapplicable here.
+:alias_command\
+    'void open_coprocess_running_code(string code1, ...)'\
+    'if { is_in_function } {
+        :disable_option_local monitor
+     }
+     coproc' <<'/---'
+Run the passed code as a *coprocess* (i.e., subshell of the current shell whose
+standard input and output are attached to a temporary anonymous FIFO readable
+and writable only from the current shell). To safely close such coprocess and
+corresponding subshell and file descriptors, consider calling close_coprocess()
+from a subsequent `always` block: e.g.,
+
+== Caveats ==
+
+Coprocesses currently suffer several critical defects, ranging from merely
+annoying to fatal -- particularly for noninteractive scripting use. Until `zsh`
+resolves such defects, coprocesses should generally be unavoided. In ascending
+order of severity, these include:
+
+=== Extraneous Output ===
+
+To prevent `zsh` from printing extraneous job control messages (e.g.,
+`[24] 8579`) to standard error after opening such coprocess, this alias locally
+disables job monitoring in the current function when expanded within a function.
+When expanded outside of a function (e.g., at the command line or script level),
+this alias preserves the current state of job monitoring -- thus printing such
+messages if expanded in an interactive shell enabling such monitoring (as is the
+default). Since this is probably undesirable, consider only expanding this alias
+within functions.
+
+Neither this nor any subsequent `zeshy` alias or function attempts to locally
+reenable job monitoring in the current function. Do _not_ attempt to do so
+yourself manually (either locally or globally). When expanding this alias within
+functions, `zsh` restores job monitoring to its prior setting on leaving such
+functions -- safely, silently, and reliably. There exists little need to do so
+manually.
+
+Indeed, doing so manually is decidedly unsafe. While disabling job control will
+_never_ deadlock the current shell and hence is inherently safe, enabling job
+control under subshells and non-interactive shells running a concurrent
+coprocess deadlocks such shells -- and hence is inherently unsafe. While
+reenabling job control only if the current shell satisfies neither condition
+_should_ suffice to avoid such entanglements, in practice such safety measures
+do _not_ suffice. Since there (hopefully) exists no compelling reason to locally
+reenable job monitoring, this (hopefully) remains a non-issue.
+
+=== Signalling ===
+
+*Avoid trapping interrupt signal SIGINT (and possibly others) in coprocesses.*
+Doing so results in the process group owning such coprocess (i.e., the main
+shell and all children of such shell, including such coprocess) terminating on
+the coprocess receiving such signal, regardless of the contents of such trap.
+
+===  ===
+
+*Avoid 
+/---
+
+# ....................{ OUTPUTTERS                         }....................
+:alias_command\
+    'void :output_string_to_coprocess(string text = "")'\
+    'print -rp --' <<'/---'
+Output the passed string (defaulting to the empty string) suffixed by a newline
+to standard input of the coprocess for the current shell. If no such coprocess
+exists, throw an exception.
+/---
+
+# Although :output_string_to_coprocess() implicitly suffixes such EOT with a
+# newline, explicitly suffix such EOT with a newline anyway -- thus suffixing
+# such EOT with two newlines in total. Why? The reasons are inscrutably subtle
+# and (admittedly) not entirely clear. Suffixing such EOT with a single newline
+# does suffice for the common non-erroneous case but fails for the following
+# erroneous case:
+#
+# * The current shell in the current terminal executes a function (e.g.,
+#   run_code_and_set_string_to_coprocess_output_from_redirection()) redirecting
+#   the output of some sufficiently slow command (e.g., "list_path_recursive /")
+#   to the coprocess.
+# * The current user interactively enters <Ctrl-c> in such terminal.
+# * The terminal sends the interrupt signal to the current shell.
+# * The current shell activates the trap for such signal.
+# * Such trap calls send_coprocess_eot() to gracefully terminate the coprocess.
+#
+# If this function fails to explicitly suffix such EOT with a second newline,
+# the above call to this function from such trap fails to gracefully terminate
+# the coprocess. In fact, the coprocess fails to receive such EOT at all! While
+# unclear why this occurs, the solution is elegantly simple.
+:alias_command\
+    'void send_coprocess_eot()'\
+    ':output_string_to_coprocess "${ZESHY_ASCII_EOT}${ZESHY_ASCII_NEWLINE}"
+' <<'/---'
+Output the end-of-transmission (EOT) character suffixed by a newline to the
+standard input of the coprocess for the current shell. This alias is intended to
+be expanded only with coprocesses running command(s) terminating on receiving
+such character from standard input (e.g., get_stdin_until_eot()).
+/---
+
+# ....................{ CLOSERS                            }....................
+#FIXME: This should probably throw an exception if no coprocess is currently
+#open. No idea if testing such condition is even feasible at the moment,
+#however. (Hmm, perhaps attempting a "print -np &>/dev/null" and seeing if an
+#exception is thrown?)
+#FIXME: It'd be nice to extricate "wait $!" and "wait" into corresponding
+#aliases of a new jobs parcel -- say @{05-alias/io/job}?
+#FIXME: We should probably be calling disable_job_monitoring_for_code() here.
+#Oddly, it doesn't seem to be an issue...?
+
+# Honestly, this is insanity. In theory, waiting for the exit() coprocess to
+# complete should suffice to ensure that all coprocesses are complete. In
+# practice, the "always" block enclosing such expansion complicates matters.
+# Without such block, a single wait suffices; with such block, an additional
+# wait on *ALL* running jobs in the current context is also required. It's
+# patently unclear why, but at least this belatedly suffices.
+#
+# The "coproc { coproc : }" command comes courtesy Bart Schaefer at the
+# "zshworkers" mailing list -- apparently resolving a long-standing issue with
+# coprocess handling of subshells. See any of the following threads:
+#
+# * http://www.zsh.org/mla/users/2011/msg00093.html
+# * http://www.zsh.org/mla/users/2011/msg00095.html
+# * http://www.zsh.org/mla/workers/2013/msg00188.html
+#
+# We really do wish they'd simply resolve the underlying issue. (This is
+# becoming somewhat embarrassing, fellows.)
+#
+# Do *NOT* reenable job control. While disabling job control is "safe" in the
+# sense that such disabling will never deadlock the current shell, enabling job
+# control shares no such safety. If the current shell is either non-interactive
+# or a subshell, enabling job control often (probably erroneously) deadlocks the
+# such shell! While this could be avoided by reenabling job control only for
+# shells satisfying neither condition and for which job control was previously
+# enabled, the current approach adequately suffices.
+
+#FIXME: The second wait() may or may not be a terrible idea. I haven't noticed
+#any issues yet, but am concerned
+
+# Wrap such expansion in "{" and "}" delimiters to avoid syntax errors when
+# preceding such alias by "always".
+:alias_command 'void close_coprocess()'\
+   'coproc { coproc : }
+    wait_on_job_prior_exit_if_found' <<'/---'
+Close the coprocess for the current shell, thus closing the corresponding
+file descriptor and subshell.
+/---
+
+# --------------------( WASTELANDS                         )--------------------
+#       wait
+#       $(disable_job_monitoring_for_code '
+#           coproc { coproc : }
+#           wait ${!}
+#           wait')
+
+# ....................{ SETTERS                            }....................
+# This should probably be shifted elsewhere, but I can't be bothered.
+#declare_function_with_stdin <<'/---'
+#void set_string_to_coprocess_output(string string_name)
+#
+#Set the passed string variable to all standard output of the coprocess for the
+#current shell. If no such coprocess exists, throw an exception.
+#/---
+#function set_string_to_coprocess_output() {
+#    # Validate sanity.
+#    die_unless_arg 'Expected one string name.'
+#
+#    # Set such string. Ideally, the following (slightly more efficient)
+#    # assignment should also work:
+#    #
+#    #     IFS= read -rp -d "" string_name__sstco
+#    #
+#    # Instead, such assignment silently blocks. Note that the "{" and "}"
+#    # delimiters are essential, ensuring the expansion of :stdin.get() receives
+#    # standard input from such coprocess rather than from the current context.
+##   eval ${string_name__sstco}'="$(< /dev/stdin)" <&p'
+#    { :string.set "${1}" "$(:stdin.get)" } <&p
+#}
+
+#FUXME: The disable_job_monitoring_for_code() approach appears not to work *AT
+#ALL*. Very bad and unpredictable things happen. *sigh*
+#       '"$(disable_job_monitoring_for_code 'eval coproc "${(q)command_name}"')"'
+#FUXME: Since we've reverted back to the prior approach, drop the heredoc style
+#and just have the last command this expands to be "coproc". Then rename to
+#open_coprocess_running_code(). Do *NOT* rename to run_code_as_coprocess, as
+#that implies the caller is responsible for quote-protecting arguments (which
+#isn't needed here, of course).
+#FUXME: Document!
+#:alias_command\
+#    'void open_cocommand_running(string command_name)'\
+#    '{
+#        # Validate sanity.
+#        string command_name; command_name="$(:stdin.get)"
+#
+#        # Locally disable job control to prevent zsh from printing an unctuous
+#        # message immediately after opening such coprocess (e.g., "[24] 8579").
+#        :disable_option_local monitor
+#
+#        # Open such coprocess. To ensure coproc() opens the expansion of
+#        # such variable rather than the string literal "${(q)command_name}",
+#        # evaluate the entire statement.
+#        eval coproc "${(q)command_name}"
+#    } <<<' <<'/---'
+#Run the passed command as a *coprocess* (i.e., subshell of the current shell
+#whose standard input and output are attached to a temporary anonymous FIFO
+#readable and writable only from the current shell). To safely
+#close such coprocess (and corresponding subshell and file descriptors) _and_
+#reenable such monitoring, consider calling close_coprocess() from a subsequent
+#`always` block: e.g.,
+#
+#== Motivation ==
+#
+#Coprocesses are generalizations of pipelines. In a pipeline, all commands
+#except the last are run in subshells and hence cannot modify the current shell.
+#Using a coprocess, however, arbitrary commands can be executed in either
+#subshells _or_ the current shell and hence modify the current shell.
+#Placeholder.
+#/---
+
+# Do *NOT* attempt to subsequently reenable shell option "monitor" (either
+# locally or globally). While disabling job control is always safe in the sense
+# that such disabling will not deadlock the current shell, enabling job control
+# is *NOT* safe in this sense. Specifically, attempting to enable job control
+# under non-interactive shells or subshells appears to frequently deadlock such
+# shells -- a zsh issue, to be sure. While reenabling job control only if the
+# current shell satisfies neither condition *SHOULD* suffice to avoid such
+# entanglements, in practice even this does *NOT* appear to be enough. Since
+# there is little compelling reason to reenable such option in any case, avoid
+# doing so altogether.
+
+#monitoring such coprocess 
+#
+#printing unctuous job monitoring messages to standard error immediately after performing
+#        # such code (e.g., "[24] 8579").
+#   "$(disable_job_monitoring_for_code ':output_string_to_coprocess "${ZESHY_ASCII_EOT}"')" <<'/---'
+
+#FUXME: Never used, currently. It's quite nice though. Be a shame to obliterate
+#it, wouldn't it...
+#FUXME: Document me.
+#function disable_job_monitoring_for_code() {
+#    # Validate sanity.
+#    die_unless_args 'Expected one or more shell words.'
+#    string code="${*}"
+#
+#    # Get such code. Since :string.output() may or may not have been previously
+#    # declared at this point, return such string "the old fashioned way."
+#    print -r --\
+#       '# If the current shell is interactive *AND* not a subshell *AND* job
+#        # control is currently enabled, locally disable job control to prevent
+#        # zsh from printing an unctuous message immediately after performing
+#        # such code (e.g., "[24] 8579"). While disabling job control is always
+#        # safe in the sense that it will never deadlock the current shell,
+#        # enabling job control will -- particularly, if the current shell is
+#        # either non-interactive or a subshell. To avoid deadlocks, enable job
+#        # control only if the current shell satisfies neither condition.
+#        #
+#        # To efficiently test whether or not job control is currently enabled,
+#        # search for the character "m" in string global ${-}. See
+#        # get_shell_options_enabled_as_characters() for further details.
+#        if { is_shell_interactive and not
+#             is_shell_subshell and is "${-}" == *"m"* si } {
+#            # For safety, only locally disable job control.
+#            :disable_option_local monitor
+#
+#            # Perform such code.
+#            '${code}'
+#
+#            # Reenable job control. Since :disable_option_local() has
+#            # already enabled option "local_options", enable such option as is.
+#            enable_shell_option monitor
+##           :output_string_to_stderr "reenabling job control; shell level: ${ZSH_SUBSHELL}"
+##           output_call_stack 1>&2
+#        # Else, simply perform such code.
+#        } else {
+#            '${code}'
+#        }'
+#}
+
+#and thus render coprocesses more flexible than pipelines, 
+#flexibility is welcome,
+#coprocesses incur dramatic costs in inscrutible code complexity and fragility.
+#
+#Such inversion of control removes the
+#main constraint imposed by pipelines impose,
+#
+#Coprocesses , however, explicitly specify which commands `zsh` is to execute in
+#the current shell and which to be executed in subshells -- referred to as the
+#*coprocess* of the current shell. 
+#
+#While such flexibility is welcome,
+#coprocesses incur dramatic costs in inscrutible code complexity and fragility.
+#pipelines.
+#In practice, prefer 
+#
+#provide control over such 
+#
+#improve the flexibility -- at a somewhat dramatic cost in code complexity and fragility. 
+#
+# (e.g., by setting globals)
+#Using coprocesses, however, ony explicitly notifies `zsh` of which commands
+#
+#Coprocesses 
+#
+#Using coprocesses, however,  permit 
+#
+#Using a coprocess, however, 
+#
+#arbitrary commands can be executed in
+#either subshells _or_ the current shell and hence modify the current shell.
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# Synchronize changes with send_coprocess_eot().
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#       :enable_option_local no_monitor
+#       :enable_option_local monitor
+
+#:alias_command\
+#    'void open_coprocess(string code1, ...)'\
+#   '#:enable_option_local no_monitor
+#    coproc' <<'/---'
+#Run the passed sequence of commands as a *coprocess* (i.e., subshell of the
+#current shell whose standard input and output are attached to a temporary
+#anonymous FIFO readable and writable only from the current shell). To reduce
+#verbosity, this alias also disables job monitoring for the current context.
+#To safely close such coprocess (and associate subshell and file descriptor) and
+#_and_ reenable such monitoring, consider calling close_coprocess() from a
+#subsequent `always` block: e.g.,
+#
+#== Motivation ==
+#
+#Coprocesses are generalizations of pipelines. In a pipeline, all commands
+#except the last are run in subshells and hence cannot modify the current shell.
+#Using a coprocess, however, arbitrary commands can be executed in either
+#subshells _or_ the current shell and hence modify the current shell.
+#/---
+
+#        # If the current shell is interactive *AND* not a subshell *AND* job
+#        # control is currently enabled, locally disable job control to prevent
+#        # zsh from printing an unctuous message immediately after opening such
+#        # coprocess (e.g., "[24] 8579"). While disabling job control is always
+#        # safe in the sense that it will never deadlock the current shell,
+#        # enabling job control will -- particularly, if the current shell is
+#        # either non-interactive or a subshell. To avoid deadlocks, enable job
+#        # control only if the current shell satisfies neither condition.
+#        #
+#        # To efficiently test whether or not job control is currently enabled,
+#        # search for the character "m" in string global ${-}. See
+#        # get_shell_options_enabled_as_characters() for further details.
+#        if { is_shell_interactive and not
+#             is_shell_subshell and is "${-}" == *"m"* si } {
+#            # Disable job control.
+#            :disable_option_local monitor
+#
+#            # Open such coprocess. To ensure coproc() opens the expansion of
+#            # such variable rather than the string literal "${(q)command_name}",
+#            # evaluate the entire statement.
+#            eval coproc "${(q)command_name}"
+#
+#            # Reenable job control.
+#            enable_shell_option monitor
+##           :output_string_to_stderr "reenabling job control; shell level: ${ZSH_SUBSHELL}"
+##           output_call_stack 1>&2
+#        # Else, simply open such coprocess. See above.
+#        } else {
+#            eval coproc "${(q)command_name}"
+#        }
+
+#FUXME: This is no longer a useful function. Since we no longer disable option
+#"monitor", the coprocess will be emitted. There's really no way around this,
+#suggesting we should probably dispense with this in favor of
+#open_coprocess_calling_function() entirely.
+#       :func.die_unless "${command_name}"
+#To reduce verbosity, this
+#alias also locally disables job monitoring for the current context. 
+
+#FUXME: I don't quite get it. We should be able to prefix such alias expansion
+#with "always ", as alias always_catch_exception_as_warning() does. I recall
+#attempting that and it not working. Nonetheless, it *SHOULD* work... Try again!
+
+# Ideally, this alias should also reenable job monitoring by calling
+# ":enable_option_local monitor". Sadly, doing so typically displays job
+# monitoring for the call to coproc() below -- even when waiting for all jobs
+# to complete in the current context *AND* reenabling job monitoring only after
+# such jobs complete. We managed to track this down to the "always" block
+# construct; for some glibly unfathomable reason, zsh fails to wait properly in
+# such blocks. Instead, the caller must explicitly 
+#   :enable_option_local monitor' <<'/---'
+
+# Short of sleeping for a sufficiently long
+# duration, there's no reliable means of getting this to work; hence, we don't.
+#   string string_name__sstco="${1}"
+#   :var.die_unless_type_string "${string_name__sstco}"
+
+#   print 'ok..'
+#   print "coproc: $(:stdin.get)" <&p
+#   print 'ko..'
+#:alias_command\
+#    'void set_string_to_coprocess_output(string string_name)'\
+#    '{
+#        # Validate sanity.
+#        string string_name__sstco; string_name__sstco="$(:stdin.get)"
+#        :var.die_unless_type_string "${string_name__sstco}"
+#
+#        # Set such string. Ideally, the following (slightly more efficient)
+#        # assignment should also work:
+#        #
+#        #     IFS= read -rp -d "" string_name__sstco
+#        #
+#        # Instead, such assignment silently blocks. *shrug*
+#        print "coproc: $(:stdin.get)" <&p
+#        :string.set "${string_name__sstco}" "$(:stdin.get)" <&p
+#    } <<<' <<'/---'
+#Set the passed string variable to all standard output of the coprocess for the
+#current shell. If no such coprocess exists, throw an exception.
+#/---
+
+#:enable_option_local monitor
+# This alias also reenables the job monitoring
+#temporary disabled by open_coprocess().
+
+#always 
+#Such
+#coprocess should always be closed by calling close_coprocess() from an `always` block to 
+
+#   'void open_coprocess_to_stdin_until_eot()'\
+        # Set such string. Dismantled, this is:
+        #
+        # * "IFS=", preventing read() from splitting input on field separators.
+        # * "-r", preserving input characters (e.g., backslashes do not escape).
+        # * "-p", reading from the current coprocess.
+        # * "-d ''", reading all input rather than merely to the first newline.
+#       IFS= read -rp -d "" string_name__sstco
+
+# (and hence cannot modify the current shell)
+#current shell and subshells. should be executed in
+#subshells and which 
+#execute arbitrarily many pipeline subcommands
+#in an arbitrary sequence of 
+
+#subshells of the current shell whose standard input
+#and output  connected that of the current shell with a temporary FIFO),
+#(i.e., a 

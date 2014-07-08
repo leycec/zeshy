@@ -1,0 +1,797 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+# Due to a chicken-and-the-egg problem, all functions and globals defined below
+# are subsequently documented under ={help} in the main codebase.
+
+#FIXME: We'll need some mechanism for cross-referencing other components in
+#AsciiDoc descriptions. How about a "@{...}"-style syntax (e.g.,
+#"Please see component @{string} or @{variable/map/map}")? Finding *WHICH*
+#component such reference references is slightly more difficult than for
+#aliases, functions, and globals, however, as component names are non-unique.
+#Since components often change paths, we probably want to employ a relative
+#path-searching algorithm as follows:
+#
+#* If such component is prefixed with an absolute or relative path prefix
+#  (e.g., @{/always/variable/list/list} or @{../../type}), test whether such
+#  file exist. Relative paths are simply relative to the directory containing
+#  the current component. Absolute paths should be prefixed with the directory
+#  of the overlay root containing containing the current component. (Err,
+#  perhaps *ANY* overlay root, testing each? No sense being overly restrictive.)
+#* If that fails, prefix such component name with "./" (e.g., from @{string} to
+#  @{./string}). If such file exists in the same directory as the directory of
+#  the current component, such file is the desired target of such cross-reference.
+#* If that fails, prefix such component name with "../" (e.g., from @{string} to
+#  @{../string}). Again test whether such file exists.
+#* Continue prefixing such component name with an additional "../" until either
+#  traversing above the overlay root containing the current component or
+#  discovering such component.
+#FIXME: Actually, the above searching mechanism isn't quite enough, as parcels
+#residing under discontiguous overlay roots would never be able to find each
+#other. Frankly, it's a fairly annoying issue. It's also extremely inefficient
+#under the default premise of explicitly searching the filesystem on each
+#@{...} reference. The latter can be significantly improved, at least, by
+#performing an upfront "print -lr -- **/*": that is, caching the set of all
+#absolute paths of all zeshy scripts compiled into the current user digest file.
+#Indeed, caching such set into a map should provide reasonably efficient lookup.
+#FIXME: Ah! We've divorced parcels from scripts. Before, there was a one-to-one
+#relationship between parcels and scripts; now, there's basically a many-to-many
+#relationship, where each script can declare arbitrarily many parcels and
+#parcels can be distributed across multiple files. Hence, the set of all parcel
+#names (which should, of course, be formatted as "/"-delimited pathnames, which
+#need not necessarily exist but typically will under the conventional one-to-one
+#scenario) is easily iterated as the *KEYS* of map ${ZESHY_PARCEL_NAME_TO_HELP}.
+#FIXME: Ah! We could even do one better, by caching into a map whose keys are
+#script basenames and whose values are a null-delimited string list of all
+#absolute dirnames containing such basename, *SORTED* alphabetically. The
+#sorting is essential... err, perhaps it isn't. In any case, this should provide
+#*EXTREMELY* efficient lookup. If such value contains only one string, we have
+#our candidate; otherwise, search such value split on null. We're then looking
+#for a dirname with the minimum distance to the current script's dirname. Sure,
+#we could manually implement a Levenshtein or Hamming distance function,
+#calculate each such distance, and take the dirname with the minimum distance.
+#But that strikes me as overkill. Given the nature of POSIX paths, I see a
+#simpler solution. If we can efficiently find the longest common prefix of both
+#dirnames, then counting the total number of "/" characters in the remainder
+#following such prefix in *BOTH* dirnames gives the total directory distance
+#between such dirnames. Sweet, no? The question is: can we efficiently find
+#longest common prefixes? I'm not completely sure, but a PCRE-based approach
+#appears to work at least decently:
+#
+#* Append "/" to each dirname, if not already present. (This ensures the
+#  correctness of the distance calculation.)
+#* SCRATCH THIS (i.e., ignore): Determine which of the two dirnames is longer.
+#* Ah-ha! Convert the current script's dirname to a PCRE as follows:
+#  * Using a glob, replace every substring matching "([^/]##/)" to
+#    "(${match[1]})?". Actually, that's not quite right; to ensure proper
+#    nesting (and efficiency!), we need to nest such expressions. For example,
+#    convert "/usr/share/zeshy/with/all/" to
+#    "/(usr/(share/(zeshy/(with/(all/)?)?)?)?)?". Ah! Simple. Replace
+#    each such substring with "(${match[1]}", then append ${X} number of ")?"
+#    to the end of such string, where ${X} is 1 minus the number of "/"
+#    characters in such string. This is probably easiest implemented with a glob-
+#    based iterator, frankly. In any case, we have our PCRE!
+#  * Then, just match each dirname split from such null-delimited list with such
+#    PCRE. *EVERY* dirname is guaranteed to match. The longest common prefix is
+#    given by iterating match groups, starting at -1 and ending at -${X}. The
+#    last *NONEMPTY* match group giv... Actually, just concatenate match groups!
+#    Why not, right? Then "${match[*]}" with IFS="/" should give the longest
+#    common prefix. Sweet. This is rather eclectically cool, and probably
+#    deserves its own function -- say, get_path_distance()? Can't imagine we'll
+#    often need it, but... heck, it's there, anyway.
+#  * Then, remove such longest common prefix from both dirnames and count the
+#    total number of remaining "/" characters in such strings.
+#  * It's all quite doable, really.
+#* If such count is 1, stop prematurely. There can't be anything closer... Well,
+#  there could be something equally as close but in the opposite direction. Hmm;
+#  I suppose we should give precedence to subdirectories rather than parent
+#  directories, yes? *sigh*
+#FIXME: In retrospect, "@{...}"-style parcel syntax was perhaps a poor choice,
+#given the conflict with existing "@"-style list syntax. Since the '=" appears
+#to particularly unused, consider switching all "@{...}"-style parcel
+#references to "={...}", instead.
+
+# See ={global} and ={function} for help strings for all globals and functions
+# defined below, respectively.
+
+# ....................{ GLOBALS                            }....................
+#FIXME: Excise! Supplant with function-driven documentation. This will
+#(probably) necessitate changes in only the following functions:
+#
+#* :parcel.is().
+#* :parcel.declare().
+
+# Map from parcel names to help strings documenting such parcels. Avoid formally
+# documenting such map, which zeshy precompilation subsequently undefines (to
+# conserve space). See also the following lists specific to top-level
+# components, which precompilation converts into elements of related maps:
+# ${ZESHY_CORE_HELP_ALIASES}, ${ZESHY_CORE_HELP_FUNCTIONS}, and
+# ${ZESHY_CORE_HELP_GLOBALS}.
+typeset -Ag ZESHY_PARCEL_NAME_TO_HELP
+
+# Map from parcel names to null-delimited string lists of all aliases,
+# functions, and globals declared by such parcel, respectively.
+typeset -Agx\
+    ZESHY_PARCEL_NAME_TO_ALIAS_NAMES\
+    ZESHY_PARCEL_NAME_TO_FUNCTION_NAMES\
+    ZESHY_PARCEL_NAME_TO_GLOBAL_NAMES
+
+#FIXME: Reset to the empty string before its compilation into the digest file.
+#This can be achieved with a late precompile hook, yes? This is important, as it
+#ensures that all subsequent calls involving a parcel will throw an exception as
+#desired (since the empty string is not an existing parcel -- hopefully, anyway!).
+
+# Current parcel name. Since the value of such global is typically specific to
+# the most recent zeshy script to have called declare_parcel_as_script(), avoid exporting
+# such global to caller scripts.
+typeset -g ZESHY_PARCEL_NAME
+
+# ....................{ EXCEPTIONS                         }....................
+#FIXME: Shift all ={*-main/help/declare/parcel} documentation here.
+
+:func.document <<'/---'
+:void :parcel.die_if(:string parcel_name)
+
+Throw an exception if the passed parcel exists.
+/---
+function :parcel.die_if() {
+    (( # == 1 )) || :die 'Expected one parcel name.'
+    ! :parcel.is "${1}" || {
+        local parcel_name="${1}"
+        :die 'Parcel "'${parcel_name}'" already declared.'
+    }
+}
+
+:func.document <<'/---'
+:void :parcel.die_unless(:string parcel_name)
+
+Throw an exception unless the passed parcel exists.
+/---
+function :parcel.die_unless() {
+    (( # == 1 )) || :die 'Expected one parcel name.'
+    :parcel.is "${1}" || {
+        local parcel_name="${1}"
+        :die 'Parcel "'${parcel_name}'" undeclared.'
+    }
+}
+
+# ....................{ TESTERS                            }....................
+:func.document <<'/---'
+[status = :bool] :parcel.is(:string parcel_name)
+
+Report success if the passed parcel exists.
+/---
+function :parcel.is() {
+    (( # == 1 )) || :die 'Expected one parcel name.'
+    (( ${+ZESHY_PARCEL_NAME_TO_HELP[${1}]} ))
+}
+
+# ....................{ SETTERS                            }....................
+# To avoid tiresome timing issues, such functions are not called by this parcel
+# Since such functions are called by top-level parcel "global", they cannot be
+# relegated to "always/zeshy/parcel".
+
+:func.document <<'/---'
+:void set_parcel(:string parcel_name)
+
+Set the current parcel to the previously declared passed parcel. See
+:parcel.declare().
+/---
+function set_parcel() {
+    # Validate sanity.
+    (( # == 1 )) || :die 'Expected one parcel name.'
+    local parcel_name="${1}"
+    :parcel.die_unless "${parcel_name}"
+
+    # Set such parcel.
+    ZESHY_PARCEL_NAME="${parcel_name}"
+}
+
+:func.document <<'/---'
+:void set_parcel_as_script(:string script_name)
+
+Set the current parcel to the previously declared parcel with the passed path
+referring to an existing `zeshy` script. Unless such path refers to an existing
+`zeshy` script associated with a previously declared parcel, an exception is
+thrown. For simplicity, such path may be absolute or relative and contain
+symbolic link components. See convert_path_to_parcel() for further details.
+/---
+function set_parcel_as_script() {
+    # Validate sanity.
+    (( # == 1 )) || :die 'Expected one parcel name.'
+    local parcel_name="${1}"
+    [[ -f "${parcel_name}" ]] || :die 'Script "'${parcel_name}'" not found.'
+#   print -r -- "args: ${*}"
+
+    # Convert the absolute path of such script to a parcel name.
+    :convert_path_to_parcel parcel_name
+
+    # Set the current parcel to such name.
+    set_parcel "${parcel_name}"
+}
+
+# ....................{ CONVERTERS                         }....................
+#FIXME: Fix documentation, now that such function behaves completely
+#differently (i.e., in-place on a passed string variable name).
+
+:func.document <<'/---'
+:void :convert_path_to_parcel(^:string parcel_name)
+
+Convert the passed existing absolute or relative path to the parcel name
+corresponding to such path. If such path does _not_ exist, an exception is
+thrown. Relative paths will be converted to absolute paths. Symbolic link path
+components will be replaced with their transitive targets. If such path begins
+with an overlay directory, such system-specific directory will be replaced with
+a system-agnostic parcel scheme as discussed below (e.g., from
+`/usr/share/zeshy/always/zsh/zsh` to `zeshy://always/zsh/zsh`).
+
+All `zeshy` scripts reside in one of the following `zeshy` overlays:
+
+* ${ZESHY_OVERLAY_DIR}, the system-wide overlay of official scripts.
+* ${ZESHY_USER_OVERLAY_DIR}, the user-specific overlay of third-party scripts.
+* ${ZESHY_USER_CONFIG_DIRNAME}, the user-specific overlay of user-specific
+  configuration scripts.
+
+In either case, the overlay directories prefixing script paths are system-
+specific. For portability, this function replaces such prefixes with the
+following system-agnostic schemes:
+
+* `zeshy://`, for paths prefixed by ${ZESHY_OVERLAY_DIR}.
+* `zeshy.user://`, for paths prefixed by ${ZESHY_USER_OVERLAY_DIR}.
+* `zeshy.user.config://`, for paths prefixed by ${ZESHY_USER_CONFIG_DIRNAME}.
+
+For example:
+
+.convert_path_to_parcel()
+==========================================
+[source]
+------------------------------------------
+>>> change_dir "${ZESHY_OVERLAY_DIR}"
+>>> convert_path_to_parcel "is_pathable/mutt"
+zeshy://is_pathable/mutt
+>>> convert_path_to_parcel "${ZESHY_OVERLAY_DIR}/is_pathable/mutt"
+zeshy://is_pathable/mutt
+>>> convert_path_to_parcel "${ZESHY_USER_OVERLAY_DIR}/is_pathable/awesome"
+zeshy.user://is_pathable/awesome
+------------------------------------------
+==========================================
+/---
+
+function :convert_path_to_parcel() {
+    # Validate sanity.
+    (( # == 1 )) || :die 'Expected one string name.'
+    local string_name__cptp="${1}" parcel_name__cptp
+    local -a parcel_name_list__cptp
+    :var.die_unless_type_string "${string_name__cptp}"
+
+    # Absolute or relative path of such parcel.
+    parcel_name__cptp="${(P)string_name__cptp}"
+    [[ -e "${parcel_name__cptp}" ]] || :die\
+        'Parcel "'${parcel_name__cptp}'" not found.'
+
+    # Canonicalize such path. Unfortunately, the simplistic approach performed
+    # by :set_string_to_path_canonical() cannot simply be copied here (due to
+    # the unavailability of other functions such function calls at this time).
+    # Instead, we reimplement such approach in low-level zsh by applying
+    # history expansion modifier "(:A)" in a nonscalar (e.g., list assignment)
+    # rather than scalar (e.g., string assignment) context. See
+    # :set_string_to_path_canonical() for further details.
+    #
+    # Technically, such operation is also implementable with the following
+    # somewhat simpler but dramatically slower approach:
+    #
+    #     parcel_name__cptp="$(print -r -- "${parcel_name__cptp}"(:A))"
+    parcel_name_list__cptp=( "${parcel_name__cptp}"(:A) )
+    parcel_name__cptp="${parcel_name_list__cptp[1]}"
+
+    # Replace system-specific overlay prefixes with system-agnostic labels.
+    # Note the lack of an "else" branch in the logic below. If such parcel is a
+    # symbolic link to a script physically residing outside of a zeshy overlay,
+    # both of the branches below fail. This is hardly ideal (due to portability
+    # issues) but currently ignorable. Since most parcels reside in the system-
+    # wide overlay, attempt to match such overlay first. Dismantled, this is:
+    #
+    # * "(#b)(*)", matching the fragment of such path following the unmatched
+    #   directory of the overlay containing such path into ${match[1]}.
+    # * "${match[1]#/}", removing a prefixing "/" from such path if present to
+    #   avoid parcel names prefixed an extraneous "/" (e.g.,
+    #   "zeshy:///always/zsh/zsh").
+    case "${parcel_name__cptp}" {
+        ("${ZESHY_OVERLAY_DIR}"(#b)(*))
+            parcel_name__cptp="zeshy://${match[1]#/}";;
+        ("${ZESHY_USER_OVERLAY_DIR}"(#b)(*))
+            parcel_name__cptp="zeshy.user://${match[1]#/}";;
+        ("${ZESHY_USER_CONFIG_DIRNAME}"(#b)(*))
+            parcel_name__cptp="zeshy.user.config://${match[1]#/}";;
+        # Else, such parcel resides under no canonical overlay. While this should
+        # never happen, parcels are hardly essential to zeshy operation. Print a
+        # warning to standard error rather than throwing an exception.
+        (*)
+            :warning.output\
+                'Parcel "'${parcel_name__cptp}'" in no zeshy overlay and hence system-specific.'
+    }
+
+    # Set such path to such name.
+    :string.set "${string_name__cptp}" "${parcel_name__cptp}"
+}
+
+# ....................{ ADDERS                             }....................
+#FIXME: Technically, suffix aliases reside in a separate namespace and hence
+#require separate handling. I can't really be bothered at the moment. Shouldn't
+#be a terribly difficult change; just keep it in mind. For simplicity and
+#orthogonality with nomenclature elsewhere, retain this function and simply add
+#a new function add_parcel_alias_suffix(). Note we'll probably want to add a new
+#subdirectory "15-alias/" containing the existing file "15-alias" and a new file
+#"suffix" containing new declare_alias_suffix() functions.
+
+function add_parcel_alias() {
+    # Validate sanity. Since alias names can contain any character and
+    # hence null used below to delimit alias names, escape nulls in such name.
+    # See :alias_command.define() for further details.
+    (( # == 2 )) || :die 'Expected one parcel name and one alias name.'
+    local parcel_name__apa="${1}" alias_name__apa="${2//$'\0'/\\$'\0'}"
+    :parcel.die_unless "${parcel_name__apa}"
+
+    # If at least one alias has already been added to such parcel, delimit
+    # this alias from prior aliases with a null.
+    if (( ${+ZESHY_PARCEL_NAME_TO_ALIAS_NAMES[${parcel_name__apa}]} )) {
+        ZESHY_PARCEL_NAME_TO_ALIAS_NAMES[${parcel_name__apa}]+=$'\0'"${alias_name__apa}"
+    # Else, this is the first alias to be added to such parcel, initialize such
+    # value to this alias.
+    } else {
+        ZESHY_PARCEL_NAME_TO_ALIAS_NAMES[${parcel_name__apa}]="${alias_name__apa}"
+    }
+}
+
+function add_parcel_function() {
+    # See add_parcel_alias() for further details.
+    (( # == 2 )) || :die 'Expected one parcel name and one function name.'
+    local parcel_name__apf="${1}" function_name__apf="${2//$'\0'/\\$'\0'}"
+    :parcel.die_unless "${parcel_name__apf}"
+    if (( ${+ZESHY_PARCEL_NAME_TO_FUNCTION_NAMES[${parcel_name__apf}]} )) {
+        ZESHY_PARCEL_NAME_TO_FUNCTION_NAMES[${parcel_name__apf}]+=$'\0'"${function_name__apf}"
+    } else {
+        ZESHY_PARCEL_NAME_TO_FUNCTION_NAMES[${parcel_name__apf}]="${function_name__apf}"
+    }
+}
+
+function add_parcel_global() {
+    # Since global names can only contain identifier characters and hence *NOT*
+    # null, nulls need not be escaped. See add_parcel_alias() for further
+    # details.
+    (( # == 2 )) || :die 'Expected one parcel name and one global name.'
+    local parcel_name__apg="${1}" global_name__apg="${2}"
+    :parcel.die_unless "${parcel_name__apg}"
+    if (( ${+ZESHY_PARCEL_NAME_TO_GLOBAL_NAMES[${parcel_name__apg}]} )) {
+        ZESHY_PARCEL_NAME_TO_GLOBAL_NAMES[${parcel_name__apg}]+=$'\0'"${global_name__apg}"
+    } else {
+        ZESHY_PARCEL_NAME_TO_GLOBAL_NAMES[${parcel_name__apg}]="${global_name__apg}"
+    }
+}
+
+# ....................{ DECLARERS                          }....................
+:func.document <<'/---'
+:void :parcel.declare(:string parcel_name, :string parcel_asciidoc)
+
+Declare a new *parcel* (i.e., `zeshy`-specific abstraction packaging
+aliases, globals, and functions declared by some `zeshy` script or scripts),
+uniquely identified with the passed <<parcel.name,absolute path>> and documented
+with the passed <<parcel.help,help string>>.
+
+While most high-level languages provide native support for declaring package-
+like abstractions (e.g., `perl` packages, `python` modules, `ruby` gems), `zsh`
+does not. Even if `zsh` did, however, `zeshy`\'s compilation into unstructured
+digest files would likely render such packaging moot.
+
+== Motivation ==
+
+Parcels implement a useful (if limited) pure-`zsh` facsimile of the typical
+package motif, aggregating logically related `zsh` objects into abstract units.
+Under most high-level languages, such units form a language-specific topology
+of reusable components and readable documentation. Under `zsh`, only the latter
+applies. Since digest files offer no internal structure (and hence no reusable
+components), *parcels currently only serve to structure `zeshy` documentation.*
+
+And that's it. At such time as `zsh` adds native support for declaring package-
+like abstractions, however, this could conceivably change.
+
+[[parcel.name]]
+== Parcel Names ==
+
+Parcel names are arbitrary strings containing no null characters, typically
+formatted as URIs prefixed by one of the following two schemes:
+
+* `zeshy://`, for parcels declared by official `zeshy` scripts residing in
+  the system-wide `zeshy` overlay.
+* `zeshy.user://`, for parcels declared by thirdy-party `zeshy` scripts residing
+  in the system-wide `zeshy` overlay.
+
+Since parcels are only abstractions, such URIs need _not_ refer to existing
+filesystem paths. Under the typical
+<<parcel.relations.1to1,one-to-one relationship>> between parcels and scripts,
+however, this is the case. See convert_path_to_parcel() for further details.
+
+[[parcel.help]]
+== Parcel Documentation ==
+
+Parcel documentation adheres to http://asciidoc.org[AsciiDoc] syntax, augmented
+with `zeshy`-specific syntax for cross-referencing other `zeshy` documentation.
+Since single- and double-quoted `zsh` string syntax conflicts with such syntax,
+consider passing such documentation to declare_parcel_with_stdin() as a here-
+document on standard input instead.
+
+=== Cross-reference Syntax ===
+
+Cross-referencing other `zeshy` aliases, functions, globals, and parcels
+requires simple `zeshy`-specific syntax, typically in a human-readable manner
+inspired by the corresponding `zsh` syntax.
+
+==== Globals ====
+
+To cross-reference a global, simply delimit such global's name by `${` and `}`
+(e.g., `${ZESHY_FUNCTION_NAME_TO_DOCUMENTATION}`).
+
+==== Aliases or Functions ====
+
+To cross-reference an alias or function, simply suffix the name of such alias or
+function by `()` (e.g., `die_with_your_boots_on()`). If both an alias and
+function exist with such name, the alias rather than function will be cross-
+referenced (in keeping with `zsh` precedent).
+
+==== Function Disambiguation ====
+
+To cross-reference a function for which there exists an alias of the same name,
+simply delimit such function's name by `function://` and `()`
+(e.g., `function://die_with_your_boots_on()`).
+
+==== Parcels ====
+
+To cross-reference a parcel, delimit by `@{` and `}` either:
+
+* Such parcel's name (e.g., `@{zeshy://always/zsh/zsh}`). Since parcel names
+  form unique identifiers, this has the advantage of disambiguity but the
+  disadvantage of subsequently failing should the script declaring such parcel
+  be moved (e.g., from `/usr/share/zeshy/always/zsh/zsh` to
+  `/usr/share/zeshy/always/lang/zsh/zsh`).
+* Any suffix of such parcel's name following but _not_ including a directory
+  separator `/` (e.g., `@{always/zsh/zsh}`, `@{zsh/zsh}`, or `@{zsh}`). This
+  induces a depth-first search for the first parcel name suffixed by `/`
+  followed by such suffix of:
++
+--
+. All `zeshy` overlays in the following order (thus giving official parcels
+  precedent over third-party parcels):
+.. `zeshy://`, the system-wide overlay of official parcels.
+.. `zeshy.user://`, the user-specific overlay of third-party parcels.
+. All subdirectories of each such overlay in lexicographic order.
+
+This has the disadvantage of ambiguity but the advantage (especially with
+shorter suffixes) of preserving a cross-reference should the script declaring
+such parcel be moved. Note that creating a new script residing in a
+lexicographically ``earlier'' path declaring a parcel of the same suffix
+rewires existing cross-references to target the new script (e.g., creating
+`/usr/share/zeshy/always/00-declare/zsh/zsh` rewires `@{zsh/zsh}` and `@{zsh}`).
+In some cases, this may be beneficial; in others, however, this is probably not.
+--
+
+For example, all of the following cross-reference parcel
+`zeshy://always/zsh/zsh` (in order of increasing brevity and hence ambiguity):
+
+. `@{zeshy://always/zsh/zsh}`, unambiguously cross-referencing such parcel.
+. `@{always/zsh/zsh}`, cross-referenced by depth-first search under overlay
+  `zeshy://`.
+. `@{zsh/zsh}`, cross-referenced by depth-first search under overlay
+  subdirectory `zeshy://always/`.
+. `@{zsh}`, cross-referenced by depth-first search under overlay subdirectory
+  `zeshy://always/zsh/`.
+
+== Parcel-script Relationships ==
+
+Parcels are non-physical abstractions related to (but _not_ necessarily
+synonymous with) the physical `zeshy` scripts declaring such parcels.
+
+[[parcel.relations.1to1]]
+=== One-to-one Parcel-script Relationships ===
+
+There typically exists a one-to-one relationship between parcels and scripts.
+For each such script, there exists a corresponding parcel whose name is the
+absolute path of such script -- both guaranteeing uniqueness between parcel
+names and establishing a convenient means of associating parcels with scripts.
+With such relationships, a script's absolute path identifies its parcel and a
+parcel's name its script's absolute path.
+
+To implement such relationship, such scripts should call a *parcel declarer*
+(e.g., declare_parcel_as_script(), declare_parcel_script_with_stdin()) before calling any
+other declarers (e.g., declare_alias(), :func.document()).
+
+=== One-to-many Parcel-script Relationships ===
+
+A one-to-many relationship between parcels and scripts, in which one parcel is
+distributed across multiple scripts (hereafter referred to as the *swarm* of
+scripts declaring and defining such parcel), is also feasible. As with aliases,
+functions, and variables, parcels are typically only declared once. Hence, for
+one script in each such swarm, there exists a corresponding parcel whose name
+is the absolute path of such script. All other scripts in such swarm non-
+ambiguously refer to such parcel by such path.
+
+To implement such relationship, the declaring script in such swarm should call
+a parcel declarer before calling any parcel-specific declarers. All other
+scripts in such swarm should call a *parcel setter* (e.g., set_parcel(),
+set_parcel_script()) before calling any parcel-specific declarers.
+
+=== Many-to-one Parcel-script Relationships ===
+
+A many-to-one relationship between parcels and scripts, in which multiple
+parcels (hereafter referred to as the *passel* of parcels being declared and
+defined) are centralized into one script, is also feasible. For each such
+script, there exist multiple corresponding parcels. To guarantee uniqueness
+between parcel names, only one such parcel name may be the absolute path of
+such script. All other parcel names in such passel must be arbitrary (probably
+nonextant) absolute paths (e.g., by appending arbitrary integers to the path of
+such script).
+
+To implement such relationship, such script should be internally subdivided into
+such parcels, calling a parcel declarer for each such parcel before calling all
+declarers specific to such parcel.
+
+=== Many-to-many Parcel-script Relationships ===
+
+Lastly, a many-to-many relationship between parcels and scripts, in which
+multiple parcels are distributed across multiple scripts, is also feasible.
+Since such relationships blend one-to-many and many-to-one relationships, see
+prior sections for further details. (Given the subtle complexities of such
+relationships, many-to-many parcel-script relationships are rather uncommon.)
+
+=== Parcel-script Relationships in zeshy ===
+
+Since one-to-one relationships tend to conform more closely to user expectations
+than one-to-many, many-to-one, or many-to-many relationships, all scripts in the
+`zeshy` codebase declare and define exactly one parcel.
+/---
+function :parcel.declare() {
+    # Validate sanity. If such parcel has already been declared, throw
+    # an exception. Since parcels are typically associated with absolute paths,
+    # this shouldn't ever occur. Make sure it doesn't!
+    (( # == 2 )) || :die 'Expected one parcel name and one help string.'
+    local parcel_name="${1}" parcel_help="${2}"
+#   print -r -- "declaring parcel \"${parcel_name}\""
+    :parcel.die_if "${parcel_name}"
+
+    #FIXME: Document such constraint.
+
+    # If such name contains at least one "}" character, throw an exception.
+    # Since zeshy-specific syntax delimits such names by "={" and "}", parcel
+    # names may contain any characters except "}".
+    [[ ${parcel_name} != *'}'* ]] || :die\
+        'Parcel "'${parcel_name}'" invalid (i.e., contains reserved delimiter "}").'
+
+    # Set the current parcel. See set_parcel() for further details.
+    ZESHY_PARCEL_NAME="${parcel_name}"
+
+    # Map such parcel name to such help string.
+    ZESHY_PARCEL_NAME_TO_HELP[${parcel_name}]="${parcel_help}"
+}
+
+# ....................{ DECLARERS ~ script                 }....................
+function declare_parcel_as_script() {
+    # Validate sanity.
+    (( # == 1 || # == 2 )) ||
+        :die 'Expected optional script name and one help string.'
+    local script_name="${ZESHY_SCRIPT_NAME}" help="${@[-1]}"
+    if (( # == 2 )) {
+        script_name="${1}"
+    }
+    [[ -f "${script_name}" ]] || :die\
+        'Script "'${script_name}'" not found or not a file.'
+
+    # Convert the absolute path of such script to a parcel name.
+    :convert_path_to_parcel script_name
+
+    # Declare such parcel with such documentation.
+    :parcel.declare "${script_name}" "${help}"
+}
+
+function :parcel() {
+    run_runnable_with_stdin declare_parcel_as_script "${@}"
+}
+
+# ....................{ DOCUMENTERS                        }....................
+:parcel <<'/---'
+Handle parcel declarers. See :parcel.declare() for further details.
+/---
+
+# --------------------( WASTELANDS                         )--------------------
+    #FUXME: Such constraint should *NOT* be necessary here. Shift such
+    #validation into
+
+    # If such name is not a path (i.e., contains null characters), throw an
+    # exception. See documentation for further details.
+    # [[ ${parcel_name} != *$'\0'* ]] || :die\
+    #     'Parcel "'${parcel_name}'" not a path (due to embedded null characters).'
+
+    #FUXME: Insufficient. If such parcel name contains "}", throw an exception.
+    #As a function of parcel delimiters "={" and "}", parcel names may contain
+    #any characters except "}". Naturally, document this!
+
+# Set the current parcel to the previously declared parcel with the passed
+# (possibly nonextant) absolute path. See :parcel.declare() for further details.
+
+    # See :map.is_key() for further details.
+    # If such string variable does not exist, throw an exception. See
+    # :var.die_unless_type_string() for further details.
+    # [[ "${(tP)string_name__cptp-}" == 'scalar'* ]] || :die\
+    #     'Variable ${'${string_name__cptp}'} not found or not a string.'
+
+#FUXME: Rename to :convert_parcel_from_path().
+    #FUXME: Both horrible and inefficient. See :set_string_to_path_canonical()
+    #for a non-subshell-based approach.
+
+#FUXME: I'd rather not add another ad-hoc overlay to handle "~/.zeshy/config/"
+#script parcels. To avoid this, we'll want to have the *REAL* directory
+#containing such scripts be a new "~/.zeshy/overlay/if_config/" directory,
+#which "~/.zeshy/config" simply symbolically links to for user convenience.
+#This is quite a nice refactoring, actually, as it brings all zeshy scripts
+#to be compiled into the digest strictly under an overlay root. It also
+#simplifies our previously stated (and still quite sensible) intention of
+#sourcing *BOTH* "/usr/share/zeshy/if_config/"* and
+#"~/.zeshy/overlay/if_config/"* *WHENEVER* recompiling such digest.
+#FUXME: Wait. No. "~/.zeshy/overlay/if_config/"* already stores third-party
+#configuration parcels -- a completely different and competing purpose to that
+#of user-specific parcels. O.K.; keep "~/.zeshy/config" as a physical directory
+#as it currently is. I don't see much way around it but to consider
+#"~/.zeshy/config" to be a third overlay type and hence label here: say,
+#"zeshy.user.config://". The substantial upside from this, however, is that it
+#ensures parcels copied to "~/.zeshy/config" will have unique (and hence non-
+#conflicting names).
+
+# If such name is not an absolute path (i.e., is
+    # either not prefixed by "/" or contains null characters), such name is
+    # invalid as a parcel name, so throw an exception. See @{parcel} for further
+    # details.
+    # If such parcel does not exist, throw an exception.
+#   :parcel.die_unless "${parcel_name}"
+
+    # Else, set the current parcel to such parcel.
+#   ZESHY_PARCEL_NAME="${parcel_name}"
+#FUXME: declare_parcel_as_script() should call this function. WAIT. No. Full
+#stop. We need a new convert_script_to_parcel() function. (I know, I know.) Just
+#go gonzo, yo!
+#is either not prefixed by "/" or 
+#   [[ "${parcel_name}" != '/'* || "${parcel_name}" == *$'\0'* ]] &&
+#       :die "parcel \"${parcel_name}\" invalid (i.e., not an absolute path)"
+#FUXME: O.K.; we don't actually require this here. Shift to "zeshy/parcel" and
+#shift its documentation (currently in "10-function") with it. Huzzah!
+    # Convert
+#   parcel_name=
+
+    # Since the implementation below fails to cleanly integrate with that of
+    # :parcel.declare(), reimplement rather than call such function.
+    #
+    # Map such parcel name to such help string *BEFORE* calling
+    # set_parcel_as_script(), which throws an exception if this is not the case.
+#   ZESHY_PARCEL_NAME_TO_HELP[${parcel_name}]="${help}"
+
+    # Set the current parcel to such parcel.
+#   set_parcel_as_script "${parcel_name}"
+
+    # Declare such parcel as such script path, canonicalized to avoid ambiguity
+    # between parcels. See set_parcel_as_script() for further details.
+#is absolute (e.g., `/usr/src/zeshy/always/os/os`), such path need _not_
+#exist. Otherwise
+    # Declare such parcel as such script path, canonicalized to avoid ambiguity
+    # between parcels. See set_parcel_as_script() for further details.
+#   :parcel.declare "$(print -- "${script_name}"(:A))" "${help}"
+
+#FUXME: Rename "parcel_as_script" to "parcel_as_script" everywhere.
+#FUXME: Fairly important: shift set_parcel() back here and augment such function
+#to replace ${ZESHY_OVERLAY_DIR} and ${ZESHY_USER_OVERLAY_DIR} when prefixing
+#parcel names with "/zeshy/" and "/user/" prefixes, respectively.
+#the directory of the overlay containing the passed script
+#with a system-agnostic label indicating the overlay:
+#FUXME: Yes, in hindsight, we probably want a separate string global
+#${ZESHY_OVERLAY_DIR}, currently initialized to just ${ZESHY_HOME}. It's easy to
+#conceive of scenarios in which such directory is a ${ZESHY_HOME} subdirectory,
+#justifying such choice.
+#documentation.
+#While parcels have no bearing 
+#Since digest files `zeshy`\'s user digest files 
+#While such units 
+#units, parcels form the building blocks for `zeshy`\'s online documentation and
+#offline help systems.
+
+#FUXME: Rename this to declare_parcel_script() and likewise below. Then, have
+#such functions call a new declare_script() function, which should call a new
+#set_parcel() function. declare_parcel_script() should thus perform the expected
+#die_unless_file() routine. (See below.)
+#FUXME: Rename set_parcel() to set_parcel_script(). Then, define a new
+#set_parcel() function. For efficiency, set_parcel_script() should *NOT* call
+#set_parcel().
+
+#FUXME: For sanity, these should probably default the first argument to
+#${ZESHY_PARCEL_NAME} if only passed one argument. Simplifies use elsewhere.
+#FUXME: Fixup documentation.
+    # Due to implementation details, avoid calling :parcel.declare().
+    # Nonetheless, ensure this function implements similar logic.
+
+    # If such parcel has already been declared, throw an exception.
+#   die_if_parcel_name "${parcel_name}"
+
+    # Map such parcel name to such help string.
+#   ZESHY_PARCEL_NAME_TO_HELP[${parcel_name}]="${help}"
+
+    # Set the current parcel to such script. This internally converts such
+    # script to a parcel name, necessitating we subsequently use
+    # ${ZESHY_PARCEL_NAME} rather than ${script_name}.
+#   set_parcel_as_script "${script_name}"
+
+    # If such parcel has already been declared, throw an exception. Since
+    # parcels are typically associated with unique paths, this should never
+    # happen. Make sure it doesn't! See :map.is_key() for further details.
+#   (( ${+ZESHY_PARCEL_NAME_TO_HELP[${parcel_name}]} )) and
+#       :die "parcel \"${parcel_name}\" already declared"
+
+#FUXME: Shift all such adders as well as :parcel.die_unless(), :parcel.is(), and
+#whatever else we don't explicitly require here into new parcel "zsh/parcel".
+    # Validate sanity.
+#   (( # == 2 )) || :die 'expected one script name and one help string'
+#   local script_name="${ZESHY_SCRIPT_NAME}" help="${argv[-1]}"
+#   is_args_2 and script_name="${1}"
+#   die_unless_file "${script_name}"
+
+    # Canonicalize such path to avoid ambiguity when cross-referencing parcels.
+    # See :canonicalize_path() for further details.
+#   script_name="$(print -- "${script_name}"(:A))"
+
+    # If such parcel has already been declared, throw an exception. Since
+    # parcels are typically associated with unique paths, this should never
+    # happen. Make sure it doesn't! See :map.is_key() for further details.
+#   (( ${+ZESHY_PARCEL_NAME_TO_HELP[${script_name}]} )) and
+#       :die "parcel \"${script_name}\" already declared"
+
+    # Map such parcel name to such help string.
+#   ZESHY_PARCEL_NAME_TO_HELP[${script_name}]="${help}"
+
+    # Set the current parcel to such name.
+#   ZESHY_PARCEL_NAME="${script_name}"
+
+    #FUXME: O.K.; convert the script to a parcel name by stripping the prefix
+    #corresponding to the current overlay root from such name. Again, we'll need
+    #a similar global to "${ZESHY_SCRIPT_NAME}" expanding to the
+    #absolute path of the current overlay root. Simple!
+    #FUXME: Set the current parcel, as well.
+
+    # Name of such parcel.
+#   local parcel_name
+
+#alias, global, and function help strings into
+#logically related units.
+# ....................{ DECLARERS                          }....................
+#declare_function_with_stdin <<'/---'
+#void declare_parcel_as_script(string documentation)
+#
+#Declare the current shell script to be a new parcel documented with the passed
+#help string. See declare_parcel_as_script() for further details.
+#/---
+#function declare_parcel_as_script() {
+#    (( # == 1 )) || :die 'expected one help string'
+#    declare_parcel_as_script "${ZESHY_SCRIPT_NAME}" "${1}"
+#}
+
+#FUXME: Are we not overthinking this? Why not simply rename "parcels" to
+#"scripts", below?
+#FUXME: "${0}" doesn't appear to expand to the current script name within
+#functions. While we could hack about this, a simpler solution is to utilize a
+#string global set by "src/compile". Yummm!
+#FUXME: Shift to "03-global". Ah, wait. We can't declare globals without the
+#corresponding aliases being defined. O.K.; we need to shift the
+#"../01-type/variable" subdirectory here, then shift "03-global" there. Hmmm;
+#perhaps not. "03-global" is really only valid *AFTER* sourcing all parcels in
+#such subdirectory, so... perhaps we want:
+#
+#00-declare/
+#   03-variable/
+#   04-global
+#
+#Simpler, in terms of dependency management.

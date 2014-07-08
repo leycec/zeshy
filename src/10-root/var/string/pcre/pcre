@@ -1,0 +1,1278 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle Perl-compatible Regular Expressions (PCREs).
+
+== Caveats ==
+
+While glob-specific functions are declared to be `<globbable>` and hence
+permit globs to be unquoted, PCRE-specific functions are _not_ and hence
+require PCREs to be single-quoted. Avoid double-quoting PCREs, which often
+contain `\`-prefixed expressions treated by `zsh` as character escapes
+implicitly deleting each such `\`.
+/---
+
+#FIXME: We've finally uncovered the Dark Magestic Art of *BOTH* passing aliases
+#multiple arguments *AND* "passing" aliases code to be dynamically evaluated.
+#The solution to the latter leverages the solution to the former, so we start
+#there. Consider the current alias undefine_variable_for():
+#
+#    alias undefine_variable_for='{
+#        # Validate sanity.
+#        list args__uvf; set_list_to_stdin_words args__uvf
+#        (( ${#args__uvf} >= 1 )) or :die "Expected one or more variable names."
+#
+#        # For safety, destructively coerce such variables to writable local strings.
+#        # When passed read-only variables, this prevents zsh from failing on the
+#        # subsequent call to unset() with "zsh: ${variable_name} read-only".
+#        typeset +r -- "${args__uvf[@]}"
+#
+#        # Unset such variables.
+#        unset -- "${args__uvf[@]}"
+#    } <<<'
+#
+#This is replaceable with the following normal alias undefine_variables()
+#internally defining a temporary global alias, arbitrarily shadowing "--" in
+#this case:
+#
+#    alias ":undefine_variables--"='
+#       :alias_general "--"="
+#           :undefine_alias \"--\"
+#           typeset +r -- \"${variable_names__uv[@]}\"
+#           unset -- \"${variable_names__uv[@]}\""
+#       :list variable_names__uv
+#       :set_list_to_args_1_or_more variable_names__uv'
+#
+#Ridiculously simple as well as fairly clever, eh? A propitious combination.
+#Such alias must be called like so:
+#
+#    :undefine_variables-- this_one and_this_one and_this_last_one --
+#
+#Due to the additional burden on the caller, such alias names should probably be
+#suffixed by "--" to explicitly inform the caller of such calling conventions.
+#Alternately, and this is probably the better solution, we could temporarily
+#shadow "{" to expand to the empty string and "}" to expand to the prior
+#definition of "--", called like so:
+#
+#    :undefine_variables_in_block { this_one and_this_one and_this_last_one }
+#
+#That's certainly more intuitive.
+#
+#An issue does arise with all of this, however. If an exception is called by the
+#arguments passed to such alias, the subsequent alias reverting such temporary
+#shadowing will never be expanded, effectively rendering such shadowing
+#*PERMANENT* -- which is *REALLY, REALLY HORRIBLE*. Since we *REALLY, REALLY*
+#crave the freedom that such aliases afford, however, this must simply be worked
+#around. And, obviously, it can.
+#
+#Simply have our homespun exception handler forcefully undefine all aliases
+#shadowing "{" and "}". Fortunately, it's not hard to test this: e.g.,
+#
+#    # This should trigger the edge case noted above.
+#    :undefine_variables_in_block { $(false) }
+#
+#All such aliases *MUST* explicitly state in their documentation's "Caveats"
+#section that alias arguments *MUST* on penalty of terrible things happening
+#delimit such arguments with "{" and "}". Failing to do so will cause "{" and
+#"}" to be shadowed until the next thrown exception. Since shadowing "{" and
+#"}" in this way is likely to provoke an exception in short order, this isn't
+#quite as terrible as it could be. But it's still terrible.
+#
+#If the burden of shadowing "{" and "}" simply becomes too much (or zsh
+#prohibits us from shadowing such strings), there are certainly safer
+#alternatives we could try -- namely, similar parens pairs. Neither "[" and "]"
+#or "(" and ")" are used *AT ALL* in the zeshy codebase, suggesting that
+#terribly things probably won't happen when the user fails to embed arguments in
+#such delimiters. How about:
+#
+#    :undefine_variables_in_parens ( this_one and_this_one and_this_last_one )
+#
+#Oh, wait. "(" and ")" are obviously used extensively for nonscalar definitions.
+#Right, then. That leaves us with:
+#
+#    :undefine_variables_bracketed [ this_one and_this_one and_this_last_one ]
+#
+#Should be the safest, I imagine. Right. Let's go with this one! "[" and "]"
+#weren't doing anything for us, anyway, given their obsoletion in zsh by the
+#similar pair "[[" and "]]".
+#
+#Ah! Right. Since subshells inherit aliases, we absolutely *CANNOT* shadow a
+#critical delimiter. Consider the following:
+#
+#    # And... we've now broken the world.
+#    :undefine_variables_in_block { $(if true { print oh } else { print no }) }
+#
+#"[" and "]" it is, then. :)
+
+#FIXME: Which returns us to a solution for the second matter above, of "passing"
+#aliases code to be dynamically evaluated. Note that the following example uses
+#delimiters "[" and "]" for the exact same reasons as the prior solution. "{"
+#and "}" are simply out of the question, due to command substitutions. Then:
+#
+#    :for_string_text_matching_pcre_bracketed "test string" "\s++(str)" [
+#        ::string.output "${match[1]}"
+#    ]
+#
+#Great. I've confirmed Vim syntax highlights such code as expected, which
+#(unsurprisingly) is a principal concern, although it probably shouldn't be! In
+#any event, how does one define such alias? Simple, given the prior solution:
+#
+#    alias :for_string_text_matching_pcre_bracketed='
+#       :alias_general "["="
+#           :undefine_alias \"[\""
+#           :string\
+#               text__fstmpb="${args__fstmpbb[1]}"\
+#               pcre__fstmpb="${args__fstmpbb[2]}"\
+#               code__fstmpb="${args__fstmpbb[3]}"
+#           :die_unless_str_nonempty pcre__fstmpb 'Expected non-empty PCRE.'
+#           :string  MATCH
+#           :list match
+#           pcre_compile -- "${pcre__fstmpb}"
+#           pcre_study
+#           string ZPCRE_OP='0 0'
+#           while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text__fstmpb}" } {"
+#       :alias_general "]"="}
+#           :undefine_alias \"]\""
+#       :list args__fstmpbb
+#       :set_list_to_args_3 args__fstmpbb'
+#
+#It's almost ludicrously brilliant in its circularity. And I'm 100% confident it
+#will work as advertised. We did it! I can hardly believe, and doubt terribly
+#many others will ever see the worth in it. But... there it is. Awesome.
+#FIXME: There's only one catch, and it relates to an issue we've noted elsewhere
+#with such sorts of solutions. There's no real reason that the bracketed code
+#can't expand another such alias. But the above definition implicitly prohibits
+#such expansion, as that would overwrite the prior definition of "]". Ah, but,
+#so long as we just alias "]" to "}" as we do above, this isn't an issue. But,
+#it *WILL* probably be an issue with other such iterators, some of which will
+#need to expand code *AFTER* the caller-provided block of code. And doing that
+#reliably requires some... finesse. Which means that assuming "]" still expands
+#to "}" is inherently unsafe, since other aliases will need to expand it
+#differently.
+#
+#Hmm; honestly, the only safe means of doing so is somewhat clumsy, requiring
+#alias-specific initiators and terminators. We'd call such aliases like so:
+#
+#    :for_string_text_matching_pcre_bracketed_start "test string" "\s++(str)" [
+#        ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_bracketed_stop
+#
+#Of course, at this point, readability has all but died. How about:
+#
+#    :for_string_text_matching_pcre_init "test string" "\s++(str)"
+#    :for_string_text_matching_pcre_start
+#    ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Right. It's either that, or:
+#
+#    :for_string_text_matching_pcre_start "test string" "\s++(str)" --
+#    ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Right. While terser, the latter form is inherently dangerous when operating on
+#arbitrary user-provided strings. While the user *COULD* conceivably pass...
+#Hm. Right. We no longer need to have such delimiter terminate such line,
+#implying that the following should suffice:
+#
+#    :for_string_text_matching_pcre_start "test string" "\s++(str)"
+#    :
+#    ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Sweet, no? I mean, *SURE*, it is a bit awkward. But it's reliable, moderately
+#terse, and immanently usuable. I'm unconvinced we can do better. Still,
+#contemplate her a bit more before we commit this to repository memory. Ah;
+#wait. ":" has critical import in zsh, as used widely throughout the zeshy
+#codebase, ensuring conflicts with command substitutions in alias arguments. So,
+#how about:
+#
+#    :for_string_text_matching_pcre_start "test string" "\s++(str)"
+#    ::
+#
+#    ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#It's either that or use "." (which also works). Right. Go with "::". As the
+#prior example demonstrates, "::" produces a reasonably aesthetic result that
+#*SHOULD* be readily memorable. That said, the nomenclature needs to explicitly
+#specify double colons to be required. Hm; "_with_double_colon" and similar is
+#overly cumbersome. How about just:
+#
+#    :for_string_text_matching_pcre_start:: "test string" "\s++(str)"
+#    ::
+#
+#    ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#The "::" suffixing such alias name should suffice to inform the user that
+#something's up. Assuming the user actually then reads the alias documentation
+#or is sufficiently aware of zeshy to recall what a suffixing "::" means, this
+#should be reasonably readable. I mean, sure... it's a bit obtuse. But I'm not
+#convinced we can do better. Right. We *REALLY* don't want to prefix such alias
+#name by "::", as that implies such alias to be a private alias as well as
+#requiring the corresponding "_stop" alias to also be prefixed by "::" for
+#orthogonality.
+#
+#O.K.; I'm satisfied. The prior example *IS IT*. Full stop. Let's do this! Oh,
+#right. We'd might as well truncate that to:
+#
+#    :for_string_text_matching_pcre_start::{ "test string" "\s++(str)" ::}
+#    ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Ugh. Alternative delimiters "[" and "]" *AND* "(" and ")" cannot be used
+#without explicit escaping in function and alias names, rendering such
+#delimiters useless for our purposes. We'd prefer to use the briefer ":{" and
+#":}" here, but for (obvious reasons) such delimiters are already occupied.
+#However, I'd argue that the prior sort of aliases will be more common than
+#"} always {...}" blocks... Hmm; perhaps not. Right. "always" blocks *ARE* more
+#core to the language. Grumble; grumble.
+#
+#Oh; right. Why not a *DIFFERENT* prefix other than ":", here? If the closing
+#delimiter were anything *BUT* a temporary expedient, adopting a different
+#prefix would (of course) be a poor idea. But as it is, such alias is unlikely
+#to conflict with terribly much; how about:
+#
+#   #:for_string_text_matching_pcre_start%{ "test string" "\s++(str)" }%
+#   #:for_string_text_matching_pcre_start={ "test string" "\s++(str)" }:catch
+#   #:for_string_text_matching_pcre_start-{ "test string" "\s++(str)" }-
+#    :for_string_text_matching_pcre_start~{ "test string" "\s++(str)" }~
+#    ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#Yes, zsh prohibits us using anything suffixed by "}". So, "}-" or similar will
+#have to do. "}:catch" appears to be out as well, coughing up similar parse errors.
+#"}~" and "}-" are demonstrably the more aesthetic. Given that "}:" requires
+#holding shift for all such characters, "}~" is the sound, orthogonal choice.
+#It's also somewhat more aesthetic, *ESPECIALLY* for use with the corresponding
+#prefix "~{".
+
+#FIXME: O.K.; there we have it. After great deliberation, aliases accepting
+#multiple arguments should be called with the following conventions:
+#
+#    :for_string_text_matching_pcre_start~{ "test string" "\s++(str)" }~
+#
+#And aliases accepting multiple arguments *AND* code to be dynamically evaluated
+#called with the following conventions:
+#
+#    :for_string_text_matching_pcre_start~{ "test string" "\s++(str)" }~
+#    ::string.output "${match[1]}"
+#    :for_string_text_matching_pcre_stop
+#
+#I'm content. And that's all she wrote.
+#FIXME: Given this, contemplate adopting the following style of alias definition:
+#
+#    alias ":for_string_text_matching_pcre_start~{"='
+#       :alias_general "}~"="
+#           }:catch{
+#               :undefine_alias \"}~\""
+#           }:
+#
+#           :die_unless_str_nonempty pcre__fstmpb 'Expected non-empty PCRE.'
+#           :string MATCH
+#           :list match
+#           pcre_compile -- "${pcre__fstmpb}"
+#           pcre_study
+#           :string ZPCRE_OP='0 0'
+#           while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text__fstmpb}" } {"
+#
+#       # This is the cool part. The call to :set_strings_to_strings() *MUST* be
+#       # the last line of this alias, which, when appended by the caller's
+#       # passed arguments, will set the desired variables. Naturally, we need
+#       # define such function, but it shouldn't be terribly hard. Here is what
+#       # a complete expansion of the last line looks like (post-expansion!):
+#       #
+#       #     :set_strings_to_strings text__fstmpb pcre__fstmpb -- "test string" "\s++(str)"
+#       #
+#       # Also, we protect such call with a :try block, guaranteeing. This
+#       # means we do *NOT* need to modify our existing exception handler make
+#       # sure that alias "}~" has been undefined.
+#       :try{
+#           :string              text__fstmpb pcre__fstmpb
+#           :set_strings_to_args text__fstmpb pcre__fstmpb --'
+#    alias :for_string_text_matching_pcre_stop='
+#           }'
+#
+#That's a *HECK* of a lot of awesome boilerplate automation. This should
+#positively rock, once we get this up and running at a large enough scale.
+#FIXME: So, "~{" and "}~" delimiters are quite nice, but one wonders if we
+#can't do slightly better. Unlikely, but worth examining. Consider:
+#
+#    :for_string_text_matching_pcre_start~{ "test string" "\s++(str)" }~
+#
+#    :for_string_text_matching_pcre_start~ "test string" "\s++(str)" ~
+#
+#    :for_string_text_matching_pcre_start~~ "test string" "\s++(str)" ~~
+#
+#    :for_string_text_matching_pcre_start: "test string" "\s++(str)" :
+#
+#    :for_string_text_matching_pcre_start:: "test string" "\s++(str)" ::
+#
+#O.K.; we're fairly convinced. "~{" and "}~" *ARE* quite nice and probably the
+#best we can reasonably do.
+#FIXME: Actually, some reassessment is in order. Since we expect to leverage
+#such high-level aliases considerably more than low-level ":try{...}" always,
+#strongly consider switching our use of "~{" and ":{". Namely:
+#
+#* Rename ":{" to "~{" and "}:" to "}~" everywhere. (Should be a fairly trivial
+#  global replacement.) For example:
+#  :try{
+#      :die
+#  }:catch{
+#      yumyum
+#  }~
+#* Name such aliases as follows:
+#  :for_string_text_matching_pcre_start:{ "test string" "\s++(str)" }:
+#
+#Great! But that only gets us halfway. If you'll note, we actually have two
+#discrete styles for such aliases:
+#
+#1. Aliases *NOT* required to be followed by corresponding stop aliases: e.g.,
+#   :append_list_with_list_local:{ okok }:
+#2. Start aliases required to be followed by corresponding stop aliases: e.g.,
+#     :for_string_text_matching_pcre yum yum :{
+#        yumyum
+#    }:for_string_text_matching_pcre  # either this...
+#    }:fstmp                          # ...or this
+#
+#Right. While the latter abbreviation is certainly more succinct, it also
+#makes using such aliases in the wild something of a crapshoot, requiring the
+#coder to correctly guess such alias' abbreviation. And when he or she
+#inevitably fails, the result is an inscrutable error. (Not good.) So go with
+#the unabbreviated form, we should think. (Not terribly fond of such
+#repetition,
+#but all alternatives are decidably contemptible.)
+#
+#To summarize the above examples, the former sort of alias names should be
+#suffixed by ":{" and require the last argument to be "}:", while the latter
+#sort of alias names should *NOT* be suffixed but should require their last
+#argument to be ":{" (rather than "}:") *AND* should require a final stop alias
+#of the same name prefixed by "}". Sweet, no?
+#
+#Given that, we'll clearly want different sorts of alias definers. Let's begin
+#exploring, shall we?
+
+# ....................{ GLOBALS                            }....................
+#FIXME: Actually use such globals in place of their magic strings everywhere.
+
+:string_global ZESHY_PCRE_OPTION_CASELESS='(?i)' <<'/---'
+PCRE option enabling case-insensitive matching for the remainder of the pattern
+following such option at the same group level. By default, PCREs match case-
+sensitively.
+/---
+
+:string_global ZESHY_PCRE_OPTION_DOTALL='(?s)' <<'/---'
+PCRE option enabling *dotall matching* (i.e., quantifier `.` matches any
+character including newline) for the remainder of the pattern following such
+option at the same group level. By default, such quantifier matches any
+character excluding newline.
+/---
+
+:string_global ZESHY_PCRE_OPTION_EXTENDED='(?x)' <<'/---'
+PCRE option enabling *extended matching* (i.e., ignoring all unescaped
+whitespace _and_ substrings between an unescaped `#` and newline character or
+the string end in the PCRE) for the remainder of the pattern following such
+option at the same group level. By default, PCRE whitespace is significant and
+unescaped `#` characters are matched as is.
+/---
+
+:string_global ZESHY_PCRE_OPTION_MULTILINE='(?m)' <<'/---'
+PCRE option enabling *multiline matching* (i.e., assertion `^` matches before
+the string beginning or newline _and_ assertion `$` matches before the string
+end or newline) for the remainder of the pattern following such option at the
+same group level. By default, `^` only matches before the string beginning and
+`$` only matches before the string end.
+/---
+
+# ....................{ TESTERS                            }....................
+declare_function_with_stdin <<'/---'
+[status: boolean] is_string_matches_pcre(string text, string pcre)
+
+Report success if the passed string matches the passed PCRE. See
+for_string_text_matching_pcre:() for further details.
+/---
+function is_string_matches_pcre() {
+    # Match such string. While calling pcre_compile(), pcre_study(), and
+    # pcre_match() would suffice to perform such match, operator "=~" does so
+    # concisely and equally efficiently (in most cases).
+    die_unless_args_2 'Expected one string and one PCRE.'
+    is "${1}" =~ "${2}" si
+}
+
+declare_function_with_stdin <<'/---'
+[status: boolean] :is_string_has_pcre_syntax(string text)
+
+Report success if the passed string contains at least one PCRE-reserved
+character, notably including most ASCII punctuation (e.g., `[`, `{`, `(`, `|`).
+/---
+function :is_string_has_pcre_syntax() {
+    die_unless_arg 'Expected one string.'
+    is "${1}" == *['[]{}()|.+*?^$']* si
+}
+
+# ....................{ GETTERS ~ count                    }....................
+#FIXME: Rename to :get_string_text_count_matching_pcre().
+declare_function_with_stdin <<'/---'
+integer get_string_pcre_match_count(string text, string pcre)
+
+Get the number of substrings in the passed string matching the passed PCRE. See
+for_string_text_matching_pcre:() for further details: e.g.,
+
+.get_string_pcre_match_count()
+==========================================
+[source]
+------------------------------------------
+>>> get_string_pcre_match_count "anthropocene tropes" '(?x)
+...     # An extended PCRE matching both "ropo" and "rope".
+...     rop[aeiou]'
+2
+------------------------------------------
+==========================================
+/---
+function get_string_pcre_match_count() {
+    die_unless_args_2 'Expected one string and one PCRE.'
+    integer match_count=0
+    for_string_text_matching_pcre: "${@}" '(( ++match_count ))'
+    :string.output ${match_count}
+}
+
+# ....................{ ITERATORS                          }....................
+#FIXME: Excise, shifting documentation to alias
+#:for_string_text_matching_pcre~{().
+declare_function_with_stdin <<'/---'
+[stdout: str, stderr: str] for_string_text_matching_pcre:(
+    string text,
+    string pcre,
+    string code)
+
+Run the passed code for each substring of the passed string matching the passed
+PCRE: e.g.,
+
+.for_string_text_matching_pcre:()
+==========================================
+[source]
+------------------------------------------
+>>> string will_durant=\
+...    "The great snare of thought is uncritical acceptance of irrational
+...     assumptions."
+>>> for_string_text_matching_pcre: "${will_durant}"\
+...     '(?im)(?|th([eo])|^?(?) |?(?|c(c)|r(r)|s(s)))'\
+...     ':string.output "${MATCH}" ("${match[1]}")'
+The (e)
+tho (o)
+is (s)
+acc (c)
+of (f)
+irr (r)
+ass (s)
+------------------------------------------
+==========================================
+
+== PCRE Syntax ==
+
+`zsh` performs PCRE matching by linking against the system-wide PCRE library
+implemented in pure C and hence supports _all_ features of such library:
+
+* Perfect emulation of Perl- and Python-specific regular expression syntax,
+  including syntax specific to the most recently released version of Perl.
+* Partial emulation of .NET-, Oniguruma-, and JavaScript-specific regular
+  expression syntax.
+* Just-in-time (JIT) optimization.
+* UTF-8-driven Unicode character properties and extended grapheme clusters.
+* Arbitrarily recursive patterns capable of matching fully balanced parentheses.
+* Greedy and non-greedy quantifiers for controlling match length.
+* Atomic groups and possessive quantifiers for preventing backtracking.
+* Backtracking control verbs for controlling backtracking behaviour.
+* Named and numbered subpatterns, including duplicates for resetting branches.
+* Absolute and relative back references and subroutine calls.
+* Positive and negative lookahead and lookbehind assertions.
+* Conditional subpatterns for testing subpattern and recursion matches.
+
+Such library is sufficiently powerful, expressive, and efficient to implement
+non-regular context-free text parsers in pure `zsh` -- as `zeshy` itself does
+elsewhere (e.g., parsing help documentation strings). For further details, see
+the following documentation:
+
+* http://www.pcre.org/pcre.txt[PCRE *.txt], concatenating all PCRE man pages
+  into a single plaintext file. This is arguably the optimal means of searching
+  PCRE documentation for specific features, phrases, or syntax.
+* `man pcre`, indexing other PCRE man pages.
+
+=== PCRE-internal Options ===
+
+Like most regular expression implementations, the PCRE library supports numerous
+options for modifying PCRE matching on a PCRE-specific basis -- including common
+options for enabling caseless, multiline, and extended matching. While the
+underlying `zsh/pcre` module interfacing with such library supports passing such
+options as `-`-prefixed options to builtin pcre_compile() (e.g.,
+`pcre_compile -m ^$`, a multiline PCRE matching both the empty string and blank
+lines), this function requires such options be embedded directly into PCREs with
+syntax `(?${options})`, where `${options}` is a string of one or more of the
+following characters:
+
+* `i`, enabling caseless (i.e., case-insensitive) matching. By default, matches
+  are case-sensitive.
+* `m`, enabling multiline matching such that:
+** `^` matches either a newline or the string start. By default, `^` matches
+   only the string start.
+** `$` matches either a newline or the string end. By default, `$` matches only
+   the string end.
+* `s`, permitting `.` to match all characters _including_ newline. By default,
+  `.` matches all characters _excluding_ newline.
+* `x`, enabling extended matching by ignoring:
+** All whitespace characters neither escaped or in a character class. By
+   default, whitespace is significant.
+** All characters between an unescaped `#` not in a character class and the next
+   newline, thus ignoring comments. By default, `#` characters are matched
+   literally.
+* `J`, permitting subpattern names to be duplicated, typically used for so-
+  called ``branch resets.'' By default, subpattern names must be unique.
+* `U`, inverting quantifier greediness such that quantifiers _not_ suffixed by
+  `?` are non-greedy and quantifiers suffixed by `?` are greedy. By default,
+  quantifiers _not_ suffixed by `?` are greedy and quantifiers suffixed by `?`
+  are non-greedy.
+
+Either prefixing or suffixing a PCRE with such options suffices to globally
+enable such options on the full PCRE.
+
+== PCRE Globals ==
+
+On each successful match, the passed command may access the following globals:
+
+* ${MATCH}, a string global expanding to the currently matched substring.
+* ${match}, a list global containing each match group captured within such
+  substring (e.g., `${match[1]}`, the first match group).
+
+Note that globs enabling globbing flags `(#b)` and `(#m)` (e.g., by calling
+convert_string_to_glob_capturing_groups_and_substrings()) set similar globals,
+as well as several others _not_ set for PCRE matches (i.e., ${mbegin}, ${mend},
+${MBEGIN}, ${MEND}). Since the latter globals are largely unhelpful, this tends
+not to be an issue.
+/---
+function for_string_text_matching_pcre:() {
+    # Validate sanity.
+    die_unless_args_3 'Expected one string, one PCRE, and one command.'
+    string text__fstmp="${1}" pcre__fstmp="${2}" code__fstmp="${3}"
+    die_unless_string_nonempty pcre__fstmp 'Expected non-empty PCRE.'
+
+    # Localize string and list match globals.
+    string MATCH
+    list   match
+
+    # Compile such PCRE, as required by the subsequent call to pcre_match().
+    pcre_compile -- "${pcre__fstmp}"
+
+    # Optimize such compilation.
+    pcre_study
+
+    # Iterate such matches. Dismantled, this is:
+    #
+    # * "ZPCRE_OP='0 0'", a zsh string global tracking the first and last
+    #   0-based byte indices of the currently matched substring in ${text}.
+    # * "pcre_match", matching the next substring given:
+    #   * "-b", tracking indices in the ${ZPCRE_OP} global.
+    #   * "-n", starting matching at the passed string index:
+    #     * "${ZPCRE_OP[(w)2]}", expanding to the byte immediately following the
+    #       last byte index of the previously matched substring.
+    #
+    # For efficiency, evaluate the loop once rather than on each loop iteration.
+    string ZPCRE_OP='0 0'
+    eval 'while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text__fstmp}" } {
+        '${code__fstmp}'
+    }'
+}
+
+# --------------------( WASTELANDS                         )--------------------
+# ....................{ ITERATORS                          }....................
+#FUXME: Rename all runnables called below accordingly (e.g., prefix by ":")!
+
+# :alias_command\
+#     '[stdout: str, stderr: str] ":for_string_text_matching_pcre_start~{"(
+#         str text,
+#         str pcre,
+#         str code)'\
+#     ':alias_general "}~"="
+#         :undefine_alias \"}~\"
+#         :string\
+#             text__fstmps=\"${args__fstmps[1]}\"\
+#             pcre__fstmps=\"${args__fstmps[2]}\"\
+#             code__fstmps=\"${args__fstmps[3]}\"
+#         :die_unless_str_nonempty pcre__fstmps \"Expected non-empty PCRE.\"
+# 
+#         :string  MATCH
+#         :list match
+# 
+#         pcre_compile -- \"${pcre__fstmps}\"
+# 
+#         pcre_study
+# 
+#         string ZPCRE_OP=\"0 0\"
+#         while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- \"${text__fstmps}\" } {"
+# 
+#     :list args__fstmps
+#     :set_list_to_args_3_or_die args__fstmps\
+#         "Expected one string, one PCRE, and one command."' <<'/---'
+# Hello.
+# /---
+
+#I'm afraid the three-alias variant above
+#remains the sanest choice.
+#    string text_name = "text",
+#    string pcre,
+#    string code)
+#
+#Run the passed code for each substring of the passed string copied to the passed
+#local string variable (defaulting to ${text}) matching the passed PCRE: e.g.,
+
+# for optimum matching with the passed options.
+#   string text="${1}" pcre="${2}"
+    # If passed no PCRE options, operator "=~" provides concise PCRE matching.
+    # Implement such conditionals with binary operators rather than an "if"
+    # statement, as the latter squelches exit status of such tests.
+#   { is_args_0 and is "${text}" =~ "${pcre}" si } or
+    # Else, manually compile the passed PCRE with the passed PCRE options
+    # and match with such compiled PCRE.
+#   {
+#       print "pcre_compile \"${pcre_options}\" -- \"${pcre}\""
+#       pcre_compile -- "${pcre}"
+#       pcre_study
+#       pcre_match -- "${text}"
+#   }
+
+#.for_string_text_matching_pcre:()
+#==========================================
+#[source]
+#------------------------------------------
+#>>> for_string_text_matching_pcre: "Holocene extinction event" ([Hl](o)|e[nvx])\
+#...     'print -- "${MATCH}" "${match[1]}"'
+#Ho o
+#lo o
+#en
+#ex
+#ev
+#en
+#------------------------------------------
+#==========================================
+
+#FUXME: Uhm; this is erroneously named now. Revert back to
+#get_string_pcre_multiline_match(). *sigh*
+#FUXME: The whole PCRE options thing is a bit heavyweight *AND* unnecessary, as
+#such options can simple be embedded in such PCRE (e.g., "(?m)" rather than
+#"-m"). In fact, doing so is quite a bit safer *AND* more efficient, as passing
+#a PCRE then suffices to pass all such options.
+
+#Consider anchoring such PCRE to lines rather arbitrary substrings lines rather than the entire string To , this function:
+#* Enables multiline matching by prefixing such PCRE with "(?m)".
+#* Anchors 
+
+#FUXME: Terrible idea. Impossible to implement reliably.
+#declare_function_with_stdin <<'/---'
+#<globbable> string convert_string_to_pcre_matching_lines(string pcre)
+#
+#Convert the passed PCRE to a *line-oriented PCRE* prefixed with `(?m)^.*?` if
+#not already prefixed with equivalent expressions. Note that:
+#
+#* `(?m)` enables multiline matching, inducing `^` and `$` to match a newline as
+#  well as the string start and end, respectively.
+#* `^.*?` anchors such string to either a newline or the string start.
+#/---
+#function convert_string_to_pcre_matching_lines() {
+#    # If such PCRE already contains "(?m)", prefixing yet another does no harm.
+#    die_unless_arg 'expected one PCRE'
+#    string pcre="${1}"
+#
+#    # If the passed regex is not explicitly anchored to newlines with "^", add
+#    # such anchor.
+#    is "${pcre[1]}" == '^' si or {
+#        if is "${pcre}" == '.*'* si {
+#            pcre="^${pcre}"
+#        } else {
+#            pcre="^.*?${pcre}"
+#        }
+#    }
+#
+#    # Enable multiline matching *AFTER* the above prefixes. See
+#    # convert_string_to_pcre_multiline() for further details.
+#    return_string "(?m)${pcre}"
+#}
+
+# --------------------( TODO                               )--------------------
+# * Uhm; the "[[ ... =~ ... ]]" operator sets globals "${MATCH}" and "${match}"
+#   on success, thus providing a far more concise and probably efficient
+#   alternative to our current implementation. That said, the current
+#   implementation does permit the user of caller-specific variables, which is
+#   nice. Hence, we could improve the match() function with an optimization in
+#   the case the caller accepts the default variable names. For further details,
+#   see section "Conditional Expressions" under "info zsh".
+# * Provide a glob-specific equivalent to the get_*match() family of functions.
+#   The (M) flag to #- and %-style matches appears to support this, if crudely.
+#   convert_string_to_pcre_enabling_option "${1}" m
+    # Validate sanity.
+#   string pcre="${1}"
+
+    # If such PCRE already contains option "m", return such PCRE as is.
+#   if is_pcre_enabling_option "${pcre}" 'm' si {
+#       return_string "${pcre}"
+    # Else, return such PCRE prefixed with such option.
+#   } else {
+#       return_string "(?m)${pcre}"
+#   }
+
+    #FUXME: Stop this. It's simply not safe. In fact, it's blatantly stupid.
+    # If the passed regex is not explicitly anchored to newlines with a "^"
+    # prefix and "$" suffix, add such anchors.
+#   is "${pcre[1]}"  == '^' si or pcre="^.*?${pcre}"
+#   is "${pcre[-1]}" == '$' si or pcre="${pcre}.*?$"
+
+    # Validate sanity, treating piped input as the passed string and
+    # removing all arguments except for the list of PCRE options if passed.
+#Such options include zero or more of the following:
+#
+#* `-i`, matching case-insensitively. By default, matches are case-sensitive.
+#* `-m`, matching multiline-aware such that:
+#** `^` matches either a newline or the string start. By default, `^` matches
+#   only the string start.
+#** `$` matches either a newline or the string end. By default, `$` matches only
+#   the string end.
+#* `-s`, permitting `.` to match all characters including newline. By default,
+#  `.` matches all characters excluding newline.
+#* `-x`, matching an extended PCRE ignoring whitespace and `#` comments. By
+#  default, whitespace and `#` are significant and hence matched ``as is.''
+
+#   if { is_args_0 } {
+#       is "${text}" =~ "${pcre}" si and report_status_silent
+    # Else, manually compile the passed PCRE with the passed PCRE options
+    # and match with such compiled PCRE.
+#   } else {
+#       print "pcre_compile \"${pcre_options}\" -- \"${pcre}\""
+#       pcre_compile "${@}" -- "${pcre}"
+#       pcre_study
+#       pcre_match -- "${text}" and report_status_silent
+
+#       :string.output "matched: ${match[@]}"
+#Such globals are a proper subset of those that globs enabling globbing flags
+#`(#b)` and `(#m)` set: . (Specifically, such globs also set
+
+#Match globals accessible to such command include:
+#   string_global_export ZPCRE_OP='0 0'
+    # If the passed PCRE is empty, :die. If the passed string is empty, noop.
+#   is_string_empty "${text}" and report_success
+
+#   integer match_count=0
+#   :is_stdin_pipe and run_code_with_stdin_piped\
+#       for_string_text_matching_pcre: "${@}" '(( ++match_count ))' or
+#       for_string_text_matching_pcre: "${@}" '(( ++match_count ))'
+#   :string.output ${match_count}
+
+#FUXME: Use in place of for_string_text_matching_pcre:(), above.
+#   string error_message='expected one string, one PCRE, and optional regex options'
+
+    # If piped input, pipe such input to get_string_pcre_match_count().
+#   if :is_stdin_pipe; then
+#       die_unless_args "${error_message}"
+#       string pcre; pcre="$(convert_string_to_pcre_multiline "${1}")"
+#       shift_arg
+#       run_code_with_stdin_piped get_string_pcre_match_count "${pcre}" "${@}" -m
+    # Otherwise, call get_string_pcre_match_count() as expected.
+#   else
+#       die_unless_args_2_or_more "${error_message}"
+#       string text="${1}" pcre; pcre="$(convert_string_to_pcre_multiline "${2}")"
+#       shift_args_2
+#       get_string_pcre_match_count "${text}" "${pcre}" "${@}" -m
+#   fi
+
+#FUXME: The order of arguments seems a bit... off. The command should be passed
+#*LAST*, which reads much more intuitively, actually resembling a proper loop: e.g.,
+#
+#   for_string_text_matching_pcre: "${text}" "${pcre}" "${@}" -m\
+#       "output \"\${match[${group_index}]}\"; break"
+
+#'expected non-empty regex'
+#   string error_message='expected one command, one string, one PCRE, and optional regex options'
+#   die_unless_args "${error_message}"
+#   string command="${1}" text pcre
+#   shift_arg
+#   :string.output "command: ${command}"
+
+    # If passed piped input, such input is the string to be matched.
+#   if :is_stdin_pipe; then
+#       die_unless_args_1_to_2 "${error_message}"
+#       set_string_to_stdin_piped text
+#       pcre="${1}"
+#       shift_arg
+    # Otherwise, the second passed argument is the string to be matched.
+#   else
+#       die_unless_args_2_to_3 "${error_message}"
+#       text="${1}"
+#       pcre="${2}"
+#       shift_args_2
+#   fi
+#   print_string_with_escapes "text: ${text}\npcre: ${pcre}"
+
+    # If passed piped input, treat such input as the passed string.
+#   if :is_stdin_pipe; then
+#       set_string_to_stdin_piped text
+#       pcre="${1}"
+#       shift_arg
+    # Otherwise, treat the first passed argument as the passed string.
+#   else
+#       text="${1}"
+#       pcre="${2}"
+#       shift_args_2
+#   fi
+
+        # Shift off the leading PCRE and iterate such matches.
+        # Shift off the leading PCRE and iterate such matches.
+# all arguments except for the list of PCRE options if passed.
+
+    #FUXME: Throw an exception unless the passed PCRE contains a match group. We
+    #probably want a new die_unless_pcre_containing_match_group() function.
+
+# Groups matched by non-multiline PCREs cannot reliably be delimited by
+# newlines, as matches may themselves contain newlines; so, no corresponding
+# get_string_pcre_match() function exists. Instead, consider calling
+# for_string_text_matching_pcre:() for such logic.
+
+# For efficiency, this function returns the first line returned by get_string_pcre_multiline_match()
+# in an efficient manner (i.e., by immediately halting on such line).
+#   list pcre_options; pcre_options=( "${@}" )
+#   for_string_text_matching_pcre: "output matches: \${match[@]}; break 2"\
+#       "output \${match[${group_index}]}; break 2" "${text}" "${@}" -m
+#   substring (e.g., "${match[1]}" expands to the first match group). As caveat,
+#   note this *REQUIRES* embedding "(#b)" prior to such match groups in the
+#   passed PCRE. For efficiency, this function does not embed "(#b)" by default.
+
+#FUXME: Shift to "list".
+#get_list_items() {
+#    die_unless_args 'expected at least one list index'
+#
+#    for index ("${@}") {
+#    }
+#}
+
+#       '(( ${#match} )) and :string.output ${match[@]} or :string.output ${MATCH}'\
+
+#FUXME: We really want to eliminate the *_multiline() functions. Nice idea, but
+#there are simply too many useful permutations (e.g., multiline_caseless,
+#multiline_extended). Rather, use a similar mechanism as the
+#get_string_pcre_match_count() function whereby options are passed after all other
+#parameters. (Somewhat awkward, but... *shrug*)
+
+    # If piped input, convert such input to sanity.
+#   if :is_stdin_pipe; then
+#       die_unless_arg 'expected one PCRE and optional regex options'
+#       :args.set "$(get_stdin_piped)" "${@}"
+#   fi
+
+    # Localize sanity.
+#   die_unless_args_2_or_more\
+#       'expected one string, one PCRE, and optional regex options'
+#   string text="${1}" pcre
+#   pcre="$(convert_string_to_pcre_multiline "${2}")"
+#   shift_args_2
+
+    # Count.
+#   get_string_pcre_match_count "${pcre}" "${@}" -m
+# ....................{ MATCHES                            }....................
+#FUXME: Good name; just a comment to myself: list_ is better than get_ here.
+#Since we're matching on lines, we can safely return a newline-delimited string.
+#That said, it's not terribly orthogonal; perhaps return_list(), instead?
+#
+#FUXME: Completely rewrite. First, note that I've already stored the current
+#implementation of this function in the WASTELANDS. Second, stop accepting
+#"match_variable_name" and "group_array_name"; instead, force use of $MATCH and
+#$match. The alternative is simply unreadable, unmanageable, and exceptionally
+#confusing when read as a function call. Third, shift to a function parameter
+#style as in the above functions. This reduces the function to something very
+#sensible. Oh, and support :is_stdin_pipe() and get_stdin_piped(), as above.
+
+# void match_pcre(
+#   string regular_expression, string text = null,
+#   string match_variable_name = "MATCH", string group_array_name = "match")
+#
+# Match the passed string or stdin if no such string is passed against the
+# passed Perl-compatible regular expression (PCRE). This function returns
+# failure if this string does not match and success otherwise, as well as
+# setting match group-specific variables in the latter case:
+#
+# * The name of the scalar variable to which this function puts the whole match,
+#   defaulting to the global variable "${MATCH}".
+# * The name of the array variable to which this function puts all match groups,
+#   defaulting to the global variable "${match}".
+#
+# This function never prints :string.output in either case. Hence if you require the
+# exact text matched, you must either access the above match group-specific
+# variables or call a helper function defined by Zeshy Regex.
+#
+# This function also accepts a hidden "fifth parameter": the global variable
+# "${ZESHY_MATCH_OPTIONS}", which when set causes this function to pass those
+# options to the pcre_compile() built-in when compiling the passed pattern.
+#
+# For convenience, this function also accepts "stdin"-style piped input rather
+# than an explicit passed string: e.g.,
+#
+#     >>> print 1776 | match '^\d'
+#     >>> print "${MATCH}"
+#     1
+#match_pcre() {
+    # Parse parameters.
+#    die_unless_args_2_or_more\
+#        'expected at least one regular expression and one string'
+#    string regex="${1}" text="${2}"\
+#        match_variable_name="${3:-MATCH}" group_array_name="${4:-match}"
+#   print "pattern: "${(q)regex}" | string: ${string} | match_variable_name: ${match_variable_name} | group_array_name: ${group_array_name} "
+#   print "mo: ${ZESHY_MATCH_OPTIONS[@]}"
+
+    # Compile the match. (Yes, zsh requires this regardless of whether we intend
+    # to actually reuse this match.)
+#    if :var.is 'ZESHY_MATCH_OPTIONS'; then
+#       print "ZESHY_MATCH_OPTIONS: ${ZESHY_MATCH_OPTIONS}"
+#       pcre_compile -m "${pattern}" ||
+#        pcre_compile "${ZESHY_MATCH_OPTIONS[@]}" "${regex}" or
+#            :die "\"${regex}\" not a valid regular expression under match options \"${ZESHY_MATCH_OPTIONS[@]}\""
+#    else
+#        pcre_compile "${regex}" or
+#            :die "\"${regex}\" not a valid regular expression"
+#    fi
+
+    # Match.
+#    pcre_match -v "${match_variable_name}" -a "${group_array_name}" -- "${text}"
+#}
+
+# void match_pcre_multiline(...)
+#
+# Match the passed string against the passed Perl-compatible regular expression
+# (PCRE) in a multi-line fashion (e.g., matching '^' and '$' at both newline and
+# the beginning and end of the string, respectively). In all other respects,
+# this function is identical to the match() function.
+#match_pcre_multiline() {
+#    list ZESHY_MATCH_OPTIONS; ZESHY_MATCH_OPTIONS=( -m )
+#    match_pcre "${@}"
+#}
+
+# ....................{ MATCHES ~ by groups                }....................
+# string match_pcre_first_group(...)
+#
+# Return the first group to successfully match in the passed string against the
+# passed regex. If no group matched, fail. See match() comments for further
+# details: e.g.,
+#
+#     >>> match_first_group '(\d)$' '1984'
+#     4
+#match_pcre_first_group() {
+    # Match.
+#    match_pcre "${@}"
+
+    # If at least one group matched, return the first such group.
+#    string group_array_name="${4:-match}"
+#    :var.is "${group_array_name}" si and
+#        :string.output "${${(@P)group_array_name}[1]}"
+#   is -n "${(@P)group_array_name}" si and print "${${(@P)group_array_name}[1]}"
+#}
+
+# void match_pcre_multiline_first_group(...)
+#
+# Return the first group to successfully match in the passed string against the
+# passed regex, in a multi-line fashion (e.g., matching '^' and '$' at both
+# newline and the beginning and end of the string). If no group matched, fail.
+#
+# This function is otherwise identical to the match_multiline() function.
+#match_pcre_multiline_first_group() {
+#    list ZESHY_MATCH_OPTIONS; ZESHY_MATCH_OPTIONS=( -m )
+#    match_pcre_first_group "${@}"
+#}
+
+# ....................{ MATCHES ~ by lines                 }....................
+# string match_pcre_first_line(...)
+#
+# Match the passed string against the passed Perl-compatible regular expression
+# (PCRE) and return the first matched line, if at least one such line matched,
+# or the empty string otherwise.
+#
+# In all other respects, this function is identical to the match() function.
+# In particular, note groups may still be obtained via the "${match}" array.
+#match_pcre_first_line() {
+#    die_unless_args_2_or_more\
+#        'expected at least one regular expression and one string'
+
+    # Guarantee the passed regular expression roots itself to single rather than
+    # multiple lines (i.e., begins with '^' and ends with '$').
+#    string regex="${1}"
+#    shift_arg
+
+    # No, I don't know why the former requires a '.' while the latter does not.
+    # I'm sure there's a highly rational reason within the musty bowels of ZSH.
+#   print "regex: "${regex}
+#    is "${regex}" == ^.* si or regex="^.*${regex}"
+#    is "${regex}" == *$  si or regex="${regex}.*$"
+#   print "regex: "${regex}
+
+    # Pack this modified regular expression back into the array of all passed
+    # arguments, for convenience.
+#    :args.set "${regex}" "${@}"
+
+    # Match.
+#    match_pcre_multiline "${@}"
+
+    # Print the first matching line.
+#    string match_string_name="${3:-MATCH}"
+#    :string.output "${(P)match_string_name}"
+#}
+
+# ....................{ SETTERS                            }....................
+# int append_pcre_match_to(
+#   list *matches_name,
+#   string text, string pcre, string pcre_option1, string pcre_option2, ...)
+
+# Append all match groups...
+# Set the list with the passed name to .
+# Get the number of substrings in the passed string matching the passed PCRE
+# with the passed PCRE options: e.g.,
+#
+#     >>> list matches_pcre
+#     >>> set_pcre_match_to matches_pcre 'Xanadu  # XaXaXaXaXaXa' '([Xn]a)' -x
+#     >>> print ${matches_pcre[-1]}
+#     na
+#append_pcre_match_to() {
+#    die_unless_args_2_or_more\
+#        'expected one list name, one string, one PCRE, and optional regex options'
+#    string matches_name="${1}"
+#    :var.die_unless_type_list "${matches_name}"
+
+#    for_string_text_matching_pcre: 'matches_name+=(( ${MATCH} ))' "${@}"
+#   eval '${matches_name}:catch( )
+#}
+
+#get_string_matches_pcre_count_old() {
+    # Localize sanity.
+#    string text pcre
+#    if :is_stdin_pipe; then
+#        die_unless_args_1_to_2\
+#            'expected one PCRE and optional regex options'
+#        text="$(get_stdin_piped)"
+#        pcre="${1}"
+#        shift_arg
+#    else
+#        die_unless_args_2_to_3\
+#            'expected one string, one PCRE, and optional regex options'
+#        text="${1}"
+#        pcre="${2}"
+#        shift_args_2
+#    fi
+#    list pcre_options; pcre_options=( "${@}" )
+
+    # If either the passed string or PCRE is empty, return 0.
+#    { is_string_empty "${text}" or is_string_empty "${pcre}" } and :string.output 0
+
+    # Compile the passed PCRE for optimum matching with the passed options.
+#    pcre_compile "${pcre_options[@]}" -- "${pcre}"
+#    pcre_study
+
+    # Count with brute-force iteration. While zsh offers no flags or
+    # functions for optimizing counting, iterating a counter while matching
+    # until no matches remain yields the number of matches. Dismantled, this is:
+    #
+    # * "ZPCRE_OP='0 0'", initializing a zsh global tracking the first and last
+    #   0-based byte indices of the currently matched substring in ${text}.
+    # * "pcre_match", matching the next substring given:
+    #   * "-b", tracking indices in the ${ZPCRE_OP} global.
+    #   * "-n", starting matching at the passed string index:
+    #     * "${ZPCRE_OP[(w)2]}", expanding to the byte immediately following the
+    #       last byte index of the previously matched substring.
+#    integer pcre_match_count=0
+#    string_global_export ZPCRE_OP='0 0'
+#    while pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}"; do
+#        (( ++pcre_match_count ))
+#    done
+#    :string.output ${pcre_match_count}
+#}
+
+#FUXME: This shares nearly the same implementation as get_string_pcre_match().
+#Clearly, what we need is a helper function passed the same arguments as this
+#function with an additional first argument specifying the command to be
+#evaluated in each "while" loop iteration. Say, run_code_on_pcre_match()?
+
+    #FUXME: Hmm; we should probably anchor the passed PCRE with "^.*" and ".*$"
+    #unless already beginning with "^" and ending with "$". Otherwise, we're not
+    #actually matching within lines. Too much work, for the present.
+    #FUXME: Silly. get_string_pcre_match_count() should be revised to accept piped
+    #stdin, and this revised to pass_piped_stdin_to() and manual dying on args.
+    # If the string was passed to this function from piped standard input, then
+    # die_unless_args_2() erroneously reversed the argument order. Reverse it
+    # back. Otherwise, we're good to go.
+#   die_unless_args_2 'expected one string and one PCRE'
+#   then get_string_pcre_match_count "${@[-1]}" "${@[1,-2]}" -m
+
+# void match_pcre(
+#   string regular_expression, string text = null,
+#   string match_variable_name = "MATCH", string group_array_name = "match")
+#
+# Match the passed string or stdin if no such string is passed against the
+# passed Perl-compatible regular expression (PCRE). This function returns
+# failure if this string does not match and success otherwise, as well as
+# setting match group-specific variables in the latter case:
+#
+# * The name of the scalar variable to which this function puts the whole match,
+#   defaulting to the global variable "${MATCH}".
+# * The name of the array variable to which this function puts all match groups,
+#   defaulting to the global variable "${match}".
+#
+# This function never prints :string.output in either case. Hence if you require the
+# exact text matched, you must either access the above match group-specific
+# variables or call a helper function defined by Zeshy Regex.
+#
+# This function also accepts a hidden "fifth parameter": the global variable
+# "${ZESHY_MATCH_OPTIONS}", which when set causes this function to pass those
+# options to the pcre_compile() built-in when compiling the passed pattern.
+#
+# For convenience, this function also accepts "stdin"-style piped input rather
+# than an explicit passed string: e.g.,
+#
+#     >>> print 1776 | match '^\d'
+#     >>> print "${MATCH}" 
+#     1
+#match_pcre() {
+    # Parse parameters.
+#    die_unless_args_2_or_more\
+#        'expected at least one regular expression and one string'
+#    string regex="${1}" text="${2}"\
+#        match_variable_name="${3:-MATCH}" group_array_name="${4:-match}"
+#   print "pattern: "${(q)regex}" | string: ${string} | match_variable_name: ${match_variable_name} | group_array_name: ${group_array_name} "
+#   print "mo: ${ZESHY_MATCH_OPTIONS[@]}"
+
+    # Compile the match. (Yes, zsh requires this regardless of whether we intend
+    # to actually reuse this match.)
+#    if :var.is 'ZESHY_MATCH_OPTIONS'; then 
+#       print "ZESHY_MATCH_OPTIONS: ${ZESHY_MATCH_OPTIONS}"
+#       pcre_compile -m "${pattern}" ||
+#        pcre_compile "${ZESHY_MATCH_OPTIONS[@]}" "${regex}" or
+#            :die "\"${regex}\" not a valid regular expression under match options \"${ZESHY_MATCH_OPTIONS[@]}\""
+#    else
+#        pcre_compile "${regex}" or
+#            :die "\"${regex}\" not a valid regular expression"
+#    fi
+    
+    # Match.
+#    pcre_match -v "${match_variable_name}" -a "${group_array_name}" -- "${text}"
+#}
+
+#FUXME: This is uniformly terrible, any way you dice it. Slice this apart.
+# string get_enabling_multiline(...)
+#
+# Get all lines matching the passed regex. Unlike most Zeshy matching
+# functions, this function uses "grep" rather than the "zsh/pcre" module as the
+# latter provides no efficient means of obtaining non-overlapping matches.
+#
+# Unfortunately, this implies groups to be inaccessible.
+#get_enabling_multiline() {
+#    die_unless_args_2_or_more\
+#        'expected at least one regular expression and one string'
+#   local regexp="${1}" string="${2}"
+#    :string.output "${2}" | grep --perl-regexp "${1}"
+#}
+
+#   print "arg1: ${1}\narg2: ${2}"
+
+# int get_enabling_multiline_count(...)
+#
+# Return the number of lines matching the passed regex. See the
+# get_enabling_multiline() function for caveats.
+#get_enabling_multiline_count() {
+#    die_unless_args_2_or_more\
+#        'expected at least one regular expression and one string'
+##    :string.output "${2}" | grep --perl-regexp --count "${1}"
+#}
+
+#   pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}"
+#   print "pmc: ${pcre_match_count}\nop: ${ZPCRE_OP[(w)2]}"
+#   pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}"
+#   print "pmc: ${pcre_match_count}\nop: ${ZPCRE_OP[(w)2]}"
+#       print "pmc: ${pcre_match_count}\nop: ${ZPCRE_OP[(w)2]}"
+#   while (pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text}") {
+#       (( pcre_match_count++ ))
+#   }
+# int get_string_pcre_match_count(string pcre_options, string text, string pcre)
+#   string error_message='expected optional options, one string, and one PCRE'
+#   die_unless_args "${error_message}"
+#   if si "${1[1]}" == '-' si; then
+#       die_unless_args_3 "${error_message}"
+#   else
+#       die_unless_args_2 "${error_message}"
+#   fi
+
+#FUXME: This is horrible. IT'S ALL HORRIBLE! Use pure zsh expressions rather
+#than this nonsense. There exists no guarantee that grep's "--perl-regexp" are
+#anything like zsh's. The implementation should resemble that of
+#get_match_count(). (Yes, I've searched for better ways. They don't exist.)
+#
+#That said; it'd be a shame to jettison this. Instead, just shift the existing
+#function into Zeshy Grep, perhaps renamed to get_grep_match_count(...).
+
+# See also the get_integer_of_matches_glob() function, which behaves similarly
+# but less efficiently -- matching via multiple glob rather than one regular
+# expression.
+
+# --------------------( CONVENTIONS                        )--------------------
+# All regular expressions matched by this component are Perl-compatible regular
+# expressions (PCRE), unless otherwise stated. Thus, we abbreviate such regular
+# expressions "regexes."
+# 
+# All functions defined by this component accept the same number and type of
+# parameters as the core match() function, unless otherwise stated. Thus, we
+# abbreviate such parameters "...". 
+#
+# ....................{ GROUPS ~ last                      }....................
+#FUXME: Does this actually work? And even if it does, we really should be using
+#the ZSH "pcre" facility to guarantee as-expected interpretation of the regex.
+# string match_last_group(string regular_expression, string text)
+#
+# Match the passed string against the passed Perl-compatible regular expression
+# (PCRE) and return the last matched group, if at least one such group matched.
+#match_last_group() {
+#    die_unless_args_2_or_more\
+#        'expected exactly one regular expression and one string'
+#        
+#    # Parse parameters.
+#    string regexp="${1}" string="${2}"
+#
+#    # Match. For simplicity, use "grep" rather than zsh's "pcre" module.
+#    try "echo '${string}' | tac | grep --perl-regexp -m 1 '${regexp}'"
+#}
+
+    #FUXME: Uncommenting this causes *HORRIBLE, UTTERLY IMPOSSIBLE TO DEBUG*
+    #issues. And it shouldn't. But there it is.
+    # Localize the group array.
+#   typeset -Ag ${group_array_name}
+
+    # Retrieve the first group.
+#   string first_group_name="${group_array_name}[1]"
+
+    # If this match matched at least one group, return that. Otherwise, nil.
+#   print "first_group_name: ${first_group_name}"
+#   string first_group="${(P)first_group_name}"
+#   print "first_group: ${first_group}"
+
+    # If there exists at least one group, print the first and return success;
+    # otherwise, print nothing and return failure.
+#   is_string_nonempty "${first_group}" and print "${first_group}"
+
+#   local regexp="${1}" string="${2}"
+#   try "get_enabling_multiline '${@}' | get_string_line_count"
+#   try "echo '${string}' | sed 's/${regex}/${regex}\n/g' | grep --perl-regexp --count '${regex}'"
+#   return
+#       :die "\"${string}\" not matched by regular expression \"${regex}\""
+    # If the passed regex contains no groups, embed that regex in a group
+    # matching the entire prior regex.
+#   [[ "${1}" == *\(*\)* ]] || set -- "(${regex})" "${@}"
+
+    # Match.
+#   match "${@}" || return ${?}
+#   echo "${#match}"
+
+    # Print the number of matches.
+#   local group_array_name="${4:-match}"
+#   print "${(P)#group_array_name}"

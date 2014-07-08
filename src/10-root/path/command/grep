@@ -1,0 +1,995 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle *path grepping* (i.e., recursive pattern matching on file content).
+/---
+
+#FIXME: Acquired from online grepping:
+#
+#"Years ago I switched from regular grep to ack for typical searches because it
+# is faster, has saner defaults and doesn’t search files and directories I am
+# usually not interested in. Recently, ag aka The Silver Searcher by Geoff Greer
+# made the rounds. It is much faster than ack but provides an ack-compatible
+# interface."
+#
+#It sounds like we should investigate "ag", eh? I'd certainly be happier with
+#saner defaults, wouldn't you?
+#FIXME: Right. Since "grep" is the standard verb for such path operation, *ALL*
+#grep_*() functions defined below should be implemented with the standard
+#"if { is_pathable ag } { ... } elif { is_pathable ack } { ... } else { ... }"
+#paradigm. ("grep" should *ALWAYS* be available on *EVERY* system without
+#exception, so fallback to that.) Extensive research shows "ag" to be vastly
+#superior to "ack" to be vastly superior to "grep". So, there you go!
+#FIXME: Additionally, all grep functions below should be optimized with
+#*RUNTIME* logic such that, when run from within a directory under revision
+#control, the appropriate grep function is called (e.g., :grep_git()).
+
+#FIXME: Add examples!
+
+#FIXME: All ${path_command}_with_options() functions should be improved so as
+#to defer to:
+#
+#    ${path_command}_recursive_with_options "${@}" and report_status
+#
+#...when passed options "-r", "-R", and/or "--recursive" (depending on command).
+
+#FIXME: It'd be nice to emit a progress bar for long `grep` operations. Investigate.
+#Yes. It looks like this is halfway there:
+#   find . -name "*.rb" | pv | xargs grep
+#Note that we should use "zargs" instead, that we'll need to explicitly pass
+#the total number of files to "pv" (...perhaps it has a mode or option for
+#this already), and that...uhm. Well, it'll be a bit of work, anyway! But
+#it's well doable.
+#FIXME: The principle difficulty with a "grep" progress bar is that "grep" is
+#concurrently printing matching lines to stdout. To circumvent this, one *COULD*
+#silently capture such output into a variable while printing only a progress bar
+#and then print such output after completion. While a tolerable improvement for
+#small to medium jobs, such an approach is probably unhelpful for large jobs in
+#which the user really just cares about the initial matches. What is *REALLY*
+#needed is an external command (probably implemented in C) running the passed
+#command and displaying dynamically updated terminal output -- probably with the
+#first line of such output a progress bar and all subsequent lines the
+#sequential output of such command.
+#FIXME: Actually, we could probably implement this is a page_stdin()-style zeshy
+#function iterating over "grep" output (i.e., matching lines) and updating a
+#progress bar. Which, now that I consider it, should probably be at the bottom
+#of the terminal, yes? This is probably nice, assuming it preserves the shell
+#scroll buffer *AND* allows us to cleanly erase the progress bar from such
+#buffer after completion. (Which it should, whereas a progress bar at the top
+#would probably complicate such issues.)
+#FIXME: Actually, such logic should be performed by a new function in the
+#page_stdin*() family with a corresponding new function in the
+#run_code_paged*() family that we call in lieu of the current call to
+#run_code_paged() below. Wait. Scratch the latter. We want to pipe "grep" *INTO*
+#such function rather than *FROM* such function (as in the case of "pv"),
+#implying that a run_code_paged() function won't cut it. Hence, we'll just pipe
+#grep_path() into a new function page_stdin_with_... Wait. How would such
+#function receive the count of how many files "grep" had already processed?
+#FIXME: Ugh. Forget all that. "pv" provides the ideal route for this. I've
+#already tested it a bit, and the following behaves tolerably well:
+#
+#    command find . -type f -name '*' -print0 | command pv | command xargs --null grep "${pattern}"
+#
+#This does exactly what we could hope for, although (admittedly) without ANSI
+#embellishment.
+#FIXME: Replace the above "find" with pure-zeshy functions implementing the
+#equivalent in both recursive and non-recursive variants -- say,
+#get_paths_globbed() and get_paths_globbed_recursive(). Such nomenclature
+#complies with existing nomenclature (e.g., set_list_to_paths_globbed(),
+#:is_glob_qualified_path()). Note that get_paths_globbed_recursive()
+#could probably be implemented in terms of get_paths_globbed() by suffixing
+#passed directory names with "/**/*". (Nice!) Naturally, such functions should
+#delimited paths with null rather than newline characters (as paths may contain
+#the latter but not former), possibly suggesting alternative names -- say,
+#get_paths_globbed_on_null(). Err... maybe not. (Surprisingly difficult to
+#concoct a function name that isn't terrible here. Probably just go with
+#get_paths_globbed() -- at least initially.) In any case, get_paths_globbed()
+#should itself defer to set_list_to_paths_globbed(). Oh, yes -- it all begins to
+#come together.
+#FIXME: Wait. We really need to just call set_list_to_paths_globbed() *BEFORE*
+#calling "pv" to grab the number of matching paths and then do something
+#resembling:
+#
+#    list pathnames; set_list_to_paths_globbed pathnames "${glob}"
+#    joint_list_on_null pathnames |
+#       command pv --size "$(get_string_length "${pathnames[*]}")" |
+#       command xargs --null grep "${pattern}"
+#
+#While "pv" has a means of counting by newlines, it sadly lacks a means of
+#counting by nulls. This means the only means of using "pv" in this context is
+#having it count pathname bytes -- which, while quite strange, does actually
+#work. Since this is quite strange, however, we should probably just disable the
+#portion of "pv" output displaying how many bytes have been processed. *shrug*
+#FIXME: "pv" output is pure ASCII, which isn't necessarily ideal. Unfortunately,
+#uncountable *HOURS* of grepping about online yielded basically nothing. There's
+#really no viable alternative to "pv", at the moment. Which is fine, because
+#"pv" is more than sufficient as is. ANSI would have been nice, but... *shrug*
+#FIXME: O.K.; the above appears all good, except for the
+#set_list_to_paths_globbed() part. What in bl00dy h3ck were we on there, eh?
+#There's no need to glob anything. zsh does that for us and passes us a list of
+#all matching pathnames as function arguments. *sigh*
+
+# ....................{ TESTERS                            }....................
+declare_function_with_stdin <<'/---'
+[status: bool] is_file_line_matching_grep(
+    string pathname1, ...,
+    string pattern)
+
+Report success if at least one line of at least one passed file matches the
+passed pattern with the currently configured `grep`-specific options (e.g.,
+${ZESHY_OPTIONS_GREP}).
+/---
+function is_file_line_matching_grep() {
+    die_unless_args_2_or_more 'Expected one or more filenames and one pattern.'
+    { get_file_lines_matching_grep_if_found "${@}" } :silent
+}
+
+# ....................{ GETTERS                            }....................
+declare_function_with_stdin <<'/---'
+[stdout: string, status: bool] get_file_lines_matching_grep_if_found(
+    string pathname1, ...,
+    string pattern)
+
+Get a newline-delimited list of all lines of the passed files matching the
+passed pattern with the currently configured `grep`-specific options (e.g.,
+${ZESHY_OPTIONS_GREP}). If all such files exist _and_ at least one such file
+matches, success is returned; else, failure.
+/---
+function get_file_lines_matching_grep_if_found() {
+    # Validate sanity.
+    die_unless_args_2_or_more 'Expected one or more filenames and one pattern.'
+    string pattern="${@[-1]}" option_list_names
+    pop_arg
+
+    #FIXME: Shift such logic into a new run_code_with_options_noninteractive()
+    #function. We'll certainly want to leverage such functionality elsewhere.
+
+    # Option lists to be applied to the grep below. If a non-interactive variant
+    # of such list is defined, apply such list as well. However, do *NOT* apply
+    # an interactive variant of such list even if defined. This function *MUST*
+    # return raw lines rather than ANSI-embellished lines.
+    option_list_names='ZESHY_OPTIONS_GREP'
+    if { :var.is_type_list ZESHY_OPTIONS_GREP_IF_NONINTERACTIVE } {
+        option_list_names+='ZESHY_OPTIONS_GREP_IF_NONINTERACTIVE'
+    }
+
+    # Grep such paths.
+    run_code_with_options 'command grep'\
+        "${option_list_names}" -- "${(q)pattern}" "${(q)@}"
+}
+
+# ....................{ GREPPERS                           }....................
+# By design, both grep_path() and grep_path_with_options() and variants thereof
+# accept the passed pattern *BEFORE* passed pathnames, behavior similar to that
+# of "grep" itself.
+
+#FIXME: Poor examples. Improve by explicitly writing temporary files with
+#write_file_with_string() -- which incidentally should be renamed to simply
+#write_file(). (Err, perhaps not!)
+
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: bool] grep_path(
+    string pattern,
+    string pathname1, ...)
+
+Grep the passed paths for files with lines matching the passed pattern with
+the currently configured `grep`-specific options (e.g., ${ZESHY_OPTIONS_GREP}).
+See grep_path_with_options() for further details.
+/---
+function grep_path() {
+    die_unless_args_2_or_more 'Expected one pattern and one or more filenames.'
+    grep_path_with_options -- "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: bool] grep_path_with_options(
+    string grep_option1?, ...,
+    string pattern,
+    string pathname1 = "$(get_dir)/*(-.)", ...)
+
+Grep the passed paths (defaulting to all files in the current directory
+after resolving symbolic links, if called directly from the command line) for
+files with lines matching the passed pattern with both the passed and
+currently configured `grep`-specific options (e.g., ${ZESHY_OPTIONS_GREP}). If
+all such files exist _and_ at least one file matches, success is reported;
+else, failure: e.g.,
+
+.grep_path_with_options()
+==========================================
+[source]
+------------------------------------------
+>>> grep_path_with_options -i /proc/* "Matthew@Sobol"
+/proc/version: Linux version 3.6.11-gentoo (matthew@sobol) (gcc version 4.6.3)
+------------------------------------------
+==========================================
+/---
+function grep_path_with_options() {
+    # Validate sanity.
+    if { is_context_cli_function } {
+        die_unless_args\
+            'Expected optional "grep" options, one pattern, and optional pathnames.'
+
+        # Default pathnames to all text files in the current directory.
+        is_args_2_or_more or {
+            list filenames
+            set_list_to_dir_files_text filenames "$(get_dir)"
+            :arg.append "${filenames[@]}"
+        }
+    } else {
+        die_unless_args_2_or_more\
+            'Expected optional "grep" options, one pattern, and one or more pathnames.'
+    }
+
+    # Grep such paths.
+    run_code_with_options_configured\
+        'run_code_paged command grep' ZESHY_OPTIONS_GREP "${(q)@}"
+}
+
+# ....................{ GREPPERS ~ recursive               }....................
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: bool] grep_path_recursive(
+    string pattern,
+    string pathname1, ...)
+
+Recursively grep the passed paths for files with lines matching the passed
+pattern with the currently configured `grep`-specific options (e.g.,
+${ZESHY_OPTIONS_GREP}). See grep_path_with_options() for further details.
+/---
+function grep_path_recursive() {
+    die_unless_args_2_or_more 'Expected one pattern and one or more filenames.'
+    grep_path_recursive_with_options -- "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: bool]
+    grep_path_recursive_with_options(
+        string grep_option1?, ...,
+        string pattern,
+        string pathname1 = "$(get_dir)", ...)
+
+Recursively grep the passed paths (defaulting to the current directory, if
+called directly from the command line) for files with lines matching the
+passed pattern with both the passed and the currently configured `grep`-specific
+options (e.g., ${ZESHY_OPTIONS_GREP}). See grep_path_with_options() for further
+details.
+/---
+function grep_path_recursive_with_options() {
+    # Validate sanity. If passed only a pattern, note that `grep` already
+    # defaults to the current directory. (Hence, we needn't do so explicitly.)
+    if { is_context_cli_function } {
+        die_unless_args_1_or_more\
+            'Expected optional "grep" options, one pattern, and optional pathnames.'
+    } else {
+        die_unless_args_2_or_more\
+            'Expected optional "grep" options, one pattern, and one or more pathnames.'
+    }
+    list run_code_args
+
+    # Arguments to be passed to calls to run_code() below excluding the
+    # prefixing command name. To accommodate multiple executions of such
+    # command, manually add such command name below.
+    run_code_args=(
+        'ZESHY_OPTIONS_GREP ZESHY_OPTIONS_GREP_IF_RECURSIVE'
+        "${(q)@}"
+    )
+
+    #FIXME: Not the best interactive message. Rather, this should resemble:
+    #
+    #    print_message_item_interactively\
+    #        "Grepping $(join_strings_readable: "${pathnames[@]}") for \"${pattern}\"..."
+    #
+    #Naturally, this requires ignoring any prefixing passed options. Certainly
+    #feasible via set_list_to_dir_files_text() (as above); just have to do it!
+
+    # The conditional below first runs `grep` silently. To (slightly) improve
+    # the user experience, print a brief message first.
+    print_message_item_interactively\
+        "Grepping $(join_strings_readable: "${@}")..."
+
+    #FIXME: Clever, but non-ideal. While this does work perfectly, it also
+    #consumes twice as much time and presents the user with no output for the
+    #first half of its execution time. This is terrible. Instead, here's what
+    #I'd like to do. Now that we have a means of concurrently capturing the
+    #stderr from a command run in the same shell, there's really no reason not
+    #to do the following:
+    #
+    #* Define a new run_code_paged_and_set_string_to_stderr() function doing
+    #  exactly that. (Should be trivial, but critically important, to define.)
+    #* Call such function below.
+    #* If such function fails, either:
+    #  * Test the captured stderr for nonemptiness. We need to experentially
+    #    confirm whether or not "grep" prints to stderr on failing to match
+    #    anything. I don't believe it does. stderr should remain empty unless a
+    #    nonfatal error occurs (e.g., broken symbolic link), in which case
+    #    "grep" complains. Hence, a nonemptiness test *SHOULD* suffice. Verify.
+    #  * Match the captured stderr, if a nonemptiness test does *NOT* suffice.
+    #    But it should, so this probably doesn't apply.
+    #  * Perform the silent dry-run attempt, below. But this is slow and lame;
+    #    so, probably don't do this.
+
+    # Silently dry-run such search before performing such search below. For
+    # numerous common cases most users would not consider to constitute fatal
+    # errors (e.g., broken symbolic links, subdirectories unreadable by the
+    # current user), "grep" when run non-silently returns failure but when run
+    # silently returns success. To avoid returning failure for non-fatal errors,
+    # dry-run such search first by running "grep" silently and fail *ONLY* if
+    # such dry-run fails. Assuming default ${ZESHY_GREP_IF_SILENT} options,
+    # such dry-run enables options "-qs".
+    #
+    # Bang-up job, esteemable "grep" authors.
+    run_code_silent_with_options 'command grep' "${run_code_args[@]}" or
+        report_status
+
+    # Perform such search. Since the prior search already guarantees non-zero
+    # exit status on fatal error, force zero exit status and hence success here.
+    run_code_with_options_configured\
+        'run_code_paged command grep' "${run_code_args[@]}" or ignore_failure
+}
+
+# ....................{ GREPPERS ~ caseless                }....................
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: bool] grep_path_caseless(
+    string pattern,
+    string pathname1, ...)
+
+Case-insensitively grep the passed paths for files with lines matching the
+passed pattern with the currently configured `grep`-specific options (e.g.,
+${ZESHY_OPTIONS_GREP}). See grep_path_with_options() for further details.
+/---
+function grep_path_caseless() {
+    die_unless_args_2_or_more 'Expected one pattern and one or more filenames.'
+    grep_path_caseless_with_options -- "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: bool]
+    grep_path_caseless_with_options(
+        string grep_option1?, ...,
+        string pattern,
+        string pathname1 = "$(get_dir)", ...)
+
+Case-insensitively grep the passed paths (defaulting to the current directory,
+if called directly from the command line) for files with lines matching the
+passed pattern with both the passed and the currently configured `grep`-specific
+options (e.g., ${ZESHY_OPTIONS_GREP}). See grep_path_with_options() for further
+details.
+/---
+function grep_path_caseless_with_options() {
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with grep_path_recursive_caseless_with_options().
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Instruct grep_path_with_options() to ignore the call to this function for
+    # purposes of testing zsh context and hence whether or not argument defaults
+    # are applicable. See is_context_cli_function() for further details.
+    ignore_context_function_call
+
+    # Grep such path(s).
+    append_list_with_list_locally_from\
+        'ZESHY_OPTIONS_GREP ZESHY_OPTIONS_GREP_IF_CASELESS'
+    grep_path_with_options "${@}"
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: bool]
+    grep_path_recursive_caseless_with_options(
+        string grep_option1?, ...,
+        string pattern,
+        string pathname1 = "$(get_dir)", ...)
+
+Recursively case-insensitively grep the passed paths (defaulting to the current
+directory, if called directly from the command line) for files with lines
+matching the passed pattern with both the passed and the currently configured
+`grep`-specific options (e.g., ${ZESHY_OPTIONS_GREP}). See
+grep_path_with_options() for further details.
+/---
+function grep_path_recursive_caseless_with_options() {
+    # See grep_path_caseless_with_options() for further details.
+    ignore_context_function_call
+    append_list_with_list_locally_from\
+        'ZESHY_OPTIONS_GREP ZESHY_OPTIONS_GREP_IF_CASELESS'
+    grep_path_recursive_with_options "${@}"
+}
+
+#FIXME: In lieu of unit tests...
+#function gree() {
+#    grep_path_recursive_caseless_with_options "$(get_home)/tmp" 'oeu'
+#}
+
+# --------------------( WASTELANDS                         )--------------------
+#FUXME: Or perhaps we don't really care about "pv" interleaving its stderr
+#output with "grep"'s stdout output.
+
+# with non-interactive options, coercing such output into
+    # raw lines rather than ANSI-embellished lines.
+#FUXME: Define is_file_line_matches_grep() and
+#is_file_line_matches_grep_recursive() to *SILENTLY* grep such paths. Don't
+#bother accepting "grep" arguments: these functions are solely for
+#non-interactive use.
+
+# While the grep_path*() family of functions accept arguments in "grep" order
+# (i.e., pattern followed by pathnames), the getter functions below accept
+# arguments in conventional zeshy order (i.e., pathnames followed by pattern) as
+# well as *NOT* paging such output.
+
+#Grep the passed paths (defaulting to the current directory) for the passed
+#case-insensitive pattern recursively with both the passed and currently
+#configured `grep`-specific options. See grep_path() for further details.
+#   append_list_with_list_locally_from\
+#       'ZESHY_OPTIONS_GREP ZESHY_OPTIONS_GREP_IF_CASELESS'
+#   grep_path "${@}"
+
+#FUXME: Hmmmm; actually, the above command could significantly alter the semantics
+#(or at least output content, which is quite relevant for scripting
+#purposes). That said, implementing a zsh analogue to the above in a *NEW*
+#function named something resembling
+#grep_path_recursive_progressively_with_options() seems an excellent idea.
+#Note this also solves the issue under default recursion of fatal errors on
+#broken symlinks and such, which is quite nice.
+
+#FUXME: Provide getter-style synonyms resembling get_file_lines_matching_grep().
+#Or perhaps just rename such functions, I should think!
+#FUXME: Sweet! O.K.; get_file_lines_matching_grep() should be a separate
+#function accepting arguments in a zeshy-style order: e.g., as
+#   string pathname1, ...,
+#   string pattern)
+#...rather than:
+#   string pattern,
+#   string pathname1, ...)
+
+# Hence, do not manually append either
+    # "." or "$(get_dir)" to the current argument list, which slightly reduces
+    # output verbosity.
+# ....................{ GETTERS ~ count                    }....................
+#FUXME: The current implementation pretty suck. Stop using "--pcre-regexp"
+#and just use the "ZESHY_OPTIONS_GREP" default. Ah; right. We can pretty much
+#cut the whole implementation and replace with a much simpler call to
+#run_code_with_options(). Out with the verbosely old; in with the briefly new!
+
+#declare_function_with_stdin <<'/---'
+#integer get_path_subpaths_matching_grep_count(
+#    string pathname1, ...,
+#    string pattern)
+#
+#Get the number of matches in the passed string. Among other uses, this
+#function counts occurrences of characters and substrings in strings: e.g.,
+#
+#    #FUXME: Uhm, what? Did I eat the rest of this example?
+#    >>> get_grep_match_count
+#    2
+#/---
+#function get_path_subpaths_matching_grep_count() {
+#    #FUXME: Uhm; what? The function signature fails to correspond to the current
+#    #implementation. *UGH* <~~~ our feelings in relation to this function
+#    # Validate sanity.
+#    die_unless_args_2_or_more\
+#        'Expected one or more pathnames and one grep expression.'
+#    string pattern="${@[-1]}" string_newlined
+#    pop_arg
+#
+#    #FUXME: This is *TERRIBLE*. No, really. ${string} used to be a single passed
+#    #path. But we now accept any number of passed paths, so this doesn't apply.
+#    #Did I also mention it's terrible?
+#
+#    # Escape """ and "~" characters in the passed string, in preparation for
+#    # replacement by "sed".
+#    string="${string//\"/\\\"}"
+#    string="${string//\~/\\~}"
+#
+#    # This exceptionally clever (and frankly obscene) logic comes inspired by
+#    # StackOverflow user "user216915" via this question:
+#    #
+#    #     http://stackoverflow.com/questions/1781329/count-the-number-of-occurrences-of-a-string-using-sed
+#    #
+#    # Sadly, neither sed, awk, grep, or zsh itself have any coherent means of
+#    # matching individual occurences regardless of newline; rather, they only
+#    # match each such occurence as a newline-specific group. This hack uses this
+#    # newline obsession by replacing each match with that match suffixed by a
+#    # newline. This guarantees no more than one match occupies each line.
+#    #
+#    # Finally, feeding the result into "grep -c" counts the number of such lines
+#    # and hence the number of matches. (Yeth, this sucketh mightily.)
+##   print "sed expression: s/${(q)pattern}/${(q)pattern}\n/g"
+#    string_newlined="$(print "${string}" | sed --patternp-extended "s~(${pattern})~\1\n~g")"
+##   die_unless_ok "string \"${string}\" or regular expression \"${pattern}\" malformed"
+##   print "string_newlined: ${string_newlined}"
+#
+#    # If "sed" said nothing, then neither should we.
+#    if { is "${string}" == "${string_newlined}" si } {
+#        return_string 0
+#    } else {
+#        :string.output "${string_newlined}" |
+#            command grep --perl-patternp --count "${pattern}"
+#    }
+#}
+
+#FUXME: For simplicity, grep_path() functions should simply defer to
+#get_file_lines_matching_grep() functions by reversing their argument order.
+#Done!
+
+# returning success if all such files exist _and_ at least one such file matches
+#and failure otherwise
+
+#FUXME: To comply with zeshy nomenclature, globally rename "\bgrep_path" to
+#"is_path_matches_grep". This is important, as we'll probably eventually add
+#"is_path_matches_glob" and "is_path_matches_pcre" variants of such functions.
+
+#FUXME: Globally rename "_recursive" to "_recursive" and "_caseless" to
+#"_caseless".
+    #FUXME: Fix default option handling. Not quite sure how, however. The
+    #simplest solution would be to define a boolean local
+    #${ZESHY_IS_CONTEXT_CLI_FUNCTION} here defined according to the state of
+    #is_context_cli_function() in this function *AND* then to change the
+    #conditional test in grep_path_recursive_with_options() to:
+    #
+    #    if { is_context_cli_function or
+    #       (( ${ZESHY_IS_CONTEXT_CLI_FUNCTION-0} )) {
+    #FUXME: Such functionality should be extended to grep_path_with_options() as
+    #well.
+
+#FUXME: Rename to something consonant with zeshy nomenclature -- say,
+#get_path_
+
+#While
+#grep_path() returns success only if at least one such file matches such pattern,
+#this function _always_ returns success to avoid unhelpful exceptions .
+
+    #FUXME: It'd actually be better to run the first grep with a progress bar of
+    #some sort.
+#   join_list_on_newline ZESHY_OPTIONS_GREP
+#FUXME: Re-enable after improving grep_path() for safety. We need grep_path()
+#to succeed on receiving piped input: e.g.,
+#
+#  find /bin /sbin /usr/bin /usr/sbin -type l | xargs ls -l | grep busybox
+#
+#The prior command currently fails. Prefixing `grep` with "command" succeeds,
+#however. Hence, something is awry. Ah, yes -- it's fairly obvious: `grep`
+#either requires file arguments or standard input and no arguments. But die_*()
+#aliases set arguments, by default. So, we need to cease using die_*(), test the
+#passed args manually, test if stdin is piped (:is_stdin_pipe), and if so
+#propagate the pipe on to grep. Since this is becoming a common theme, perhaps:
+#
+#  alias propagate_piped_input='cat /dev/stdin |'  # --OR--
+#  alias run_code_with_stdin_piped='cat /dev/stdin |'   # --OR--
+#  alias run_code_with_stdin_piped='cat /dev/stdin |'
+#
+#Yeah. The latter one rocks. Let's adopt that one.
+
+#alias_cli_substitution {g}rep='grep_path'
+
+# ....................{ GREP ~ old                         }....................
+#FUXME: Again, this is terrible. We really want to be using run_code_with_options().
+#FUXME: The order of arguments is wrong. Shift the paths to before the pattern.
+#declare_function '
+#string grep_path_caseless(string grep_arg1, string grep_arg2, ...)
+#
+#Match the contents of the passed files against the passed `grep` pattern case-
+#insensitively.
+#'
+#function grep_path_caseless() {
+#    # Append "-i" to ${ZESHY_OPTIONS_GREP} for the duration of this call.
+#    list zeshy_grep_options; zeshy_grep_options=( "${ZESHY_OPTIONS_GREP[@]}" -i )
+#    list ZESHY_OPTIONS_GREP; ZESHY_OPTIONS_GREP=( "${zeshy_grep_options[@]}" )
+#    grep_path "${@}"
+#}
+
+# ....................{ GREP ~ recursive                   }....................
+#declare_function '
+#string grep_path_recursive_caseless(
+#  string pattern, string pathname = "$(get_dir)")
+#
+#Recursively match the contents of all files in the passed paths (defaulting to
+#the current working directory) against the passed `grep` pattern case-
+#insensitively.
+#'
+#function grep_path_recursive_caseless() {
+#    # Append "-ri" to ${ZESHY_OPTIONS_GREP} for the duration of this call.
+#    list zeshy_grep_options; zeshy_grep_options=( "${ZESHY_OPTIONS_GREP[@]}" -ri )
+#    list ZESHY_OPTIONS_GREP; ZESHY_OPTIONS_GREP=( "${zeshy_grep_options[@]}" )
+#    is_args_1 and :arg.append "${PWD}"
+#    grep_path "${@}"
+#}
+
+#FUXME: The grep_path_recursive() implementation should just defer to
+#grep_path_recursive_with_options() much like in "list".
+
+#declare_function '
+#string grep_path_old(string pattern, string pathname1, string pathname2, ...)
+#
+#Match the contents of the passed pathnames (defaulting to all plain files in
+#the current directory) against the passed grep expression: e.g.,
+#
+#    # Grep all text files in the current directory for the passed string.
+#    >>> grep_path "Matthew*Sobol"
+#'
+#function grep_path_old() {
+    # Mimic run_code_with_options(). Unfortunately, grep's eccentric runtime behavior
+    # precludes our calling that function directly.
+#    die_unless_args 'expected at least one grep pattern'
+#    list grep; grep=( command grep "${ZESHY_OPTIONS_GREP[@]}" )
+
+#    if is_shell_interactive
+#    then grep+=( "${ZESHY_OPTIONS_GREP_IF_SHELL_INTERACTIVE[@]}" )
+#    else grep+=( "${ZESHY_OPTIONS_GREP_IF_SHELL_NONINTERACTIVE[@]}" )
+#    fi
+
+    #FUXME: Should really be all plaintext plain files. Unsure how to test
+    #efficiently... grep the forums.
+    # Default to all plaintext files in the current directory, if needed.
+#    is_args_1 and :arg.append "${^PWD}/"*(.)
+
+    #FUXME: Clever, but insufficient. Unfortunately, conditional
+    #'if "${grep[@]}" -qs -- "${(q)@}"' still fails when called recursively
+    #and at least one subdirectory of a passed directory is not readable by the
+    #current user, in the same way that "ls" fails. This is silly. The solution
+    #is the same as under "ls": exclude paths to which the current user has no
+    #permissions or which are broken symbolic links. (It'd be helpful to print
+    #warning messages for each excluded path, but by no means necessary under an
+    #initial implementation. Actually, this shouldn't be terribly hard to
+    #implement, no? Since we'd like to perform such printing elsewhere, we'd
+    #probably want to encapsulate such printing as an alias or function.
+    #Consider.)
+    #FUXME: This is pointless for non-recursive operation, since we can simply
+    #manually exclude broken symbolic links and non-readable files. That said,
+    #we probably shouldn't do *ANY* of that for non-recursive operation. When
+    #non-recursive, users expect actual errors on such files... so, shift all of
+    #this to grep_path_recursive().
+    #FUXME: Actually, this block works to ignore both broken links and non-
+    #readable paths, which is quite sweet. Cleverness. Definitely preserve for
+    #recursive use.
+
+    # Grep such paths. Since `grep` fails if at least one of the passed paths is
+    # a broken symbolic link despite such links *NOT* signifying a true `grep`
+    # failure, ignore such links by preemptively running the same `grep` command
+    # with additional options "-qs" squelching output. Such preemptive  and hence only helpful in returning the proper exit code.Since `grep` fails to emit helpful messages on failure,
+    # do so. Unfortunately, detecting failure is more cumbersome than it need
+    # be. 
+    # # For efficiency, perform such testing prior to running the real `grep`
+    # command printing proper output. If such testing succeeds, force `grep`
+    # to return success. (Yes, this is all incredibly, indelibly non-
+    # sensical. Thanks, GNU `grep`. Bang-up job there.)
+    #
+    # For safety, quote-protect the sanity. (Otherwise, `grep` fails
+    # to receive whitespace in grep expressions.)
+#    if "${grep[@]}" -qs -- "${(q)@}"
+#       print_message "running \"${grep[@]} -- ${@}\" paged..."
+#    then run_code_paged "${grep[@]}" -- "${(q)@}" or true
+    #FUXME: Truncate such list to produce reasonable output.
+#    else :die\
+#        "\"${1}\" not found in $(join_strings_readable: "${@[2,-1]}")"
+#    fi
+#}
+
+    #FUXME: Actually, I bet we can do this by reconstituting the bloody thing
+    #twice. It's not *TOO* heavy-weight, is it? Just give it a go. Because this
+    #is way too heavy-weight on the developer end.
+
+    #FUXME: It'd be nice to return the actual failure code. I believe we could
+    #run the above statement in a subshell preceded by run_code_and_get_status(),
+    #yes? Come to think, it'd be devilishly easy to define a new
+    #run_code_silent_with_options_and_get_status() function.
+    #FUXME: Ah; actually, it'd be much simpler to define a new
+    #return_prior_status_if_nonzero<> alias. Note this alias should expand
+    #to true otherwise, to allow the above conditional to continue working.
+#   else report_failure
+#   fi
+
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    #NEW, but old
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Mimic run_code_with_options(). Unfortunately, the eccentric runtime behavior of
+    # POSIX `grep` precludes calling that function directly. AND NOW YOU KNOW
+    # WHY WE DON'T MANUALLY RE-IMPLEMENT run_code_with_options(), EVERYWHERE.
+    #
+    # Validate sanity. If passed only a pattern, note that `grep`
+    # already defaults to the current directory. Hence, do not manually append
+    # either "." or "$(get_dir)" to the current argument list, which
+    # slightly reduces output verbosity.
+#   die_unless_args_1_or_more 'expected one pattern and optional paths'
+
+    # Command to be run.
+#   list command__gprwo
+
+    # If passed piped input, propagate such input to the command to be run.
+#   :is_stdin_pipe and command__gprwo+=( cat '/dev/stdin' \| )
+
+    # Append the actual command.
+#   command__gprwo+=( command grep )
+
+    # List of option list names to be interpolated below.
+#   list options_list__gprwo; options_list__gprwo=( ZESHY_OPTIONS_GREP )
+
+    # If an options list with name corresponding to whether the current shell is
+    # interactive or not exists, append such name to the passed list of such
+    # names if such list exists.
+#   string options_list_name__gprwo
+#   if is_shell_interactive
+#   then options_list_name__gprwo="ZESHY_OPTIONS_GREP_IF_SHELL_INTERACTIVE"
+#   else options_list_name__gprwo="ZESHY_OPTIONS_GREP_IF_SHELL_NONINTERACTIVE"
+#   fi
+#   :var.is_type_list "${options_list_name__gprwo}" and
+#       options_list__gprwo+="${options_list_name__gprwo}"
+
+    # For each options list name, append the contents of such list to such
+    # command or print a warning if no such list exists.
+#   for options_list_name__gprwo ("${options_list__gprwo[@]}") {
+#       if :var.is_type_list "${options_list_name__gprwo}"
+#       then command__gprwo+=( "${(@P)options_list_name__gprwo}" )
+#       else print_warning "\"${options_list_name__gprwo}\" not a list"
+#       fi
+#   }
+
+    # Append all remaining sanity to such command.
+#   command__gprwo+=( "${(q)@}" )
+
+    # Grep such paths. Since `grep` fails if at least one of the passed paths is
+    # a broken symbolic link despite such links *NOT* signifying a true `grep`
+    # failure, ignore such links by preemptively running the same `grep` command
+    # with additional options "-qs" squelching output. Such preemptive  and hence only helpful in returning the proper exit code.Since `grep` fails to emit helpful messages on failure,
+    # do so. Unfortunately, detecting failure is more cumbersome than it need
+    # be. 
+    #
+    # For efficiency, perform such testing prior to running the real `grep`
+    # command printing proper output. If such testing succeeds, force `grep`
+    # to return success. (Yes, this is all incredibly, indelibly non-
+    # sensical. Thanks, GNU `grep`. Bang-up job there.)
+    #
+    # For safety, quote-protect the sanity. (Otherwise, `grep` fails
+    # to receive whitespace in grep expressions.)
+#   if "${command__gprwo[@]}" -qs -- "${(q)@}"
+#       print_message "running \"${grep[@]} -- ${@}\" paged..."
+#   then run_code_paged "${command__gprwo[@]}" -- "${(q)@}" or true
+    #FUXME: Truncate such list to produce reasonable output.
+#   else :die\
+#       "\"${1}\" not found in $(join_strings_readable: "${@[2,-1]}")"
+#   fi
+
+    # Grep such paths.
+#   :string.output "run_code_with_options: \"${command__rwo[*]}\"..."
+#   run "${command__gprwo[@]}"
+
+    # Grep such paths.
+#   run_code_with_options_configured 'command grep' ZESHY_OPTIONS_GREP "${(q)@}"
+
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    #OLD
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Mimic run_code_with_options(). Unfortunately, grep's eccentric runtime behavior
+    # precludes our calling that function directly.
+#   die_unless_args 'expected at least one grep pattern'
+#   list grep; grep=( command grep "${ZESHY_OPTIONS_GREP[@]}" )
+
+#   if is_shell_interactive
+#   then grep+=( "${ZESHY_OPTIONS_GREP_IF_SHELL_INTERACTIVE[@]}" )
+#   else grep+=( "${ZESHY_OPTIONS_GREP_IF_SHELL_NONINTERACTIVE[@]}" )
+#   fi
+
+    #FUXME: Should really be all plaintext plain files. Unsure how to test
+    #efficiently... grep the forums.
+    # Default to all plaintext files in the current directory, if needed.
+#   is_args_1 and :arg.append "${^PWD}/"*(.)
+
+    #FUXME: Clever, but insufficient. Unfortunately, conditional
+    #'if "${grep[@]}" -qs -- "${(q)@}"' still fails when called recursively
+    #and at least one subdirectory of a passed directory is not readable by the
+    #current user, in the same way that "ls" fails. This is silly. The solution
+    #is the same as under "ls": exclude paths to which the current user has no
+    #permissions or which are broken symbolic links. (It'd be helpful to print
+    #warning messages for each excluded path, but by no means necessary under an
+    #initial implementation. Actually, this shouldn't be terribly hard to
+    #implement, no? Since we'd like to perform such printing elsewhere, we'd
+    #probably want to encapsulate such printing as an alias or function.
+    #Consider.)
+    #FUXME: This is pointless for non-recursive operation, since we can simply
+    #manually exclude broken symbolic links and non-readable files. That said,
+    #we probably shouldn't do *ANY* of that for non-recursive operation. When
+    #non-recursive, users expect actual errors on such files... so, shift all of
+    #this to grep_path_recursive().
+    #FUXME: Actually, this block works to ignore both broken links and non-
+    #readable paths, which is quite sweet. Cleverness. Definitely preserve for
+    #recursive use.
+
+    # Grep such paths. Since `grep` fails if at least one of the passed paths is
+    # a broken symbolic link despite such links *NOT* signifying a true `grep`
+    # failure, ignore such links by preemptively running the same `grep` command
+    # with additional options "-qs" squelching output. Such preemptive  and hence only helpful in returning the proper exit code.Since `grep` fails to emit helpful messages on failure,
+    # do so. Unfortunately, detecting failure is more cumbersome than it need
+    # be. 
+    #
+    # For efficiency, perform such testing prior to running the real `grep`
+    # command printing proper output. If such testing succeeds, force `grep`
+    # to return success. (Yes, this is all incredibly, indelibly non-
+    # sensical. Thanks, GNU `grep`. Bang-up job there.)
+    #
+    # For safety, quote-protect the sanity. (Otherwise, `grep` fails
+    # to receive whitespace in grep expressions.)
+#   if "${grep[@]}" -qs -- "${(q)@}"
+#       print_message "running \"${grep[@]} -- ${@}\" paged..."
+#   then run_code_paged "${grep[@]}" -- "${(q)@}" or true
+    #FUXME: Truncate such list to produce reasonable output.
+#   else :die\
+#       "\"${1}\" not found in $(join_strings_readable: "${@[2,-1]}")"
+#   fi
+
+#Since `grep` fails to emit helpful messages on failure,
+    # do so. Unfortunately, detecting failure is more cumbersome than it need
+    # be. 
+    #
+    # For efficiency, perform such testing prior to running the real `grep`
+    # command printing proper output. If such testing succeeds, force `grep`
+    # to return success. (Yes, this is all incredibly, indelibly non-
+    # sensical.#
+#   if run_code_silent_with_options 'command grep' ZESHY_OPTIONS_GREP "${(q)@}"
+#       run_code_with_options_configured\
+#           'run_code_paged command grep' ZESHY_OPTIONS_GREP "${(q)@}" or
+#           true
+#declare_function '
+#string grep_path_recursive(
+#  string pattern, string pathname = "$(get_dir)")
+#
+#Recursively match the contents of all files in the passed paths (defaulting to
+#the current working directory) against the passed `grep` pattern.
+#'
+#function grep_path_recursive() {
+#    # Append "-r" to ${ZESHY_OPTIONS_GREP} for the duration of this call.
+#    list zeshy_grep_options; zeshy_grep_options=( "${ZESHY_OPTIONS_GREP[@]}" -r )
+#    list ZESHY_OPTIONS_GREP; ZESHY_OPTIONS_GREP=( "${zeshy_grep_options[@]}" )
+#    is_args_1 and :arg.append "${PWD}"
+#    grep_path "${@}"
+#}
+
+    # For safety, quote-protect the sanity. (Otherwise, `grep` fails
+    # to receive whitespace in grep expressions.)
+#
+#FUXME: If passed no paths, default to "." rather than "$(get_dir)"; the
+#former produces much shorter and hence more intelligible path output.
+#FUXME: Interesting; when using option "-r", we don't need to provide any
+#default. `grep` implicitly greps the current directory. Not passing even "."
+#has the added marginal benefit of reducing output by two characters each line.
+#Helpful, if not earth shatteringly so!
+#FUXME: grep_path_recursive_with_options() should not deferring to calling
+#grep_path_with_options(), by the first FUXME above.
+    # also pass the current
+    # directory as "." rather than "$(get_dir)" to reduce output
+    # verbosity.
+#   set_integers_to_arg_nonoption_count arg_nonoption_count
+#   (( arg_nonoption_count == 1 )) and :arg.append '.'
+#It would help if we
+#first improve is_shell_interactive() to note that commands in the middle of a
+#pipeline (e.g., the `grep` in "cat /tmp/oeu | grep humu | sort -r") are
+#non-interactive. Readily testable with "[[ -p /dev/stdout ]]", I expect.) Or
+#does zsh ensure that already? Probably not. Test. Whatever the fix, we'll also
+#need adjust alias_cli() to accomodate such changes.
+#
+#Then,#   is_args_1 and :arg.append "${^PWD}/"*
+#   die_unless_args 'expected at least one grep expression'
+#   string grep_pattern="${1}"
+#   shift_arg
+#   grep -r "${grep_pattern}" "${@:-${PWD}}"
+
+#       then print_message "grepping ${grep[@]} -qs ${@}..."; run_code_paged "${grep[@]}" "${@}"
+#       then "${grep[@]}"     "${@}"
+
+    #FUXME: Truncate the list of files to seem reasonable length. We'll probably
+    #need a new trivial "type/string/string" function for this.
+
+    #FUXME: Terrible. See related "FUXME" comments elsewhere.
+    # If the topmost function on the function stack is `grep`-specific,
+    # the current user called this function directly from the command-line.
+
+#       if (( ${#funcstack} == 1 )) or is "${funcstack[-2]}" == grep* si
+#FUXME: Obsolete.
+    # Call is_shell_interactive() rather than is_shell_interactive_directly(). The embedded
+    # conditional below implicitly implements the latter, already.
+#   if is_shell_interactive; then
+
+    # If running non-interactively, pass *NO* Zeshy-specific options to `grep`.
+    # Doing so breaks non-interactive shell scripts and functions expecting
+    # default (and arguably broken) `grep` behavior.
+#   else command grep "${@}"
+#   fi
+
+# Please note that `grep` fails with error if at least one of the passed files
+# is a broken symbolic link, even if when passing symbolic brokens
+
+#grep_caseless() {
+#    die_unless_args_2_or_more\
+#        'expected at least one grep pattern and filename'
+#
+##    # See alias_cli().
+#    disable_function grep
+#    if is_shell_interactive; then
+#        if (( #funcstack == 1 ))
+#        then grep --ignore-case "${ZESHY_OPTIONS_GREP_IF_SHELL_INTERACTIVE[@]}" "${@}"
+#        else grep --ignore-case "${ZESHY_OPTIONS_GREP[@]}" "${@}"
+#        fi
+#    # If running non-interactively, pass *NO* Zeshy-specific options to `grep`.
+#    # Doing so breaks non-interactive shell scripts and functions expecting
+#    # default `grep` behavior (e.g., basic patterns).
+#    else grep "${@}"
+#    fi
+#    enable_function grep
+#}
+#
+## ....................{ RECURSIVE                          }....................
+##FUXME: Reimplement to resemble the implementation of grep(), above.
+## string grep_recursive(string pattern, string path)
+##
+## Recursively match all file contents under the passed path against the passed
+## POSIX-style regular expression. If no path is passed, this recursively matches
+## under the current path. Thusly, the simplest usage of this shell script is:
+##
+##   # Find all text files whose contents match "Wisdom ~ \d\d ~ Outlays".
+##   >>> grep-recursively 'Wisdom ~ \d\d ~ Outlays'
+#grep_recursive() {
+#    die_unless_args 'expected at least a regular expression'
+#    string grep_pattern="${1}"; shift
+#
+##   print_message 'grepping...'
+#    run_code_paged grep\
+#        --recursive "${ZESHY_OPTIONS_GREP_IF_SHELL_INTERACTIVE[@]}"\
+#        "${grep_pattern}" "${@:-${PWD}}"
+#}
+#
+## string grep_caseless_recursive(string pattern, string path)
+##
+## Recursively match all file contents under the passed path against the passed
+## POSIX-style regular expression, case-insensitively.
+#grep_caseless_recursive() {
+#    die_unless_args 'expected at least a regular expression'
+#    string grep_pattern="${1}"; shift
+#
+##   print_message 'grepping case-insensitively...'
+#    run_code_paged grep\
+#        --recursive "${ZESHY_OPTIONS_GREP_IF_SHELL_INTERACTIVE[@]}" --ignore-case\
+#        "${grep_pattern}" "${@:-${PWD}}"
+#}
+#
+#list ZESHY_OPTIONS_GREP_MORE
+#alias_cli gr="grep ${ZESHY_OPTIONS_GREP_IF_SHELL_INTERACTIVE[@]}"
+#alias_cli gri="grep ${ZESHY_OPTIONS_GREP_IF_SHELL_INTERACTIVE[@]}"
+
+# This
+#   includes the standard retinue of *NIX commands, like "awk", `grep`, "sed", 
+#   and so forth.
+        #as a directory, ignoring non-text files, dotfiles, and \"test\" subdirectories..."
+#FUXME: Bizarre. "grep --include" does absolutely nothing. O_o
+#alias grg="grep_glob"
+#alias grgi="grep_glob_insensitively"
+#
+## string grep_glob(string grep_pattern, string glob_expression)
+##
+## Grep all files matching the passed glob expression (e.g., "*.txt") against the
+## passed grep pattern (e.g., "^unity in faith$").
+#grep_glob() {
+#    [[ ${#} -eq 1 || ${#} -eq 2 ]] ||
+#        :die "expected at least one regular expression"
+#
+#    local grep_pattern="${1}"
+#    local glob_pattern="${2:-*.txt}"
+#
+#    print_message "grepping \"${glob_pattern}\"..."
+#    grep --include "${glob_pattern}" ${=ZESHY_OPTIONS_GREP}\
+#        "${grep_pattern}" | "${PAGER}"
+#}
+#
+## string grep_glob_insensitively(string grep_pattern, string glob_expression)
+##
+## Grep all files matching the passed glob expression (e.g., "*.txt") against the
+## passed grep pattern (e.g., "^unity in faith$") insensitively.
+#grep_glob_insensitively() {
+#    [[ ${#} -eq 1 || ${#} -eq 2 ]] ||
+#        :die "expected at least one regular expression"
+#
+#    local grep_pattern="${1}"
+#    local glob_pattern="${2:-*.txt}"
+#
+#    print_message "grepping \"${glob_pattern}\" case-insensitively..."
+#    grep --include="${glob_pattern}" ${=ZESHY_GREP_INSENSITIVELY_OPTIONS}\
+#        "${grep_pattern}"
+#}

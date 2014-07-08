@@ -1,0 +1,571 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle file compression and decompression.
+/---
+
+#FIXME: Pursue a dynamic function calling approach rather than inefficient
+#"case" statements, as under @{metadata}.
+#FIXME: Actually, @{metadata} shouldn't be implementing a dynamic function
+#approach either. Imagine how many bloody functions we'll need to implement for
+#the permutation of all possible filetypes and archive operations. While it *IS*
+#feasible, it would heavily pollute the global function namespace *AND* slow
+#down both digest compilation and zeshy startup by a non-negligible amount.
+#Moreover, imagine trying to ever refactor such functions in the event of an
+#API change. The whole approach is sheer over-engineered madness, really.
+#
+#So, is there a better way. *OF COURSE THERE IS.* Use maps from media type
+#strings to single-quoted code. I'm serious. This is *CLEARLY* the best of all
+#possible approaches. It's highly efficient, unlike a "case" statement. It also
+#permits third-party extension, again unlike a "case" statement. But neither is
+#a single map nearly as heavyweight as an ungodly set of independent functions.
+#
+#I mean, really. Take a gander at this awesomeness:
+#
+#  map ZESHY_PRINT_ARCHIVE_FILETYPE_GLOB_TO_CODE=(
+#      '7z'                        'command 7za l -- "${filename}"'
+#      '(bz|bz2)'                  'command bunzip2 -tv -- "${filename}"'
+#      'tar'                       'command tar -tvf "${filename}"'
+#      '(tar.bz2|tbz|tbz2)'        'command tar -tvjf "${filename}"'
+#      '(tar.gz|tgz)'              'command tar -tvzf "${filename}"'
+#      '(tar.lzma|tar.xz|tlz|txz)' 'command tar -tvJf "${filename}"'
+#  )
+#
+#Clearly, we want to use media types rather than filetypes. But the overall
+#thrust still stands: this is patently the ideal implementation pattern for
+#dispatching filetype-specific code. Just *LOOK* at that terseness and
+#efficiency. Gotta love the knife that cuts cleanly.
+#FIXME: Actually, the "file" command is almost certainly incapable of reliably
+#detecting one or more archive media types. The above filetype glob approach is
+#the only reliable approach, after all. Great! That said, efficient lookup has
+#gone out the window. Hmm; what if the keys of such map are null-delimited lists
+#rather than actual globs? In that case... Well, O.K.; that *WOULD* be more
+#efficient, but we can still do better, and more simply at that. How about:
+#
+#    () {
+#        map_global ZESHY_PRINT_ARCHIVE_FILETYPE_TO_CODE
+#
+#        if { is_pathable 7za } {
+#            ZESHY_PRINT_ARCHIVE_FILETYPE_TO_CODE[7z]='command 7za l -- "${filename}"'
+#        }
+#        if { is_pathable bunzip2 } {
+#            ZESHY_PRINT_ARCHIVE_FILETYPE_TO_CODE[bz2]='command bunzip2 -tv -- "${filename}"'
+#        }
+#
+#        #FIXME: Probably want to generalize this to a new map function -- say,
+#        #add_map_key_synonyms().
+#
+#        :list synonyms='bz2 bz'
+#        :string canonical synonym
+#        for     canonical synonym ("${synonyms[@]}") {
+#            ZESHY_PRINT_ARCHIVE_TO_CODE[synonym}]="${ZESHY_PRINT_ARCHIVE_TO_CODE[${canonical}]}"
+#        }
+#    }
+#
+#Ruthlessly simple *AND* efficient. Right. The obvious way to go. So, let's go!
+
+#FIXME: *UGH*. We'll want to extract all options into corresponding lists. For
+#sanity, I'd rather not have one list per archive type per operation type (e.g.,
+#${ZESHY_7Z_OPTIONS_IF_LISTING}). We'd be looking at at least 30 lists. That
+#said, it is the orthogonal approach, and clearly delineates shell words.
+#Alright; alright. Let's go heavyweight, here. Fuck it: make a new config file
+#"if_config/archive" containing one list per archive type per operation type:
+#e.g., ${ZESHY_OPTIONS_PRINT_ARCHIVE_7Z}, ${ZESHY_OPTIONS_MAKE_ARCHIVE_7Z}, and
+#${ZESHY_OPTIONS_EXTRACT_ARCHIVE_7Z}. While I'd prefer a shorter verb than
+#"extracting", I'm afraid there really isn't one without losing specificity;
+#"opening", for example, is bad, as printing an archive temporarily "opens" that
+#archive without necessarily extracting from it.
+#FIXME: Alternately, we could simply define map globals resembling
+#${ZESHY_OPTIONS_PRINT_ARCHIVE_COMMAND_TO_ARGS} defined as follows:
+#
+#    map ZESHY_OPTIONS_PRINT_ARCHIVE_COMMAND_TO_ARGS
+#    ZESHY_OPTIONS_PRINT_ARCHIVE_COMMAND_TO_ARGS=(
+#       'bz2' '-tv'
+#    )
+#
+#This strikes me as fundamentally saner. After all, defining excessively many
+#globals will negatively impact performance -- and the above approach *SHOULD*
+#suffice.
+
+# ....................{ PRINTERS                           }....................
+declare_function_with_stdin <<'/---'
+[stdout: string, status: bool] print_archive(string filename1, ...)
+
+Print a human-readable synopsis of the passed archive files and contents of such
+files. If any such file is _not_ a recognized archive type, a warning is
+printed, all other files are printed, and failure is returned.
+/---
+function print_archive() {
+    # Validate sanity.
+    die_unless_args 'Expected one or more filenames.'
+    :string filetype
+    :int exit_status="${ZESHY_STATUS_SUCCESS}"
+
+    # Print such archives.
+    :string filename
+    for     filename ("${@}") {
+        #FIXME: If no filetype, use "file" to attempt to magically ascertain its
+        #MIME type and hence filetype. This also goes for the "*)" below. This
+        #requires calling get_file_type_if_found() instead, here.
+        filetype="$(get_file_type "${filename}")"
+
+        # Print such archive.
+        print_message_item "Listing \"${filename}\"..."
+        case "${filetype}" {
+        7z)
+            command 7za l -- "${filename}";;
+        #FIXME: I'm unsure there *IS* a list function for plain "bzip2"
+        #archives, mostly as they're structureless in the filesystem sense.
+        #This is probably the best we can do. At least it verifies the
+        #integrity of the passed archive.
+        bz|bz2)
+            command bunzip2 -tv -- "${filename}";;
+#           cpio)
+#               command cpio -idmv < "${file_name}";;
+#           gz)
+#               command gunzip -c "${filename}" >\
+#                   "$(remove_string_suffix "${filename}" '.gz')";;
+#           lzma)
+#               command unlzma "${filename}";;
+#           rar)
+#               command unrar x "${filename}";;
+        # "tar" erroneously treats "--" as a filename rather than separator!
+        tar)
+            command tar -tvf "${filename}";;
+        tar.bz2|tbz|tbz2)
+            command tar -tvjf "${filename}";;
+        tar.gz|tgz)
+            command tar -tvzf "${filename}";;
+        tar.lzma|tar.xz|tlz|txz)
+            command tar -tvJf "${filename}";;
+#           xz)
+#               command unxz "${filename}";;
+#           zip|jar|cbz)
+#               command unzip "${filename}";;
+#           Z)
+#               command uncompress -v "${filename}";;
+        # Else, such file is *NOT* a recognized archive. Print a warning and
+        # return failure after printing all other files.
+        *)
+            :print_warning_item "\"${filename}\" not a recognized archive."
+            exit_status="${ZESHY_STATUS_FAILURE}";;
+        }
+    }
+
+    # Report such exit status.
+    report_integer ${exit_status}
+}
+
+# ....................{ EXTRACTORS                         }....................
+#FIXME: Modify for multi-part RAR files. When passed such files, *ONLY* the
+#first part should actually be extracted from, as "unrar" implicitly extracts
+#from *ALL* parts simply on being passed the first; all other parts should be
+#ignored (i.e., removed from the passed argument list).
+
+declare_function_with_stdin <<'/---'
+[status: boolean] extract_archive(string filename1, ...)
+
+*Extract* (i.e., decompress) the passed archive files into the current working
+directory. If any such file is _not_ a recognized archive type, a warning is
+printed, all other files are extracted, and failure is returned.
+/---
+function extract_archive() {
+    # Validate sanity.
+    die_unless_args 'Expected one or more filenames.'
+    :string filetype
+    :int exit_status="${ZESHY_STATUS_SUCCESS}"
+
+    # Extract such archives.
+    :string filename
+    for     filename ("${@}") {
+        #FIXME: If no filetype, use "file" to attempt to magically ascertain its
+        #MIME type and hence filetype. This also goes for the "*)" below. This
+        #requires calling get_file_type_if_found() instead, here.
+        #FIXME: Filetypes should either be forced to lowercase here or tested
+        #case-insensitively below.
+        #FIXME: Copy such changes to all other such functions.
+
+        filetype="$(get_file_type "${filename}")"
+#       print "filetype: ${filetype}"
+
+        # Extract such archive.
+        print_message_item "Extracting \"${filename}\"..."
+        case "${filetype}" {
+        7z)
+            command 7za x -- "${filename}";;
+        # Dismantled, this is:
+        #
+        # * "-k", preventing deletion of input files. (WUT!?!?!?!?!?!?!?!?!?!?!)
+        # * "-v", printing verbosely.
+        bz|bz2)
+            command bunzip2 -kv -- "${filename}";;
+        cpio)
+            command cpio -idmv < "${file_name}";;
+        gz)
+            :string filename_trg="${filename}"
+            remove_string_suffix filename_trg '.gz'
+            command gunzip -c -- "${filename}" > "${filename_trg}";;
+        lzma)
+            command unlzma -- "${filename}";;
+        # Pass option "x" rather than "e" to "unrar". The former preserves
+        # subdirectory structure; the latter does not.
+        rar)
+            command unrar x -- "${filename}";;
+        #FIXME: "tar" fails to display incremental progress. Happily, we can
+        #circumvent this with the following simple "pv"-based pipeline (if
+        #"pv" is pathable, of course!):
+        #    command pv "${filename}" | command tar -xvzf -
+        # "tar" erroneously treats "--" as a filename rather than separator!
+        tar)
+            command tar -xvf "${filename}";;
+        tar.bz2|tbz|tbz2)
+            command tar -xvjf "${filename}";;
+        tar.gz|tgz)
+            command tar -xvzf "${filename}";;
+        tar.lzma|tar.xz|tlz|txz)
+            command tar -xvJf "${filename}";;
+        xz)
+            command unxz -- "${filename}";;
+        #FIXME: Interesting! "unzip" is, by modern measures, rather outdated. In
+        #particular, most stable versions of "unzip" in the wild are unable to
+        #handle password-protected zip files, failing with:
+        #"unsupported compression method 99".
+        #Happily, "7z" *DOES* properly handle such files! So, prefer "7z" for
+        #unzipping zip files and fallback to "unzip" only if necessary.
+        zip|jar|cbz)
+            command unzip -- "${filename}";;
+        Z)
+            command uncompress -v -- "${filename}";;
+        # Else, such file is *NOT* a recognized archive. Print a warning and
+        # return failure after printing all other files.
+        *) 
+            :print_warning_item "\"${filename}\" not a recognized archive."
+            exit_status="${ZESHY_STATUS_FAILURE}";;
+        }
+    }
+
+    # Report such exit status.
+    report_integer ${exit_status}
+}
+
+# ....................{ MAKERS                             }....................
+#FIXME: Improve documentation on defaults.
+#FIXME: Add a make_archive_encrypted() function, leveraging "if_installed/7z".
+#FIXME: Defaults would *DEFINITELY* benefit from configurable options lists.
+
+declare_function_with_stdin <<'/---'
+void make_archive(
+    string source_pathname1 = "$(get_dir)", ...,
+    string target_filename =
+        "$(get_path_basename "$(:get_path_canonical "${source_pathname1}")").tar.bz2")
+
+Archive the passed source paths (defaulting to the current directory, if called
+directly from the command line) into the passed target archive file (defaulting
+to the basename of the first passed source path suffixed by `tar.bz2`).
+/---
+function make_archive() {
+    # Validate sanity.
+    if { is_context_cli_function } {
+        # If passed no arguments, default the source path to the current directory.
+        if { is_args_0 } {
+            :args.set "$(get_dir)"
+        }
+
+        #FIXME: Default instead to the "best" canonical compressor available on
+        #the current system. In order, this probably currently resembles:
+        #7z, tar.bz2, tar.xz, zip, tar.gz. (Note that for "tar" formats, both
+        #"tar" and the underlying compressor must be available.)
+
+        # If passed one argument, default the target file to the canonicalized
+        # basename of the passed source path (thus tripping trailing "/" from such
+        # basename, if passed) suffixed with ".tar.bz2".
+        if { is_arg } {
+            :string source_basename
+            :set_string_to_path_canonical source_basename "${1}"
+            :set_string_to_path_basename  source_basename "${source_basename}"
+            :arg.append "${source_basename}.tar.bz2"
+        }
+    } else {
+        die_unless_args_2_or_more\
+            'Expected one or more source pathnames and one target filename.'
+    }
+    :string target_filename="${@[-1]}" target_filetype
+    pop_arg
+
+    # Type of archive to create.
+    target_filetype="$(get_file_type "${target_filename}")"
+
+    # If such archive already exists, remove such file.
+    remove_file_if_found "${target_filename}"
+
+    #FIXME: Leverage run_code_with_options(), as above. Also, implement currently
+    #unimplemented types.
+
+    # Create such archive.
+    print_message_item "Creating \"${target_filename}\"..."
+    case "${target_filetype}" {
+    #FIXME: To incorporate -mmt="$(get_processor_count)" as a default option,
+    #we probably want to define a new integer global ${ZESHY_PROCESSOR_COUNT}
+    #available at the top level in configuration files. This makes sense, both
+    #because the processor count should *NEVER* change during the lifetime of a
+    #compiled zeshy digest and because "$(get_processor_count)" could
+    #conceivably throw an exception and hence should be wrapped in a try-always
+    #block (which, of course, is beyond the scope of a configuration file).
+
+    # Dismantled, this is:
+    #
+    # * "-t7z", with 7zip compression. (Probably the default; doesn't hurt.)
+    # * "-mx=9", with Ultra (i.e., maximum) compression.
+    # * "-mpass=15", with the maximum number of (compression?) passes for
+    #   additional compression.
+    # * "-mfb=257", with the maximum number of (compression?) fast bytes for
+    #   additional compression.
+    # * "-mmt=...", with one thread per logical processor or core.
+    #
+    # See also: http://docs.bugaco.com/7zip/MANUAL/switches/method.htm
+    7z)
+        command 7z a -t7z\
+            -mx=9 -mpass=15 -mfb=257 -mmt="$(get_processor_count)" --\
+            "${target_filename}" "${@}";;
+    # Dismantled, this is:
+    #
+    # * "-c", compressing to standard output.
+    # * "-k", preventing deletion of input files. (WUT!?!?!?!?!?!?!?!?!?!?!)
+    # * "-p", printing a progress bar.
+    # * "-v", printing verbosely.
+    # * "-9", allocating the largest in-memory block size possible.
+    bz|bz2)
+        die_unless_arg\
+            "\"bzip2\" supports compression of only one file, but ${#} paths were passed."
+        die_unless_file "${1}"
+        command bzip2 -ckpv9 -- "${1}" > "${target_filename}";;
+    #FIXME: See update_initramfs() for the (rather long) command. This
+    #implies that, once getting this working here, we can defer that
+    #function's implementation to calling this function (which seems rather
+    #more sensible).
+#       cpio)
+#           cpio -idmv < "${file_name}";;
+#       cpio.gz) cpio -idmv < "${file_name}";;
+#       gz) gunzip -c "${filename}" > "$(remove_string_suffix "${filename}" '.gz')";;
+#       lzma) unlzma "${filename}";;
+#       # Call "unrar" with option "x" rather than "e". The former preserves
+#       # subdirectory structure; the latter does not.
+#       rar) unrar x "${filename}";;
+    # "tar" erroneously treats "--" as a filename rather than separator!
+    tar)
+        command tar -cf  "${target_filename}" "${source_pathnames[@]}";;
+    tar.bz2|tbz|tbz2)
+        command tar -cjf "${target_filename}" "${source_pathnames[@]}";;
+    tar.gz|tgz)
+        command tar -czf "${target_filename}" "${source_pathnames[@]}";;
+    tar.lzma|tar.xz|tlz|txz)
+        command tar -cJf "${target_filename}" "${source_pathnames[@]}";;
+#       xz) unxz "${filename}";;
+#       zip|jar|cbz) unzip "${filename}";;
+#       Z) uncompress -v "${filename}";;
+    *)  :die "\"${filename}\" not a recognized archive.";;
+    }
+
+    # If the current shell is interactive, list such archive for verification.
+    if { is_shell_interactive } {
+        print_archive "${target_filename}"
+    }
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#FUXME: Interestingly, not even defining toolchain-specific options will be
+#enough however (e.g., a GNU-specific
+#${ZESHY_OPTIONS_PRINT_ARCHIVE_COMMAND_TO_ARGS_IF_OS_TYPE_GNU}). BSD archive
+#commands (particularly "tar") behave fundamentally differently, as verified at
+#NFSN (a FreeBSD environment!). 
+
+#UIXME: Ah. A problem arises, however, suggesting function dispatch to probably
+#be the way forward. It's rather simple, too: what if multiple commands are
+#capable of dealing with such archive type? In that case, we want to use an
+#"if { is_pathable ... }" approach. Ah. Right. Of course, the above map approach
+#fully supports that. 
+
+#For such files with unrecognized filetype, if this function is:
+#
+#* Called non-interactively, throw an exception.
+#* Called interactively with two or more arguments, print a warning but do
+#  *NOT* throw an exception. This better coincides with user expectations.
+#  When called with one argument, users expect fatal errors if not an archive.
+#  When called with more than one argument, however, users prefer warnings on
+#  non-archive arguments while continuing with subsequent arguments: e.g.,
+#
+#      # Extract all archives in the current directory, printing warnings but
+#      # otherwise ignoring all other files.
+#      >>> extract_archive *
+
+#        *)  string error_message="\"${filename}\" not a recognized archive"
+#            if is_shell_interactive and is_args_2_or_more
+#            then print_warning "${error_message}"
+#            else :die   "${error_message}"
+#            fi;;
+#        }
+#    }
+
+#            string error_message="\"${filename}\" not a recognized archive."
+#            if { is_shell_interactive and is_args_2_or_more } {
+#                print_warning "${error_message}"
+#            } else {
+#                :die "${error_message}"
+#            };;
+
+# list source_pathnames; source_pathnames=( "${@}" )
+            # By definition, target archives are *NOT* shell-specific. Shell-
+            # specific archives are created on shell forks and usually cannot be
+            # overwritten. Hence, calling :canonicalize_path() is safe here.
+            # If only such file was passed, throw an exception.
+#           if { is_arg } {
+
+#FUXME: Rename to open_archive(). (Rename corresponding interactive alias, too.)
+#FUXME: Actually, this function is demonstrably terrible. Just stop using it.
+#FUXME: We *REALLY* want to accept option list names (e.g.,
+#"ZESHY_BZIP2_OPTIONS") rather than the currently very hacky command-options-
+#packed-into-a-single-string-and-then-unpacked-with-"(z)"-style we have here.
+#What's nice about such options is that we could then dynamically construct
+#functions based on which are currently installed whose implementations simply
+#leverage such options. Wait. That doesn't *quite* work; many archivers require
+#stdin or stdout oddities. But, still...
+
+# void make_archive_helper(
+#   string archive_filetype,
+#   string archive_command, string archive_command_options,
+#   string archive_list_command, string archive_list_command_options,
+#   string pathname = '.')
+#
+# Archive the passed path (defaulting to the current working directory) into a
+# file of the passed filetype using the passed command. This is a helper
+# intended to be called only by other Zeshy functions.
+#make_archive_helper() {
+#    (( # >= 7 )) or :die\
+#        'expected one archive filetype, archive command and options, '\
+#        'archive list command and options, and source pathname'
+#
+#    # Localize and validate sanity. Canonicalize the passed dirname to
+#    # an absolute pathname. (This strips trailing '/' from the passed dirname,
+#    # as required for constructing valid archive filenames from such dirnames.)
+#    string\
+#        filetype="${1}"\
+#        command_name="${2}"\
+#        command_pre_options="${3}"\
+#        command_post_options="${4}"\
+#        list_command_name="${5}"\
+#        list_command_pre_options="${6}"\
+#        list_command_post_options="${7}"\
+#        pathname="${8:-$(get_dir)}"
+#    die_unless_path "${pathname}"
+#    string filename="$(get_path_basename "$(:canonicalize_path "${pathname}")").${filetype}"
+#
+#    # Compress.
+#    interactively print_message "archiving \"${filename}\"..."
+##   print "${command} ${command_pre_options} \"${filename}\" \"${pathname}\" ${command_post_options}"
+#    ${command_name}\
+#        ${(z)command_pre_options} "${filename}" "${pathname}"\
+#        ${(z)command_post_options}
+#
+#    # If interactive, list the contents of the compressed archive.
+#    if is_shell_interactive; then
+#        print_newline
+#        print_message "listing \"${filename}\"..."
+#        ${list_command_name}\
+#            ${(z)list_command_pre_options} "${filename}"\
+#            ${(z)list_command_post_options}
+#    fi
+#}
+
+        #FUXME: "-v" options should only be passed if is_shell_interactive. Better yet,
+        #this really requires a run_code_with_options() approach. Quite a bit of busy
+        #work involved in that one, however; so... pass for now. Hmm; I'm not
+        #entirely convinced it would work. Consider "<" and ">"; while
+        #run_code_with_options should implicitly support such redirection, only a
+        #real-world test can reveal the truth of it.
+        #
+        #Hmm. Actually, I'm unconvinced we can reasonably use run_code_with_options()
+        #here. The number of combinations is simply too large; we have 12
+        #different filetypes and numerous operation to interact with such
+        #filetypes: listing, creating, encrypting, decrypting, etc.
+
+        # Get this filename's filetype, supporting optional two-part "tar"-
+        # specific filenames (e.g., "yog.sothoth.tar.xz"'s filetype is "tar.xz"
+        # rather than "sothoth.tar.xz" or merely "xz"). The regular expression
+        # matches a prefixing ".", discarded via "#." below for brevity.
+#       is "${filename}" =~ '\.(tar\.)?([^.]+)$' si or
+#           :die "\"${filename}\" has no identifying filetype"
+#       filetype="$(remove_string_prefix "${MATCH}" '.')"
+
+    # Set default arguments if passed insufficient arguments.
+
+#       print "filename: ${filename}\nfiletype: ${filetype}"
+#       filetype="${MATCH#.}"
+
+#FUXME: Revise to coincide with archive_dir(). Improve documentation.
+# Archive of arbitrary type and command.
+#archive_file() {
+#    if [[ -n "${1}" && -f "${1}" ]]; then
+#        # Remove this path's trailing '/', if it has such a trailing '/'.
+#        2=$(echo "${1}" | sed --regexp-extended 's/\.[^.]+$/.'${2}'/' -)
+#        
+#        print_message "creating \"${2}\"..."
+#        ${3} ${4} "${2}" "${1}"
+#
+#        echo ""
+#        print_message "listing \"${2}\"..."
+#        ${5} ${6} "${2}"
+#    elif is_string_empty    "${1}"; then :die "no path passed"
+#    elif not :is_file "${1}"; then :die "\"${1}\" not a file"
+#    fi
+#}
+
+# * Called non-interactively, 
+# * Called interactively with two or more arguments, print a
+#   warning but do *NOT* throw an exception. This improves the
+#   user interface by better coinciding with user expectations.
+#   When called with only one argument, most users expect a
+#   fatal error if such argument is not actually an archive.
+#   When called with more than one argument, however, users
+#   prefer warning for non-archive arguments and continuing with
+#   subsequent arguments, thus supporting simple globs: e.g.,
+#
+#       # Extract all archives in the current directory.
+#       >>> extract_archive *
+#        #FUXME: There must be a pure-zsh alternative. Find it, please.
+        # Obtain this archive's filetype. This is considerably more complex than it
+        # should be, as "sed" seems to be incapable of obeying the following
+        # substitution:
+        #
+        #   ... | sed -r 's/^.+\.(tar\.)?/\1/') 
+        #
+        # Specifically, "sed" refuses to substitute "\1" with "tar." when the
+        # latter is found. If we remove the "?", then it does perform the
+        # substitution, but (of course) fails on filenames not having the "tar."
+        # extension. This is the best we can do, therefore; and it actually works.
+        #
+        # Oddly, zsh also seems incapable of obeying the following PCRE:
+        #
+        #   ... =~ \.(tar\.)?(.+)
+        # 
+        # Thus, "sed" hackiness it is.
+#       filetype="$(print "${filename}" | sed -r 's/^.+\.(tar\.)/tar~/' | sed -r 's/^.+\.//' | sed -r 's/tar~/tar./')"       
+
+#       # Canonicalize abbreviated filetypes.
+#       case "${filetype}" in
+#           cbz) filetype='zip';;
+#           jar) filetype='zip';;
+#           tbz) filetype='tar.bz2';;
+#           tgz) filetype='tar.gz';;
+#       esac
+
+# Strip any trailing '/' from the
+    # passed dirname to aid in constructing an archive filename.
+# string bzcat_page(string bzcat_option1, string bzcat_option2, ...)
+#
+# Print the passed bz2-compressed filename under the current pager.
+#bzcat_page() {
+#    page bzcat "${@}"
+#}

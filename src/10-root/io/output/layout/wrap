@@ -1,0 +1,1142 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle *line wrapping* (i.e., soft wrapping strings to the width of the current
+terminal by inserting newlines into such strings at appropriate break points).
+/---
+
+# ....................{ GLOBALS                            }....................
+:int_global ZESHY_STRING_WRAP_PCRE_INDEX_SPLIT=1 <<'/---'
+1-based index in list ${match} of the next text substring to be wrapped by a
+PCRE returned by set_string_to_pcre_wrapping_to_width(), guaranteed to have been
+properly split on an inter-word delimiter (e.g., space, tab, newline) or
+intra-word delimiter (e.g., hyphen). In either case, such substring is
+guaranteed to be no longer than the maximum line length passed to such function
+_and_ requires no suffixing hyphenation.
+/---
+
+:int_global ZESHY_STRING_WRAP_PCRE_INDEX_UNSPLIT=2 <<'/---'
+1-based index in list ${match} of the next text substring to be wrapped by a
+PCRE returned by set_string_to_pcre_wrapping_to_width(), guaranteed to _not_ have
+been properly split on an inter-word delimiter (e.g., space, tab, newline) or
+intra-word delimiter (e.g., hyphen). Such substring is guaranteed to be no
+longer than the maximum line length passed to such function _but_ requires
+suffixing hyphenation.
+
+Ideally, most substrings to be wrapped are properly split and hence matched into
+index ${ZESHY_STRING_WRAP_PCRE_INDEX_SPLIT} instead. However, when the shortest
+splittable substring exceeds the width in characters of the current terminal,
+such substring must be itself be broken into substrings smaller than such width.
+This index captures such substrings.
+/---
+
+# ....................{ GETTERS                            }....................
+declare_function_with_stdin <<'/---'
+integer get_string_wrapped_width_in_style(string style_prefix)
+
+Get the maximum number of characters in the body of each line of output (i.e.,
+excluding width of visual borders on such lines) wrapped to the current terminal
+under the user-configurable styles prefixed by the passed prefix. Since such
+output is often prefixed and/or suffixed by visual borders, this number is often
+slightly less than that returned by get_terminal_width().
+/---
+function get_string_wrapped_width_in_style() {
+    # Validate sanity.
+    die_unless_arg 'Expected one style prefix.'
+    :string style_prefix="${1}"
+
+    # Get such width. To avoid negative widths, cap such width to a minimum 1.
+    # See wrap_string_in_style() for further details.
+    get_integer_maximum 1 $(( COLUMNS -\
+        ${(m)#ZESHY_STYLE_TO_TEXT[${style_prefix}border_left]-} -\
+        ${(m)#ZESHY_STYLE_TO_TEXT[${style_prefix}border_right]-} ))
+}
+
+# ....................{ SETTERS                            }....................
+#FIXME: This function employs the naive greedy algorithm minimizing the
+#resulting number of lines. Since this is no better than modern word processors
+#do, this is hardly a calamity. That said, an alternative algorithm minimizing
+#the "raggedness" of the end of each line is *CLEARLY* a better approach, as
+#LaTeX demonstrates. To that end, it would be helpful to implement a modern
+#variant on Knuth's now-infamous "minimization of the square of the space at the
+#end of all paragraph lines" algorithm. While the most common solutions are
+#O(n^2), a number of novel linear-time soutions appear to exist. Furthermore,
+#note this interesting addendum, http://search.cpan.org/perldoc?Text::Reflow --
+#"The reflow algorithm tries to keep the lines the same length but also tries to
+#break at punctuation, and avoid breaking within a proper name or after certain
+#connectives ("a", "the", etc.). The result is a file with a more "ragged" right
+#margin than is produced by fmt or Text::Wrap but it is easier to read since
+#fewer phrases are broken across line breaks." In any case, there's no want of
+#great alternatives. Here are a few other continuations to the core Knuth
+#algorithm:
+#
+#* http://www.leverkruid.eu/GKPLinebreaking/elements.html
+#* http://wiki.apache.org/xmlgraphics-fop/PageLayout/
+#
+#The best resource on linear time and near-linear time implementations is
+#probably "Comment 8" by (clearly academic) poster "callcc" at:
+#
+#* https://bugzilla.mozilla.org/show_bug.cgi?id=630181
+#
+#He (?) gives an excellent synopsis of the current state of the art. Great stuff!
+
+declare_function_with_stdin <<'/---'
+string set_string_to_pcre_wrapping_to_width(
+    string string_name,
+    integer line_width)
+
+Set the passed string variable to a PCRE matching at most the passed number of
+characters suffixed by either a hyphen, whitespace, or the string end. By
+design, this PCRE is suitable for iteratively wrapping lines to such length in a
+multiline-aware manner by calling for_string_text_matching_pcre:(), as implemented by
+for_string_wrapped_to_width().
+
+== Algorithmic Alternatives ==
+
+Such PCRE efficiently implements the ``naive'' greedy algorithm for wrapping
+lines in a word-aware manner, wrapping maximally many words per line and hence
+minimizing the resulting number of lines. While efficient, such algorithm
+commonly fails to produce a uniform ragged right edge and hence aesthetical
+and/or legible output. Since this is no worse than modern word processors do,
+such failings hardly constitute a calamity. Yet we can do better. (Indeed, the
+prior example exhibits an extremely ragged right edge.)
+
+Ideally, lines should be wrapped so as to minimize *right raggedness* (i.e., the
+difference between the length of each line in a contiguous paragraph). The
+canonical algorithm for doing so remains Donald Knuth's implementation of line
+wrapping in [La]TeX, minimizing the square of the space at the end of all
+paragraph lines. Such algorithm requires numerical computation and hence cannot
+be implemented as a PCRE. For further details, see the corresponding
+https://en.wikipedia.org/wiki/Word_wrap[Wikipedia article].
+/---
+function set_string_to_pcre_wrapping_to_width() {
+    # Validate sanity.
+    die_unless_args_2 'Expected one string name and one integer.'
+    :string\
+        string_name__sstpwtw="${1}"\
+        line_length__sstpwtw="${2}"
+    :int.die_unless_positive "${line_length__sstpwtw}"
+
+    # If such line length is 1, such PCRE should not attempt to break lines at
+    # hyphens preceded by at least one character. Instead, only break lines at
+    # each character. While this remains an unlikely edge case, handling such
+    # case is critical to avoid spurious exceptions and behavior.
+    #
+    # To ensure the expected match groups, capture each character to the match
+    # group typically matching words *NOT* exceeding line length and the empty
+    # string to all other match groups. Since "libpcre" sadly lacks a means of
+    # explicitly specifying the number to assign to a match group, ensure this
+    # implicitly with empty match groups. (Lame? This is my uncaring face.)
+    if (( line_length__sstpwtw == 1 )) {
+        :string.set "${string_name__sstpwtw}" '()(.)()()'
+    # Else, return a general-purpose PCRE. Dismantled, this is:
+    #
+    # * "\G", anchoring such match immediately after the end of the prior match.
+    # * "(?|...)", matching any of the following alternatives under duplicate
+    #   subpattern numbers (i.e., resetting capturing group numbers in each
+    #   alternative to ensure such groups capture to the same number regardless
+    #   of which alternative matches):
+    #   * "\n", matching but *NOT* capturing a blank line (i.e., line containing
+    #     only a newline). Since this alternative captures no groups, all groups
+    #     will be the empty string on matching a blank line.  While this
+    #     probably sounds unhelpful, the simple implementation of
+    #     for_string_wrapped_to_width() proves otherwise.
+    #   * "(...)(?:...)", capturing a maximally long substring not exceeding the
+    #     passed length to ${match[1]}, suffixed by an uncaptured and hence
+    #     ignored delimiter consisting of either:
+    #     * "\h+\n?", a maximally long run of horizontal whitespace followed by
+    #       an ignorable newline.
+    #     * "\n", a newline.
+    #     * "\Z", either the string end or a newline followed by the string end.
+    #   * "(...-)", capturing a maximally long hyphenated substring not
+    #     exceeding the passed length minus one to ${match[1]}.
+    #   * "()(...)", capturing a maximally long unhyphenated substring not
+    #     exceeding the passed length minus one to ${match[2]}, suffixed by none
+    #     of the above delimiters. This fallback condition handles such edge
+    #     cases as contiguous runs of characters exceeding the length of a
+    #     single line but containing no spaces, tabs, newlines, or hyphens,
+    #     without which such characters would be silently ignored during PCRE
+    #     iteration. Since the caller typically breaks such runs at the passed
+    #     line length into substrings suffixed by a hyphen and newline, such
+    #     group matches one less character than the line length.
+    #
+    # All alternatives except those already matching a suffixing newline match
+    # an ignorable newline. Since the caller typically suffixes such substring
+    # by a newline already, such newline should simply be ignored if present.
+    } else {
+        # Such length minus one, typically to account for suffixing hyphens.
+        :int line_length_minus_one__sstpwtw=$(( line_length__sstpwtw - 1 ))
+
+        # PCRE matching any character preceded by zero or more ignorable ANSI
+        # escape sequences. Such sequences should typically be ignored when
+        # wrapping text, implying this PCRE should always be used in place of
+        # simpler "." expressions in the PCRE below.
+        :string char__sstpwtw='(?:(?:'${ZESHY_ANSI_PCRE}')*.)'
+
+        # Set such string to such PCRE.
+        :string.set "${string_name__sstpwtw}"\
+            '\G(?|\n()()|('${char__sstpwtw}'{1,'${line_length__sstpwtw}'})(?:\n|\h+\n?|\Z)()|('${char__sstpwtw}'{1,'${line_length_minus_one__sstpwtw}'}-)\n?()|()('${char__sstpwtw}'{1,'${line_length_minus_one__sstpwtw}'})\n?)'
+#       :string.output "pcre wrapping at line length ${line_length}/$(get_terminal_width):${ZESHY_ASCII_NEWLINE}${pcre_wrapping}" 1>&2
+    }
+}
+
+# ....................{ SETTERS                            }....................
+function :set_string_to_string_wrapped() {
+    # Validate sanity.
+    die_unless_args_2_or_more\
+        'Expected one string name and one or more strings.'
+    :int terminal_width
+
+    # Width of the current terminal.
+    :set_int_to_terminal_width_if_found_or_default terminal_width
+
+    # Set such string.
+    :set_string_to_string_wrapped_to_width "${@}" "${terminal_width}"
+}
+
+function :set_string_to_string_wrapped_to_width() {
+    # Validate sanity.
+    die_unless_args_3_or_more\
+        'Expected one string name, one or more strings, and one integer width.'
+    :string string_name__sstswtw="${1}" text__sstswtw width__sstswtw="${@[-1]}"
+    shift_arg
+    pop_arg
+
+    # Join such strings into a single string before passing the latter below.
+    :string.set text__sstswtw "${@}"
+
+    # Initialize such variable to the empty string.
+    :clear_string "${string_name__sstswtw}"
+
+    # Iteratively append such variable by each line wrapped from such strings.
+    for_string_wrapped_to_width\
+        "${text__sstswtw}"\
+        "${width__sstswtw}"\
+        line__sstswtw\
+        ${string_name__sstswtw}'+="${line__sstswtw}'${ZESHY_ASCII_NEWLINE}'"'
+}
+
+# ....................{ WRAPPERS                           }....................
+#FIXME: Exceedingly poor nomenclature. Rename *ALL* such functions into getters
+#(e.g., from wrap_string() to :get_string_wrapped()). Why? Because such
+#nomanclature is now used elsewhere to imply such functions modify a passed
+#string variable in-place -- which is, of course, *NOT* the case here.
+#FIXME: Overly long example. Shift a portion of it elsewhere, please.
+
+declare_function_with_stdin <<'/---'
+string wrap_string(string text1, ...)
+
+Wrap the passed strings to the width of the current terminal. See
+wrap_string_to_width() for further details: e.g.,
+
+.wrap_string()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_divinorum=\
+...    "An extremely rare cultigen, found only at a few locations in Oaxaca."\
+...    "There are specimens in botanical gardens, and in a few private"\
+...    "collections, but lack of genetic diversity is a concern."
+>>> :string on_ska_maria_pastora=\
+...    "The plant is endangered by the forces of imperialistic religion, and"\
+...    "has been for four hundred years, possibly longer."
+>>> :string on_yerba_de_maria=\
+...    "Her real name must not be told—"\
+...    "Her real name is closer to Medusa than to Mary."\
+...    '  "They came with crosses—'\
+...    "    they came to drag us"\
+...    "from our huts, from our beds,"\
+...    '    the soldiers that serve the priests."'
+>>> wrap_string "${on_divinorum}"\
+...     "${on_ska_maria_pastora}" "${on_yerba_de_maria}"
+An extremely rare cultigen, found only at a few locations in Oaxaca. There are
+specimens in botanical gardens, and in a few private collections, but lack of
+genetic diversity is a concern. The plant is endangered by the forces of
+imperialistic religion, and has been for four hundred years, possibly longer.
+Her real name must not be told—
+Her real name is closer to Medusa than to Mary.
+"They came with crosses—
+they came to drag us
+from our huts, from our beds,
+the soldiers that serve the priests."
+------------------------------------------
+==========================================
+/---
+function wrap_string() {
+    # Validate sanity.
+    die_unless_args 'Expected one or more strings.'
+    :string string_wrapped
+
+    # Return such strings wrapped.
+    :set_string_to_string_wrapped string_wrapped "${@}"
+    :string.output "${string_wrapped}"
+}
+
+#FIXME: Refactor to call :set_string_to_string_wrapped_to_width().
+declare_function_with_stdin <<'/---'
+string wrap_string_to_width(string text, int line_length)
+
+Get the passed string wrapped to the passed line length in a word-aware manner.
+See set_string_to_pcre_wrapping_to_width() for further details: e.g.,
+
+.wrap_string_to_width()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_rebellion=\
+...    "Peasant rebellions were not exceptional events. They erupted so"\
+...    "frequently in the course of these four centuries that they may be said"\
+...    "to have been as common in this agrarian society as factory strikes"\
+...    "would be in the industrial world. In southwestern France alone, some"\
+...    "450 rebellions occurred between 1590 and 1715. No region of Western"\
+...    "Europe was exempted from this pattern of chronic violence. The fear of"\
+...    "sedition was always present in the minds of those who ruled. It was a"\
+...    "corrective, a salutary fear — since only the threat of insurrection"\
+...    "could act as a check against unlimited exactions."
+>>> wrap_string_to_width "$(get_string_lines "${on_rebellion}" 1 4)" 66
+Peasant rebellions were not exceptional events. They erupted so
+frequently in the course of these four centuries that they may be
+said to have been as common in this agrarian society as factory
+strikes would be in the industrial world. In southwestern France
+alone, some
+------------------------------------------
+==========================================
+/---
+function wrap_string_to_width() {
+    # Validate sanity.
+    die_unless_args 'Expected one or more strings.'
+    :string string_wrapped
+
+    # Return such strings wrapped.
+    :set_string_to_string_wrapped_to_width string_wrapped "${@}"
+    :string.output "${string_wrapped}"
+}
+
+# ....................{ WRAPPERS ~ style                   }....................
+declare_function_with_stdin <<'/---'
+string wrap_string_in_style_caller(string text1, ...)
+
+Wrap the passed string(s) to the width of the current terminal, using user-
+configurable styles prefixed by the dot-suffixed caller's name (i.e.,
+`$(get_caller).`) See wrap_string_in_style() for further
+details.
+/---
+function wrap_string_in_style_caller() {
+    die_unless_args 'Expected one or more strings.'
+    :string caller
+    :set_string_to_caller caller
+    wrap_string_in_style "${*}" "${caller}."
+}
+
+declare_function_with_stdin <<'/---'
+string wrap_string_in_style(string text, string style_prefix)
+
+Wrap the passed string to the width of the current terminal, using
+user-configurable styles prefixed by the passed prefix. See
+wrap_string_to_width_in_style() for further details.
+/---
+function wrap_string_in_style() {
+    # Validate sanity.
+    die_unless_args_2 'Expected one string and one style prefix.'
+    :int terminal_width
+
+    # Width of the current terminal.
+    :set_int_to_terminal_width_if_found_or_default terminal_width
+
+    # Wrap such strings.
+    wrap_string_to_width_in_style\
+        "${1}" "${terminal_width}" "${2}"
+}
+
+declare_function_with_stdin <<'/---'
+string wrap_string_to_width_in_style(
+    string text,
+    int line_width,
+    string style_prefix)
+
+Wrap the passed string to the passed line width, using user-configurable styles
+prefixed by the passed prefix. See set_string_to_pcre_wrapping_to_width() for
+further details.
+
+== Styles ==
+
+Such styles are keys of both the user-configurable map ${ZESHY_STYLE_TO_COLOR}
+(specifying colors to be output) and ${ZESHY_STYLE_TO_TEXT} (specifying string
+literals to be output), including:
+
+* `${style_prefix}text`, styling the passed string itself.
+* `${style_prefix}border_left` and `${style_prefix}border_right`, styling the
+  the left and right *borders* (i.e., the first and last substrings to be
+  printed) of the first line wrapped from such string, each defaulting to the
+  empty string.
+* `${style_prefix}border_left_midst` and
+  `${style_prefix}border_right_midst`, styling the left and right borders of
+  all lines after the first wrapped from such string, defaulting to the value of
+  `${style_prefix}border_left` and `${style_prefix}border_right`.
+* `${style_prefix}joiner_right`, styling the substring non-repeatedly situated
+  between the text and right padder for each wrapped line, defaulting to a space.
+* `${style_prefix}padder_right`, styling the substring repeatedly filling the
+  space between the text and right border for each wrapped line, defaulting to a
+  space.
+/---
+function wrap_string_to_width_in_style() {
+    # Validate sanity.
+    die_unless_args_3\
+        'Expected one string, one line width, and one style prefix.'
+    :string\
+        text="${1}"\
+        line_width="${2}"\
+        style_prefix="${3}"\
+        line_first_style_prefix\
+        line_midst_style_prefix\
+        line_first_border_left\
+        line_first_border_right\
+        line_first_suffix_right\
+        line_first_joiner_right\
+        line_first_padder_right\
+        line_midst_border_left\
+        line_midst_border_right\
+        line_midst_suffix_right\
+        line_midst_joiner_right\
+        line_midst_padder_right\
+        line\
+        line_joiner_padder
+    :int\
+        line_first_width\
+        line_midst_width\
+        line_width_minimum\
+        line_first_border_left_length\
+        line_first_border_right_length\
+        line_first_suffix_right_length\
+        line_first_joiner_right_length\
+        line_first_padder_right_length\
+        line_midst_border_left_length\
+        line_midst_border_right_length\
+        line_midst_suffix_right_length\
+        line_midst_joiner_right_length\
+        line_midst_padder_right_length\
+        line_length\
+        line_joiner_padder_length
+    :die_unless_terminal_column "${line_width}"
+
+    # Preferred styles for the first and all subsequent lines of such text.
+    line_first_style_prefix="${style_prefix}line_first."
+    line_midst_style_prefix="${style_prefix}line_midst."
+
+    # Substrings to be measured (but not repeated) below and hence *NOT* yet
+    # injected with color. Such substrings are optional and hence default to the
+    # empty string. Preferred styles take precedence over fallback styles.
+    line_first_border_left="${ZESHY_STYLE_TO_TEXT[${line_first_style_prefix}border_left]-${ZESHY_STYLE_TO_TEXT[${style_prefix}border_left]-}}"
+    line_first_border_right="${ZESHY_STYLE_TO_TEXT[${line_first_style_prefix}border_right]-${ZESHY_STYLE_TO_TEXT[${style_prefix}border_right]-}}"
+    line_first_suffix_right="${ZESHY_STYLE_TO_TEXT[${line_first_style_prefix}suffix_right]-${ZESHY_STYLE_TO_TEXT[${style_prefix}suffix_right]-}}"
+    line_first_joiner_right="${ZESHY_STYLE_TO_TEXT[${line_first_style_prefix}joiner_right]-${ZESHY_STYLE_TO_TEXT[${style_prefix}joiner_right]-}}"
+    line_midst_border_left="${ZESHY_STYLE_TO_TEXT[${line_midst_style_prefix}border_left]-${line_first_border_left}}"
+    line_midst_border_right="${ZESHY_STYLE_TO_TEXT[${line_midst_style_prefix}border_right]-${line_first_border_right}}"
+    line_midst_suffix_right="${ZESHY_STYLE_TO_TEXT[${line_midst_style_prefix}suffix_right]-${ZESHY_STYLE_TO_TEXT[${style_prefix}suffix_right]-}}"
+    line_midst_joiner_right="${ZESHY_STYLE_TO_TEXT[${line_midst_style_prefix}joiner_right]-${line_first_joiner_right}}"
+
+    # Substrings to be repeated below and hence never injected with color. Since
+    # :set_string_to_string_ansiless_repeated_to_length() requires strings *NOT*
+    # containing colors, shift such colors to preceding substrings. Such
+    # substrings are mandatory and hence default to a single space.
+    line_first_padder_right="${ZESHY_STYLE_TO_TEXT[${line_first_style_prefix}padder_right]-${ZESHY_STYLE_TO_TEXT[${style_prefix}padder_right]- }}"
+    line_midst_padder_right="${ZESHY_STYLE_TO_TEXT[${line_midst_style_prefix}padder_right]-${line_first_padder_right}}"
+
+    # Lengths of such substrings. For efficiency, inline such implementations.
+    # See get_string_ansiless_length_printable() for further details.
+    line_first_border_left_length="${(m)#line_first_border_left}"
+    line_first_border_right_length="${(m)#line_first_border_right}"
+    line_first_suffix_right_length="${(m)#line_first_suffix_right}"
+    line_first_joiner_right_length="${(m)#line_first_joiner_right}"
+    line_first_padder_right_length="${(m)#line_first_padder_right}"
+    line_midst_border_left_length="${(m)#line_midst_border_left}"
+    line_midst_border_right_length="${(m)#line_midst_border_right}"
+    line_midst_suffix_right_length="${(m)#line_midst_suffix_right}"
+    line_midst_joiner_right_length="${(m)#line_midst_joiner_right}"
+    line_midst_padder_right_length="${(m)#line_midst_padder_right}"
+
+    # If such padding is empty, throw an exception. Subsequent wrapping expects
+    # such substrings to be strictly nonempty.
+    :int.die_unless_positive "${line_first_padder_right_length}"\
+        'Expected nonempty padding.'
+    :int.die_unless_positive "${line_midst_padder_right_length}"\
+        'Expected nonempty padding.'
+
+    # Number of characters allocated for the first line and all subsequent lines
+    # to wrapping text and thus excluding the length of padding substrings.
+    line_first_width=$((\
+        line_width -\
+        line_first_border_left_length -\
+        line_first_border_right_length -\
+        line_first_suffix_right_length -\
+        line_first_joiner_right_length ))
+    line_midst_width=$((\
+        line_width -\
+        line_midst_border_left_length -\
+        line_midst_border_right_length -\
+        line_midst_suffix_right_length -\
+        line_midst_joiner_right_length ))
+#   print "line_first_width: ${line_first_width}\nline_midst_width: ${line_midst_width}"
+
+    # Minimum of the two prior lengths.
+    line_width_minimum="$(get_integer_minimum\
+        ${line_first_width} ${line_midst_width})"
+
+    # If either such length is non-positive, assume the passed width to be an
+    # anomolous condition to be corrected by the current user (e.g., by
+    # increasing the width of the current terminal). Since such width is
+    # probably inappropriate for displaying human-readable content, this is
+    # probably a safe assumption. For simplicity, assume such width will be
+    # corrected back to a default 80 columns.
+    if (( line_width_minimum < 1 )) {
+          line_width_minimum=80
+    }
+
+    # Inject colors into all prior substrings *EXCEPT* substrings to be
+    # subsequently repeated, as previously discussed.
+    line_first_border_left="${ZESHY_STYLE_TO_COLOR[${line_first_style_prefix}border_left]-${ZESHY_STYLE_TO_COLOR[${style_prefix}border_left]-}}${line_first_border_left}${ZESHY_STYLE_TO_COLOR[${line_first_style_prefix}text]-${ZESHY_STYLE_TO_COLOR[${style_prefix}text]-}}"
+    line_first_border_right="${ZESHY_STYLE_TO_COLOR[${line_first_style_prefix}border_right]-${ZESHY_STYLE_TO_COLOR[${style_prefix}border_right]-}}${line_first_border_right}"
+    line_first_suffix_right="${ZESHY_STYLE_TO_COLOR[${line_first_style_prefix}suffix_right]-${ZESHY_STYLE_TO_COLOR[${style_prefix}suffix_right]-}}${line_first_suffix_right}"
+    line_first_joiner_right="${ZESHY_STYLE_TO_COLOR[${line_first_style_prefix}joiner_right]-${ZESHY_STYLE_TO_COLOR[${style_prefix}joiner_right]-}}${line_first_joiner_right}${ZESHY_STYLE_TO_COLOR[${line_first_style_prefix}padder_right]-${ZESHY_STYLE_TO_COLOR[${style_prefix}padder_right]-}}"
+    line_midst_border_left="${ZESHY_STYLE_TO_COLOR[${line_midst_style_prefix}border_left]-${ZESHY_STYLE_TO_COLOR[${style_prefix}border_left]-}}${line_midst_border_left}${ZESHY_STYLE_TO_COLOR[${line_midst_style_prefix}text]-${ZESHY_STYLE_TO_COLOR[${style_prefix}text]-}}"
+    line_midst_border_right="${ZESHY_STYLE_TO_COLOR[${line_midst_style_prefix}border_right]-${ZESHY_STYLE_TO_COLOR[${style_prefix}border_right]-}}${line_midst_border_right}"
+    line_midst_suffix_right="${ZESHY_STYLE_TO_COLOR[${line_midst_style_prefix}suffix_right]-${ZESHY_STYLE_TO_COLOR[${style_prefix}suffix_right]-}}${line_midst_suffix_right}"
+    line_midst_joiner_right="${ZESHY_STYLE_TO_COLOR[${line_midst_style_prefix}joiner_right]-${ZESHY_STYLE_TO_COLOR[${style_prefix}joiner_right]-}}${line_midst_joiner_right}${ZESHY_STYLE_TO_COLOR[${line_midst_style_prefix}padder_right]-${ZESHY_STYLE_TO_COLOR[${style_prefix}padder_right]-}}"
+#   print "border_left_first: ${border_left_first}\nborder_left_midst: ${border_left_midst}"
+
+    # If true, this is the first line to be printed. (Defaults to true.)
+    :bool is_line_first=${ZESHY_BOOLEAN_TRUE}
+
+    # For each text substring to be printed as each line, print:
+    #
+    # * Such left border.
+    # * Such substring.
+    # * Sufficient spaces to render the subsequently printed right border
+    #   flush with the right edge of the current terminal. For efficiency,
+    #   inline such implementation. See repeat_string() for further details.
+    # * Such right border.
+    # * A newline.
+    for_string_wrapped_to_width\
+        "${text}" "${line_width_minimum}" line '\
+        # Length of the current line excluding ANSI escape sequences.
+        :set_int_to_string_length_printable line_length "${line}"
+
+        if (( is_line_first )) {
+            is_line_first='${ZESHY_BOOLEAN_FALSE}'
+
+            #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # Synchronize changes with conditional below.
+            #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+            # Number of characters on the current line allocated to padding.
+            line_joiner_padder_length=$(( line_first_width - line_length ))
+
+            # If such number is positive, repeat such padding accordingly.
+            if (( line_joiner_padder_length > 0 )) {
+                :set_string_to_string_ansiless_repeated_to_length\
+                    line_joiner_padder\
+                    "${line_first_padder_right}"\
+                    "${line_joiner_padder_length}"
+
+                # Prefix such padding with the corresponding joiner.
+                line_joiner_padder="${line_first_joiner_right}${line_joiner_padder}"
+            # Else, revert such padding to the empty string.
+            } else {
+                line_joiner_padder=""
+            }
+
+            # Output such line.
+            :string.output\
+                "${line_first_border_left}${line}${line_first_suffix_right}${line_joiner_padder}${line_first_border_right}"
+        } else {
+            line_joiner_padder_length=$(( line_midst_width - line_length ))
+
+            if (( line_joiner_padder_length > 0 )) {
+                :set_string_to_string_ansiless_repeated_to_length\
+                    line_joiner_padder\
+                    "${line_midst_padder_right}"\
+                    "${line_joiner_padder_length}"
+
+                # Prefix such padding with the corresponding joiner.
+                line_joiner_padder="${line_midst_joiner_right}${line_joiner_padder}"
+            } else {
+                line_joiner_padder=""
+            }
+
+            :string.output\
+                "${line_midst_border_left}${line}${line_midst_suffix_right}${line_joiner_padder}${line_midst_border_right}"
+        }'
+}
+
+# ....................{ ITERATORS                          }....................
+#FIXME: Optional arguments are horrible. Require the caller *ALWAYS* pass a
+#variable name for such lines.
+
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: int] for_string_wrapped_to_width(
+    string text,
+    int line_length,
+    string line_name = "LINE",
+    string command)
+
+Run the passed command for each line of the passed string wrapped to the passed
+line length in a word-aware manner, setting the passed local string variable
+(defaulting to `${LINE}`) to each such line. See
+set_string_to_pcre_wrapping_to_width() for further details: e.g.,
+
+.for_string_wrapped_to_width()
+==========================================
+[source]
+------------------------------------------
+>>> string on_boxes=\
+...    "The box is full of salmon, and a man sits atop the box. Long ago this"\
+...    "man hired armed guards to keep anyone from eating his fish. The many"\
+...    "people who sit next to the empty river starve to death. But they do"\
+...    "not :die of starvation. They :die of a belief. Everyone believes that"\
+...    "the man atop the box owns the fish. The soldiers believe it, and they"\
+...    "will kill to protect the illusion. The others believe it enough that"\
+...    "they are willing to starve. But the truth is that there is a box,"\
+...    "there is an emptied river, there is a man sitting atop the box, there"\
+...    "are guns, and there are starving people."
+>>> for_string_wrapped_to_width "${on_boxes}" 75 on_parables\
+...    ':is_string_matches_glob "${on_parables}" [Tt]he* and
+...         :string.output "${on_parables}"'
+The box is full of salmon, and a man sits atop the box. Long ago this man
+the illusion. The others believe it enough that they are willing to starve.
+------------------------------------------
+==========================================
+/---
+function for_string_wrapped_to_width() {
+    # Validate sanity.
+    die_unless_args_3_to_4\
+        'Expected one string, one integer, optional line name, and one command.'
+    string\
+        text__fswall="${1}"\
+        line_length__fswall="${2}"\
+        line_name__fswall='LINE'\
+        command__fswall="${@[-1]}"\
+        pcre__fswall
+    if { is_args_4 } { line_name__fswall="${3}" }
+    :die_unless_var_name "${line_name__fswall}"
+    die_unless_string_nonempty "${command__fswall}" 'Expected nonempty command.'
+
+    # Get a PCRE wrapping lines to such width.
+    set_string_to_pcre_wrapping_to_width pcre__fswall "${line_length__fswall}"
+
+    # For each line's worth of text, print such line suffixed by a newline.
+    string "${line_name__fswall}"
+    for_string_text_matching_pcre: "${text__fswall}" "${pcre__fswall}" '
+        # If such PCRE failed to match a substring, throw an exception.
+        (( ${#match} )) or
+            :die "PCRE \"${pcre__fswall}\" failed to wrap current line."
+
+        # If such substring was *NOT* properly split (e.g., by a hyphen), such
+        # substring exceeded the passed line length and hence must be manually
+        # hyphenated. While this is not the common case, matching this case
+        # explicitly ensures desired behavior below.
+        if is -n "${match['${ZESHY_STRING_WRAP_PCRE_INDEX_UNSPLIT}']}" si {
+            '${line_name__fswall}'="${match['${ZESHY_STRING_WRAP_PCRE_INDEX_UNSPLIT}']}-"
+        # Else, such substring was properly split. If such substring is:
+        #
+        # * A nonempty string, this is a non-blank line suffixed by either a
+        #   space, tab, newline, or the string end. This is the common case.
+        # * The empty string, this is a blank line. Assuming the caller appends
+        #   a newline to such substring, such line will be preserved as is
+        #   without further intervention on our part.
+        } else {
+            '${line_name__fswall}'="${match['${ZESHY_STRING_WRAP_PCRE_INDEX_SPLIT}']}"
+        }
+
+        # Run such command.
+        '${command__fswall}
+}
+
+# --------------------( WASTELANDS                         )--------------------
+    # die_unless_args_2 'Expected one string and one integer.'
+    # for_string_wrapped_to_width "${@}" ':string.output "${LINE}"'
+
+#  450 rebellions occurred between 1590 and 1715. No
+# region of Western Europe was exempted from this pattern of chronic
+# violence. The fear of sedition was always present in the minds of
+# those who ruled. It was a corrective, a salutary fear — since only
+# the threat of insurrection could act as a check against unlimited
+# exactions.
+
+#     # Validate sanity.
+#     die_unless_args 'Expected one or more strings.'
+#     :int terminal_width
+# 
+#     # Width of the current terminal.
+#     :set_int_to_terminal_width_if_found_or_default terminal_width
+# 
+#     # Wrap such strings.
+#     wrap_string_to_width "${*}" "${terminal_width}"
+# }
+
+    #FUXME: Subshells are noxious. Arguably, wrap_string_to_width_in_style()
+    #should be refactored to defer to a new setter
+    #:set_string_to_string_wrapped_to_width_in_style(), avoiding subshell
+    #inefficiency where unnecessary.
+    # "${1}" "$(wrap_string "${}")"
+
+#FUXME: Excise after eliminating all references to such function.
+#declare_function_with_stdin <<'/---'
+#string get_pcre_wrapping_at_line_length(integer line_width)
+#
+#Get a PCRE matching at most the passed number of characters suffixed by either a
+#hyphen, whitespace, or the string end. By design, this PCRE is suitable for
+#iteratively wrapping lines to such length in a multiline-aware manner by calling
+#for_string_text_matching_pcre:(), as implemented by
+#for_string_wrapped_to_width().
+#/---
+#function get_pcre_wrapping_at_line_length() {
+#    # Validate sanity.
+#    die_unless_arg 'Expected one integer.'
+#    string line_length="${1}" pcre_wrapping
+#    :int.die_unless_positive "${line_length}"
+#
+#    if (( line_length == 1 )) {
+#        return_string '()(.)()()'
+#    } else {
+#        integer line_length_minus_one=$(( line_length - 1 ))
+#        string character='(?:(?:'${ZESHY_ANSI_PCRE}')*.)'
+#        return_string '\G(?|\n()()|('${character}'{1,'${line_length}'})(?:\n|\h+\n?|\Z)()|('${character}'{1,'${line_length_minus_one}'}-)\n?()|()('${character}'{1,'${line_length_minus_one}'})\n?)'
+#    }
+#}
+
+#FUXME: For efficiency, refactor into a setter function.
+#FUXME: Poor nomenclature. Rename to set_string_to_pcre_wrapping_to_width().
+
+#FUXME: Poor nomenclature. Just as we have a center_string() function, the
+#getters below should be renamed to wrap_string*(). No refactoring required,
+#thankfully.
+            # If such number is negative, throw an exception.
+#           (( line_joiner_padder_length >= 0 )) or
+#               :die "Padding length ${line_joiner_padder_length} < 0."
+
+            #FUXME: Not quite right. If the length:
+            #   $(( line_first_width - line_length ))
+            #...is zero, neither a padder or joiner should be printed. Moreover,
+            #if such result is less than 1, we have a problem and should throw
+            #an exception. Make it so, please!
+            #FUXME: O.K.; I''ve eliminated ${line_first_joiner_right_length}
+            #from the computation of ${line_first_width} above, implying we''ll
+            #need to incorporate such length here.
+
+            # Repeat such padding as needed to fill available space.
+#            :set_string_to_string_ansiless_repeated_to_length\
+#                line_joiner_padder\
+#                "${line_first_padder_right}"\
+#                "${line_joiner_padder_length}"
+
+    #FUXME: Heavyweight. Inline, yes?
+    #FUXME: Silly. Just embed colors directly.
+    # Colors for such substrings to be printed below with similar defaults. Such
+    # colors are expanded several times, encouraging their storage into local
+    # variables here.
+#   text_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}text]-}"
+#   border_right_first_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_right]-}"
+#   border_left_midst_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_left_midst]-${border_left_first_color}}"
+#   border_right_midst_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_right_midst]-${border_right_first_color}}"
+
+# For safety, consider calling the latter function
+#rather than this function.
+
+    # Width in characters of the current terminal.
+#   terminal_width="$(get_terminal_width)"
+
+#           :string.output "padder_right_count: $(( line_first_length - ${(m)#line} ))"
+#       ':string.output "text line length: ${(m)#line}/${line_length}"
+#       :string.output "@${line}@"
+#       :string.output "${border_left_first}${line}${(l:$(( line_length - ${(m)#line})):: :):-}${border_right_first}"'
+
+    #FUXME: Silly. Just embed colors directly.
+    # Colors for such substrings to be printed below with similar defaults. Such
+    # colors are expanded several times, encouraging their storage into local
+    # variables here.
+#        text_color\
+#        border_left_first_color\
+#        border_right_first_color\
+#        border_left_midst_color\
+#        border_right_midst_color
+#    text_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}text]-}"
+#    border_left_first_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_left]-}"
+#    border_right_first_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_right]-}"
+#    border_left_midst_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_left_midst]-${border_left_first_color}}"
+#    border_right_midst_color="${ZESHY_STYLE_TO_COLOR[${style_prefix}border_right_midst]-${border_right_first_color}}"
+#
+#    # Inject colors into all prior substrings *EXCEPT* substrings to be
+#    # subsequently repeated, as previously discussed.
+#    border_left_first="${border_left_first_color}${border_left_first}${text_color}"
+#    border_right_first="${border_right_first_color}${border_right_first}"
+#    border_left_midst="${border_left_midst_color}${border_left_midst}${text_color}"
+#    border_right_midst="${border_right_midst_color}${border_right_midst}"
+#    joiner_right="${ZESHY_STYLE_TO_COLOR[${style_prefix}joiner_right]-}${joiner_right}${ZESHY_STYLE_TO_COLOR[${style_prefix}padder_right]-}"
+#   print "border_left_first: ${border_left_first}\nborder_left_midst: ${border_left_midst}"
+
+#            :string.output "${border_left_first}${line}${joiner_right}${(l^$(( line_first_length - line_length ))^^'${padder_right}'^):-}${border_right_first}"
+#        } else {
+#            :string.output "${border_left_continued}${line}${joiner_right}${(l^$(( line_continued_length - line_length ))^^'${padder_right}'^):-}${border_right_continued}"
+
+    # Embed colors in such substrings *AFTER* calculating their string lengths.
+    #
+    # Do *NOT* embed colors in the right padding. Such string is repeated below
+    # with the "${(l::...:...:):-}" approach, which expects the printable and
+    # nonprintable length of such string to equate. In any case, suffixing such
+    # colors onto the end of the right padding joiner more efficiently suffices.
+
+    # Substrings to be printed below. Border substrings are optional and hence
+    # default to the empty string. Do *NOT* embed colors in such substrings
+    # until *AFTER* calculating their string lengths, below.
+
+    #FUXME: Correct this. Since we must then account for padding substrings that
+    #do not perfectly pad the available space (e.g., by appending such padding
+    #with sufficient spaces), such correction is admittedly troublesome.
+
+    # If such padding is *NOT* a single character, throw an exception. While the
+    # implementation below can (and should) certainly be improved to accommodate
+    # arbitrary padding, we cannot quite be bothered at the moment.
+#   :die_unless_char "${padder_right}"
+
+    # If either such length is less than 1, the current terminal is
+    # insufficiently wide to border such text. in which case such text should be
+    # returned as is.
+#   if (( line_width_minimum < 1 )) {
+#       return_string "${text_color}${text}"
+#   }
+
+    #FUXME: If ${padder_right} contains the flag delimiter (here, "^"), the
+    #call to :string.output() in iteration below will fail with error. To correct
+    #this, we should probably devolve such implementation to the general-purpose
+    #solution for repeating strings. See repeat_string().
+    #FUXME: Right. We now provide an efficient setter
+    #:set_string_to_string_ansiless_repeated_to_length() for doing just that.
+    #Excise! Simplify! Replace!
+
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with get_string_wrapped_width_in_style().
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+        # Length of the current line excluding ANSI escape sequences. See
+        # get_string_length_printable() for further details.
+#       line_length="${(m)#${line//${~ZESHY_ANSI_GLOB}}}"
+
+#FUXME: I believe that wrapping is currently failing for long contiguous strings
+#lacking internal whitespace, suggesting a regression in
+#set_string_to_pcre_wrapping_to_width(). Investigate as time permits.
+#FUXME: A thought experiment succinctly identified the issue: ANSI escape
+#sequences embedded in strings. We need to account for such sequences when
+#wrapping strings, principally in the following two places:
+#
+#* set_string_to_pcre_wrapping_to_width(). The returned PCRE must ignore such
+#  sequences. To do so, replace every instance of "." with
+#  "(?:${ZESHY_ANSI_PCRE})?.", where ${ZESHY_ANSI_PCRE} is a newly defined
+#  string global defined in @{ansi} based on corresponding glob patterns.
+#* wrap_string_in_style(). Such function currently calculates
+#  the length of the current line manually. We'll probably need to replace that
+#  with a process substitution calling
+#  get_string_length_printable() -- which should be renamed to
+#  get_string_length_printable(), incidentally.
+#
+#Theoretically, that should do it. *shrug*
+
+    # To accept arbitrary strings (e.g., possibly containing zsh or zeshy code),
+    # avoid character classes "\w" and "\W" matching only spoken language words.
+
+#, suffixed by such
+    #     captured and hence unignored hyphen
+#   if (( text_line_first_length     <= 1 )) or
+#      (( text_line_continued_length <= 1 )) {
+
+    #FUXME: Documentation outdated.
+    # Else, such line length is greater than 1, the common case. Dismantled,
+    # this is:
+    #
+    # * "\h*+", matching ignorable horizontal whitespace (i.e., non-newline)
+    #   without backtracking, for efficiency.
+    # * "(?:...)", matching either:
+    #   * "\n", a newline to ${match[1]}. Such newline will typically be printed
+    #     as is without conversion.
+    #   * "(.{...}(?:...))(?(2)|(?:...))", a line's worth of text suffixed by a
+    #     word delimiter to ${match[2]} with:
+    #     * ".{...}", matching all characters in such line excluding the last
+    #       character.
+    #     * "[^-]|(-)", matching the last character in such line. If such
+    #       character is a hyphen, capture such hyphen to ${match[3]} to enable
+    #       the following condition to test whether a hyphen matched.
+    #     * "(?(-1)|(?:...))", matching either:
+    #       * If a hyphen suffix previously matched, then nothing else.
+    #       * Else, one of the following suffixes:
+    #         * Mandatory horizontal whitespace.
+    #         * A newline.
+    #         * The string end.
+    #         In any case, such suffix will typically be converted into a single
+    #         newline by the caller.
+    #   * "(.{...})", matching a line's worth of text *NOT* suffixed by a word
+    #     delimiter. This fallback condition handles such edge
+    #     cases as single words exceeding the length of a single line, without
+    #     which such words would be silently ignored during PCRE iteration. In
+    #     such case, such words will typically be broken at the passed line
+    #     length into substrings suffixed by a hyphen followed by a newline.
+    #     Hence, match the line length minus one.
+    # * "\n?", matching an ignorable newline suffixing such text. Since the
+    #   caller typically suffixes such text by a newline already, an additional
+    #   newline should not be captured and hence printed as well.
+    #
+    # To accept arbitrary strings (e.g., possibly containing zsh or zeshy code),
+    # avoid character classes "\w" and "\W" matching only spoken language words.
+
+    #     Since callers typically
+    #     .
+    #   Assuming the caller prints
+    #     the following match group with :string.output(), this match group need
+    #     not be explicitly handled. If ${match[1]} (i.e.,  was matched, then
+    #     ${match[2]} did not and hence is the empty string, in which case printing
+    #   Such newline will typically be printed
+    #     as is without conversion.
+
+#.set_string_to_pcre_wrapping_to_width()
+#==========================================
+#[source]
+#------------------------------------------
+#>>> string on_neoclassical_economics=\
+#...    "The neoclassical school is the dominant (and probably the numerically
+#...     largest) school in contemporary economics. For neoclassical economists,
+#...     microeconomic theory (i.e., welfare economics) underlies every
+#...     theoretical subfield of specialization and every theoretical, practical,
+#...     and policy-oriented conclusion at which they arrive. All of their cost-
+#...     benefit analyses, their demonstrations of the universal gains from
+#...     foreign trade, their notions of market efficiency that are encountered
+#...     in every branch of applied economics, as well as their notion of
+#...     rational prices, have absolutely no meaning whatsoever other than that
+#...     manifested in their faith that a free-enterprise, competitive market
+#...     system will tend toward a Pareto optimal situation. Without a Pareto
+#...     optimal situation in effect, these phrases and notions cannot be
+#...     defended. In fact, in the absence of an optimal situation, these
+#...     phrases have no meaning whatsoever. They are given meaning only when
+#...     the neoclassical economists first posit the existence of a Pareto
+#...     optimum; then, by definition, all exchangers are said to 'gain,'
+#...     resources are said to be 'efficiently allocated,' prices are said to
+#...     be 'rational' and therefore conducive to making accurate assessments —
+#...     on utilitarian grounds — of the social costs and social benefits of
+#...     various government projects. Utilitarian neoclassical welfare
+#...     economics pervades and dominates nearly all neoclassical analyses on
+#...     all theoretical and practical matters."
+#>>> for_string_text_matching_pcre:\
+#...     "${on_neoclassical_economics}"\
+#...     "$(get_pcre_wrapping_at_line_length 70)"\
+#...     ':is_string_matches_glob\
+#...         "${match[${ZESHY_STRING_WRAP_PCRE_INDEX_TEXT}]}" *meaning* and
+#...         :string.output "${match[${ZESHY_STRING_WRAP_PCRE_INDEX_TEXT}]}"'
+#notion of rational prices, have absolutely no meaning whatsoever other
+#situation, these phrases have no meaning whatsoever. They are given
+#meaning only when the neoclassical economists first posit the
+#------------------------------------------
+#==========================================
+
+#:int_global ZESHY_STRING_WRAP_PCRE_INDEX_TEXT=1 <<'/---'
+#1-based index in list ${match} of the next text substring to be wrapped by a
+#PCRE returned by set_string_to_pcre_wrapping_to_width(). By design, such substring
+#is guaranteed to be no longer than the line length passed to such function.
+#/---
+
+#"${ZESHY_PCRE_OPTION_MULTILINE}"
+    # Get such PCRE.
+#   return_string "${pcre_wrapping}"
+
+    # Construct such PCRE. Dismantled, this is:
+    #
+    # * "\G", anchoring such match immediately after the end of the prior match.
+#   pcre_wrapping="${ZESHY_PCRE_OPTION_MULTILINE}"'\G'
+
+#       pcre_wrapping+='(?:(\n)|(?|(.{1,'${line_length}'})(?:\h+|$)|(.{1,'${line_length_minus_one}'}-)|(.{1,'${line_length_minus_one}'})))\n?'
+
+    #FUXME: We've significantly updated this PCRE. Update everywhere we use it
+    #as well! In particular, handle ${match[3]} by suffixing such substrings by
+    #"-${ZESHY_ASCII_NEWLINE}".
+    #FUXME: Document the two significant match groups matched by this string:
+    #
+    #* ${match[2]}, matching a line's worth of text suffixed by a word delimiter.
+    #* ${match[4]}, matching a line's worth of text *NOT* suffixed by a word delimiter.
+
+#       pcre_wrapping+='\h*+(?:(\n)|(.{1,'$(( line_length - 1 ))'}(?:[^-\n]|(-)))(?(-1)|(?:\h+\n?|$))|(.{1,'${line_length}'}))'
+
+# ....................{ PRINTERS                           }....................
+#FUXME: Right. Absolutely excise this.
+#FUXME: Unconvinced this method is still widely useful, now that it's
+#effectively been extended into print_box() (or the equivalent function now).
+#declare_function_with_stdin <<'/---'
+#string print_string_wrapped_with_line_prefix(string text, string line_prefix)
+#
+#Print the passed string wrapped to the current terminal width, prefixing each
+#resulting line with the passed prefix. Specifically:
+#
+#. Split such string into substrings satisfying the following constraints:
+#** Each substring is suffixed by either whitespace or the end of such string.
+#** Each substring is no longer than the current terminal width subtracted by the
+#   length of such prefix.
+#. Print each substring prefixed by such prefix and suffixed by a newline.
+#
+#For example:
+#
+#.print_string_wrapped_with_line_prefix()
+#==========================================
+#[source]
+#------------------------------------------
+#>>> string on_boxes=\
+#...    "The box is full of salmon, and a man sits atop the box. Long ago this"\
+#...    "man hired armed guards to keep anyone from eating his fish. The many"\
+#...    "people who sit next to the empty river starve to death. But they do"\
+#...    "not :die of starvation. They :die of a belief. Everyone believes that"\
+#...    "the man atop the box owns the fish. The soldiers believe it, and they"\
+#...    "will kill to protect the illusion. The others believe it enough that"\
+#...    "they are willing to starve. But the truth is that there is a box,"\
+#...    "there is an emptied river, there is a man sitting atop the box, there"\
+#...    "are guns, and there are starving people."
+#>>> print_string_wrapped_with_line_prefix "${on_boxes}" box
+#box: The box is full of salmon, and a man sits atop the box. Long ago this man
+#box: hired armed guards to keep anyone from eating his fish. The many people who
+#box: sit next to the empty river starve to death. But they do not :die of
+#box: starvation. They :die of a belief. Everyone believes that the man atop the
+#box: box owns the fish. The soldiers believe it, and they will kill to protect
+#box: the illusion. The others believe it enough that they are willing to starve.
+#box: But the truth is that there is a box, there is an emptied river, there is a
+#box: man sitting atop the box, there are guns, and there are starving people.
+#------------------------------------------
+#==========================================
+#/---
+#function print_string_wrapped_with_line_prefix() {
+#    # Validate sanity.
+#    die_unless_args_2 'expected one string and one line prefix'
+#    string text="${1}" line_prefix="${2}"
+#
+#    # Lengths of the current terminal, message text, and message prefix. The
+#    # latter lengths exclude non-printable characters, including ANSI escapes.
+#    integer terminal_width text_length line_prefix_length
+#    terminal_width="$(get_terminal_width)"
+#    text_length="$(get_string_length_printable "${text}")"
+#    line_prefix_length="$(\
+#        get_string_length_printable "${prefix}")"
+#
+#    # Maximum length of each text substring to be printed on each output line.
+#    integer line_length; line_length=$(( terminal_width - prefix_length ))
+#
+#    # If required, print delimiting prefixing whitespace.
+#    :print_stdout_separated_start
+#
+#    # For each text substring to be printed on each output line, print such
+#    # substring prefixed by the message prefix and suffixed by at least a
+#    # newline. See wrap_string_to_width() for further details.
+#    for_string_text_matching_pcre:\
+#        "${text}" "$(get_pcre_wrapping_at_line_length "${line_length}")"\
+#        '# Prefix the current line by such prefix.
+#        :output_string_sans_newline "${line_prefix}"
+#
+#        # Print such line.
+#        if is -n "${match['${ZESHY_STRING_WRAP_PCRE_INDEX_DELIMITED}']}" si {
+#            :string.output "${match['${ZESHY_STRING_WRAP_PCRE_INDEX_DELIMITED}']}"
+#        } else {
+#            :string.output "${match['${ZESHY_STRING_WRAP_PCRE_INDEX_UNDELIMITED}']}-"
+#        }'
+#
+#    # Sanitize the current terminal in preparation for subsequent output.
+#    :print_stdout_separated_stop
+#}
+
+#       if is -n "${match['${ZESHY_STRING_WRAP_PCRE_INDEX_DELIMITED}']}" si {
+#           '${line_name__fswall}'="${match['${ZESHY_STRING_WRAP_PCRE_INDEX_DELIMITED}']}"
+#       } else {
+#           '${line_name__fswall}'="${match['${ZESHY_STRING_WRAP_PCRE_INDEX_UNDELIMITED}']}-"
+#       }
+
+#       (( ${#match} >= '${ZESHY_STRING_WRAP_PCRE_INDEX_TEXT}' )) ||
+#:int_global ZESHY_STRING_WRAP_PCRE_INDEX_DELIMITED=2 <<'/---'
+#1-based index in list ${match} of a line's worth of text suffixed by a word
+#delimiter or the empty string if no such text exists, after matching a PCRE
+#returned by set_string_to_pcre_wrapping_to_width(). See such function for further
+#details.
+#/---
+#
+#:int_global ZESHY_STRING_WRAP_PCRE_INDEX_UNDELIMITED=4 <<'/---'
+#1-based index in list ${match} of a line's worth of text _not_ suffixed by a
+#word delimiter or the empty string if no such text exists, after matching a PCRE
+#returned by set_string_to_pcre_wrapping_to_width(). See such function for further
+#details.
+#/---
+
+    # For each line's worth of text, print such line suffixed by a newline.
+    # If such line is *NOT* already suffixed by a word delimiter (e.g., hyphen),
+    # suffix such line by a hyphen. The latter case typically arises when
+    # splitting single words exceeding such line length.
+#   for_string_text_matching_pcre:\
+#       "${text}" "$(get_pcre_wrapping_at_line_length "${line_length}")"\
+#       'if is -n "${match['${ZESHY_STRING_WRAP_PCRE_INDEX_DELIMITED}']}" si {
+#           :string.output "${match['${ZESHY_STRING_WRAP_PCRE_INDEX_DELIMITED}']}"
+#       } else {
+#           :string.output "${match['${ZESHY_STRING_WRAP_PCRE_INDEX_UNDELIMITED}']}-"
+#       }'
+
+    #FUXME: Does this PCRE behave sanely if the passed line length is only 1?
+    #This depends on whether or not libpcre matches ".{1,0}" sanely (e.g.,
+    #matches such subpattern as the empty string).
+    #FUXME: Call a new function reset_terminal_color() in lieu of such logic
+    #both here and below.
+
+# ':string.output "${line_prefix}${match[1]}"'
+    # For each text substring to be printed on each output line, print such
+    # substring prefixed by the message prefix and suffixed by newline. Match
+    # multiline to prevent "." from matching newlines.
+
+#, in which case ${match[1]} will be the empty string,
+    #     ensuring an equivalent of ':string.output "${match[1]}"' will simply
+    #     reprint the matched newline.
+
+    #   * Else, the empty string. This fallback condition handles such edge
+    #     cases as single words exceeding the length of a single line, without
+    #     which such words would be silently ignored during PCRE iteration. In
+    #     such case, such words will typically be broken at the passed line
+    #     length into substrings suffixed by a hyphen followed by a newline.
+#. This PCRE assumes *multiline matching*
+#(i.e., the `.` quantifier matches all characters _except_ newline) and hence
+#should only be used under such matching
+# Match
+    # multiline to prevent "." from matching newlines.
+    # Return such string.
+#   return_string "${text_wrapped}"
+
+#Wouldn't you like to see a positive LSD story on the news? To base your decision on information rather than scare tactics and superstition? Perhaps? Wouldn't that be interesting? Just for once?
+#   "Today, a young man on acid realized that all matter is merely energy condensed to a slow vibration – that we are all one consciousness experiencing itself subjectively. There's no such thing as death, life is only a dream, and we're the imagination of ourselves. Here's Tom with the weather."
+
+    # PCRE wrapping lines to such length.
+#   pcre_wrapping_lines="$(get_pcre_wrapping_at_line_length "${line_length}")"
+
+    #FUXME: Abstract into a string global.
+    # PCRE matching such a substring. To ensure human-readable output, wrap at
+    # word endings by requiring such substring be suffixed by either whitespace
+    # or the end of such string. To accept zsh code embedded in such input,
+    # avoid character classes "\w" and "\W" matching spoken language words.
+    # Dismantled, this is:
+    #
+    # * "\G", anchoring such match immediately after the end of the prior match.
+    # * "\h*+", matching ignorable horizontal whitespace (i.e., non-newline)
+    #   without backtracking, for efficiency.
+    # * "(?:...)", matching either:
+    #   * "\n", a newline, in which case ${match[1]} will be the empty string,
+    #     ensuring an equivalent of ':string.output "${match[1]}"' will simply
+    #     reprint the matched newline.
+    #   * "(.{...})", a line's worth of text to ${match[1]}, optionally:
+    #     * "(-)", capturing a hyphen suffix to ${match[2]}.
+    # * "(?(2)|(?:...))", matching either:
+    #   * If a hyphen suffix previously matched, then nothing else.
+    #   * Else, mandatory horizontal whitespace, a newline, or the string end.
+    #     In any case, such suffix will typically be converted into a newline.
+#   line_pcre='\G\h*+(?:\n|(.{1,'${line_length}'}(-)?)(?(2)|(?:\h+|$))'
+    # * "(?:...)", matching such line's delimiter as either:
+
+#Minimizing Line Count versus Right Raggedness 
+#a maximal line's worth  substring. To ensure human-readable output, wrap at
+#word endings by requiring such substring be suffixed by either whitespace
+#or the end of such string.

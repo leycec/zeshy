@@ -1,0 +1,1137 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+#
+# --------------------( SYNOPSIS                           )--------------------
+# Casually inspect the current system (e.g., operating system, window manager).
+# @{digest} depends on this parcel to determine whether or not the previously
+# compiled digest file applies to the current system.
+
+#FIXME: While it's great that we developed a sane, efficient technique for
+#detecting the current Linux distribution if any, doing so actually turns out to
+#be unnecessary here. Hence, ::set_system_globals_os() should be refactored into
+#:set_string_to_linux_distro() and shifted into a new parcel @{linux/distro}.
+#So, why is detecting distros unneeded? Numerous reasons:
+#
+#A. It's insufficiently granular. What we *REALLY* care about is the set of all
+#   package management systems and the set of all system management daemons
+#   supported by the current system. Both are efficiently detectable by the
+#   existence of specific pathables (e.g., "portageq", implying such system to
+#   support Portage-based package management).
+#B. It's both inefficient and unreliable. Reliably detecting such distros
+#   requires parsing an external file in the ideal case and globbing for
+#   recognized pathnames in the non-ideal case. Either case is fairly terrible.
+#
+#Replace such detection with two new functions:
+#
+#* ::set_system_globals_package_manager().
+#* ::set_system_globals_system_daemon().
+#FIXME: Actually, such detection also strikes us as overkill here. ${PATH}
+#detection in @{digest} should implicitly handle changes to package managers and
+#system daemons. So, probably just shift ::set_system_globals_os() away entirely
+#without any replacement functionality.
+
+#FIXME: Note that, since neither Mir or Wayland currently appear to provide
+#command-line interfaces to query for the current window manager,
+#${ZESHY_WINDOW_MANAGER_NAME} should simply be set to either "Mir" or
+#"Wayland" under such display servers. Indeed, under Wayland, the display
+#server *IS* the window manager. What we refer to as "window managers" under
+#X11 will be *MUCH* more tightly bound to Wayland itself. Indeed, under Weston
+#(the reference implementation of Weston), window managers appear to be loaded
+#as dynamically shared libraries on Weston startup and hence referred to as
+#"shell plugins". Specifically:
+#
+#"Weston has shell plugins. A shell plugin is basically a window manager,
+# implementing all the window management policy and protocol. It is a plugin,
+# because it has to be part of the server.  The desktop-shell plugin is a window
+# manager for desktops. There is also a tablet-shell plugin, but it would need
+# more love. The desktop-shell plugin is accompanied with the desktop-shell
+# client, which in a separate process is resposible for GUI elements, like
+# backgrounds and panels. The Wayland protocol extension specific to
+# desktop-shell is wl_shell.  The name is misleading nowadays, since it is not
+# really part of the core protocol. Any client will use wl_shell for window
+# management related requests."
+#
+#This is all a bit annoying, as it implies that under non-Weston Wayland
+#implementations, window managers will probably be implemented in a completely
+#non-orthogonal, different manner, and there exists no uniform API -- accessible
+#at the CLI or not -- for querying the name of "the thing currently managing
+#windows." Silly. But there it is. Of course, it'll be a year or two before
+#Wayland is even robust enough for general-purpose use. In the meantime, we just
+#set ${ZESHY_WINDOW_MANAGER_NAME} to simple strings without attempting querying.
+#
+#There already exist a few such shell plugins: i3way (inspired by tiling window
+#manager i3), Orbital, and so on. The interesting thing is that zeshy probably
+#doesn't *NEED* to care about shell plugins. Weston should theoretically
+#eventually provide a uniform C API and hence command-line interface for
+#performing generic operations universally applicable to *EVERY* shell plugin
+#(e.g., setting the background image).
+#
+#Right. Then, under Weston, the interesting thing to see will be how the KDE
+#and GNOME desktop environments are implemented -- perhaps as one or more
+#plugins? Though, that seems a bit ridiculous, given the heavy and fiercely
+#independent nature of both. In any case, at the moment, *WHO CARES.* :{}
+#FIXME: Interestingly, GNOME 3.12 provides a GNOME-specific Wayland compositor
+#and hence alternative to Weston, the reference Wayland compositor. Detect the
+#GNOME-specific compositor below and set appropriate variables. It seems likely
+#KDE will follow suite, requiring we also detect the Wayland compositor KDE 5
+#(?) inevitably provides as well.
+#FIXME: Interesting. Due to fewer available developers, KDE will be implementing
+#a so-called "Wayland session compositor" running on top of a genuine Wayland
+#compositor rather than implementing a full Wayland compositor, suggesting KDE
+#Wayland users will need to run KDE either as a Weston or Mutter (GNOME Wayland)
+#shell plugin. (Har har!) In any case, detection presumably becomes that much
+#more cumbersome.
+
+# ....................{ GLOBALS                            }....................
+# Detect human- rather than machine-readable names for system-specific metadata,
+# as:
+#
+# * External commands typically provide human- rather than machine-readable
+#   names (e.g., "wmctrl -m", printing only the human-readable name of the
+#   current window manager).
+# * Human-readable names are losslessly convertable to machine-readable names
+#   (e.g., from human-readable display server name "Cygwin/X" to the
+#   corresponding machine-readable name "cygwin_x"), implying the latter may be
+#   algorithmically obtained from the former. Indeed, this is precisely what
+#   subsequent logic in @{*-start/*-test} does.
+# * Machine-readable names are *NOT* generally losslessly convertable human-
+#   readable names (e.g., there exists no algorithmically deterministic means of
+#   converting "cygwin_x" to "Cygwin/X").
+typeset -g\
+    ZESHY_SYSTEM_ID\
+    ZESHY_LINUX_DISTRO_NAME\
+    ZESHY_DISPLAY_SERVER_NAME\
+    ZESHY_DESKTOP_ENVIRONMENT_NAME\
+    ZESHY_WINDOW_MANAGER_NAME
+
+# ....................{ SETTERS                            }....................
+# Detecting system-specific metadata in a reliable manner is notoriously hard,
+# let alone in an efficient *AND* reliable manner. Since zeshy calls the
+# following functionality on every startup, such functionality should be
+# optimized. In practice, this means that *MOST* inspection of the current
+# system should reduce to scalar comparisons on:
+#
+# * String globals, either guaranteed to exist by zsh itself (e.g., ${OSTYPE})
+#   or whose existence strongly implies the existence of related functionality
+#   (e.g., ${DISPLAY}, implying that a display server supporting the X11
+#   protocol is currently running).
+# * Pathable commands, whose existence strongly implies the existence of related
+#   functionality (e.g., "portageq", implying that the Gentoo Portage package
+#   management system is currently available).
+#
+# As inspiration for such functionality, contemplate the following sources (in
+# descending order of subjective reliability and utility as of this writing):
+#
+# * HardInfo, a C system profiler.
+# * screenFetch, a Bash system profiler.
+# * inxi, a Bash system profiler.
+
+# void ::set_system_globals(void)
+function ::set_system_globals() {
+    # Validate sanity.
+    (( # == 0 )) || :die 'Expected no arguments.'
+
+    # Define all of the globals declared above.
+    ::set_system_globals_os
+    ::set_system_globals_gui
+
+    # String signifying whether or not the current shell is a login shell.
+    local shell_login_state
+    if [[ -o login ]] { shell_login_state="login"
+    } else            { shell_login_state="non-login" }
+
+    # Define the global uniquely identifying the current system as (in order):
+    #
+    # * The hostname of the current system if any or "none" otherwise. (Yes,
+    #   the hostname can technically be set to the empty string. It's not a
+    #   particularly good idea, but then... is anything? --Signed, Nihilist)
+    # * The lowercase name of the current operating system, guaranteed to be
+    #   nonempty. See @{*-core/*-test/*-os} for further details.
+    # * The lowercase name of the current CPU architecture, guaranteed to be
+    #   nonempty. See @{*-core/*-test/*-architecture} for further details.
+    # * The current Linux-specific distribution if any or "none" otherwise.
+    # * The current display server if any or "none" otherwise.
+    # * The current desktop environment if any or "none" otherwise.
+    # * The current window manager if any or "none" otherwise.
+    # * The lowercase name of the current terminal emulator if any or "none"
+    #   otherwise.
+    #
+    # While prior logic should guarantee most such names to be both set *AND*
+    # nonempty, a bit of overzealous caution never hurt no one.
+    ZESHY_SYSTEM_ID="${HOST:-none}.${OSTYPE}.${MACHTYPE}.${ZESHY_LINUX_DISTRO_NAME:-none}.${ZESHY_DISPLAY_SERVER_NAME:-none}.${ZESHY_DESKTOP_ENVIRONMENT_NAME:-none}.${ZESHY_WINDOW_MANAGER_NAME:-none}.${TERM:-none}.${shell_login_state}"
+
+    # Convert such identifier to a valid cross platform-portable pathname.
+    # Specifically, convert all contiguous runs of one or more non-alphanumeric
+    # characters to underscores, excluding commonplace punctuation known to be
+    # portable (e.g., ".", "-"). This includes both whitespace *AND* characters
+    # prohibited on certain platforms (e.g., Windows, prohibiting more
+    # characters than Unix-like platforms). While we could positively match such
+    # characters, doing so negatively should be more robust.
+    ZESHY_SYSTEM_ID="${ZESHY_SYSTEM_ID//[^[:alnum:].-]##/_}"
+
+    # Inform debuggers of such identifier.
+    :output_line_if_debugging 'Identified current system as "'${ZESHY_SYSTEM_ID}'".'
+}
+
+# ....................{ SETTERS ~ os                       }....................
+# To add support for a new distribution, match such distribution's specific file
+# in the appropriate structures below. Specifically:
+#
+# * If such distribution provides "/etc/lsb-release", discover the value of
+#   canonical key "DISTRIB_ID" in such file. If such value requires munging
+#   (e.g., capitalization), do so explicitly.
+# * Else if such distribution provides "/etc/os-release", discover the value of
+#   canonical key "NAME" in such file. Again, munge such value if required.
+# * In either case, determine if such distribution installs a distribution-
+#   specific file (e.g., "/etc/gentoo-release" for Gentoo). If so, match such
+#   file into both the list and both below.
+#
+# For both maintainability and efficiency, officially discontinued distributions
+# should be removed as soon as possible from all such structures.
+
+# void ::set_system_globals_os(void)
+function ::set_system_globals_os() {
+    # Validate sanity.
+    (( # == 0 )) || :die 'Expected no arguments.'
+
+    # If the current OS is *NOT* GNU/Linux, return immediately. Only GNU/Linux
+    # offers what are referred to as Linux distributions, at present.
+    [[ "${OSTYPE}" == 'linux-gnu' ]] || return 0
+
+    # Load zsh module "mapfile", providing efficient access to file contents.
+    # See :load_module_mapfile_start() for further details.
+    zmodload zsh/mapfile
+
+    {
+        # PCRE capturing either a double-quoted string excluding such quotes
+        # *OR* the remainder of the current line into ${match[1]}.
+        local pcre_value='(?|"([^"]++)"|(.++))' 
+
+        # The canonical command "lsb_release" reads "/etc/lsb-release" to print
+        # the current Linux distribution name. Unfortunately, several
+        # distributions scurrilously violate such standard by installing
+        # distribution-specific "lsb-release"-like files with differing
+        # filenames but similar contents *NOT* read by "lsb_release". Such files
+        # take precedence over "/etc/lsb-release" and hence must be tested for
+        # first. On the bright side, the existence of any such file
+        # deterministically provides the current distribution.
+        if [[ -f '/etc/lsb-release-crunchbang' ||
+              -f '/etc/crunchbang-lsb-release' ]] { # Why, CrunchBang? *WHY*!?!
+            ZESHY_LINUX_DISTRO_NAME='CrunchBang'
+        # Else if "/etc/lsb-release" exists, parse the value of key "DISTRIB_ID"
+        # from such file (e.g., string Gentoo from line 'DISTRIB_ID="Gentoo"').
+        # Note command "lsb_release" also provides such value as follows:
+        #
+        #     # If "lsb_release" is pathable, capture such command's output.
+        #     if (( ${+commands[lsb_release]} )) {
+        #         ZESHY_LINUX_DISTRO_NAME="$(lsb_release --short --id)"
+        #     }
+        #
+        # However, such approach requires:
+        #
+        # * Both file "/etc/lsb-release" and command "lsb_release", whereas the
+        #   current approach requires only the former.
+        # * An inefficient command substitution and hence subshell, whereas the
+        #   current approach operates entirely within the current shell.
+        #
+        # Else if "/etc/os-release" exists, parse the unquoted value of standard
+        # key "NAME" from such file as above. Unlike above, however, there
+        # appears to exist no equivalent command for parsing such file.
+        #
+        # For both efficiency and simplicity, combine the two tests. Dismantled,
+        # this is:
+        #
+        # * "(?m)", matching such PCRE in a multiline-aware manner (i.e., such
+        #   that "^" and "$" match both newlines and the string start and end).
+        # } elif false && { [[ -f '/etc/lsb-release' && "${mapfile[/etc/lsb-release]}" =~\
+        } elif\
+           [[ -f '/etc/lsb-release' && "${mapfile[/etc/lsb-release]}" =~\
+                 '(?m)^DISTRIB_ID='${pcre_value}'$' ]] ||
+           [[ -f '/etc/os-release' && "${mapfile[/etc/os-release]}" =~\
+                 '(?m)^NAME='${pcre_value}'$' ]] {
+            ZESHY_LINUX_DISTRO_NAME="${match[1]}"
+
+            # Canonicalize such distribution name. Do *NOT* implicitly
+            # capitalize such name, as numerous distribution names are intended
+            # to be lowercase (e.g., "elementary OS").
+            #
+            # Remove all instances of the current operating system from such
+            # name (e.g., the "Linux" in "Arch Linux ARM", "LinuxMint", and
+            # "Gentoo Linux"), unless such instance is absolutely critical to
+            # the understanding of such name (e.g., the "Linux" in "Linux From
+            # Scratch"). Dismantled, this is:
+            #
+            # * "(i)", matching case-insensitively. Several distributions
+            #   entirely capitalize such name (e.g., "SUSE LINUX").
+            if [[ "${ZESHY_LINUX_DISTRO_NAME}" != 'Linux From Scratch' ]] {
+                ZESHY_LINUX_DISTRO_NAME="${ZESHY_LINUX_DISTRO_NAME//(i)linux}"
+            }
+
+            # Map non-canonical to canonical distribution names. Numerous
+            # distributions set "DISTRIB_ID" in "/etc/lsb-release" to an either
+            # overly specific or ambiguous name, in either case resulting in
+            # related variants of the same distribution being erroneously
+            # treated as different distributions. Correct this.
+            case "${ZESHY_LINUX_DISTRO_NAME}" {
+            # If such name is either "Archarm" or prefixed by "Arch " (e.g.,
+            # "Arch ARM"), reduce such name to simply "Arch".
+            'Arch'('arm'|' '*)) ZESHY_LINUX_DISTRO_NAME='Arch';;
+            # If such name is either "CentOS" or prefixed by "RedHatEnterprise"
+            # (e.g., "RedHatEnterpriseWS", "RedHatEnterpriseServer"), reduce
+            # such name to simply "Red Hat Enterprise".
+            'CentOS'|'RedHatEnterprise'*) ZESHY_LINUX_DISTRO_NAME='Red Hat Enterprise';;
+            # If such name is "elementary", suffix such name by " OS".
+            'elementary') ZESHY_LINUX_DISTRO_NAME='elementary OS';;
+            # If such name is "frugalware", capitalize such name.
+            'frugalware') ZESHY_LINUX_DISTRO_NAME='Frugalware';;
+            # If such name is "openSUSE project", strip the latter word.
+            'openSUSE project') ZESHY_LINUX_DISTRO_NAME='openSUSE';;
+            }
+        # Else, iteratively search for a distribution-specific "/etc" file
+        # typically implying the current distribution (e.g., if
+        # "/etc/DISTRO_SPECS" exists, such distribution is almost certainly
+        # Puppy Linux).
+        } else {
+            # There exist two approaches to implementing such search:
+            #
+            # * The simplistic brute-force approach of iteratively searching for
+            #   each such file "one at a time."
+            # * The significantly more efficient approach of globbing for all
+            #   such files "all at once" into a local list. Since such files are
+            #   distribution-specific and hence mutually exclusive, such list
+            #   should contain either:
+            #   * Zero filenames if the current distribution is unrecognized.
+            #   * One filename specific to the current distribution.
+            #
+            # Since globbing for a small finite set of filenames is presumably
+            # efficient *AND* since mapping the globbed filename to the
+            # corresponding distribution name only requires a constant-time
+            # map lookup, such approach is usually much more efficient than
+            # manual iteration.
+            #
+            # Technically, the current filesystem could contain more than one
+            # distribution-specific file, in which case there exists no
+            # reasonable means of deciding which better describes the current
+            # distribution. In such cases, print a warning and arbitrarily
+            # select the first.
+            local distro_filename
+            local -a distro_filenames
+            local -A distro_filename_to_name
+
+            # Map each recognized distribution-specific file in "/etc" to the
+            # corresponding human-readable distribution name. Exclude files
+            # shared between multiple distributions (e.g., "redhat-release"),
+            # tested below only if no distribution-specific file is found.
+            distro_filename_to_name=(
+                '/etc/arch-release'       'Arch'
+                '/etc/centos-release'     'Red Hat Enterprise'
+                '/etc/chakra-release'     'Chakra'
+                '/etc/DISTRO_SPECS'       'Puppy'
+                '/etc/distro-release'     'Foresight'
+                '/etc/enlisy-release'     'Enlisy'
+                '/etc/fedora-release'     'Fedora'
+                '/etc/frugalware-release' 'Frugalware'
+                '/etc/gentoo-release'     'Gentoo'
+                '/etc/knoppix-version'    'Knoppix'
+                '/etc/lfs-version'        'Linux From Scratch'
+                '/etc/mageia-release'     'Mageia'
+                '/etc/pardus-release'     'Pardus'
+                '/etc/redflag-release'    'Red Flag'
+                '/etc/SuSE-release'       'SUSE'
+                '/etc/sabayon-release'    'Sabayon'
+                '/etc/slackware-release'  'Slackware'
+                '/etc/system-release'     'Amazon AMI'
+                '/etc/turbolinux-release' 'Turbolinux'
+                '/etc/vine-release'       'Vine'
+                '/etc/yellowdog-release'  'Yellow Dog'
+                '/etc/zenwalk-version'    'Zenwalk'
+            )
+
+            # List of all such files found on the current system. Dismantled,
+            # this is:
+            #
+            # * "${(k@)^...}", expanding to each key of such map (which
+            #   coincidentally are all such files).
+            # * "(#q.)", excluding all files *NOT* found on the current system.
+            distro_filenames=( ${(k@)^distro_filename_to_name}(#q.) )
+            # print okok
+
+            # If at least one such file exists...
+            if (( ${#distro_filenames} )) {
+                # If more than one such file exists, print a nonfatal warning.
+                if (( ${#distro_filenames} >= 2 )) {
+                    print 'zeshy: Multiple conflicting distribution-specific files found: ' 1>&2
+                    print "zeshy: ${distro_filenames[@]}" 1>&2
+                }
+
+                # Map the first such file to a corresponding distribution name.
+                # For safety, map to the empty string if we erroneously failed
+                # to map such file above.
+                ZESHY_LINUX_DISTRO_NAME="${distro_filename_to_name[${distro_filenames[1]}]-}"
+
+                # If such file was *NOT* mapped to such a name above, print a
+                # nonfatal warning. While there exist various means of testing
+                # whether map keys exist, this is the easiest when map values
+                # are guaranteed to be nonempty -- as inspection shows above.
+                [[ -n "${ZESHY_LINUX_DISTRO_NAME}" ]] ||
+                    print 'zeshy: Distribution-specific file "'${distro_filenames[1]}'" unmapped.' 1>&2
+            # Else, search for a non-distribution-specific file strongly
+            # implying the current distribution. Such files are provided by
+            # numerous distributions and hence must be tested for only as a
+            # fallback, after exhausting all other options above. Since there
+            # exist only a few such files, search for such files iteratively
+            # rather than via the above efficient but complex approach.
+            #
+            # If a Debian-specific file exists, this is that distribution.
+            } elif [[ -f '/etc/debian_version' ]] {
+                ZESHY_LINUX_DISTRO_NAME='Debian'
+            # If a Red Hat-specific file exists, this is that distribution.
+            } elif [[ -f '/etc/redhat-release' ]] {
+                ZESHY_LINUX_DISTRO_NAME='Red Hat'
+            # Else, such distribution name remains the empty string.
+            }
+        }
+    # Unload the previously loaded zsh module "mapfile", even in the event of
+    # uncaught exceptions or unhandled errors. See :load_module_mapfile_stop()
+    # for further details.
+    } always {
+        zmodload -ui zsh/mapfile
+    }
+}
+
+# ....................{ SETTERS ~ gui                      }....................
+# void ::set_system_globals_gui(void)
+function ::set_system_globals_gui() {
+    # Validate sanity.
+    (( # == 0 )) || :die 'Expected no arguments.'
+
+    # If the current display server is Wayland, set such global.  Wayland
+    # *ALWAYS* exports such variable to Wayland clients as the named socket for
+    # the current Wayland display server. To quote "man weston": "Weston will
+    # export WAYLAND_DISPLAY with this value in the environment for all child
+    # processes to allow them to connect to the right server automatically."
+    if (( ${+WAYLAND_DISPLAY} )) {
+        # If such server supports the X11 protocol, XWayland must be running.
+        if (( ${+DISPLAY} )) {
+            ZESHY_DISPLAY_SERVER_NAME='XWayland'
+        # Else, only Wayland itself is running.
+        } else {
+            ZESHY_DISPLAY_SERVER_NAME='Wayland'
+        }
+
+        #FIXME: Does such test actually suffice under Wayland?
+
+        # If GNOME-specific environment variable ${GNOME_DESKTOP_SESSION_ID}
+        # exists, this is a GNOME Shell Wayland compositor and hence desktop
+        # environment. See ::set_system_globals_gui_x() for further details.
+        if (( ${+GNOME_DESKTOP_SESSION_ID} )) {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME Shell'
+        }
+    # Else if the current display server is Mir, set such global. Mir *ALWAYS*
+    # exports such variable to Mir clients as the named socket for the current
+    # Mir display server. To quote a recent Mir commit: "Servers now set the
+    # $MIR_SOCKET environment variable to their own socket name for any direct
+    # children's benefit."
+    } elif (( ${+MIR_SOCKET} )) {
+        # Mir provides its own desktop environment as a Mir plugin. Curiously,
+        # such environment retains the predictable Ubuntu name "Unity" despite
+        # having little to nothing in common under the hood with prior GNOME-
+        # and Compiz-based Ubuntu desktop environments of the same name. True
+        # to its word, "Unity" has responsibly unified open-source efforts.
+        # (Said with finger down throat.)
+        ZESHY_DESKTOP_ENVIRONMENT_NAME='Unity'
+
+        # If such server supports the X11 protocol, XMir must be running.
+        if (( ${+DISPLAY} )) {
+            ZESHY_DISPLAY_SERVER_NAME='XMir'
+        # Else, only Mir itself is running.
+        } else {
+            ZESHY_DISPLAY_SERVER_NAME='Mir'
+        }
+    # Else if the current OS is either Apple OS X, set such global.
+    #
+    # Interestingly, like Windows but unlike Android, the iOS UI stack is
+    # sufficiently tightly integrated as to have *NO* display server.
+    # Unfortunately, since this condition matches both OS X and iOS, it's
+    # unclear at the moment how to efficiently distinguish the two.
+    } elif [[ "${OSTYPE}" == 'darwin'* ]] {
+        # If the current display server (Quartz Compositor) supports the X11
+        # protocol, XQuartz must be running.
+        if (( ${+DISPLAY} )) {
+            ZESHY_DISPLAY_SERVER_NAME='XQuartz'
+        # Else, only Quartz Compositor is running.
+        } else {
+            ZESHY_DISPLAY_SERVER_NAME='Quartz'
+        }
+    # Else if the current OS is Google Android, set such global.
+    } elif [[ "${OSTYPE}" == 'linux-android'* ]] {
+        ZESHY_DISPLAY_SERVER_NAME='SurfaceFlinger'
+    # Else if the current OS is Microsoft Windows, set such global.
+    } elif [[ "${OSTYPE}" == ('cygwin'|'mingw')* ]] {
+        # If the current display server supports the X11 protocol, either XMing
+        # or Cygwin/X is probably running. Since the latter is now the most
+        # common such server for Windows, assume the latter.
+        if (( ${+DISPLAY} )) {
+            ZESHY_DISPLAY_SERVER_NAME='Cygwin/X'
+        # Else, only Windows itself is running. Since Windows provides no
+        # display server, such name remains the empty string.
+        }
+    # Else if the current display server supports the X11 protocol, set such
+    # globals dynamically by querying the appropriate X11 property of the root
+    # window (i.e., the desktop). This is fairly computationally complex, but
+    # there's little we can do about that.
+    #
+    # X *ALWAYS* exports such variable to X clients as a string describing the
+    # connection to the current X display server, formatted as a ":"-delimited
+    # optional hostname followed by mandatory display number. In any case, the
+    # existence of such global unambiguously implies the current shell to be
+    # running under X. Indeed, setting such variable in an environment *NOT*
+    # running under X provokes calamity, suggesting that should never happen.
+    #
+    # To corroborate such test, we could also test the existence of at least one
+    # process running "${commands[X]}" as the current user *AND* listening to
+    # the current value of ${DISPLAY}. However, since this function is called
+    # comparatively early in zeshy startup, embedding cross platform-portable
+    # functionality for testing processes here would be overly burdensome and
+    # inefficient. In the immortal words of Malcolm Reynolds, "Frack that."
+    } elif (( ${+DISPLAY} )) {
+        ::set_system_globals_gui_x
+    # Else, there either exists no display server or the current OS is running
+    # an OS-specific and hence non-X11-compatible display server. For
+    # simplicity, ignore the latter case. In the former case, the current shell
+    # is running under a virtual console. Since virtual consoles are *NOT*
+    # display servers, such name remains the empty string.
+    }
+}
+
+# void ::set_system_globals_gui_x(void)
+function ::set_system_globals_gui_x() {
+    # Validate sanity.
+    (( # == 0 )) || :die 'Expected no arguments.'
+
+    # Set the current display server to merely X.
+    ZESHY_DISPLAY_SERVER_NAME='X'
+
+    # Identify the current window manager.
+    #
+    # If "wmctrl" is installed, prefer such command. Whereas "xprop" requires at
+    # least two command substitutions and string mungings to reliably do so,
+    # "wmctrl" only requires one of each. See is_pathable() for further details.
+    if (( ${+commands[wmctrl]} )) {
+        # Get a human-readable synopsis of the current window manager: e.g.,
+        #
+        #     Name: FVWM
+        #     Class: N/A
+        #     PID: N/A
+        #     Window manager's "showing the desktop" mode: N/A
+        ZESHY_WINDOW_MANAGER_NAME="$(command wmctrl -m)"
+
+        # Extract the substring between "Name: " and the first newline.
+        # Dismantled, this is:
+        #
+        # * "(f)", expanding to the first line of such synopsis.
+        # * "[7,-1]", stripping such prefix from such line.
+        ZESHY_WINDOW_MANAGER_NAME="${ZESHY_WINDOW_MANAGER_NAME[(f)1][7,-1]}"
+    # Else if "xprop" is installed, fallback to such command.
+    } elif (( ${+commands[xprop]} )) {
+        # Get the window ID of the child window of the root window whose window
+        # properties reflect the current window manager rather than such window.
+        # Default "xprop" output is cumbersome to parse: e.g.,
+        #
+        #     _NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x80001a
+        #
+        # Hence, pass options streamlining such output: e.g.,
+        #
+        #     _NET_SUPPORTING_WM_CHECK 0x80001a
+        integer window_id_wm; window_id_wm="$(command xprop -root -notype\
+            -f _NET_SUPPORTING_WM_CHECK 32x ' $0' _NET_SUPPORTING_WM_CHECK)"
+
+        # Strip the prefixing property name from such ID.
+        window_id_wm="${window_id_wm##* }"
+
+        # Get the name of the current window manager from such window. Again,
+        # default "xprop" output is cumbersome to parse: e.g.,
+        #
+        #     _NET_WM_NAME(UTF8_STRING) = "FVWM"
+        #
+        # Hence, pass options streamlining such output: e.g.,
+        #
+        #     _NET_WM_NAME "FVWM"
+        ZESHY_WINDOW_MANAGER_NAME="$(command xprop -id "${window_id_wm}" -notype\
+            -f _NET_WM_NAME 8u ' $0' _NET_WM_NAME)"
+
+        # Munge such name. Specifically:
+        #
+        # * Strip the prefixing property name and '"' from such name.
+        # * Strip the suffixing '"' from such name.
+        ZESHY_WINDOW_MANAGER_NAME="${${ZESHY_WINDOW_MANAGER_NAME##*\"}[1,-2]}"
+    }
+
+    # Identify the current desktop environment *AFTER* such window manager, as
+    # the latter can frequently be used to efficiently determine the former.
+    #
+    # If canonical KDE-specific environment variable ${KDE_SESSION_VERSION}
+    # exists, this is a KDE desktop of major version equal to such value.
+    if (( ${+KDE_SESSION_VERSION} )) {
+        ZESHY_DESKTOP_ENVIRONMENT_NAME="KDE ${KDE_SESSION_VERSION}"
+    # Else if canonical KDE-specific environment variable ${KDE_FULL_SESSION}
+    # exists, this is a KDE desktop. Recall that:
+    #
+    # * KDE 3.5.5 introduced ${KDE_FULL_SESSION}.
+    # * KDE 4 introduced ${KDE_SESSION_VERSION}.
+    # * ${KDE_SESSION_VERSION} does *NOT* exist.
+    #
+    # Hence, we deduce this to necessarily be a KDE 3 desktop.
+    } elif (( ${+KDE_FULL_SESSION} )) {
+        ZESHY_DESKTOP_ENVIRONMENT_NAME='KDE 3'
+    # Else if canonical MATE-specific environment variable
+    # ${MATE_DESKTOP_SESSION_ID} is set, this is a MATE desktop.
+    } elif (( ${+MATE_DESKTOP_SESSION_ID} )) {
+        ZESHY_DESKTOP_ENVIRONMENT_NAME='MATE'
+    # Else if such window manager was identified, attempt to match the desktop
+    # environment corresponding to such manager.
+    } elif [[ -n "${ZESHY_WINDOW_MANAGER_NAME}" ]] {
+        # If such window manager name is (in descending order of likelihood)...
+        case "${ZESHY_WINDOW_MANAGER_NAME}" {
+        # ..."Muffin", this is a Cinammon desktop (i.e., GNOME 3 fork).
+        ('Muffin') ZESHY_DESKTOP_ENVIRONMENT_NAME='Cinammon';;
+        # ..."Mutter", this is a GNOME 3 desktop.
+        ('Mutter') ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME Shell';;
+        # ..."Marco", this is a MATE desktop (i.e., GNOME 2 fork).
+        ('Marco') ZESHY_DESKTOP_ENVIRONMENT_NAME='MATE';;
+        # ..."Metacity", this is a GNOME 2 desktop.
+        ('Metacity') ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME 2';;
+        # ...prefixed by "Xfwm" (e.g., "Xfwm4", "Xfwm5), this is an XFCE desktop
+        # of major version equal to such name's suffix.
+        ('Xfwm'*) ZESHY_DESKTOP_ENVIRONMENT_NAME="Xfce ${ZESHY_WINDOW_MANAGER_NAME[5,-1]}";;
+        }
+    }
+
+    # If such desktop environment remains unidentified, attempt increasingly
+    # unreliable tests.
+    if [[ -z "${ZESHY_DESKTOP_ENVIRONMENT_NAME}" ]] {
+        # If proposed environment variable ${XDG_CURRENT_DESKTOP} exists *AND*
+        # is set to the name of a desktop environment rather than window
+        # manager, default to the value of such variable verbatim. As the answer
+        # beginning "On Ubuntu 12.04 I tested environment..." at
+        # http://askubuntu.com/questions/72549/how-to-determine-which-window-manager-is-running
+        # demonstrates, *ALL* desktop environments setting such variable appear
+        # to reliably format such variable's value exactly as we require (e.g.,
+        # "GNOME", "LXDE", "Unity").
+        #
+        # The following window managers erroneously set such global and hence
+        # must be explicitly excluded:
+        #
+        # * Enlightment.
+        if (( ${+XDG_CURRENT_DESKTOP} )) &&
+           [[ "${XDG_CURRENT_DESKTOP}" != 'ENLIGHTENMENT' ]] {
+            # Map XDG- to zeshy-specific desktop environment names.
+            case ("${XDG_CURRENT_DESKTOP}") {
+            ('XFCE') ZESHY_DESKTOP_ENVIRONMENT_NAME='Xfce';;
+            # Else, such XDG-specific name is already zeshy-specific.
+            (*) ZESHY_DESKTOP_ENVIRONMENT_NAME="${XDG_CURRENT_DESKTOP}"
+            }
+        # If GNOME-specific environment variable ${GNOME_DESKTOP_SESSION_ID}
+        # exists, this is a GNOME desktop. Note that later versions of GNOME 2
+        # and all versions of GNOME 3 deprecate but continue to reliably set
+        # such variable to "this-is-deprecated". Amusingly, the existence of
+        # such variable serves as the most efficient means of detecting GNOME.
+        #
+        # Test such variable *AFTER* testing for ${XDG_CURRENT_DESKTOP}, which
+        # most if not all modern GNOME forks and variants set to their specific
+        # name (e.g., "Unity") and is hence preferable to "GNOME" itself.
+        } elif (( ${+GNOME_DESKTOP_SESSION_ID} )) {
+            # Technically, differentiating between GNOME versions requires
+            # either determining whether a currently running process
+            # deterministically mappable to such version is attached to the
+            # current display (e.g., a process running the GNOME 3-specific
+            # command "gnome-shell" attached to current display :0).
+            # Unfortunately, doing so in a reliably cross-platform-portable
+            # manner this early in the digest compilation process is effectively
+            # infeasible.
+            #
+            # When environment variable ${XDG_CURRENT_DESKTOP} exists under
+            # GNOME, the value for such variable is typically "GNOME". Since
+            # this is equally unhelpful and requires differentiation, default
+            # such name to "GNOME" here and attempt to differentiate between
+            # GNOME 2 and 3 below.
+            ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME'
+        # Else if proposed environment variable ${DESKTOP_SESSION} exists,
+        # default to the value of such variable verbatim. As function
+        # detect_desktop_environment() in HardInfo suggests (and as the answer
+        # beginning "I've tested the best tools I've found with..." at the prior
+        # URL confirms), desktop environments setting such variable and *NOT*
+        # also setting ${XDG_CURRENT_DESKTOP} appear to reliably format such
+        # variable's value.
+        #
+        # Since this remains the least reliable of available globals, test such
+        # global last. Since the value of such global is typically lowercase
+        # (e.g., "xfce"), capitalize such value.
+        } elif (( ${+DESKTOP_SESSION} )) {
+            # Map non-canonical to zeshy-specific desktop environment names.
+            case ("${DESKTOP_SESSION}") {
+            ('gnome')    ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME';;
+            ('Lubuntu')  ZESHY_DESKTOP_ENVIRONMENT_NAME='LXDE';;
+            # Map the following non-canonical Xfce names: "xfce", "xfce4",
+            # "Xfce Session".
+            ([Xx]'fce'*) ZESHY_DESKTOP_ENVIRONMENT_NAME='Xfce';;
+            # Else, such name is already zeshy-specific.
+            (*) ZESHY_DESKTOP_ENVIRONMENT_NAME="${DESKTOP_SESSION}"
+            }
+        }
+    }
+
+    # If such desktop environment was ambiguously identified as "GNOME", attempt
+    # to differentiate between GNOME 2 and 3. GNOME 3 significantly broke
+    # backwards compatibility with GNOME 2, operating more as a discontiguous
+    # offshoot rather than smooth continuation of such desktop environment.
+    # Indeed, it's not unreasonable to suggest that GNOME 3 should have been
+    # forked off into a new product line rather than merely being rebranded as
+    # the new major version of GNOME.
+    #
+    # Unfortunately, despite such glaringly sharp discontinuities, there exist
+    # few efficient mechanisms for reliably differentiating GNOME 2 from 3.
+    # Since the broken world is at it is, however, we half-heartedly try anyway.
+    if [[ "${ZESHY_DESKTOP_ENVIRONMENT_NAME}" == 'GNOME' ]] {
+        # As unreliable but efficient alternatives, attempt the following
+        # heuristics (in decreasing order of reliability):
+        #
+        # * If ${GNOME_DESKTOP_SESSION_ID} is *NOT* "this-is-deprecated",
+        #   this must be GNOME 2.
+        # * Else if command "gnome-shell" is pathable, assume this to be GNOME
+        #   3. This is probably terrible, but here we are.
+        # * Else, assume this to be GNOME 2.
+        if [[ "${GNOME_DESKTOP_SESSION_ID}" != 'this-is-deprecated' ]] {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME 2'
+        } elif (( ${+commands[gnome-shell]} )) {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME Shell'
+        } else {
+            ZESHY_DESKTOP_ENVIRONMENT_NAME='GNOME 2'
+        }
+    }
+}
+
+# ....................{ MAIN                               }....................
+::set_system_globals
+
+# --------------------( WASTELANDS                         )--------------------
+    #FIXME: Arguably, such local should be globalized for access elsewhere.
+    # Basename of the wrapper script responsible for the current zeshy process.
+    # local ZESHY_WRAPPER_FILENAME="${${ZESHY_BOURNE_WRAPPER_FILENAME-zeshy}:t}"
+
+#FUXME: @{inspect} should now unconditionally suffix ${ZESHY_SYSTEM_ID} with
+#".${terminfo[colors]}" *IF AND ONLY IF* the current system provides a valid
+#"terminfo" database. We'll probably need to:
+#
+#* Test for the existence of a command implying the existence of such
+#  database. Ugh. There is none. (Not any command that's universally
+#  applicable, anyway.) Instead, what we'll need to do is test whether or
+#  not zsh module "terminfo" is currently available.
+#* If such module is available *AND* standard output is attached to a
+#  terminal device (as efficiently tested by "[[ -t 1 ]]", suggesting we
+#  should probably test that condition first), then and only then zmodload()
+#  such module, thus implicitly declaring list global ${terminfo}.
+#
+#O.K.; so, how exactly do we test for the existence of a module? While not
+#terribly hard, we actually haven't implemented that yet. But here's the
+#rough idea:
+#
+#* Iterate directory names in list global ${module_path} and for each
+#  listed directory that exists, set the result of globbing for
+#  'terminfo.'* into a local list.
+#* If such list is nonempty, successfully break such iteration.
+#* Else if such list is still empty at the end of such iteration, the
+#  current system does *NOT* provide a "terminfo" database. In such case, set
+#  integer global ${ZESHY_TERMINAL_COLOR_COUNT} to 2 (i.e., black and white).
+#
+#After we get the above algorithm working, generalize it into is_module(),
+#whose existing implementation is horribly broken.
+#FUXME: This is sufficiently complex that we probably want to define a new
+#::define_system_terminal_globals() function and associate integer global
+#${ZESHY_TERMINAL_COLOR_COUNT}. After implementing such function, we should
+#probably redefine :get_terminal_color_count() to return the value of such
+#global. (Actually, we should just *ELIMINATE* such function entirely. Just
+#expand ${ZESHY_TERMINAL_COLOR_COUNT} where required. It's now a core global
+#necessarily guaranteed to exist.)
+#FUXME: Actually, the above is somewhat overkill in this case. Don't get us
+#wrong: it's absolutely ideal for a new :is_module() implementation, but it's a
+#bit inappropriate here. All we have to do is the following:
+#
+#    if [[ -t 1 ]] {
+#        zmodload zsh/terminfo 2>/dev/null
+#        ZESHY_TERMINAL_COLOR_COUNT="${terminfo[colors]-2}"
+#    }
+#
+#Clever, no? This is also *SUBSTANTIALLY* more robust than the above approach,
+#for an obscure reason: if the "terminfo" database is available *BUT* the
+#current ${TERM} is not found in such database, map ${terminfo} is almost
+#certainly either undefined or contains no "colors" key, in which case the
+#efficient approach here actually does the right thing.
+
+        # ...capturing "gnome-about --gnome-version" output. Since the prior conditional also
+        # fails to do so *AND* since zeshy subsequently does so during digest
+        # compilation, this is hardly the end of the world.
+
+        #FUXME: Note this as well:
+        # Gnome
+        #
+        #     XDG_CURRENT_DESKTOP=GNOME
+        #     GDMSESSION=gnome-shell
+        # 
+        # Gnome Classic
+        # 
+        #     XDG_CURRENT_DESKTOP=GNOME
+        #     GDMSESSION=gnome-classic
+        # 
+        # Gnome Classic no effects
+        # 
+        #     XDG_CURRENT_DESKTOP=GNOME
+        #     GDMSESSION=gnome-fallback
+        #
+        #Hence, test the contents of ${GDMSESSION} as well if set.
+
+        #FUXME: We should probably do more than merely capitalizing such value.
+        #Indeed, a portable solution probably requires explicitly mapping
+        #possible values to the corresponding human-readable names. *sigh*
+
+        # Else if such window manager was identified, default such desktop
+        # environment to such window manager. This is sensible under
+        # minimalist window managers leveraging no known desktop environment
+        # (e.g., tiling window managers). Note the similar expression below.
+        # See set_string_if_empty_to_string() for further details.
+        # } else {
+        #     : "${ZESHY_DESKTOP_ENVIRONMENT_NAME:=${ZESHY_WINDOW_MANAGER_NAME}}"
+
+    #FUXME: Only default such variables if under a monolithic display server in
+    #which the desktop environment *IS*... Wait; probably not even then. Next!
+    # If no desktop environment and/or window manager was identified, default
+    # such names to the name of the current display server if any. This does
+    # *NOT* signify an error but the common case for display servers serving as
+    # their sole window managers (e.g., Mir, Quartz, Wayland). See
+    # set_string_if_empty_to_string() for further details.
+    # : "${ZESHY_DESKTOP_ENVIRONMENT_NAME:=${ZESHY_DISPLAY_SERVER_NAME}}"
+    # : "${ZESHY_WINDOW_MANAGER_NAME:=${ZESHY_DESKTOP_ENVIRONMENT_NAME}}"
+
+# do *NOT* pretend they are. (Again, for simplicity.)
+#     } else {
+#         ZESHY_DISPLAY_SERVER_NAME='console'
+
+        # } else {
+        #     ZESHY_DISPLAY_SERVER_NAME='Windows'
+
+    # See the following article for further details on such characters:
+    # http://en.wikipedia.org/wiki/Filename#Reserved_characters_and_words
+    # ZESHY_SYSTEM_ID="${ZESHY_SYSTEM_ID//[\/\\$'\0']##/_}"
+
+# from such
+    # identifier (e.g., directory separators, null characters) 
+ # See
+    # @{*-core/*-test/*-os} for further details.
+ # See :is_display_server_wayland() for further details.
+
+#FUXME: Insufficient, although certainly close enough for now. In particular,
+#the current distribution should be appended to ${OSTYPE} to also handle
+#migration of zeshy between different distributions of the same OS.
+
+# See @{*-core/*-test/*-os} for further details.
+    # * The lowercase name of the current CPU architecture. See @{*-core/*-test/*-architecture} for further details.
+
+            # # List of all recognized distribution-specific files in "/etc".
+            # # Dismantled, this is:
+            # #
+            # # * "(.)", including only files that actually exist.
+            # distro_filenames=(
+            #     # All recognized "-release"-suffixed files in arbitrary order,
+            #     # excluding "redhat-release". Several non-Red Hat distributions
+            #     # erroneously install such file (presumably for dubious backward
+            #     # compatibility), requiring such file only be used as a fallback.
+            #     /etc/{arch,chakra,centos,distro,enlisy,fedora,frugalware,gentoo,mageia,pardus,redflag,sabayon,SuSE,slackware,system,turbolinux,vine,yellowdog}-release(.)
+
+            #     # All recognized "-version"-suffixed files in arbitrary order.
+            #     /etc/{knoppix,lfs,zenwalk}-version(.)
+
+            #     # All other distribution-specific files.
+            #     /etc/DISTRO_SPECS(.)
+            # )
+
+            #FUXME: Don't forget a last-ditch fallback, probably setting:
+            #ZESHY_LINUX_DISTRO_NAME='Unknown'
+            #FUXME: Implement me! And, yes: for our crude purposes here, merely
+            #detecting the existence of the first such file suffices. Yes, this
+            #is basically authoritative at this point, after grepping about a
+            #variety of sources both offline and online. Go, go, go!
+            # /etc/pardus-release # Pardus
+            # /etc/redflag-release # Red Flag
+            # /etc/system-release # Amazon AMI
+            # /etc/knoppix-version # Knoppix
+            # /etc/lfs-version # Linux From Scratch
+
+                # Arbitrarily select the first such file. For easier mapping, strip
+                # the "/etc/" from such filename.
+                # distro_filename="${distro_filenames[1]#/etc/}"
+
+                # # Map such file to a corresponding human-readable distribution name.
+                # case "${distro_filename}" {
+                # 'slackware-release': 
+                # }
+
+                # If the first such file was mapped to a distribution name
+                # above, set the current distribution name to such name. While
+                # there exist various means of testing whether map keys exist,
+                # this is the easiest when map values are guaranteed nonempty.
+                # if [[ -n "${}" ]] {
+            # If more than one such file exists, arbitrarily map the first.
+            # * Match such distribution's specific file into the list below.
+
+            # List of all files in "/etc" suffixed by either "-release",
+            # "_version", or "-version". In case either "/etc/lsb-release" or
+            # "/etc/os-release" exist but do *NOT* contain the previously
+            # searched for keys (e.g., due to malformed syntax), exclude such
+            # files from such list. While command "lsb_release" and
+            # hence the latter should be unavailable here, better comfy than
+            # core-dumped. Dismantled, this is:
+            #
+            # * "~...", excluding all paths matching the following glob.
+            # * "(.)", excluding all paths except extant simple files.
+            # local -a filenames_release; filenames_release=(
+            #     /etc/*{-release,-version,_version}~/etc/(lsb|os)-release(#q.) )
+
+        # The canonical command "lsb_release" reads "/etc/lsb-release" to print
+        # the current Linux distribution name. Unfortunately, several
+        # distributions scurrilously violate such standard by installing
+        # distribution-specific "lsb-release"-like files with differing
+        # filenames but similar contents *NOT* read by "lsb_release". Naturally,
+        # such files take precedence over "/etc/lsb-release" if found.
+        # local filename_lsb_release='/etc/lsb-release'
+        # if [[ -f '/etc/lsb-release-crunchbang' ||
+        #       -f '/etc/crunchbang-lsb-release' ]] { # Why, CrunchBang? *WHY*!?!
+        #     filename_lsb_release='/etc/lsb-release-crunchbang'
+        # }
+
+    # If the first letter of such name is *NOT* capitalized, do so.
+    # ZESHY_LINUX_DISTRO_NAME="${(C)ZESHY_LINUX_DISTRO_NAME[1]}${ZESHY_LINUX_DISTRO_NAME[2,-1]}"
+
+    # If such name is prefixed or suffixed by the name of the current operating
+    # system (e.g., the "Linux" in both "LinuxMint" and "Gentoo Linux"), remove
+    # such substrings.
+    # ZESHY_LINUX_DISTRO_NAME="${${ZESHY_LINUX_DISTRO_NAME#[Ll]inux}%[Ll]inux}"
+
+    #FUXME: Shift most of the contents of @{*-core/*-test/*-distro} here. This
+    #will probably be somewhat non-trivial, as we'll need to safely implement
+    #file text grepping via "mapfile".
+    #FUXME: Arguably inefficient. Consider instead testing if "/etc/lsb-release"
+    #is an existing file and, if so, parsing such file for the unquoted value of
+    #key "DISTRIB_ID": e.g., the string "Gentoo" from the line resembling:
+    #
+    #    DISTRIB_ID="Gentoo"
+    #
+    #This has two clear benefits over the current method:
+    #
+    #1. Fewer dependencies. If "lsb_release" is not pathable *BUT*
+    #   "/etc/lsb-release" is an existing file, we can still reliably harvest
+    #   the distro name from such file without "lsb_release".
+    #2. Efficiency. Avoiding additional subshells, particularly on *EVERY* zeshy
+    #   startup, is crucial.
+
+ # (By default,
+        # the second such group would be captured into ${match[2]}. "(?|...)"
+        # prevents this.)
+        # * "(?|...)", capturing all following groups into ${match[1]}. (By
+        #   default, the second such group would be captured into ${match[2]}.)
+        # If "lsb_release" is pathable, capture such command's output.
+        # if (( ${+commands[lsb_release]} )) {
+        #     ZESHY_LINUX_DISTRO_NAME="$(lsb_release --short --id)"
+        # }
+
+    # If the current *nix distribution provides the "lsb_release" command, run
+    # such command to obtain the name of such distribution. While alternatives
+    # to "lsb_release" do exist (e.g., globbing for filenames matching
+    # /etc/*release), it hardly seems worth the effort so early in the bootstrap
+    # process. Dismantled, this is:
+    #
+    # * "${:-lsb_release}", expanding to the string "lsb_release".
+    # * "${...:c}", expanding to the absolute path of "lsb_release" if installed
+    #   in the current $PATH or only "lsb_release" otherwise.
+    # * "-x", returning true if such path is executable and hence installed.
+    #   Unless the current directory contains an executable "lsb_release", this
+    #   returns true only if ":c" expanded to an absolute path.
+    # if [[ -x "${${:-lsb_release}:c}" ]] {
+
+# The strictly lowercase name of the current operating system, which zsh
+    #   guarantees to contain no whitespace. See @{*-core/*-test/*-os} for
+    #   further details.
+
+#FUXME: The current digest file needs to depend on both zeshy-specific state
+#(e.g., whether or not we're compiling a debug build) and system-specific state
+#(e.g., the current OS and windowing manager in use). At the moment, it only
+#depends on the former. The reason we such file needs to depend on both is that
+#users should be able to seemlessly move their entire "~/.zeshy" directory
+#between not only different machines running the same OS but between different
+#machines running different OSes. To effect the latter, we'll need to
+#specifically create an intermediary subdirectory directly under
+#"~/.zeshy/cache/digest" named after all relevant system state: e.g.,
+#
+#    ~/.zeshy/
+#        cache/
+#            digest/
+#                current -> linux.gentoo.x11/
+#                linux.gentoo.mir/
+#                    debug.zwc
+#                    release.zwc
+#                linux.gentoo.wayland/
+#                    debug.zwc
+#                    release.zwc
+#                linux.gentoo.x11/
+#                    debug.zwc
+#                    release.zwc
+#                darwin/
+#                    debug.zwc
+#                    release.zwc
+#                windows/
+#                    debug.zwc
+#                    release.zwc
+#
+#Note the symbolic link "current", linking to configuration tree
+#"linux.gentoo.x11/" in the above example. Such directory is both for user
+#convenience and zeshy use. Indeed, setting such symlink in a reliable manner
+#simplifies our autoloading of the digest file corresponding to the current
+#system state. (That is, assuming we set such symlink reliably, *NO* existing
+#code in this parcel needs to change to accommodate this improvement.)
+#
+#In any case, the symbolic link is quite negligible. For safety, the critical
+#thing is that we implement support for such subdirectories. That's it. Yummy!
+#FUXME: Note, however, this implies that we'll need to shift OS and windowing
+#manager detection logic here (...or possibly in a new top-level parcel sourced
+#by this parcel called, say, @{test}). Unavoidable, really. Since we only need
+#the subset of such logic producing a single flat string describing all relevant
+#system state (e.g., "linux.gentoo.x11"), such logic *HOPEFULLY* won't be
+#grossly cumbersome.
+#
+#Note, however, that such logic *WILL* be reused by @{compile} when deciding
+#which suboverlays of an "if_os" overlay to register. This suggests we probably
+#will need more than simply logic producing such string... but, without actually
+#delving into it, it's presumptuous to say with certainty.
+#FUXME: O.K.; after reasonably deep contemplation, here's the low-level plan for
+#implementing the above:
+#
+#* Create new top-level parcel @{inspect}, dynamically inspecting the current
+#  system and setting persistent string globals describing the results of such
+#  inspection. Given the variety of all possible operating systems, display
+#  servers, window managers, and so forth to be inspected, such parcel is
+#  expected to eventually grow to considerable size and hence be inappropriate
+#  for inclusion in this parcel.
+#* @{inspect} should declare and define at least the following string globals:
+#  * ${ZESHY_WINDOW_MANAGER_NAME}, the raw low-level name of the current window
+#    manager.  Basically, this is the capitalized string reported by "xprop"
+#    (with the delimiting double quotes necessarily stripped, of course). Since
+#    window managers are necessarily tied to particular display servers, the
+#    window manager name implies a unique display server (e.g., if
+#    "${ZESHY_WINDOW_MANAGER_NAME} == FVWM", then the display server is X).
+#    Hence, we needn't formalize the names of either the current display server
+#    *OR* deskop environment. (Which is nice, as the latter in particular can be
+#    fairly expensive.)
+#  * ${ZESHY_SYSTEM_ID}, set as
+#    ZESHY_SYSTEM_ID="${OSTYPE}.${ZESHY_WINDOW_MANAGER_NAME}" (e.g.,
+#    "linux-gnu.FVWM"). This is *THE* critical string, used as the basename of
+#    the subdirectory under both "~/.zeshy/cache/digest" and "~/.zeshy/config"
+#    to write and read from.  Naturally, such basename should contain no
+#    whitespace, punctuation aside from "_", "-", and ".", or UTF8 characters.
+#  And that's it, for now.
+#* This implies we should rename:
+#  * ${ZESHY_USER_DIGEST_ROOT_DIRNAME} to ${ZESHY_USER_DIGEST_ROOT_DIRNAME}.
+#  * ${ZESHY_USER_CONFIG_DIRNAME} to ${ZESHY_USER_CONFIG_DIRNAME}.
+#  Then set:
+#  * ZESHY_USER_DIGEST_ROOT_DIRNAME="${ZESHY_USER_DIGEST_ROOT_DIRNAME}/${ZESHY_SYSTEM_ID}".
+#  * ZESHY_USER_CONFIG_DIRNAME="${ZESHY_USER_CONFIG_DIRNAME}/${ZESHY_SYSTEM_ID}".
+#* Shift the window manager detection code currently embodied in
+#  :set_string_to_window_manager() to @{inspect}. Thereafter,
+#  :set_string_to_window_manager() should be dynamically defined to always
+#  statically return ${ZESHY_WINDOW_MANAGER_NAME}.
+#* Do *NOT* shift the OS detection code currently embodied in
+#  @{*-core/*-test/*-os} here. Instead, simply use the low-level raw string
+#  ${OSTYPE} as is without modification in @{inspect}.
+#* Have this parcel unconditionally source @{inspect}.
+#FUXME: [NOTE: None of the above applies, actually. See the next FUXME comment.]
+#
+#Great. So, that inspects the system and establishes the requisite globals. What
+#then? Well, then we have to actually compare the previously cached version of
+#${ZESHY_SYSTEM_ID} to the current version, implying we need to cache such
+#global. When? Where? Simple: existing function ::precompile_zeshy_cache() in
+#@{compile} *ALREADY* writes list global ${ZESHY_USER_DIGEST_DEPENDENCY_PATHNAMES} to
+#zsh script "${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME}". In fact, that's the *ONLY*
+#global that's currently written there. But it certainly needn't be. Modify such
+#function to *ALSO* write ${ZESHY_SYSTEM_ID} to such file. (Dead simple, given
+#that such function does so by calling write_file_with_variable().)
+#
+#:digest_zeshy.is_outdated() then sources such file and hence defines all such
+#globals. Arguably, ::precompile_zeshy_cache() should save at least
+#${ZESHY_SYSTEM_ID} under a different name to permit comparison with the
+#current value of ${ZESHY_SYSTEM_ID} established by @{inspect} -- say, as
+#${ZESHY_SYSTEM_ID_OLD}. (Since such global is a string, it's both trivial and
+#efficient to locally copy such string to a temporary new global
+#${ZESHY_SYSTEM_ID_OLD} defined and then subsequently unset within
+#::precompile_zeshy_cache().) Great! So, *AFTER* sourcing
+#"${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME}" but *BEFORE* examining any path
+#mtimes, :digest_zeshy.is_outdated() performs the following comparison:
+#
+#  [[ "${ZESHY_SYSTEM_ID}" == "${ZESHY_SYSTEM_ID_OLD}" ]] || return 0
+#FUXME: Oh, wait. We don't even *NEED* to perform such comparison, since it's
+#implicit in the fact that ${ZESHY_USER_DIGEST_ROOT_DIRNAME} and hence
+#${ZESHY_USER_DIGEST_FILENAME} now depends on ${ZESHY_SYSTEM_ID}. This, in turn,
+#means we don't even need to perform any of the above writing of
+#${ZESHY_SYSTEM_ID} into ${ZESHY_USER_DIGEST_DEPENDENCIES_FILENAME}. Dead simple!
+#FUXME: Ah! Note that @{digest} will actually need to set:
+#
+#* ZESHY_USER_DIGEST_ROOT_DIRNAME="${ZESHY_USER_DIGEST_ROOT_DIRNAME}/${HOST}.${ZESHY_SYSTEM_ID}".
+#* ZESHY_USER_CONFIG_DIRNAME="${ZESHY_USER_CONFIG_DIRNAME}/${ZESHY_SYSTEM_ID}".
+#
+#We prepend the hostname of the current system to the current digest but *NOT*
+#configuration root directory, ensuring that migrating zeshy to a different
+#machine triggers recompilation regardless of whether the current digest file is
+#newer than everything on such machine.
+
+    #FUXME: BSD installs no such command, so this clearly fails to suffice.
+    #We'll probably want to just import the entire get_distro_name() command.
+    #Or perhaps not. Is the logic simple, under BSD?
+    #FUXME: Oh! Right. Now that we've *SIGNIFICANTLY* refactored the codebase,
+    #we are veritably guaranteed of having get_distro_name() defined by
+    #@{20-main} prior to needing such function for deciding what to compile in
+    #@{30-if_distro}. Hence, excise all reference to ${ZESHY_DISTRO_NAME},
+    #including the code block below, and simply call get_distro_name() where we
+    #previously expanded ${ZESHY_DISTRO_NAME} below.
+
+    # * Initialize the string uniquely identifying such system to the strictly
+    # lowercase name of the current operating system, which zsh guarantees to
+    # contain no whitespace. See @{*-core/*-test/*-os} for further details.
+
+                #FUXME: It'd be great if we could efficiently differentiate
+                #between GNOME 2 and 3. Unfortunately, it's unclear that we can.
+                #While we could of course capture "gnome-about --gnome-version"
+                #output, doing so would hardly be efficient. Contemplate.
+
+        # Else if proposed canonical environment variable ${XDG_CURRENT_DESKTOP}
+        # exists, default to the value of such variable verbatim. See
+        # set_string_if_empty_to_string() for further details.
+        # } elif [[ -n "${XDG_CURRENT_DESKTOP}" ]] {
+        #     : "${ZESHY_WINDOW_MANAGER_NAME:=${XDG_CURRENT_DESKTOP}}"
+    # [[ -n "${ZESHY_DESKTOP_ENVIRONMENT_NAME}" ]] ||
+    #     ZESHY_DESKTOP_ENVIRONMENT_NAME="${ZESHY_DISPLAY_SERVER_NAME}"
+    # }
+    # [[ -n "${ZESHY_WINDOW_MANAGER_NAME}" ]] ||
+    #     ZESHY_WINDOW_MANAGER_NAME="${ZESHY_DISPLAY_SERVER_NAME}"
+    # local display_server_name
+    #     # The Wayland display server also serves as its sole window manager.
+    #     ZESHY_WINDOW_MANAGER_NAME="${ZESHY_DISPLAY_SERVER_NAME}"
+    #     # The Mir display server also serves as its sole window manager.
+    #     ZESHY_WINDOW_MANAGER_NAME="${ZESHY_DISPLAY_SERVER_NAME}"
+
+            # * Convert all spaces in such name to underscores. (Though rare, window
+            #   manager names can technically contain spaces.)
+            # ZESHY_WINDOW_MANAGER_NAME="${${ZESHY_WINDOW_MANAGER_NAME##*\"}[1,-2]// /_}"
+
+    # * The current window manager if any or "none" otherwise, converting all
+    #   spaces in such name to underscores. (Though rare, window manager names
+    #   can technically contain spaces.)
+    # ZESHY_SYSTEM_ID="${OSTYPE}.${ZESHY_DISPLAY_SERVER_NAME:-none}.${ZESHY_WINDOW_MANAGER_NAME:-none// /_}"

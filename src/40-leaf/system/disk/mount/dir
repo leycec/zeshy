@@ -1,0 +1,370 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle *mount points* (i.e., directories currently mounting a disk device).
+/---
+
+#FIXME: Command "findmnt", if available (as it usually is under modern systems)
+#dramatically trivializes most of the operations below. Update, please! For
+#example, here's how to efficiently map devices to mount points:
+#
+#    >>> findmnt --source /dev/sdb1 --options target --raw --noheadings --notruncate
+#    /home
+#
+#It's a bit verbose, but: yes, you do actually need all of those options. Works
+#great, though!
+#FIXME: What role does "/etc/mtab" play in all this? Specifically, doesn't it
+#serve as yet another means of searching mount points, analogous to
+#"/proc/mounts"? Also consider "/proc/self/mountinfo", yet another such path.
+#Initial research suggests "/proc/self/mountinfo" to offer the most reliable
+#glimpse of mount points. Certainly, that's what "findmnt" defers to by default.
+#Ah; O.K. So, "/proc/self/mountinfo" provides submounts (i.e., directories
+#mounted to under a mount point, such as the "/dev/pts" mount point under the
+#"/dev" mount point) as well as mounts. There are three such pseudo-files, all
+#under "/proc/self/": "mountinfo", "mounts", and "mountstats". Grepping any of
+#these three is strongly preferable to other files (e.g., "/etc/mtab",
+#"/proc/mounts"), as the set of all mount points visible to a process is
+#actually *SPECIFIC* to that process. Interesting, yes? In fact, command
+#"unshared" may be run to prevent devices mounted by the current process from
+#affecting other processes. (To such processes, such device remains unmounted!
+#Interesting, eh?) And of these three, "mountinfo" appears to be the "newest"
+#and hence most detailed. It also appears to be somewhat more readily parseable
+#than the other two pseudo-files. In any case, more research probably desirable.
+
+# ....................{ EXCEPTIONS                         }....................
+declare_function_with_stdin <<'/---'
+void die_if_dir_mounted(
+    string dirname,
+    string error_message = "\"${dirname}\" already a mount point.")
+
+Throw an exception with the passed message if the passed directory is an
+existing mount point. See is_dir_mounted() for further details.
+/---
+function die_if_dir_mounted() {
+    #FIXME: In the event of an exception, print what such directory is actually
+    #mounting, for clarity.
+    die_unless_args_1_to_2\
+        'Expected one dirname and optional error message.'
+    string dirname="${1}"
+    is_dir_mounted "${dirname}" and
+        :die "${2:-directory \"${dirname}\" already a mount point.}"
+}
+
+# ....................{ TESTERS                            }....................
+#FIXME: For efficiency, this elongated "if" should be externalized *AROUND*
+#this function rather than internalized *WITHIN* this function. After all,
+#whether or not "findmnt" is pathable is a precompile-time decision. To do
+#so, however, we'll need shift all relevant testers to "00-startup/20-test".
+#Certainly worthwhile, as we'll want the functionality elsewhere as well.
+
+declare_function_with_stdin <<'/---'
+[status: boolean] is_dir_mounted(string dirname)
+
+Return success if the passed directory is a *mount point* (i.e., an existing
+directory to which some disk or disk partition is at least readably mounted).
+/---
+function is_dir_mounted() {
+    #FIXME: This should arguably throw an exception. Examine under what
+    #circumstances we call this function. (Surely, such calls could be preceded
+    #by a protective "is_dir ${dirname} and is_dir_mounted ${dirname}"? The
+    #secondary reason for doing so is that simply writing
+    #"die_unless_dir ${dirname}" here is more compact than repeating the "if"
+    #conditional below, in every implementation of this function. *shrug*
+
+    # Validate passed arguments.
+    die_unless_arg 'Expected one dirname.'
+    string dirname="${1}"
+    die_unless_dir "${dirname}"
+
+    # If "findmnt" is installed, run such command. This tends to be more
+    # commonly available than "mountpoint".
+    if { is_pathable findmnt } {
+        # By default, "findmnt" searches "/proc/self/mountinfo" rather than
+        # "/etc/mtab". Sadly, when searching under the former for a submount of
+        # a mount, "findmnt" reports success whenever such mount point exists --
+        # even if such submount point does not! While bizarre, searching under
+        # the latter disables such dubious "functionality."
+        run_code_silent command findmnt --mtab --target "${(q)dirname}" and
+            report_status
+    # If "mountpoint" is installed, run such command. This is certainly more
+    # reliable than matching file content.
+    } elif { is_pathable mountpoint } {
+        command mountpoint -q "${dirname}" and report_status
+    # If "/proc/mounts" exists, grep its Linux-specific content. This is more
+    # reliable than matching "mount" output.
+    } elif { :is_file '/proc/mounts' } {
+        #FIXME: See below.
+        awk -v DIR="${dirname}"\
+            'BEGIN {CODE=1} $2 == DIR {CODE=0} END {exit CODE}' '/proc/mounts' and
+            report_status
+    # Else, manually match "mount" output. This is the least reliable and
+    # portable method. As "man mount" notes:
+    #
+    #    "For more robust and definable output use findmnt(8), especially in your
+    #     scripts."
+    } else {
+        #FIXME: O.K.; this shouldn't be terribly difficult to implement in pure-
+        #zsh. We'll want a new is_string_line_with_column_index_equals() function in
+        #component "variable/string/pcre/column". This should be *VERY* efficiently
+        #implementable with a multiline PCRE iterated over by calling
+        #for_string_text_matching_pcre_multiline:(). The nomenclature for such function
+        #resembles the similar function discussed below.
+        #FIXME: Just see below.
+
+        command mount | awk -v DIR="${dirname}"\
+            'BEGIN {CODE=1} $3 == DIR {CODE=0} END {exit CODE}' and
+            report_status
+    }
+}
+
+declare_function_with_stdin <<'/---'
+[status: boolean] is_dir_mounted_writable(string dirname)
+
+Return success if the passed directory is a *writable mount point* (i.e., an
+existing directory to which some disk or disk partition is writably mounted).
+/---
+function is_dir_mounted_writable() {
+    # Validate passed arguments.
+    die_unless_arg 'Expected one dirname.'
+    string dirname="${1}"
+    die_unless_dir "${dirname}"
+
+    # If the passed path is not a directory writable by the current user, fail.
+    if { not is_dir_writable "${dirname}" } {
+        report_failure
+    # Since "mountpoint" has no writability option, we manually match strings.
+    # This is hardly ideal, but there you are. If the Linux-specific
+    # "/proc/mounts" exists, grep its content.
+    } elif { :is_file '/proc/mounts' } {
+        #FIXME: Such inversion of exit status is pure rubbish. Implement a new
+        #for_string_line_fields_split_on_whitespace_or_report_failure(). Such
+        #function should internally call "report_failure" if such iteration fails
+        #to return. Then just call report_failure in such iteration. Damnably
+        #simple, really. Make it so. This will require a cascade of new
+        #functions, I'm afraid --
+        #for_string_line_fields_split_on_ifs_or_report_failure(),
+        #for_string_line_or_report_failure(), and so on. Not much we can do about
+        #that, I'm afraid. *shrug*
+        #FIXME: After implementing such fix, we'll also want to return such
+        #iterator's exit status by "and report_status". Simple; just don't
+        #neglect the simple things, eh?
+
+#       print 'here'
+#           "$(get_file_text '/etc/fstab')" '
+        not for_string_line_fields_split_on_whitespace\
+            "$(get_file_text '/proc/mounts')" '
+            print "field[1]: ${field[1]-}\nfield[3]: ${field[3]-}\nfield[4]: ${field[4]-}"
+            if { (( ${#field} >= 4 )) and
+                is "${field[2]}" == "${dirname}" and
+                   "${field[4]}" == (*,|)"rw"(,*|) si } {
+                report_failure
+            }'
+#        awk -v DIR="${dirname}" '
+#BEGIN { CODE = 1 }
+#$2 == DIR && $4 ~ /(^|,)rw($|,)/ { CODE = 0 }
+#END { exit CODE }' '/proc/mounts' and report_status
+#       print_message 'failed...'
+    # Else, manually match "mount" output.
+    } else {
+        #FIXME: This can presumably be implemented in pure-zsh with a new
+        #function get_string_line_first_with_column_index_equals() in component
+        #"variable/string/pcre/column". After getting the first such line, this
+        #is necessarily the *ONLY* such line (since directories are unique).
+        #Then simply call the is_string_line_with_column_index_equals() function
+        #documented above, testing for... Ah. Right. So, we'll need a similar
+        #is_string_line_with_column_index_matches_pcre() function. Simple and
+        #synergistic, happily.
+        #FIXME: Well. While the above does work perfectly well, the "awk"-based
+        #solution below has a certain elegance to it, doesn't it? In short, such
+        #solution suggests an iteration-based approach. And I have just the idea
+        #for it. Or at least, the inkling of an idea. If the caller to such PCRE-
+        #based column functions also passes the maximum number of such columns
+        #(which should certainly be known, if matching a column by index!), then
+        #there's no reason we couldn't dynamically construct a multiline PCRE
+        #explicitly, indiscriminantly, and iteratively capturing *ALL* columns
+        #into global ${match}. Then, ${match[1]} would always give the first
+        #matched column value for the current line, ${match[2]} the second, and
+        #so forth. Such function might have prototype resembling:
+        #
+        #string for_string_column_matches(
+        #    string text, integer column_count, string command)
+        #
+        #Great name, simple to call. Sweet. In fact, we could readily implement
+        #the aforementioned is_string_line_with_column_index_equals() with such
+        #function. What's great is that it permits list comprehension-style
+        #code resembling the intuitive "awk" implementation below. Ah... great!
+
+        command mount | awk -v DIR="${dirname}" '
+BEGIN { CODE = 1 }
+$3 == DIR && $NF ~ /(,|\()rw(,|\))/ { CODE = 0 }
+END { exit CODE }' and report_status
+    }
+}
+
+#FIXME: In lieu of unit tests.
+function idom() {
+    if { is_dir_mounted          '/' } { print ok } else { print ko }
+    if { is_dir_mounted_writable '/' } { print ok } else { print ko }
+}
+
+# ....................{ GETTERS                            }....................
+declare_function_with_stdin <<'/---'
+string get_mount_points()
+
+List the absolute paths of all mount points, delimited by newlines. Such list
+does _not_ contain duplicate paths and hence forms a list set.
+/---
+function get_mount_points() {
+    # The third column of "mount" :string.output gives the desired list. Oddly,
+    # such list can contain duplicate mount points: e.g.,
+    #
+    #     # "mount" lists mount point "/" twice.
+    #     >>> mount
+    #     rootfs on / type rootfs (rw)
+    #     /dev/mapper/vg-root on / type ext4 (rw,noatime,data=ordered)
+    #
+    # Hence, filter duplicate lines from the returned string.
+    die_if_args
+    remove_string_line_duplicates\
+        "$(get_string_lines_word "$(command mount)" 3)"
+}
+
+# ....................{ PRINTERS                           }....................
+#FIXME: Ugh! I've just discovered the "findmnt" command. *Very* awesome tree-
+#based output. Much superior to "mount", but doubtless even less portable than
+#that venerate command.
+declare_function_with_stdin <<'/---'
+string print_mount_points()
+
+Print a human-readable list of current mount points.
+/---
+function print_mount_points() {
+    # Validate sanity.
+    die_if_args
+
+    #FIXME: Insufficient. If "mount" encounters a non-fatal error (as occurs
+    #when the kernel coerces a mounted read-write filesystem to be read-only),
+    #it appends a newline-prefixed warning to such output. I'm afraid I don't
+    #recall the exact output, but it's something like:
+    #
+    #    ...
+    #    /dev/sda1 on /media/boot type ext2 rw
+    #
+    #    warning: "/dev/sda2" currently read-only but mounted writable; this
+    #      may indicate hardware failure
+    #
+    #Handle this by applying the tabulation to *ONLY* that substring of "mount"
+    #output preceding the first blank line, signifying warning or error output
+    #(which should ideally be colorized to highlight such warning or error).
+
+    # Dismantled, this is:
+    #
+    # * "print '...'", prefixing :string.output with a header line.
+    # * "print '-'", prefixing :string.output with a banner line. (This is a temporary
+    #   placeholder to be entirely replaced with a true banner line, below).
+    # * "LC_ALL=C ", guaranteeing :string.output from "mount" in the default format.
+    # * "mount | awk", formatting :string.output from "mount" through an "awk" script
+    #   cutting the extraneous second and fourth columns.
+    # * "(...)", aggregating such :string.output into a single :string.output stream.
+    # * "column -t", reformatting :string.output into a whitespace-delimited table.
+    # * "awk", substituting commas with spaces in the flags column. Since
+    #   "column -t" tabulates with such spaces, we must defer such substitution
+    #   until after tabulating. Dismantled, this is:
+    #   * "-v banner="$(output_line_horizontal)"", passing the desired banner line to awk
+    #     as an option variable.
+    #   * "-F'[ ]'", preserving whitespace by treating individual spaces rather
+    #     than contiguous "runs" of spaces as column delimiters.
+    #   * "NR == 1", matching the first and hence header line.
+    #   * "NR == 2", matching the second and hence banner line.
+    #   * "NR >= 3", matching all subsequent lines :string.output from "mount".
+    #   * "$NF", the last and hence flags column. We can't simply write "$4", as
+    #     treating individual spaces as delimiters creates "dummy" columns.
+    #
+    # This one-liner inspired by Peteris Krumin's magical bash one-liner at:
+    # http://www.catonmat.net/blog/another-ten-one-liners-from-commandlinefu-explained
+
+    #FIXME: This is *HORRIBLE*. We've since concocted tabulator functions
+    #accepting a list of column headings, which ensure properly themed
+    #formatting. Supplant this abject pablum posthaste. Right. So, we should be
+    #calling print_table_lines() instead -- probably after performing the string
+    #substitutions we currently perform in "awk" in zeshy instead.
+    {
+        :string.output 'device directory type flags'
+        :string.output '???'
+        LC_ALL=C command mount | awk '{$2=$4=""; print}'
+    } | tabulate_stdin |
+        awk -v BANNER="$(output_line)" -F'[ ]' '
+NR == 1 { print }
+NR == 2 { print BANNER }
+NR >= 3 {
+    gsub(/\(|\)/, "", $NF)
+    gsub(/,/, " ", $NF)
+    print
+}' | page_stdin
+}
+
+# ....................{ UNMOUNTERS                         }....................
+#FIXME: Rename to unmount_dir() and shift to new parcel @{unmount}.
+#FIXME: Document the fact that, if no such absolute path exists, we iteratively
+#search the list of all mount points for points with such path as a basename.
+declare_function_with_stdin <<'/---'
+void unmount_dir_statically(string mount_dirname1, string mount_dirname2, ...)
+
+Unmount the passed *mount points* (i.e., directories mounting devices).
+/---
+function unmount_dir_statically() {
+    # Validate passed sanity.
+    die_unless_args 'expected at least one dirname'
+
+    # List of all mount points to be unmounted, after matching the passed globs.
+    list unmount_points
+
+    #FIXME: Such functionality is of assistance only when called interactively.
+    #Hence, abstract into a new unmount_dir_with_options() function.
+    string mount_dir_statically
+    for    mount_dir_statically ("${@}") {
+        # If this path is a mount point, append it to the list of mount points
+        # to be unmounted.
+        if { is_dir_mounted "${mount_dir_statically}" } {
+            unmount_points+="${mount_dir_statically}"
+        # If this path is absolute but *NOT* a mount point, attempting to match
+        # a mount point suffixed by such path is senseless. Throw an exception.
+        } elif { is_path_absolute "${mount_dir_statically}" } {
+            :die "\"${mount_dir_statically}\" not mounted"
+        # Otherwise, append all match points suffixed by such path to the list
+        # of mount points to be unmounted.
+        } else {
+            # String of newline-delimited absolute paths of all mount points.
+            list mount_points mount_points_matching
+            set_list_to_string_lines "$(get_mount_points)" mount_points
+
+            # Retain only mount points matching this basename.
+            set_list_to_list_items_matching_glob mount_points "*/${mount_dir_statically}"
+
+            # Append such mount points to the list.
+            unmount_points+=( "${mount_points[@]}" )
+        }
+    }
+
+    #FIXME: This message isn't quite right for multiple mount points.
+    # Unmount such devices.
+    print_message_item "Unmounting \"${unmount_points[@]}\"."
+    command umount -- "${unmount_points[@]}"
+}
+
+# --------------------( WASTELANDS                         )--------------------
+#           is "${field[1]}" != [[:blank:]]#"#"* and
+
+    # If the passed path is not a directory readable by the current user, fail.
+#   if { not is_dir "${dirname}" } {
+#       report_failure
+
+#FUXME: Rename to die_unless_mount_point_static().
+#FUXME: Actually, the nomenclature's not quite right -- either here or for
+#is_dir_mountable_statically(). This should be die_unless_dir_statically_mountable(),
+#since such directory is *NOT* a mount point until it's actually mounted to.
+#We're only testing here whether "/etc/fstab" lists such directory -- not
+#whether it's also currently mounted to.

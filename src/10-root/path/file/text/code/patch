@@ -1,0 +1,353 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle text file patching.
+/---
+
+#FIXME: Add support for compressed patch files, both on input (apply_) and output
+#(make_). For the latter, we'll need a new function "is_archive_file" in
+#"file/content/archive" matching on... hmm; we probably shouldn't trust
+#filenames. "file" is probably faster, anyway, given it's C heritage; just
+#call :get_file_media_type() and test the return value. Most archive files should
+#(hopefully) have a common prefix (say, "x-compressed"). Check this.
+
+# ....................{ MAKERS                             }....................
+declare_function_with_stdin <<'/---'
+void :make_patch_from_path_to_path(
+    string patch_filename = "${old_pathname}.patch",
+    string old_pathname,
+    string new_pathname)
+
+Write the passed patch file (defaulting to the passed old path suffixed by
+`.patch`, if called directly from the command line) with all differences between
+the passed old and new paths. Such paths must be either both files or both
+directories. In the latter case, this function recursively differences all text
+files in such directories.
+
+Assuming default ${ZESHY_OPTIONS_DIFF}, such differences will be in
+https://en.wikipedia.org/wiki/Diff#Unified_format[*unified `diff` format*], the
+canonical patch file format for most open-source software projects.
+/---
+function :make_patch_from_path_to_path() {
+    # Validate sanity.
+    if { is_context_cli_function } {
+        die_unless_args_2_to_3\
+            'Expected optional patch filename, one old pathname, and one new pathname.'
+
+        # If no patch filename was passed, default such pathname to such old
+        # pathname (excluding any suffixing "/" if such path was a directory).
+        is_args_3 or {
+            :string pathname="${1}"
+            remove_string_suffix "${pathname}" '/'
+            :arg.prepend "${pathname}.patch"
+        }
+    } else {
+        die_unless_args_3\
+            'Expected one patch filename, one old pathname, and one new pathname.'
+    }
+
+    # Localize such arguments.
+    :string\
+        patch_filename="${1}"\
+        pathname_old="${2}"\
+        pathname_new="${3}"
+    :list diff zeshy_diff_options
+    :int exit_status
+    die_unless_files_text "${pathname_new}" "${pathname_old}"
+
+    #FIXME: This is silly. I see no compelling reason why we can't defer to
+    #run_code_with_options_configured(). We will require a new alias for
+    #setting the exit status of a command to an integer variable. But *THAT*
+    #shouldn't be terribly difficult. *SIGH*
+    #FIXME: The current use of ${zeshy_diff_options} is terrible. No, really.
+    #We *REALLY* need a run_code_with_options_configured()-based implementation.
+
+    # Ensure either two files or two directories were passed.
+    zeshy_diff_options=( "${ZESHY_OPTIONS_DIFF[@]}" )
+    if { is_files "${pathname_old}" "${pathname_new}" } {
+        noop
+    } elif { is_dir "${pathname_old}" and is_dir "${pathname_new}" } {
+        zeshy_diff_options+=( "${ZESHY_OPTIONS_DIFF_IF_RECURSIVE[@]}" )
+    } else {
+        :die '"'${pathname_old}'" and "'${pathname_new}'" neither both files or directories.'
+    }
+
+    #FIXME: Nice, but should *REALLY* be shifted to a new
+    #make_file_text_patch_with_options() function. Hmmmmm; actually, we can do
+    #one better. It's rarely (O.K., *NEVER*) helpful to write such patch into
+    #the same codebase you're diffing. Instead, default to:
+    #"$(get_dir)/$(get_basename "${pathname_old}").patch"
+    #FIXME: Add a new interactive alias expanding to
+    #make_file_text_patch_with_options().
+
+    # Remove such patch if already found.
+#   print_message "removing \"${patch_filename}\"..."
+    remove_file_if_found "${patch_filename}"
+
+    # Make the passed patch. If interactive, redirect standard output to error
+    # to assist the current user review the patch. Oddly, "diff" returns exit
+    # status 1 on successfully differencing non-identical files (!?) and exit
+    # status 2 on fatal error. Thanks for being idiotically different, "diff".
+    #
+    # Fortunately, the report_status() approach helps revise such idiocy.
+    # Unfortunately, this approach requires manually reimplementing both
+    # run_code_with_options() and report_status() here.
+    #
+    # *crudely blows both nostrils at the "diff" authors' pale-faced cupidity*
+    diff=( command diff "${zeshy_diff_options[@]}" )
+    if { is_shell_interactive } {
+        diff+=( "${ZESHY_OPTIONS_DIFF_IF_INTERACTIVE[@]}" )
+    } else {
+        diff+=( "${ZESHY_OPTIONS_DIFF_IF_NONINTERACTIVE[@]}" )
+    }
+
+    print_message_item 'Writing patch "'${patch_filename}'".'
+
+    #FIXME: Ugh. This implementation is terrible. It's probably also horribly
+    #broken. Reimplement this properly.
+    #FIXME: Such coercion is sufficiently useful to warrant generalization into
+    #a new alias -- say, report_status_coercing_1_to_0() or perhaps
+    #report_status_1_as_0(). Right! Definitely the latter.
+
+    # Coerce exit status 1 to 0.
+    "${diff[@]}" "${pathname_old}" "${pathname_new}" >"${patch_filename}" |
+        cat and exit_status="${pipestatus[1]}"
+    if (( exit_status == 1 )) {
+        report_success
+    } else {
+        report_status ${exit_status}
+    }
+}
+
+# ....................{ PATCHERS                           }....................
+#FIXME: Function implementation is GNU-specific. Correct with the usual
+#${ZESHY_OPTIONS_PATCH_IF_DRY_RUN} approach.
+
+declare_function_with_stdin <<'/---'
+string :apply_patch_to_dir(
+    string patch_filename, string target_dirname = "$(get_dir)")
+
+Apply the passed patch file to the appropriate file(s) in the passed directory
+(defaulting to the current directory, if called directly from the command line)
+with the first patch level in `[0, 5]` to successfully apply. See
+:apply_patch_to_dir_with_level() for further details.
+/---
+function :apply_patch_to_dir() {
+    # Validate sanity.
+    if { is_context_cli_function } {
+        die_unless_args_1_to_2\
+            'Expected one patch filename and optional target dirname.'
+
+        # If no patch pathname was passed, default such pathname to such old
+        # pathname (excluding any suffixing "/" if such path was a directory).
+        is_args_2 or :arg.append "$(get_dir)"
+    } else {
+        die_unless_args_2\
+            'Expected one patch filename and one target dirname.'
+    }
+
+    # Localize such arguments.
+    :string patch_filename="${1}" target_dirname="${2}"
+    die_unless_file "${patch_filename}"
+    die_unless_dir "${target_dirname}"
+
+    # Patch such file.
+    store_dir "${target_dirname}"
+    :try{
+        # Iteratively search for a successful patch level by attempting each in
+        # ascending order as dry runs.
+        :int patch_level patch_level_min=0 patch_level_max=5
+        for  patch_level ({${patch_level_min}..${patch_level_max}) {
+            print_message_item\
+                'Attempting patch level '${patch_level}' on "'${patch_filename}'".'
+#               run_code_with_options "patch -p${patch_level} --dry-run --force"\
+            if { run_code_with_options\
+                "command patch -p${patch_level} --dry-run --force --quiet"\
+                ZESHY_OPTIONS_PATCH "< ${(q)patch_filename}" } {
+                break
+            }
+        }
+
+        # If no patch level succeeded, rerun the first dry run, thus forcing
+        # "patch" to print a helpful error message before returning non-zero
+        # exit status and hence inducing a fatal exception.
+        if (( patch_level > patch_level_max )) {
+            run_code_with_options\
+                "command patch -p0 --dry-run --force"\
+                ZESHY_OPTIONS_PATCH "< ${(q)patch_filename}"
+        }
+    }:catch{
+        restore_dir
+    }:catch
+
+    # Apply such patch with the current (presumably successful) patch level.
+    :apply_patch_to_dir_with_level\
+        "${patch_filename}" "${target_dirname}" "${patch_level}"
+}
+
+declare_function_with_stdin <<'/---'
+string :apply_patch_to_dir_with_level(
+    string patch_filename,
+    string target_dirname,
+    integer patch_level)
+
+Apply the passed patch file to the appropriate file(s) in the passed directory
+with the passed 0-based patch level in `[0, 5]`. If such patch insecurely
+attempts to modify either an absolute path (e.g., `/sbin/init`) or parent-
+relative path (e.g., `../../../init/sh`) _and_:
+
+* If the current shell is interactive, the current user is required to confirm
+  such modification.
+* Else, an exception is thrown.
+/---
+function :apply_patch_to_dir_with_level() {
+    # Validate sanity.
+    die_unless_args_3\
+        'Expected one patch filename, one target dirname, and one patch level.'
+    :string\
+        patch_filename="${1}"\
+        target_dirname="${2}"\
+        patch_level="${3}"
+    die_unless_file "${patch_filename}"
+    die_unless_dir "${target_dirname}"
+    :int.die_unless "${patch_level}"\
+        'Patch level "'${patch_level}'" invalid (i.e., not in [0, 5]).'
+
+    # Forbid absolute and parent-relative filenames in such patch.
+    if { is_file_text_matches_pcre_multiline "${patch_filename}"\
+        '^(\*\*\*|\+\+\+|\/---\-)\s+(/|(.*/)?\.\./)' } {
+        :string error_message='"'${patch_filename}'" insecurely patches an absolute or parent-relative path.'
+
+        # If interactive, require the user confirm such risky behavior.
+        if { is_shell_interactive } {
+            print_warning "${error_message}"
+            is_query_line_yes 'Really apply a potentially dangerous patch?' or
+                report_failure
+        # Else, throw an exception.
+        } else {
+            :die "${error_message}"
+        }
+    }
+
+    # Patch such file.
+    store_dir "${target_dirname}"
+    :try{
+        # Apply such patch.
+        print_message_item\
+            'Applying "'${patch_filename}'" to "'${target_dirname}'" under patch level '${patch_level}'.'
+        run_code_with_options\
+            "command patch -p${patch_level}" ZESHY_OPTIONS_PATCH\
+            "< ${(q)patch_filename}"
+    }:catch{
+        restore_dir
+    }:catch
+}
+
+# --------------------( WASTELANDS                         )--------------------
+    # Default the passed patch to the passed old path excluding suffixing "/",
+#   patch_filename="${3-$(remove_string_suffix "${pathname_old}" '/').patch}"
+
+    #FUXME: "cat"-ing such diff doesn't strike me as particularly desirable.
+    #After all, this function is *NOT* a printer function. How hard is it to
+    #simply vim or cat the output patch file, anyway? For generality, cease
+    #such nonsense.
+
+    # Ensure either two files or two directories were passed.
+#   list zeshy_diff_options; zeshy_diff_options=( "${ZESHY_OPTIONS_DIFF[@]}" )
+#   if { is_files "${pathname_old}" "${pathname_new}" } {
+#       noop
+#   } elif { is_dir "${pathname_old}" and is_dir "${pathname_new}" } {
+#       zeshy_diff_options+=( "${ZESHY_OPTIONS_DIFF_IF_RECURSIVE[@]}" )
+#   } else {
+#       :die "\"${pathname_old}\" and \"${pathname_new}\" neither both files or directories"
+#   }
+
+    # Default the passed patch to the passed old path excluding suffixing "/",
+    # removing such patch if already found.
+#   string patch_filename
+#   patch_filename="${3:-$(remove_string_suffix "${pathname_old}" '/').patch}"
+#   print_message "removing \"${patch_filename}\"..."
+#   remove_file_if_found "${patch_filename}"
+
+    # Make the passed patch. If interactive, redirect standard output to error
+    # to assist the current user review the patch. Oddly, "diff" returns exit
+    # status 1 on successfully differencing non-identical files (!?) and exit
+    # status 2 on fatal error. Thanks for being idiotically different, "diff".
+    #
+    # Fortunately, the report_status() approach helps revise such idiocy.
+    # Unfortunately, this approach requires manually reimplementing both
+    # run_code_with_options() and report_status() here.
+    #
+    # *crudely blows both nostrils at the "diff" authors' pale-faced cupidity*
+#   list diff; diff=( diff "${zeshy_diff_options[@]}" )
+#   if { is_shell_interactive } {
+#       print_message "making \"${patch_filename}\"... [${pathname_old} -> ${pathname_new}]"
+#       diff+=( "${ZESHY_OPTIONS_DIFF_IF_SHELL_INTERACTIVE[@]}" )
+#   } else {
+#       diff+=( "${ZESHY_OPTIONS_DIFF_IF_SHELL_NONINTERACTIVE[@]}" )
+#   }
+
+    # Coerce exit status 1 to 0.
+#   integer exit_status
+#   "${diff[@]}" "${pathname_old}" "${pathname_new}" >"${patch_filename}" |
+#       cat and exit_status="${pipestatus[1]}"
+#   if (( exit_status == 1 )) {
+#       report_success
+#   } else {
+#       return ${exit_status}
+#   }
+
+#string make_file_patch(
+#    string old_pathname,
+#    string new_pathname,
+#    string patch_filename = "${old_pathname}.patch")
+#
+#Make the passed patch file (defaulting to the passed old path suffixed with
+#`.patch`) differencing the passed old and new paths. Such paths must either be
+#both files or both directories. In the latter case, differencing is recursive.
+
+#FUXME: Rename to make_path_patch(). Actually, split into two new
+#make_file_text_patch() and make_dir_file_text_patch_recursive(). Hmm... For
+#the latter, how about make_file_text_patch_from_new_and_old_dir_recursive() instead?
+#FUXME: It's not clear this function is actually helpful. In general, the
+#caller will probably prefer to call make_path_file() with source and target
+#directories, in which case "diff" should perform such operation already.
+# string make_file_patch_for_new_path(string new_pathname, string patch_filename)
+#
+# Make the passed patch file with the contents of the passed pathname. If such
+# path is a directory, the patch file contains the recursive contents of all
+# files in such directory. The resulting patch file is typically used for new
+# files added to projects.
+#make_file_patch_for_new_path() {
+    # Localize passed arguments, removing the passed patch if already extant.
+#    die_unless_args_3 'expected one new pathname and one patch filename'
+#    string new_pathname="${1}" patch_filename="${2}"
+#    die_unless_path "${new_pathname}"
+#    remove_file_if_found "${patch_filename}"
+
+    # Validate passed arguments.
+#    list zeshy_diff_options; zeshy_diff_options=( "${ZESHY_OPTIONS_DIFF[@]}" )
+#    is_dir "${new_pathname}" and
+#        zeshy_diff_options+=( "${ZESHY_OPTIONS_DIFF_IF_RECURSIVE[@]}" )
+
+    # Difference.
+#    interactively say\
+#        "from \"${new_pathname}\" into \"${patch_filename}\"..."
+#    run_code_with_options 'diff --from-file=/dev/null' 'zeshy_diff_options'\
+#        "${new_pathname}" > "${patch_filename}"
+#}
+
+#   string redirect_to_screen
+#   and redirect_to_screen='1>&2'
+#   run_code_with_options diff 'zeshy_diff_options'\
+#       "${old_pathname}" "${new_pathname}"\
+#        ${redirect_to_screen} >"${patch_filename}" | true and
+#       print_message ${pipestatus[@]}
+
+# function thus is intended for describing new
+# files added to a project.
+# By precedent, the old pathname in the resulting patch
+# file will be "/dev/null".

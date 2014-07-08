@@ -1,0 +1,1177 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+
+:parcel <<'/---'
+Handle *command output setters* (i.e., functions running commands and setting
+variables to all standard output and/or error which such commands produce).
+/---
+
+#FIXME: Unfortunately, the current coprocess approach to capturing output is
+#excessively unstable *AND* inefficient. Consequently, we need to split all
+#high-level setters calling
+#:run_code_and_set_string_to_output_redirected_by_coprocess() into two
+#distinct high-level setters: one performing the equivalent operation with
+#stable and efficient subshells, the other retaining the current approach of
+#unstable and inefficient coprocesses. For example, rename
+#run_code_and_set_string_to_stdout() to
+#:run_code_and_set_string_to_stdout_by_coprocess() and define a new
+#:run_code_and_set_string_to_stdout_by_subshell() function performing the
+#equivalent operation with subshells. For the latter, note the detritus of such
+#functions should already reside in the wastes.
+#
+#Then, we need to decide on a case-by-case basis whether to replace calls to the
+#original setter with the subshell or coprocess version. In general, we should
+#prefer the former unless absolutely requiring the latter.
+
+# ....................{ SETTERS ~ stdout                   }....................
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: int]
+    :run_code_and_set_string_to_stdout_by_subshell(
+        string code1, ...,
+        string string_name)
+
+Run the passed code in a subshell of the current shell and set the passed string
+variable to all standard output (but _not_ error) such code emits. This function
+preserves such output (rather than capturing, redirecting, or otherwise stifling
+such output), ensuring such code emits both standard output and error as usual:
+e.g.,
+
+.:run_code_and_set_string_to_stdout_by_subshell()
+==========================================
+[source]
+------------------------------------------
+>>> string on_health on_happiness=\
+...    "Can you imagine what would happen if all of America stopped buying so
+...     much unnecessary fluff that doesn't add a lot of lasting value to our
+...     lives? The economy would collapse and never recover. All of America's
+...     well-publicized problems, including obesity, depression, pollution and
+...     corruption are what it costs to create and sustain a trillion-dollar
+...     economy."
+>>> :run_code_and_set_string_to_stdout_by_subshell\
+...     'get_string_line "${on_happiness}" 3' on_health
+lives? The economy would collapse and never recover. All of America's
+>>> :string.output "${on_health}"
+lives? The economy would collapse and never recover. All of America's
+------------------------------------------
+==========================================
+
+== Caveats ==
+
+*This function isolates all shell-specific side effects of such code to the
+temporary subshell in which such code is run.* Such code cannot change _any_
+variables, runnables, or other shell objects (e.g., current directory, path
+creation mask) in the current shell. If this is undesirable, consider calling
+:run_code_and_set_string_to_stdout_by_coprocess() instead.
+
+If undesirable, consider calling
+:run_code_and_set_string_to_stdout_by_coprocess() instead.
+/---
+function :run_code_and_set_string_to_stdout_by_subshell() {
+    # Validate sanity.
+    die_unless_args_2_or_more\
+        'Expected one or more shell words and one string name.'
+    :string string_name__rcasstobs="${@[-1]}" stdout__rcasstobs
+    :file_descriptor fd_stdout__rcasstobs
+    :int status__rcasstobs
+    :var.die_unless_type_string "${string_name__rcasstobs}"
+    pop_arg
+
+    # Default the exit status such code reports to failure, in the event this
+    # function refuses to run such code. (This is only a "failsafe" precaution.)
+    status__rcasstobs="${ZESHY_STATUS_FAILURE}"
+
+    #FIXME: Define new functions
+    #:open_file_descriptor_to_stdout_start() and
+    #:open_file_descriptor_to_stdout_stop() and call below, instead.
+
+    :try{
+        # Open such descriptor for writing to the current shell's standard
+        # output. Since the subshell below substitutes such output with its own,
+        # providing a descriptor to such output provides such subshell access to
+        # such output through such descriptor.
+        open_file_descriptor_to_stdout fd_stdout__rcasstobs
+
+        # Run such code, capturing the appropriate output and preserving both
+        # such output and exit status. Dismantled, this is:
+        #
+        # * "1>&1", redirecting standard output for such subshell to itself.
+        #   While seemingly redundant, this ensures such output survives further
+        #   redirection under shell option "MULTIOS" and hence remains
+        #   "capturable" into such string.
+        # * "1>&${...}", redirecting standard output for such subshell to
+        #   standard output for the current shell.
+        #
+        # Since command substitution *NEVER* captures standard error, this has
+        # the beneficial side effect of emitting standard error as usual.
+        stdout__rcasstobs="$(run_code "${@}"\
+            1>&1 1>&${fd_stdout__rcasstobs})" and
+            set_integer_to_status status__rcasstobs
+
+        # Set such string to such output.
+        :string.set "${string_name__rcasstobs}" "${stdout__rcasstobs}"
+    # Close such descriptor safely (e.g., in the event of exceptions).
+    }:catch{
+        close_file_descriptor_if_open fd_stdout__rcasstobs
+    }:catch
+
+    # Ensure this function reports the exit status such code reported.
+    return ${status__rcasstobs}
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: int]
+    :run_code_and_set_string_to_stdout_by_coprocess(
+        string code1, ...,
+        string string_name)
+
+Run the passed code in the current shell and set the passed string variable to
+all standard output (but _not_ error) such code emits, temporarily cached into a
+coprocess of the current shell. This function preserves such output (rather than
+capturing, redirecting, or otherwise stifling such output), ensuring such code
+emits both standard output and error as usual: e.g.,
+
+.:run_code_and_set_string_to_stdout_by_coprocess()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_health on_happiness=\
+...    "For the economy to be \"healthy\", America has to remain unhealthy.
+...     Healthy, happy people don't feel like they need much they don't already
+...     have, and that means they don't buy a lot of junk, don't need to be
+...     entertained as much, and they don't end up watching a lot of
+...     commercials. The culture of the eight-hour workday is big business' most
+...     powerful tool for keeping people in this same dissatisfied state where
+...     the answer to every problem is to buy something."
+>>> :run_code_and_set_string_to_stdout_by_coprocess\
+...     'get_string_line "${on_happiness}" -1' on_health
+the answer to every problem is to buy something.
+>>> :string.output "${on_health}"
+the answer to every problem is to buy something.
+------------------------------------------
+==========================================
+
+== Caveats ==
+
+*This function implicitly closes the coprocess for the current shell before
+reopening such coprocess to cache code output.* If such coprocess was previously
+open and still executing code at the time of the call to this function, such
+call silently terminates such code. Likewise, as this function internally uses
+such coprocess, the passed code _cannot_.
+
+*This function is (arguably) less reliable than the standard subshell approach
+to capturing command output.* By design, `zsh` coprocesses were intended for
+interactive rather than non-interactive use. Naturally, this function uses
+coprocesses non-interactively. While feasible, this _can_ result in erratic
+behavior under passed code satisfying one or more of the following edge-cases:
+
+* Code consuming an excess amount of time (e.g., more than several seconds).
+* Code producing an excess amount of output (e.g., more than several kilobytes).
+* Code interactively interrupted by the current user (e.g., with <Ctrl-c>).
+
+If undesirable, consider calling
+:run_code_and_set_string_to_stdout_by_subshell() instead.
+/---
+function :run_code_and_set_string_to_stdout_by_coprocess() {
+    die_unless_args_2_or_more\
+        'Expected one or more shell words and one string name.'
+    :run_code_and_set_string_to_output_redirected_by_coprocess\
+        "${@}" '1>&1 1>&p'
+}
+
+# ....................{ SETTERS ~ stderr                   }....................
+declare_function_with_stdin <<'/---'
+[stderr: string, stderr: string, status: int]
+    :run_code_and_set_string_to_stderr_by_subshell(
+        string code1, ...,
+        string string_name)
+
+Run the passed code in a subshell of the current shell and set the passed string
+variable to all standard error (but _not_ output) such code emits. See
+:run_code_and_set_string_to_stdout_by_subshell() for further details: e.g.,
+
+.:run_code_and_set_string_to_stderr_by_subshell()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_fascism on_capitalism=\
+...    "Those who are against fascism without being against capitalism, who
+...     lament over the barbarism that comes out of barbarism, are like people
+...     who wish to eat their veal without slaughtering the calf. They are
+...     willing to eat the calf, but they dislike the sight of blood. They are
+...     easily satisfied if the butcher washes his hands before weighing the
+...     meat. They are not against the property relations which engender
+...     barbarism; they are only against barbarism itself. They raise their
+...     voices against barbarism, and they do so in countries where precisely
+...     the same property relations prevail, but where the butchers wash their
+...     hands before weighing the meat."
+>>> :run_code_and_set_string_to_stderr_by_subshell\
+...     '{ get_string_line "${on_capitalism}" 3 } :to_stdout' on_fascism
+who wish to eat their veal without slaughtering the calf. They are
+>>> :string.output "${on_fascism}"
+who wish to eat their veal without slaughtering the calf. They are
+------------------------------------------
+==========================================
+/---
+function :run_code_and_set_string_to_stderr_by_subshell() {
+    # Validate sanity.
+    die_unless_args_2_or_more\
+        'Expected one or more shell words and one string name.'
+    :string string_name__rcasstebs="${@[-1]}" stderr__rcasstebs
+    :file_descriptor fd_stdout__rcasstebs fd_stderr__rcasstebs
+    :int status__rcasstebs
+    :var.die_unless_type_string "${string_name__rcasstebs}"
+    pop_arg
+
+    # Default the exit status such code reports to failure, in the event this
+    # function refuses to run such code. (This is only a "failsafe" precaution.)
+    status__rcasstebs="${ZESHY_STATUS_FAILURE}"
+
+    :try{
+        # Open such descriptors for writing to the current shell's standard
+        # output and error. Since the subshell below substitutes such output
+        # with its own, providing descriptors to such output provides such
+        # subshell access to such output through such descriptors.
+        open_file_descriptor_to_stdout fd_stdout__rcasste
+        open_file_descriptor_to_stderr fd_stderr__rcasste
+
+        # Run such code, capturing the appropriate output and preserving both
+        # such output and exit status. Dismantled, this is:
+        #
+        # * "2>&1", redirecting standard error to output for such subshell,
+        #   ensuring such output is captured into such string.
+        # * "1>&...", redirecting standard output for such subshell to standard
+        #   output for the current shell.
+        # * "2>&...", redirecting standard error for such subshell to standard
+        #   error for the current shell.
+        stderr__rcasstebs="$(run_code "${@}"\
+            2>&1 1>&${fd_stdout__rcasstebs} 2>&${fd_stderr__rcasstebs})" and
+            set_integer_to_status status__rcasstebs
+
+        # Set such string to such output.
+        :string.set "${string_name__rcasstebs}" "${stderr__rcasstebs}"
+    # Close such descriptors safely (e.g., in the event of an exception).
+    }:catch{
+        close_file_descriptor_if_open fd_stdout__rcasstebs
+        close_file_descriptor_if_open fd_stderr__rcasstebs
+    }:catch
+
+    # Ensure this function reports the exit status such code reported.
+    return ${status__rcasstebs}
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, stderr: string, status: int]
+    :run_code_and_set_string_to_stderr_by_coprocess(
+        string code1, ...,
+        string string_name)
+
+Run the passed code in the current shell and set the passed string variable to
+all standard error (but _not_ output) such code emits, temporarily cached into a
+coprocess of the current shell. See
+:run_code_and_set_string_to_stdout_by_coprocess() for further details: e.g.,
+
+.:run_code_and_set_string_to_stderr_by_coprocess()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_learning on_ideas=\
+...    "Did ever grow anything
+...     In the garden of your mind?
+...     You can grow ideas
+...     In the garden of your mind.
+...
+...     It's good to be curious about many things.
+...     You can think about things and make believe.
+...     All you have to do is think
+...     And they'll grow.
+...
+...     There are so many things
+...     To learn about in this world.
+...     And so many people
+...     Who can help us learn."
+>>> :run_code_and_set_string_to_stderr_by_coprocess\
+...     'get_string_line "${on_ideas}" 1 1>&2' on_learning
+Did ever grow anything
+>>> :string.output "${on_health}"
+Did ever grow anything
+------------------------------------------
+==========================================
+/---
+function :run_code_and_set_string_to_stderr_by_coprocess() {
+    die_unless_args_2_or_more\
+        'Expected one or more shell words and one string name.'
+    :run_code_and_set_string_to_output_redirected_by_coprocess\
+        "${@}" '2>&2 2>&p'
+}
+
+# ....................{ SETTERS ~ silent : stdout          }....................
+declare_function_with_stdin <<'/---'
+[status: int] :run_code_silent_and_set_string_to_stdout_by_subshell(
+    string code1, ...,
+    string string_name)
+
+Run the passed code *silently* (i.e., stifling standard output and error) in a
+subshell of the current shell and set the passed string variable to all standard
+error (but _not_ output) such code emits. See
+:run_code_and_set_string_to_stdout_by_subshell() for further details: e.g.,
+
+.:run_code_silent_and_set_string_to_stdout_by_subshell()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_dominance on_consumerism=\
+...    "\"Morning, sir or madam or neuter,\" the thing said. \"This your planet,
+...     is it?"
+...     The other alien, which was stubby and green, had wandered off into the
+...     woods by the side of the road. Out of the corner of his eye Newt saw it
+...     kick a tree, and then run a leaf through some complicated gadget on its
+...     belt. It didn't look very pleased.
+...     \"Well, yes. I suppose so,\" he said.
+...     The toad stared thoughtfully at the skyline.
+...     \"Had it long, have we, sir?\" it said.
+...     \"Er. Not personally. I mean, as a species, about half a million years.
+...     I think.\"
+...     The alien exchanged glances with its colleague. \"Been letting the old
+...     acid rain build up, haven't we, sir?\" it said. \"Been letting ourselves
+...     go a bit with the old hydrocarbons, perhaps?\"
+...     \"I'm sorry?\""
+>>> :run_code_silent_and_set_string_to_stdout_by_subshell\
+...     'get_string_line "${on_consumerism}" -2' on_dominance
+>>> :string.output "${on_dominance}"
+go a bit with the old hydrocarbons, perhaps?"
+------------------------------------------
+==========================================
+/---
+function :run_code_silent_and_set_string_to_stdout_by_subshell() {
+    # Validate sanity.
+    die_unless_args_2_or_more\
+        'Expected one or more shell words and one string name.'
+    :string string_name__rcsasstobs="${@[-1]}" stdout__rcsasstobs
+    :int status__rcsasstobs
+    :var.die_unless_type_string "${string_name__rcsasstobs}"
+    pop_arg
+
+    # Run such code, capturing the appropriate output and preserving such exit
+    # status but *NOT* output.
+    stdout__rcsasstobs="$({ run_code "${@}" } :silent_stderr)" and
+        set_integer_to_status status__rcsasstobs
+
+    # Set such string to such output.
+    :string.set "${string_name__rcsasstobs}" "${stdout__rcsasstobs}"
+
+    # Ensure this function reports the exit status such code reported.
+    return ${status__rcsasstobs}
+}
+
+declare_function_with_stdin <<'/---'
+[status: int] :run_code_silent_and_set_string_to_stdout_by_coprocess(
+    string code1, ...,
+    string string_name)
+
+Run the passed code *silently* (i.e., stifling standard output and error) in the
+current shell and set the passed string variable to all standard output (but
+_not_ error) such code emits, temporarily cached into a coprocess of the
+current shell. See :run_code_and_set_string_to_stdout_by_coprocess() for further
+details: e.g.,
+
+.:run_code_silent_and_set_string_to_stdout_by_coprocess()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_dominance on_consumerism=\
+...    "\"Could you tell me your planet's albedo, sir?\" said the toad, still
+...     staring levelly at the horizon as though it was doing something
+...     interesting.
+...     \"Er. No.\"
+...     \"Well, I'm sorry to have to tell you, sir, that your polar ice caps are
+...     below regulation size for a planet of this category, sir.\"
+...     \"Oh, dear,\" said Newt. He was wondering who he could tell about this,
+...     and realizing that there was absolutely no one who would believe him.
+...     The toad bent closer. It seemed to be worried about something, insofar
+...     as Newt was any judge of the expressions of an alien race he'd never
+...     encountered before.
+...     \"We'll overlook it on this occasion, sir...\"
+...     Newt stuck his head out of the window.
+...     \"Thank you!\"
+...     The small alien walked past the car.
+...     \"C02 level up 0.5 percent,\" it rasped, giving him a meaningful look.
+...     \"You do know you could find yourself charged with being a dominant
+...     species while under the influence of impulse-driven consumerism, don't
+...     you?\""
+>>> :run_code_silent_and_set_string_to_stdout_by_coprocess\
+...     'get_string_line "${on_consumerism}" 1' on_dominance
+>>> :string.output "${on_dominance}"
+"Morning, sir or madam or neuter," the thing said. "This your planet,
+------------------------------------------
+==========================================
+/---
+function :run_code_silent_and_set_string_to_stdout_by_coprocess() {
+    die_unless_args_2_or_more\
+        'Expected one or more shell words and one string name.'
+    :run_code_and_set_string_to_output_redirected_by_coprocess\
+        "${@}" '1>&p 2>/dev/null'
+}
+
+# ....................{ SETTERS ~ silent : stderr          }....................
+declare_function_with_stdin <<'/---'
+[status: int] :run_code_silent_and_set_string_to_stderr_by_subshell(
+    string code1, ...,
+    string string_name)
+
+Run the passed code *silently* (i.e., stifling standard output and error) in a
+subshell of the current shell and set the passed string variable to all standard
+error (but _not_ output) such code emits. See
+:run_code_and_set_string_to_stdout_by_subshell() for further details: e.g.,
+
+.:run_code_silent_and_set_string_to_stderr_by_subshell()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_responsibility on_submission=\
+...    "Let's pretend for a moment that work doesn't turn people into stultified
+...     submissives. Let's pretend, in defiance of any plausible psychology and
+...     the ideology of its boosters, that it has no effect on the formation of
+...     character. And let's pretend that work isn't as boring and tiring and
+...     humiliating as we all know it really is. Even then, work would still
+...     make a mockery of all humanistic and democratic aspirations, just
+...     because it usurps so much of our time. Socrates said that manual
+...     laborers make bad friends and bad citizens because they have no time to
+...     fulfill the responsibilities of friendship and citizenship. He was
+...     right."
+>>> :run_code_silent_and_set_string_to_stderr_by_subshell\
+...     '{ get_string_line "${on_submission}" 1 } :to_stderr' on_responsibility
+>>> :string.output "${on_responsibility}"
+Let's pretend for a moment that work doesn't turn people into stultified
+------------------------------------------
+==========================================
+/---
+function :run_code_silent_and_set_string_to_stderr_by_subshell() {
+    # Validate sanity.
+    die_unless_args_2_or_more\
+        'Expected one or more shell words and one string name.'
+    :string string_name__rcsasstebs="${@[-1]}" stderr__rcsasstebs
+    :int status__rcsasstebs
+    :var.die_unless_type_string "${string_name__rcsasstebs}"
+    pop_arg
+
+    # Run such code, capturing the appropriate output and preserving such exit
+    # status but *NOT* output. Such operation is also implementable with the
+    # following (presumably less efficient) pipe: e.g.,
+    #
+    #     { run_code "${@}" } :silent_stdout |&
+    #         :string.set_to_stdin "${string_name__rcsasstebs}"
+    stderr__rcsasstebs="$({ run_code "${@}" } :to_stdout :silent_stdout)" and
+        set_integer_to_status status__rcsasstebs
+
+    # Set such string to such output.
+    :string.set "${string_name__rcsasstebs}" "${stderr__rcsasstebs}"
+
+    # Ensure this function reports the exit status such code reported.
+    return ${status__rcsasstebs}
+}
+
+declare_function_with_stdin <<'/---'
+[status: int] :run_code_silent_and_set_string_to_stderr_by_coprocess(
+    string code1, ...,
+    string string_name)
+
+Run the passed code *silently* (i.e., stifling standard output and error) in the
+current shell and set the passed string variable to all standard error (but
+_not_ output) such code emits, temporarily cached into a coprocess of the
+current shell. See :run_code_and_set_string_to_stdout_by_coprocess() for further
+details: e.g.,
+
+.:run_code_silent_and_set_string_to_stderr_by_coprocess()
+==========================================
+[source]
+------------------------------------------
+>>> :string on_responsibility on_submission=\
+...    "Because of work, no matter what we do we keep looking at our watches.
+...     The only thing \"free\" about so-called free time is that it doesn't
+...     cost the boss anything. Free time is mostly devoted to getting ready for
+...     work, going to work, returning from work, and recovering from work. Free
+...     time is a euphemism for the peculiar way labor as a factor of production
+...     not only transports itself at its own expense to and from the workplace
+...     but assumes primary responsibility for its own maintenance and repair.
+...     Coal and steel don't do that. Lathes and typewriters don't do that. But
+...     workers do. No wonder Edward G. Robinson in one of his gangster movies
+...     exclaimed, \"Work is for saps!\""
+>>> :run_code_silent_and_set_string_to_stderr_by_coprocess\
+...     '{ get_string_line "${on_submission}" 1 } :to_stderr' on_responsibility
+>>> :string.output "${on_responsibility}"
+Let's pretend for a moment that work doesn't turn people into stultified
+------------------------------------------
+==========================================
+/---
+function :run_code_silent_and_set_string_to_stderr_by_coprocess() {
+    die_unless_args_2_or_more\
+        'Expected one or more shell words and one string name.'
+    :run_code_and_set_string_to_output_redirected_by_coprocess\
+        "${@}" '1>/dev/null 2>&p'
+}
+
+#FIXME: In lieu of unit tests...
+#function comm() {
+#    string stdout stderr
+#
+#    run_code_and_set_string_to_stdout '{ print ok; print ko 1>&2; }' stdout
+#    print "stdout: ${stdout}"
+#    run_code_and_set_string_to_stderr '{ print ok; print ko 1>&2; }' stderr
+#    print "stderr: ${stderr}"
+#
+#    :run_code_silent_and_set_string_to_stdout_by_coprocess 'print "ok\nhm"; print "ko\nhm" 1>&2' stdout
+#    print "stdout (silent): ${stdout}"
+#    :run_code_silent_and_set_string_to_stderr_by_coprocess 'print "ok\nhm"; print "ko\nhm" 1>&2' stderr
+#    print "stderr (silent): ${stderr}"
+#}
+
+# ....................{ SETTERS ~ coprocess                }....................
+#FIXME: Rename to :run_code_and_set_string_to_output_redirected_by_coprocess().
+declare_function_with_stdin <<'/---'
+void :run_code_and_set_string_to_output_redirected_by_coprocess(
+    string code1, ...,
+    string string_name,
+    string redirection)
+
+Run the passed code after opening an *identity coprocess* (i.e., a coprocess
+merely outputting all input written to such coprocess) and set the passed string
+variable to all output redirected from such code to such coprocess by the passed
+string of `zsh` redirections (e.g., `1>&p 2>/dev/null`, setting such variable to
+such code's standard output _and_ silencing such code's standard error): e.g.,
+
+.:run_code_and_set_string_to_output_redirected_by_coprocess()
+==========================================
+[source]
+------------------------------------------
+>>> string on_subservience on_addiction=\
+...    "We've been led into a culture that has been engineered to leave us
+...     tired, hungry for indulgence, willing to pay a lot for convenience and
+...     entertainment, and most importantly, vaguely dissatisfied with our lives
+...     so that we continue wanting things we don't have. We buy so much because
+...     it always seems like something is still missing. Western economies,
+...     particularly that of the United States, have been built in a very
+...     calculated manner on gratification, addiction, and unnecessary spending.
+...     We spend to cheer ourselves up, to reward ourselves, to celebrate, to
+...     fix problems, to elevate our status, and to alleviate boredom."
+>>> :run_code_and_set_string_to_output_redirected_by_coprocess\
+...     'get_string_line "${on_addiction}" 1' on_subservience '1>&p 2>/dev/null'
+>>> :string.output "${on_dominance}"
+We've been led into a culture that has been engineered to leave us
+------------------------------------------
+==========================================
+
+== Identity Coprocess ==
+
+While seemingly meaningless, such coprocess serves as a temporary repository
+storing command output, permitting such command to be run in the current shell
+rather than a subshell, permitting such command to modify the current shell
+(e.g., `temporary_pathnames=( /tmp/* )`, setting list ${temporary_pathnames} to
+the absolute path of all temporary files and directories in `/tmp`). See
+get_stdin_until_eot() for further details on the function such coprocess calls.
+/---
+# Ideally, such function should be implementable without coprocesses. Indeed,
+# such function's stated intention appears simple enough: running a command in
+# the current shell and setting a string variable to such command's output while
+# preserving such output.
+#
+# For example, as a first attempt at an alternative implementation to
+# :run_code_silent_and_set_string_to_stderr_by_coprocess(), one might consider
+# the following simple pipeline:
+#
+#     { run_code "${@}" 1>/dev/null } |&
+#         :string.set_to_stdin "${string_name__rcsasstebc}"
+#
+# Naturally, such pipeline succeeds for code *NOT* modifying the current shell
+# (e.g., "print 'Our national flower is the concrete cloverleaf.'") but fails
+# for all other code (e.g., ":list war; war=(
+# War is the supreme drama of a completely mechanized society. )").
+#
+# The reason why is subtle. For those unfamiliar with the arcane viscera of
+# zsh operation, all subcommands of a pipeline except the last are executed
+# in subshells. For safety, modifying subshell environments *NEVER* modifies
+# the current shell environment. Indeed, while variables are readily
+# exportable *DOWN* the shell hierarchy from the current shell to subshells,
+# there exist no means of exporting variables back *UP* the shell hierarchy
+# from subshells to the current shell.
+#
+# The code to be run must thus be run from the current shell. While this
+# excludes pipelines, two (rather less convenient) alternatives remain:
+#
+# * Temporary files. Standard error from such command could be piped to a
+#   temporary file, the passed variable set to the contents of such file,
+#   and such file removed. While feasible, such approach is regrettably
+#   heavyweight for such a core function as this.
+# * Coprocesses. Standard error from such command could be piped to a
+#   coprocess, the passed variable set to standard input from such coprocess
+#   (which is, hopefully, the standard error piped earlier to such coprocess),
+#   and such coprocess closed. Hence, such approach uses such coprocess as a
+#   temporary repository for storing standard error from such command.
+#
+# Both approaches ensure that such command is run from *AND* such variable
+# is set in the current shell. Coprocesses are the usual solution to assembling
+# pipelines in which some subcommand other than the last must be run in the
+# current shell. Despite the inherent fragility of non-interactive coprocesses,
+# temporary files suffer even greater issues (e.g., filesystem race conditions,
+# existing filename conflicts, file ownership and permissions subtleties,
+# insufficient disk space, cross-platform portability constraints).
+#
+# In this case, coprocesses are the lesser of two significant evils.
+function :run_code_and_set_string_to_output_redirected_by_coprocess() {
+    # Validate sanity.
+    die_unless_args_3_or_more\
+        'Expected one or more shell words, one string name, and one redirection string.'
+    string string_name__rcassto="${@[-2]}" redirection__rcassto="${@[-1]}"
+    integer exit_status coprocess_pid
+    pop_args_2
+#   { print "!!!!!!!!!!call stack for coprocess redirection!!!!!!!!!!!"; output_call_stack } 1>&2
+
+    # Run get_stdin_until_eot() as a coprocess caching all standard input piped
+    # to such coprocess until receiving an end-of-transmission (EOT) character,
+    # at which point such coprocess pipes such input back to standard output.
+    # See such function for further details.
+    #
+    # Ideally, we would notify such coprocess of command completion by sending
+    # such coprocess an asynchronous signal rather than a character to standard
+    # input. After all, the latter scheme inherently conflicts with external
+    # commands printing such character to standard output (e.g., commands
+    # printing raw binary data). Unfortunately, the former scheme suffers a
+    # greater drawback: asynchronicity. If the current shell were to
+    # asynchronously signal such coprocess after running such command but before
+    # such coprocess has actually completed caching all piped standard input,
+    # standard output piped back by such coprocess will be woefully incomplete.
+    # Unfortunately, this worst case occurs reliably *AND* reproducably under
+    # commonplace conditions (e.g., when such code emits a sufficient amount of
+    # output and hence non-negligible coprocess buffering).
+    open_coprocess_running_code get_stdin_until_eot
+
+    :try{
+        # Process ID (PID) of such coprocess, for confirming such coprocess'
+        # termination below.
+        set_integer_to_pid_job_prior coprocess_pid
+
+        # Locally trap the interrupt signal (i.e., "<Ctrl-c>") to gracefully
+        # terminate the coprocess by sending an EOT character. Sadly, failing to
+        # do so deadlocks the current shell on receiving such signal.  It's
+        # unclear why zsh fails to propagate such signal to the coprocess -- but
+        # here we are.  While we initially suspected the disabling of shell
+        # option "monitor" in alias open_coprocess_running_code() to be the
+        # culprit, leaving such option enabled has no effect on coprocess signal
+        # propagation. *sigh*
+        #
+        # However, only sending such character does *NOT* suffice to gracefully
+        # terminate the coprocess. For unclear reasons, any string containing a
+        # newline *MUST* also be printed to standard output of the current
+        # shell. To avoid confusing the current user, print a blank line. (This
+        # probably concerns some subtle interaction between "stdio"-managed
+        # standard output line buffering and kernel-managed socket buffer
+        # limits. Frankly, it's all a bit beyond us -- but at least this appears
+        # to run reliably.)
+        #
+        # Ideally, such concerns could be circumvented by offloading such
+        # trapping to the coprocess itself. Unfortunately, zsh appears to suffer
+        # a critical defect here: *ANY* attempt to trap SIGINT in such coprocess
+        # results in the current shell and all children of such shell (including
+        # such coprocess) immediately terminating. Replicating this is trivially
+        # simple: just add "trap '' INT" anywhere to the body of function
+        # get_stdin_until_eot(). Indeed, adding "trap '' INT" anywhere in the
+        # body of this function has the desired effect of simply ignoring such
+        # signal. *REPORT THIS ISSUE, PLEASE*.
+        run_hook_on_signal_interrupt_local\
+            '# Ignore subsequent interrupt signals. If the current user
+             # continues sending such signals by repeatedly typing <Ctrl-C>
+             # *AND* we fail to ignore such signals, zsh abnormally terminates
+             # the current process group -- which is terrible. Stop that.
+             ignore_signal_interrupt
+
+             # Gracefully terminate such coprocess with the EOT character.
+             send_coprocess_eot
+
+             # Gracefully... O.K., you got us. We have no bloody idea why zsh
+             # requires this statement. Code dragons have mercy on our wizened
+             # souls... This is horrible.
+             :output_newline'
+
+        # Run such command, redirecting standard output and/or error to such
+        # coprocess. To avoid conflicts between such redirection and any
+        # redirections already embedded in such command, segregate the former
+        # from the latter with "{" and "}" delimiters.
+#       :string.output "variable: ${string_name__rcassto}; command: ${@}"
+        run_code '{' "${@}" '} '${redirection__rcassto} and
+            set_integer_to_status exit_status
+#       print "redirected '${@}' to coprocess" 1>&2
+
+        # Gracefully terminate such coprocess with the EOT character.
+        send_coprocess_eot
+
+        # Set the passed string to all standard error cached via such coprocess.
+        # To quote modern culture, "Shit just got real."
+        set_string_to_coprocess_output "${string_name__rcassto}"
+
+        # Wait for such coprocess to terminate. While this has typically already
+        # occurred, it's critical to ensure this. Why? If such coprocess has not
+        # terminated by the time this function returns, failing to wait for such
+        # termination leaks job control messages to standard error -- which, for
+        # a function purporting to run silently, is not nice.
+        wait_on_job_exit_if_found "${coprocess_pid}"
+    }:catch{
+        close_coprocess
+    }:catch
+
+    # Return the exit status returned by such command.
+    return ${exit_status}
+}
+
+#FIXME: In lieu of unit tests...
+#function laro() {
+#    string output
+##   print "\n!!!!!!!!!!!!!!!!!!!!!!!!!\nsubshell:\n$(lera output)"
+#    print "\n!!!!!!!!!!!!!!!!!!!!!!!!!\ncurrent shell:"
+#    lera output
+#    print "\n!!!!!!!!!!!!!!!!!!!!!!!!!\ncurrent shell (captured):\n${output}"
+#}
+#function lera() {
+#    die_unless_arg 'Expected one string name.'
+#    string stri string_name__rcassto="${1}" redirection__rcassto='1>&1 1>&p'
+#    integer exit_status coprocess_pid
+#
+#    open_coprocess_running_code get_stdin_until_eot
+#    set_integer_to_pid_job_prior coprocess_pid
+#
+##   print "!!!!!!!!!!!!!!!!!!!!!!!!\nopened coprocess ${coprocess_pid} ($$)" 1>&2
+#    {
+#        run_hook_on_signal_interrupt_local\
+#            'ignore_signal_interrupt
+#             send_coprocess_eot
+#             :output_newline'
+##       eval "list_path '${HOME}/tmp' "${redirection__rcassto} and
+#        eval "list_path_recursive '${HOME}/tmp' "${redirection__rcassto} and
+#            set_integer_to_status exit_status
+##           print '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\ngetting exit status' 1>&2
+##           print '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\ngot exit status' 1>&2
+##       print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nsending coprocess ${coprocess_pid} SIGUSR1" 1>&2
+#        send_coprocess_eot
+##       send_pid_signal_user1 "${coprocess_pid}"
+##       print '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nsent SIGUSR1' 1>&2
+#        set_string_to_coprocess_output "${string_name__rcassto}"
+##       print '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nreceived coprocess output' 1>&2
+#        wait_on_job_exit_if_found "${coprocess_pid}"
+#    } always close_coprocess
+#    return ${exit_status}
+#}
+
+# --------------------( WASTELANDS                         )--------------------
+# *This function does _not_ report the exact exit status of such code.* Instead:
+# 
+# * If such code succeeds, this function reports success.
+# * If such code fails, this function implicitly throws an exception.
+
+#FUXME: Split such example in twain.
+#FUXME: This appears to be the most efficient implementation for
+#::run_code_silent_and_set_string_to_stderr_by_by_subshell():
+#
+#     { run_code "${@}" 1>/dev/null } |&
+#         :string.set_to_stdin "${string_name__rcasste}"
+
+    # Run such code and set such string. Interestingly, such operation is *NOT*
+    # readily implementable with conventional command substitution: e.g.,
+    #
+    #     # This always sets such string to the empty string. (Naturally, so
+    #     # does inverting the two redirections.)
+    #     >>> :string.set "${string_name__rcsasstebs}"\
+    #     ...     "$(run_code "${@}" 1>/dev/null 2>&1)"
+
+    # { run_code "${@}" 1>/dev/null } |&
+    #     :string.set_to_stdin "${string_name__rcsasstobs}"
+    #FUXME: Technically, we *COULD* propagate the exit status of such code to
+    #the caller by:
+
+#       run_hook_on_signal_interrupt_local '
+#           print "coprocess ${sysparams[pid]} received SIGINT" 1>&2
+#           exit 0'
+#           report_failure'
+#       get_stdin_until_eot_WAT
+#   }
+#   open_coprocess_running_code get_stdin_until_signal_user1
+#   coproc get_stdin_until_signal_user1
+
+#       run_hook_on_signal_interrupt_local ''
+#       run_hook_on_signal_interrupt_local 'send_pid_signal_interrupt "${coprocess_pid}"'
+#           'send_coprocess_eot
+#            :output_newline'
+#       run_hook_on_signal_interrupt_local 'exec p<&-'
+#       run_hook_on_signal_interrupt_local 'send_pid_signal_interrupt "${coprocess_pid}"'
+#           'send_coprocess_eot
+#            :output_newline'
+#       run_hook_on_signal_interrupt_local 'send_pid_signal_user1 "${coprocess_pid}"'
+        # Do something expected to take a long time. Try hitting <Ctrl-c>!
+
+#       kill -0 ${coprocess_pid} and print "coprocess ${coprocess_pid} is signalable" 1>&2
+#       send_pid_signal_user1 "${coprocess_pid}"
+#       print "sent SIGUSR1 to coprocess ${coprocess_pid}" 1>&2
+#   open_coprocess_running_code get_stdin_until_signal_user1
+    # Process identifier (PID) of such coprocess, for signalling purposes below.
+#   integer coprocess_pid="${!}"
+#   set_integer_to_pid_command_prior coprocess_pid
+
+#       print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nwaiting on coprocess ${coprocess_pid}" 1>&2
+#       wait_on_job_exit "${coprocess_pid}"
+        # Write a line containing only the EOT character to such function,
+        # which should now successfully return.
+#       send_coprocess_eot
+
+    # Run get_stdin_until_eot() as the coprocess for the current shell, caching
+    # all standard input piped to such coprocess until receiving a single line
+    # containing the end-of-transmission (EOT) character, at which point such
+    # coprocess pipes such input back to standard output. See such function for
+    # further details.
+#   open_coprocess_running_code get_stdin_until_eot
+
+        #FUXME: O.K.; we have a trap() problem here. Soft termination signals
+        #(at least SIGINT induced by <Ctrl-c> and possibly others) do not induce
+        #termination. The reason why is probably that only the current shell
+        #receives and handles such SIGINT; the coprocess doesn't appear to and
+        #hence continues running in an infinite loop after the current shell has
+        #long since terminated. The coprocess is waiting to receive input, which
+        #it never does. So, on receiving SIGINT, we just need to:
+        #    :output_string_to_coprocess "${ZESHY_ASCII_EOT}"; close_coprocess
+        #Well, that or explicitly do the latter. Hmm; right. For a "soft
+        #termination", we'd might as well try to close it cleanly. So, do output
+        #EOT as well.
+        #FUXME: O.K.; the reason why is that we've implicitly disabled option
+        #"monitor" in the above expansion of open_coprocess(). As a first try,
+        #I wonder if just locally enabling "monitor" again immediately after (or
+        #in) such expansion would do it? Of course, that opens up the slim
+        #possibility of the current process receiving a termination signal in
+        #between the window of the coprocess starting and "monitor" being
+        #reenabled. Really, we just *NEED* to stop disabling job monitoring
+        #altogether. But there appears to be no way of silencing only job
+        #monitoring output, which is fairly annoying. So, we'll probably have to
+        #accept some degree of improbable race conditions here.
+        #FUXME: Alternately, perhaps we could avoid coprocesses entirely? For
+        #example, one of the better (though still terrible) solutions for
+        #coloring stderr red is to redirect stderr to a backgrounded subshell:
+        #e.g.,
+        #
+        #    exec 2>>(while read line; do
+        #       print '\e[91m'${(q)line}'\e[0m' > /dev/tty; done &)
+        #
+        #Oh, never mind. While we could buffer to a string local in such loop,
+        #where would we write such buffer to after loop termination? Coprocesses
+        #neatly solve this entanglement. It's just zsh's somewhat unjudicious
+        #printing of job control output that we'd like to circumvent. Well, we
+        #may not be able to... entirely.
+        #FUXME: Hmm. It's is a bit crazy, but how about this: rather than
+        #locally disabling "monitor", how about capturing all stderr produced by
+        #this function and squelching anything matching output specific to
+        #coprocess job control? If it weren't for the "always" block below, I'd
+        #say this is probably the way to go. Or perhaps not. There's no reliable
+        #means of deciding whether such output originated from the current
+        #process or was actually a legitimate substring of stderr output by the
+        #passed code.
+        #FUXME: Ah! Wait. We can redirect stderr from the always block to
+        #"/dev/null", right? Let's first try that in lieu of the current
+        #approach in the expansion of close_coprocess(). If that actually works,
+        #consider expanding to squelch only sterr lines matching coprocess job
+        #control. (Ugh. Probably not worth it. But what it happens of that block
+        #of code were to actually print a legitimate error or warning? If we
+        #just indiscriminantly squelch *ALL* stderr, we'll miss such output.)
+        #FUXME: O.K.; to test this, get rid of the open_coprocess() disabling of
+        #option "monitor" and give the above squelching in close_coprocess() a
+        #try. There should still be an initial coprocess job control string
+        #output, but we can go from there...
+        #FUXME: O.K.; we've successfully implemented the reenabling of job
+        #monitoring, which is nice. What isn't nice, however, is that it fixed
+        #nothing! *sigh* Here's my current thinking on the subject:
+        #
+        #    :enable_option_local local_traps
+        #    trap send_coprocess_eot HUP
+        #
+        #Note that we can't trap the zsh-specific "EXIT" signal, as zsh signals
+        #such trap when defined in a function only when such function exits --
+        #which, of course, it won't if a <Ctrl-c> interrupt is triggered.
+        #FUXME: We should also test what happens when <Ctrl-z> interrupts are
+        #triggered. No deadlocks, I should hope!
+
+#        if { is_shell_interactive and not is_shell_subshell } {
+#            enable_shell_option monitor
+#        }
+#
+#        :enable_option_local local_traps
+##       enable_shell_option local_traps
+##       trap 'print "sending INT EOT!"; :output_string_to_coprocess "${ZESHY_ASCII_EOT}"' INT
+#        trap '
+##           :output_string_to_stderr "sending INT EOT!"
+##           send_coprocess_eot
+##           close_coprocess
+##           :die "Handling SIGINT."
+##           kill -2 $$
+#            send_coprocess_eot
+##           close_coprocess
+#        ' INT
+
+    # Run get_stdin_until_signal_user1() as the coprocess for the current shell,
+    # caching all standard input piped to such coprocess until receiving a
+    # single line containing the end-of-transmission (EOT) character, at which
+    # point such coprocess pipes such input back to standard output. See such
+    # function for further details.
+        # Locally trap the interrupt signal (i.e., "<Ctrl-c>") to gracefully
+        # terminate the coprocess by sending the end-of-transmission (EOT)
+        # character as a single line. Sadly, failing to do so induces deadlock
+        # in the current shell on receiving such signal. It's unclear why zsh
+        # fails to propagate such signal to the coprocess -- but here we are.
+        # While we initially suspected the open_coprocess_running_code() alias'
+        # disabling of shell option "monitor" to be our culprit, leaving such
+        # option enabled has no effect on coprocess signal propagation. *sigh*
+        #
+        # However, only sending such character does *NOT* suffice to gracefully
+        # terminate the coprocess. For unclear reasons, any string containing a
+        # newline *MUST* also be printed to standard output of the current
+        # shell. To avoid confusing the current user, print a blank line. (This
+        # probably concerns some subtle interaction between "stdio"-managed
+        # standard output line buffering and kernel-managed socket buffer
+        # limits. Frankly, it's all a bit beyond us -- but at least this appears
+        # to run reliably.)
+#       run_hook_on_signal_interrupt_local\
+#           'print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nmain shell received SIGINT"
+#            kill -s INT "${coprocess_pid}"
+#            print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nmain shell sent SIGINT" 1>&2
+#            set_string_to_coprocess_output "${string_name__rcassto}"
+#            print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nstring copied" 1>&2
+#            :output_newline
+#            report_failure
+#            print "!!!!!!!!!!!!!!!!!!!!!!!!\nmain shell still here" 1>&2'
+#       run_hook_on_signal_interrupt_local\
+#           'send_coprocess_eot
+#            :output_newline'
+
+    #FUXME: Replace with expansion of new alias
+    #set_integer_to_pid_command_prior(): e.g.,
+    #
+    #     set_integer_to_pid_command_prior coprocess_pid
+#   integer coprocess_pid="${!}"
+        #FUXME: The necessity of suffixing the EOT sent to the coprocess with a
+        #second newline (see send_coprocess_eot()) *AND* printing any string
+        #containing a newline to standard output of the current shell is pretty
+        #horrible. We *REALLY* need to push a thread to "zsh-workers" or e-mail
+        #to Bart and suss out exactly what's going on here.
+
+        # Validate sanity.
+#       string integer_name__sitpcp; integer_name__sitpcp="$(:stdin.get)"
+#       :int.die_unless "${integer_name__sitpcp}"
+
+        # Set such integer.
+#       coprocess_pid="${!}"
+
+        # Reset the trap handling the interrupt signal to such trap's default
+        # implementation immediately *BEFORE* instructing such coprocess to
+        # terminate. Failing to do so induces the following worst case:
+        #
+        # * send_coprocess_eot() instructs the current coprocess running
+        #   get_stdin_until_eot() to cease iterating and hence terminate by
+        #   sending a newline-delimited end-of-transmission (EOT) character to
+        #   the standard input for such coprocess.
+        # * The current user interactively enters <Ctrl-c> prior to the
+        #   termination of this function.
+        # * The current terminal sends the current shell the interrupt signal.
+        # * The above trap handler resends a newline-delimited EOT character to
+        #   the standard input for such coprocess.
+        # * Since such coprocess is closed and hence *NOT* reading such input,
+        #   the socket buffer retains such input.
+        # * The current user interactively enters <Ctrl-c> prior to the
+        #   termination of this function, again.
+        # * The above process repeats, gradually filling the socket buffer for
+        #   the current coprocess.
+        # * When such buffer is eventually filled, the current process waits for
+        #   the current coprocess to begin reading such input and hence emptying
+        #   such buffer -- which it never does, inducing deadlock.
+        #
+        # While admittedly unlikely, such worst case remains avoidable by simply
+        # resetting such trap here. So we do.
+#       reset_trap_on_signal_interrupt
+        #FUXME: Define a new function send_pid_signal_interrupt() implementing
+        #such behavior.
+
+    #FUXME: While a pleasant alias, :arg_count.pop() is simply *TOO* heavyweight to
+    #expanded in such a core function as this. We really need to define a new
+    #pop_args_2() alias and expand that here instead.
+
+#       setopt local_options no_monitor
+#       trap "print -rp $'\C-D\n'; print" INT
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] sent EOT once"
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] coprocess ID: ${coprocess_pid} ($$)"
+#           wait ${coprocess_pid}
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] sent EOT"
+#   integer coprocess_pid="${!}"
+#           kill -9 "${coprocess_pid}"
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] killed coprocess"
+#           close_coprocess
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] closed coprocess"
+#           :die "Handling SIGINT."
+#           kill -2 $$
+#           send_coprocess_eot
+#           close_coprocess
+#       ' INT
+
+#       :string.output "variable: ${string_name__rcassto}; command: ${@}"
+#   setopt local_options no_monitor
+#       trap 'print "[int] coprocess received SIGINT" 1>&2' INT
+#   integer coprocess_pid="${!}"
+#   print "opened coprocess ${coprocess_pid} ($$)"
+#       if { is_shell_interactive and not is_shell_subshell } {
+#           enable_shell_option monitor
+#       }
+
+#       :enable_option_local local_traps
+#       enable_shell_option local_traps
+#       trap 'print "sending INT EOT!"; :output_string_to_coprocess "${ZESHY_ASCII_EOT}"' INT
+#       trap '
+#           print "!!!!!!!!!!!!!!!!!!!!!!\n[INT] main shell received SIGINT"
+#           send_coprocess_eot
+#           print -n
+
+        #FUXME: O.K.; we got it. This is pretty crazy, but here's why I think
+        #this works while nothing else does:
+        #
+        #* When printing to a coprocess with "-p", zsh appears to *NOT* suffix
+        #  such output with a newline. (Try it: remove the "\n" and you no
+        #  longer receive a termination message from the coprocess. Insanity.)
+        #* And I have no idea why the second print() is required. Interestingly,
+        #  it doesn't matter *WHAT* that print() prints so long as it includes a
+        #  newline. ("print -n" doesn't work, for example.) Also interestingly,
+        #  that print() has to appear *AFTER* the prior print() to the coprocess.
+        #  (How did I ever stumble upon this insanity?) Presumably, that's doing
+        #  something like flushing buffers somewhere... O.K.; you got me. It
+        #  probably won't be possible to flush out exactly what's happening here
+        #  without Bart's help.
+        #
+        #*THIS IS INSANITY.* It works, but... my God. I have a horrible sense
+        #that it's probably specific to either the Linux kernel or the Linux
+        #implementation of the "stdio" library. Either way, this is pretty
+        #horrible. We *REALLY* need to push a thread to "zsh-workers" and suss
+        #out exactly what's going on here.
+        #
+        #Incidentally, as you can see, the value of option "monitor" has utterly
+        #no effect on whether or not SIGINT is signalled -- which is great! So,
+        #keep that functionality as is.
+        #print -rp $'\C-D\n'
+
+
+#redirecting all possible command
+        # output to the coprocess.
+#       setopt no_monitor
+#       :output_string_to_coprocess "${ZESHY_ASCII_EOT}"
+#       :enable_option_local monitor
+
+    # Validate passed arguments.
+#   die_unless_args_2_or_more 'Expected one command and one string name.'
+#   string string_name__rcasste="${@[-1]}"
+#   pop_arg
+
+    # File descriptors opened for writing to standard output and error for the
+    # current shell. Since the subshell invoked below substitutes such output
+    # with its own, storing handles to such output permits their access in such
+    # subshell.
+#   file_descriptor stdout__rcasste stderr__rcasste
+#   {
+#       open_file_descriptor_to_stdout stdout__rcasste
+#       open_file_descriptor_to_stderr stderr__rcasste
+
+        # Run such command and set such string. Dismantled, this is:
+        #
+        # * "2>&1", redirecting standard error to output for the subshell,
+        #   ensuring such output is captured into such string.
+        # * "1>&${...}", redirecting standard output for the subshell to
+        #   standard output for the current shell.
+        # * "2>&${...}", redirecting standard error for the subshell to
+        #   standard error for the current shell.
+#       :string.set "${string_name__rcasste}" "$(run_code "${@}"\
+#           2>&1 1>&${stdout__rcasste} 2>&${stderr__rcasste})"
+    # Close such descriptors safely (e.g., in the event of an exception).
+#   } always {
+#       close_file_descriptor_if_open stdout__rcasste
+#       close_file_descriptor_if_open stderr__rcasste
+#   }
+
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with run_code_and_set_string_to_stdout(),
+    # run_code_and_set_string_to_stderr(), and
+    # :run_code_silent_and_set_string_to_stdout_by_coprocess().
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Validate sanity.
+#   die_unless_args_2_or_more 'Expected one command and one string name.'
+#   string string_name__rcasste="${@[-1]}"
+#   pop_arg
+
+    # Coprocess outputting all standard input piped to such subshell until
+    # receiving a line containing only an EOT character. See such function
+    # for further details.
+#   open_coprocess get_stdin_until_eot
+
+#   {
+        # Run such command, silencing standard output and redirecting standard
+        # error to such coprocess.
+#       :string.output "variable: ${string_name__rcasste}; command: ${@}"
+#       run_code "${@}" 1>/dev/null 2>&p
+
+        # Write a line containing only the EOT character to such function,
+        # which should now successfully return.
+#       :output_string_to_coprocess "${ZESHY_ASCII_EOT}"
+
+        # Set the passed string to all standard error cached via such coprocess.
+        # To quote modern culture, "Shit just got real."
+#       set_string_to_coprocess_output "${string_name__rcasste}"
+#   } always close_coprocess
+
+    # See :run_code_silent_and_set_string_to_stderr_by_coprocess() for further details.
+#   die_unless_args_2_or_more 'Expected one command and one string name.'
+#   string string_name__rcassto="${@[-1]}"
+#   pop_arg
+#   open_coprocess get_stdin_until_eot
+
+#   {
+#       run_code "${@}" 1>&1 1>&p
+#       :output_string_to_coprocess "${ZESHY_ASCII_EOT}"
+#       set_string_to_coprocess_output "${string_name__rcassto}"
+#   } always close_coprocess
+
+#       "${@[1,-2]}" '1>&p 2>/dev/null' "${@[-1]}"
+
+    # See :run_code_silent_and_set_string_to_stderr_by_coprocess() for further details.
+#   die_unless_args_2_or_more 'Expected one command and one string name.'
+#   string string_name__rcassto="${@[-1]}"
+#   pop_arg
+#   open_coprocess get_stdin_until_eot
+
+#   {
+#       run_code "${@}" 1>&p 2>/dev/null
+#       :output_string_to_coprocess "${ZESHY_ASCII_EOT}"
+#       set_string_to_coprocess_output "${string_name__rcassto}"
+#   } always close_coprocess
+
+    # File descriptor opened for writing to standard output for the current
+    # shell. Since the subshell invoked below substitutes such output with its
+    # own, storing a handle to such output permits its access in such subshell.
+#   file_descriptor stdout__rcassto
+#   {
+#       open_file_descriptor_to_stdout stdout__rcassto
+
+        # Run such command and set such string. Dismantled, this is:
+        #
+        # * "1>&1", redirecting standard output for the subshell to itself.
+        #   While redundant, this ensures such output survives subsequent
+        #   redirection under shell option "MULTIOS" and is hence captured into
+        #   such string.
+        # * "1>&${...}", redirecting standard output for the subshell to
+        #   standard output for the current shell.
+        #
+        # Since command substitution does *NOT* capture standard error, this has
+        # the beneficial side effect of printing standard error as normal.
+#       :string.set "${string_name__rcassto}"\
+#           "$(run_code "${@}" 1>&1 1>&${stdout__rcassto})"
+    # Close such descriptor safely (e.g., in the event of an exception).
+#   } always {
+#       close_file_descriptor_if_open stdout__rcassto
+#   }
