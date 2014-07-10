@@ -1,0 +1,246 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "COPYING" for additional details.
+#
+#FIXME: Convert into parcel documentation.
+# --------------------( SYNOPSIS                           )--------------------
+# Preprocess zeshy-specific code into zsh-specific code.
+
+#FIXME: O.K.; so, implementing a zsh-capable in pure-PCRE is rather difficult
+#if not infeasible. For example, consider the complexity of merely
+#differentiating the following edge cases:
+#
+#:func ':void yum()' {
+#    print ${:-
+#    :func
+#    }
+#    { print $(:stdin.get) } <<'o''k'
+#:func
+#o'k
+#}
+#
+#Things get *VERY* tricky, *VERY* rapidly. Note the fact, for example, that
+#quoted here-doc words may contain quote escapes that then need to be matched
+#as their unescaped equivalents, which isn't really feasible to accomplish with
+#simplistic PCRE-based group capturing and back referencing.
+#
+#So, here's what we're going to do for now (and possibly always): we're going
+#to implement a genuine preprocessor in the sense that preprocessing will be a
+#distinct phase performed strictly *BEFORE* zsh interpretation. In the above
+#examples, such preprocessor would treat all macros ":func" regardless of zsh
+#context the same. While non-ideal, there's just no feasible means of
+#reimplementing robust zsh parsing with PCRE-based iteration.
+
+#FIXME: Uh-oh! How do we perform nested PCRE-based matching? We need to
+#perform iterative PCRE matching here to reliably match macros and, for each
+#such macro, call such macro's preprocessor -- which itself could (and at
+#least in the case of :func() absolutely will) also perform iterative PCRE
+#matching. In a conventional language, this would be no problem. Here, however,
+#we have a problem.
+#
+#While we *COULD* probably mitigate this by performing glob-based iteration
+#here instead, globs are unwieldy, inefficient, and ultimately infeasible.
+#Consider matching here-documents without back references, for example.
+#
+#Technically, we could simply call pcre_compile() *AFTER* calling each and
+#every macro preprocessor.
+#FIXME: O.K.; the solution, clearly, is to split preprocessing into two phases:
+#
+#1. In the first phase, PCRE-based iteration finds *ALL* macros to be replaced
+#   in the second phase. Specifically, for each macro, such iteration appends
+#   the byte indices of (in order):
+#   * The first character of such macro (e.g., the ":" prefixing such macro).
+#   * For each block argument passed to such macro (i.e., "{"- and
+#     "}"-delimited block of user-defined code):
+#     * The first character of such argument (i.e., such "{" delimiter).
+#     * The last character of such argument (i.e., such "}" delimiter).
+#   * The last character of such macro (e.g., the "}" suffixing such macro),
+#     prefixed by "e". Since the number of block arguments is variable, the
+#     second phase needs to differentiate this index from block
+#     argument-specific indices. This seems a simple way.
+#2. In the second phase, list-based iteration iterates over the previously
+#   appended byte indices in *REVERSE* order, ensuring macros appearing later
+#   in such code will be replaced before macros appearing earlier. Rather than
+#   explicitly reverse such list (which introduces other complications),
+#   implicitly reverse such list by ensuring the first item of such list is
+#   always the empty string and only appending immediately after such item.
+#   Assuming a linked list implementation, this is presumably efficient.
+
+#FIXME: O.K.; that's *EXACTLY* what we're going to do, but only as an interim
+#solution. The long-term solution, though a bit balls-crazy, is as follows:
+#
+#* Merge the principal PCRE (i.e., ${ZESHY_CALLABLE_PROTOTYPE_PCRE}) produced
+#  by ={*-soil/*-declare/*-pcre} into the principal PCRE produced by ={pcre}.
+#* Refactor ={*-soil/*-declare/*-func/func} accordingly. (Actually, any
+#  refactoring should be quite minimal, as we already reference match indices
+#  by name rather than hard-coded integer).
+#
+#What's indolently pleasant about this approach is that it avoids all of the
+#repetitous PCRE compilation we currently perform. Consider it: on each and
+#every function declaration, we currently recompile
+#${ZESHY_CALLABLE_PROTOTYPE_PCRE}! This is absolute insanity. Happily, the
+#above approach does away with that entirely. It also pushes the limits of
+#PCRE-based parsing, but hopefully in a tractable, feasible way.
+#
+#Only one way to find out whether "libpcre" will actually support a PCRE that
+#monstrously complex *AND* whether we can actually reliably debug that PCRE,
+#right? So, let's do this.
+#FIXME: Or perhaps not? The prior solution appears to work quite well, now.
+
+# ....................{ DEPENDENCIES                       }....................
+::script_zsh.source_or_unwind_call_stack pcre
+
+# ....................{ GLOBALS                            }....................
+#FIXME: Document me.
+# Listset of all registered macros. 
+typeset -gaU ZESHY__MACRO_NAMES
+
+# ....................{ DECLARERS                          }....................
+#FIXME: Implement macro documentation support. This implies, of course, that
+#we'll need to shift early-time documentation functionality here. *sigh*
+#FIXME: Document me.
+
+# :void :macro[
+#     args =  (:string macro_name),
+#     stdin = (:string macro_asciidoc)]
+#
+# Declare the passed macro, documented by
+# http://asciidoc.org[AsciiDoc]-formatted standard input if passed or
+# undocumented otherwise. For convenience, consider passing such documentation
+# as a single- or double-quoted here-document: e.g.,
+#
+# == Macro Name Constraints ==
+#
+# For simplicity, macro names are constrained as follows: 
+function :macro() {
+    # Validate sanity.
+    (( # == 1 )) || :die 'Expected one macro name.'
+    local macro_name=${1}
+    [[ -n ${macro_name} ]] || :die 'Macro name empty.'
+
+    # If such name is *NOT* a valid macro name, throw an exception.
+    # Technically, we *COULD* permit *ANY* nonempty strings to be valid macro
+    # names (as is currently the case with alias and function names). Doing so,
+    # however, would substantially complicate subsequent:
+    #
+    # * PCRE generation. All "libpcre"-reserved characters in such name would
+    #   need to be explicitly escaped.
+    # * Code preprocessing. Since macro users would need to explicitly escape
+    #   all shell-reserved characters in such name *AND* since there exist
+    #   multiple means of escape such characters in zsh (e.g., "\"-prefixed
+    #   escapes and single- and double-quoted strings), matching all
+    #   permissible uses of such macro would require either:
+    #   * Matching all possible means of escape such characters.
+    #   * Matching only one such means, requiring macro users to only escape
+    #     such characters by such means.
+    #   * Matching *NO* such means, requiring macro users to *NEVER* escape
+    #     such characters. Since such preprocessing is *NOT* a zsh-compliant
+    #     parser, such requirement is implementable. Unfortunately, it also
+    #     introduces syntactic non-orthogonalities between the zsh parser and
+    #     zeshy preprocessor. In other words, it's highly problematic.
+    #
+    # The latter is, arguably, the greater concern. While correcting the former
+    # issue is certainly (albeit annoyingly) feasible, correcting the latter
+    # issue is considerably less feasible if not infeasible altogether. For the
+    # moment, sidestep such issues by prohibiting such characters.
+    [[ ${macro_name} == [a-zA-Z0-9-_:.]## ]] || :die\
+        'Macro name "'${macro_name}'" invalid. Consider renaming such macro to only contain letters and "_", "-", ".", and ":" characters.'
+
+    # If such macro has already been declared, throw an exception.
+    (( ${+ZESHY__MACRO_NAMES[${macro_name}]} == 0 )) || :die\
+        'Macro name "'${macro_name}'" already declared.'
+
+    # Declare such macro.
+    ZESHY__MACRO_NAMES+=${macro_name}
+
+    # Clear all previously generated preprocessor PCREs, forcing their
+    # regeneration on the next preprocessor call. Since such PCREs match and
+    # hence depend on the set of all macro names, declaring such macro
+    # invalidates such PCREs. (While we *COULD* do so here, deferring such
+    # regeneration prevents redundant regeneration in the common case of
+    # multiple adjacent macro declarations in a parcel.)
+    ::preprocessor_pcres.clear
+}
+
+# ....................{ SOURCERS                           }....................
+# :void :script.source(:string filename)
+function :script.source() {
+    # Validate sanity.
+    (( # == 1 )) || :die 'Expected one filename.'
+    local script_filename=${1} script_code
+    [[ -f ${script_filename} ]] || :die\
+        'Script "'${script_filename}'" not found or not a file.'
+
+    # To avoid modifying such script, localize such script's contents. For
+    # efficiency, do so via zsh module "mapfile" rather than customary
+    # alternatives (e.g., process substitution).
+    {
+        zmodload zsh/mapfile
+        script_code=${mapfile[${script_filename}]}
+    # Since such module is inherently unsafe, guarantee such module to be
+    # unloaded immediately after retrieving such code -- even in the event such
+    # retrieval induces an exception.
+    } always {
+        zmodload -ui zsh/mapfile
+    }
+
+    #FIXME: Nontrivial. We'll need to refactor
+    #get_shell_script_shebang_command_name_if_found() into a setter and shift
+    #the resulting function into a new parcel at this level. *sigh*
+
+    # If the first line of such code is *NOT* a shebang referencing the "zeshy"
+    # interpreter, throw an exception. Preprocessing and evaluating arbitrary
+    # bytes as valid zeshy code could have painful consequences and must be
+    # avoided at all costs.
+
+    # Preprocess such code.
+    :code.preprocess script_code
+
+    # Run such preprocessed code.
+    eval "${script_code}"
+}
+
+# ....................{ PREPROCESSORS                      }....................
+#FIXME: Ugh. Shift string setters and type checkers here we suppose. Let's
+#assume we've done that, for now.
+
+#FIXME: Document me.
+# :void :code.preprocess(^:string code_name)
+function :code.preprocess() {
+    # Validate sanity.
+    (( # == 1 )) || :die 'Expected one string name.'
+    local code_name__cp=${1} code__cp
+    :var.die_unless_type_string "${code_name__cp}"
+
+    # For efficiency, cache such code.
+    code__cp=${(P)code_name__cp}
+
+    # If preprocessor PCREs have yet to be generated or require regeneration
+    # (e.g., due to the declaration of new macros), do so.
+    ::preprocessor_pcres.make_if_needed
+
+    # Due to zsh inadequacies, partition preprocessing into two distinct
+    # phases. Why? Subtleties! Consider the following causal chain of logic:
+    #
+    # * Since:
+    #   * Phase 1 *ALWAYS* performs PCRE-based iteration.
+    #   * Phase 2 *MAY* perform PCRE-based iteration, conditionally depending
+    #     on whether the macros such phase calls do so. (Notably, the :func()
+    #     macro does so.)
+    #   * zsh currently only permits one PCRE to be compiled at a time,
+    #     directly implying PCRE-based iteration cannot be nested.
+    # * Such phases cannot be combined into a single phase.
+
+    # Phase 1: find all matching macros in such code with PCRE-based iteration.
+
+    #FIXME: Don't forget to strip suffixing line continuations (i.e.,
+    #"\"-prefixed newlines) from macro arguments before calling such macros.
+
+    # Phase 2: call and replace all such macros by their output in such code.
+
+    # Set such code.
+    :string.set "${code_name__cp}" "${code__cp}"
+}
+
+# --------------------( WASTELANDS                         )--------------------
