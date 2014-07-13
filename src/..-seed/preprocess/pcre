@@ -31,61 +31,233 @@ function ::preprocessor_pcres.make_if_needed() {
 #FIXME: Document me.
 # :void ::preprocessor_pcres.make()
 function ::preprocessor_pcres.make() {
-    #FIXME: Used of named references complicates match indexing. I beliewe we
+    #FIXME: Use of named references complicates match indexing. I beliewe we
     #can circumvent this, however, by leveraging named subroutines: that is,
     #declaring *ALL* named references at the very end of the regex.
+    #FIXME: Compress PCREs together. For example, we don't benefit from
+    #separate ${pcre_arg} and ${pcre_args} PCREs.
 
     # Validate sanity. Since subsequent locals often depend on prior locals
     # locals, define one local per line below.
     (( # == 0 )) || :die 'Expected no arguments.'
-
-    #FIXME: No longer required, seemingly. Now that we've merged such matching
-    #into ${pcre_chars_unreserved}, excise such PCRE.
 
     # One or more command-specific whitespace sequences (i.e., all substrings
     # connoting whitespace *NOT* terminating the current command), including
     # all whitespace except newlines *NOT* prefixed by "\". While "\"-prefixed
     # newlines are line continuations preserving the current command,
     # unprefixed newlines are effectively semicolons terminating such command.
-    local pcre_spaces='(?:\h|\\\R)++'
+    local pcre_spaces='(?<spaces>(?:\\\R)?(?:\h++(?:\\\R)?)+)'
+
+    # Character class matching non-shell-reserved characters.
+    local char_class_ureserved='''"$<>{}|`'
+
+    #FIXME: This still used? Probably... not.
 
     # One or more arbitrary characters excluding shell-reserved characters.
-    local pcre_chars_unreserved='(?:\\\R|[^\v''"$<>|`])++'
+    local pcre_chars_unreserved='(?:\\\R|[^\v'${char_class_ureserved}'])++'
+
+    # Unquoted inescapable shell word, comprising one or more arbitrary
+    # characters excluding:
+    #
+    # * Shell-reserved characters.
+    # * Whitespace characters.
+    # * Escape prefix "\".
+    local pcre_word_inescapable='[^\s\\'${char_class_ureserved}']++'
+    local pcre_word_inescapable_grouped='('${pcre_word_inescapable}')'
 
     # Single-quoted string *NOT* supporting escaped single quotes.
     local          pcre_quotes_single_inescapable="'[^']*+'"
     local pcre_quotes_single_inescapable_grouped="'([^']*+)'"
 
-    # Double-quoted string *NOT* supporting escaped double quotes.
+    # Double-quoted string *NOT* supporting escape prefix "\".
     local          pcre_quotes_double_inescapable='"[^"]*+"'
-    local pcre_quotes_double_inescapable_grouped='"([^"]*+)"'
+    local pcre_quotes_double_inescapable_grouped='"([^"\]*+)"'
+
+    #FIXME: For each named subroutine below, we need to directly embed the
+    #definition of such subroutine somewhere in ${ZESHY__MACRO_PCRE} --
+    #ideally, before the first call to such subroutine in such PCRE. (Yes, this
+    #is somewhat annoying.)
+
+    # Unquoted shell word.
+    local pcre_word_unquoted='(?<uword>[^\s'${char_class_ureserved}']++)'
+    # local pcre_spaces='(?:\h|\\\R)++'
 
     # Single-quoted string in zsh format and hence supporting escaped single
     # quotes (i.e., "''").
-    local          pcre_quotes_single="'(?:[^']|'')*'"
-    local pcre_quotes_single_grouped="'((?:[^']|'')*)'"
+    local pcre_quotes_single='(?<squote>''(?:[^'']|'''')*'')'
 
-    #FIXME: Also match process substitutions (of both ilk).
+    # Double-quoted string in zsh format and hence supporting escaped double
+    # quotes (i.e., '\"'). Unlike the prior PCRE, character class [^"] also
+    # matches "\" and hence must be matched *AFTER* matching the latter.
+    #
+    # Since zsh appears to parse terminating '"' delimiters in a phase *BEFORE*
+    # that of variable expansions, this PCRE can (and possibly should) avoid
+    # matching such expansions here. Since such behaviour is arguably either
+    # a bug or unreliable implementation detail, however, we match
+    # substitutables embedded in double quotes in the same manner as that of
+    # substitutables embedded in other syntax (e.g., arithmetic substitutions).
+    local pcre_quotes_double='(?<dquote>"(?:\\["$`]|[^"$`]|(?&sub))*")'
+
+    # Here-document or -string. Unfortunately, matching all possible
+    # here-document strings is infeasible within the purview of a pure PCRE.
+    # Matching here-document delimiters embedding escaped characters (e.g.,
+    # '<<"mother\"destroyer"') requires unescaping such characters -- a simple
+    # operation that, by definition, exceeds the purview of pure PCREs.
+    #
+    # Hence, match only the proper subset of here-document strings with
+    # delimiters containing no escaped characters. Since few to no real-world
+    # here-document strings (certainly, none zeshy itself leverages) require
+    # delimiters containing escaped characters, this is moderately ignorable.
+    local pcre_here_doc_prefix='-?\s*+(?|'${pcre_quotes_single_inescapable_grouped}'|'${pcre_quotes_double_inescapable_grouped}'|'${pcre_word_inescapable_grouped}')\R'
+    local pcre_here_doc_body='.*?'
+    local pcre_here_doc_suffix='\R(?-1)'
+    local pcre_here_doc=${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
+    local pcre_here_string='<\s*+(?&word)+'
+    local pcre_here_doc_or_string='(?<here><<(?:'${pcre_here_doc}'|'${pcre_here_string}')'
+
+    # Possibly recursively nested variable expansion. While we would prefer
+    # *NOT* to capture such expansion, recursive pattern matching in "libpcre"
+    # requires interior back references to the outermost syntactic construct
+    # recapitulating such recursion. Such groups are recursion-specific and
+    # hence *MUST* be explicitly ignored for all other purposes.
+    local pcre_var_expansion_recursive='\$\{(?:\\[$}`]|[^$}`]|(?&sub))*\}'
+
+    # Non-recursive variable expansion. See ${ZESHY_VAR_NAME_GLOB}.
+    local pcre_var_expansion_nonrecursive='\$[a-zA-Z_][a-zA-Z0-9_]*+'
+
+    # Variable expansion.
+    local pcre_var_expansion='(?<var>'${pcre_var_expansion_nonrecursive}'|'${pcre_var_expansion_recursive}')'
+
+    # Possibly recursively nested arithmetic substitution. See below.
+    local pcre_math_sub='(?<math>\$\(\((?:\\[$`]|(?!\)\))[^$`]|(?&sub))*\)\))'
+
+    # Possibly recursively nested process substitution. While we would prefer
+    # *NOT* to capture such expansion, recursive pattern matching in "libpcre"
+    # requires interior back references to the outermost syntactic construct
+    # recapitulating such recursion. Such groups are recursion-specific and
+    # hence *MUST* be explicitly ignored for all other purposes.
+    local pcre_process_sub_recursive='(?<proc>\$\((?:\\[)''"$`<]|(?!<<)[^)''"$`]|(?&code))*\))'
+
+    #FIXME: Match the same embedded constructs as above.
+    #FIXME: Perhaps simpler to replicate the definition of
+    #${pcre_process_sub_recursive} here, augmented with a negative lookahead
+    #assertion to prevent matching of an unescaped "`". Ignore for now;
+    #somewhat too much complexity, here!
+
+    # Non-recursive process substitution. Since the named group "<sub>" matches
+    # non-recursive process substitution, such group *CANNOT* be referenced
+    # here. (Doing so would permit such substitutions to be recursively
+    # nested.) Instead, match all groups matched by such group excluding
+    # non-recursive process substitution.
+    local pcre_process_sub_nonrecursive='(?<tick>`(?:\\[''"$`<]|(?!<<)[^''"$`]|(&squote)|(&dquote)|(&here)|(?=\$)(?:(?&var)|(?&math)|(?&proc)))*`)'
+
+    # Recursively substitutable or expandable syntactic construct. Since
+    # arithmetic substitution syntax greedily overlaps that of process
+    # substitution syntax, match the former prior to the latter.
+    local pcre_substitutable='(?<sub>(?=\$)(?:(?&var)|(?&math)|(?&proc))|(?&tick))'
+
+    # Shell word, comprising one of the prior syntactic constructs. Ideally,
+    # this matches any standard argument passable to a zsh command.
+    local pcre_word='(?<word>(&uword)|(&squote)|(&dquote)|(?&sub))'
+
+    # Zero or more whitespace-delimited shells words.
+    local pcre_words='(?:(?:(?&spaces)|(?&word))*(?&word))?'
+
+    # Shell code, comprising all syntactic constructs obstructing zeshy
+    # preprocessing and hence parsing of unquoted "{" and "}" characters.
+    # Unlike shell word matching, this does *NOT* include unquoted characters.
+    local pcre_code='(?<code>(&squote)|(&dquote)|(?&sub)|(&here))'
+
+    # Macro name, dynamically constructed from the current set of all declared
+    # macro names. By macro design, such names are guaranteed to contain no
+    # PCRE-reserved characters and hence require no escaping here. See :macro()
+    # and :list.join_to_string_on_char().
+    local pcre_macro_name='(?:'${(j:|:)ZESHY__MACRO_NAMES}')'
+
+    #FIXME: Such "}" must be matched as prefixed by a newline (\R) followed by
+    #the same exact horizontal whitespace as the initial macro. We currently
+    #match this as named group "(?&indent)" below. Such group *MUST* contain
+    #such newline.
+
+    # Block argument specific to zeshy macros. Ideally, 
+    local pcre_arg_block_prefix='(?&spaces)\{(?&spaces)'
+    local pcre_arg_block_body=''
+    local pcre_arg_block_suffix='(?&indent)\}(?:(?&spaces)|\Z)'
+    local pcre_arg_block=${pcre_arg_block_prefix}${pcre_arg_block_body}${pcre_arg_block_suffix}
+
+    # Argument of any type.
+    local pcre_arg='(?:'${pcre_words}'|'${pcre_arg_block}')'
+
+    # One or more arguments of any type.
+    local pcre_args=${pcre_arg}'+'
+
+    # PCRE capturing all macros (including names and block arguments) in
+    # arbitrary code.
+    ZESHY__MACRO_PCRE=${pcre_macro_name}${pcre_spaces}${pcre_args}
+}
+
+# --------------------( WASTELANDS                         )--------------------
+    #FUXME: Excise me.
+
+    # One or more whitespace-delimited shells words.
+    # local pcre_words='(?:'${pcre_spaces}'|'${pcre_word}')+'
+
+    #FUXME: Match only whitespace delimiting such words -- *NOT* prefixing such
+    #words. This should simplify matching of block arguments a bit.
+    # local pcre_words='(?:(?:'${pcre_word}'(?:\\\R)?\h++(?:\\\R)?))*(?&word))?'
+
+    # local pcre_arg_block_prefix='(?<=[ \t]|\\\v)\{'
+
+    #FUXME: This is actually used. ${pcre_spaces}, however, doesn't really
+    #appear to be. Excise the latter and shift such documentation here.
+    # local pcre_spaces='(?:\h|\\\R)+'
+
+    # local pcre_arg_block_prefix='(?:\h(?:\\\R)?|(?:\\\R)?\h)\{'
+
+    #FUXME: Excise. This is wrong, anyway. Matching line continuations is
+    #*USELESS*, if one considers. We don't care about line continuations. They
+    #signify 
+
+    # local pcre_arg_block_prefix='(?<=[ \t]|\\\v)\{'
+
+ # Hence, we
+    #really can't match this outside of the full PCRE. *shrug* 
+# '(?:'${pcre_arg}')*(?&arg)'
+
+    # Customary argument for zsh commands, comprising one or more of the prior
+    # syntactic constructs.
+    # local pcre_arg_command='(&word)+'
+
+# '(?<word>(&uword)|(&squote)|(&dquote)|(?&sub))'
+
+# ${pcre_chars_unreserved}'|'${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_substitutable}'
+    #FUXME: Correct me. Then just 
+    # local pcre_code_sans_process_sub_nonrecursive='(?<codet>))'
+
+    #FUXME: Erhm. Excise?
+    # local pcre_codes='(?:\\[''")$`<]|(?!<<)[^''")$`]|(?&code))*'
+
+    #FUXME: A non-recursive version (e.g., matching "$ughugh") needs to be
+    #defined as well, and a new umbrella PCRE matching both recursive and non-
+    #recursive variable expansions assigned the overarching group "<var>".
+
+    # local pcre_quotes_single_grouped="'((?:[^']|'')*)'"
+    # local pcre_quotes_double_grouped='"((?:\\"|[^"])*)"'
+
+    #FUXME: Also match process substitutions (of both ilk).
     #
     #Since zsh appears to search for terminating '"' delimiters in a prior
     #phase to that of variable expansions, we do *NOT* need to match variable
     #expansion here. (Isn't that nice?)
 
-    # Double-quoted string in zsh format and hence supporting escaped double
-    # quotes (i.e., '\"'). Unlike the prior PCRE, character class [^"] also
-    # matches "\" and hence must be matched *AFTER* matching the latter.
-    local          pcre_quotes_double='"(?:\\"|[^"])*"'
-    local pcre_quotes_double_grouped='"((?:\\"|[^"])*)"'
+    #FUXME: Embedding ${pcre_quotes_single} here clearly isn't quite right.
+    #While we *DO* want to match single quotes, we want to do so in a
+    #"(?qsingle)" manner. Moreover, we want to match considerably more than
+    #simply that: double quotes, here-doc strings, and so forth. *sigh*
 
-    #FIXME: Minor issue. If the captured here-document word embeds quote
-    #escapes (e.g., "ugh\"umu"), we have no sane means of matching the
-    #corresponding terminator (e.g., in the prior example, we would need to
-    #match 'ugh"umu' rather than the literally captured string). We're inclined
-    #to ignore this, at the moment. (Indeed, fixing this may be infeasible!)
-    #FUXME: Honestly, this is rather difficult to implement correctly. Given
-    #such difficulty, we're inclined to instead 
-
-    #FIXME: Define here-strings as well.
+    #FUXME: Unify with ${pcre_word}, perhaps?
+    #FUXME: Right. ${pcre_code} should subsume ${pcre_word}, adding support for
+    #here-documents and -strings. (Anything else?)
 
     # Here-document. Unfortunately, matching all possible here-document strings
     # is infeasible within the purview of a pure PCRE. Matching here-document
@@ -97,78 +269,28 @@ function ::preprocessor_pcres.make() {
     # delimiters containing no escaped characters. Since few to no real-world
     # here-document strings (certainly, none zeshy itself leverages) require
     # delimiters containing escaped characters, this is moderately ignorable.
-    local pcre_here_doc_prefix='<<-?\s*+(?|'${pcre_quotes_single_inescapable_grouped}'|'${pcre_quotes_double_inescapable_grouped}'|(\S++))\R'
-    local pcre_here_doc_body='.*?'
-    local pcre_here_doc_suffix='\R(?-1)'
-    local pcre_here_doc=${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
+    # local pcre_here_doc_prefix='<<-?\s*+(?|'${pcre_quotes_single_inescapable_grouped}'|'${pcre_quotes_double_inescapable_grouped}'|'${pcre_word_inescapable_grouped}')\R'
+    # local pcre_here_doc_body='.*?'
+    # local pcre_here_doc_suffix='\R(?-1)'
+    # local pcre_here_doc=${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
 
-    #FIXME: A non-recursive version (e.g., matching "$ughugh") needs to be
-    #defined as well, and a new umbrella PCRE matching both recursive and non-
-    #recursive variable expansions assigned the overarching group "<var>".
+    # Here-string.
+    # local pcre_here_string='<<<\s*+(?&word)'
 
-    # Possibly recursively nested variable expansion. While we would prefer
-    # *NOT* to capture such expansion, recursive pattern matching in "libpcre"
-    # requires interior back references to the outermost syntactic construct
-    # recapitulating such recursion. Such groups are recursion-specific and
-    # hence *MUST* be explicitly ignored for all other purposes.
-    local pcre_var_expansion='(?<var>$\{(?:\\[$}`]|[^$}`]|(?&sub))*\})'
+    #FUXME: Excise the above? Shift documentation here!
 
-    # Possibly recursively nested arithmetic substitution. See below.
-    local pcre_math_sub='(?<math>$\(\((?:\\[$`]|(?!\)\))[^$`]|(?&sub))*\)\))'
+    #FUXME: No longer required, seemingly. Now that we've merged such matching
+    #into ${pcre_chars_unreserved}, excise such PCRE.
 
-    #FIXME: Embedding ${pcre_quotes_single} here clearly isn't quite right.
-    #While we *DO* want to match single quotes, we want to do so in a
-    #"(?qsingle)" manner. Moreover, we want to match considerably more than
-    #simply that: double quotes, here-doc strings, and so forth. *sigh*
+ # (Since this PCRE is principally used to match here
+    #FUXME: Minor issue. If the captured here-document word embeds quote
+    #escapes (e.g., "ugh\"umu"), we have no sane means of matching the
+    #corresponding terminator (e.g., in the prior example, we would need to
+    #match 'ugh"umu' rather than the literally captured string). We're inclined
+    #to ignore this, at the moment. (Indeed, fixing this may be infeasible!)
+    #FUXME: Honestly, this is rather difficult to implement correctly. Given
+    #such difficulty, we're inclined to instead 
 
-    # Possibly recursively nested process substitution. While we would prefer
-    # *NOT* to capture such expansion, recursive pattern matching in "libpcre"
-    # requires interior back references to the outermost syntactic construct
-    # recapitulating such recursion. Such groups are recursion-specific and
-    # hence *MUST* be explicitly ignored for all other purposes.
-    local pcre_process_sub_recursive='(?<proc_rec>$\((?:'${pcre_quotes_single}'|\\[)$`]|[^)$`]|(?&sub))*\))'
-
-    # Non-recursive process substitution. Since the named group "<sub>" matches
-    # non-recursive process substitution, such group *CANNOT* be referenced
-    # here. (Doing so would permit such substitutions to be recursively
-    # nested.) Instead, match all groups matched by such group excluding
-    # non-recursive process substitution.
-    local pcre_process_sub_nonrecursive='(?<proc_nonrec>`(?:\\[`$]|[^`$]|(?&var)|(?&math)|(?&proc_rec))*`)'
-
-    # Recursively substitutable or expandable syntactic construct. Since
-    # arithmetic substitution syntax greedily overlaps that of process
-    # substitution syntax, match the former prior to the latter.
-    local pcre_substitutable='(?<sub>(?&var)|(?&math)|(?&proc_rec)|(?&proc_nonrec))'
-
-    # Macro name, dynamically constructed from the current set of all declared
-    # macro names. By macro design, such names are guaranteed to contain no
-    # PCRE-reserved characters and hence require no escaping here. See :macro()
-    # and :list.join_to_string_on_char().
-    local pcre_macro_name='(?:'${(j:|:)ZESHY__MACRO_NAMES}')'
-
-    # Customary argument for zsh commands, comprising one or more of the prior
-    # syntactic constructs.
-    local pcre_arg_command='(?:'${pcre_chars_unreserved}'|'${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_substitutable}')+'
-
-    #FIXME: Such "}" must be matched as prefixed by a newline (\R) followed by
-    #the same exact horizontal whitespace as the initial macro. Hence, we
-    #really can't match this outside of the full PCRE. *shrug* 
-
-    # Block argument specific to zeshy macros.
-    local pcre_arg_block=
-
-    # Argument of any type.
-    local pcre_arg='(?<arg>'${pcre_arg_command}'|'${pcre_arg_block}')'
-
-    # One or more arguments of any type.
-    local pcre_args='(?:'${pcre_arg}')*(?&arg)'
-
-    # PCRE capturing all macros (including names and block arguments) in
-    # arbitrary code.
-    ZESHY__MACRO_PCRE=${pcre_macro_name}${pcre_spaces}${pcre_args}
-}
-
-# --------------------( WASTELANDS                         )--------------------
     # cannot 
     #
     # we have no sane means of
