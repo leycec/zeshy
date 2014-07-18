@@ -195,44 +195,137 @@ function :script.source() {
     # avoided at all costs.
 
     # Preprocess such code.
-    :code.preprocess script_code
+    local ZESHY__PREPROCESSOR_CODE=${script_code}
+    ::code.preprocess
 
     # Run such preprocessed code.
     eval "${script_code}"
 }
 
 # ....................{ PREPROCESSORS                      }....................
-#FIXME: Ugh. Shift string setters and type checkers here we suppose. Let's
-#assume we've done that, for now.
+#FIXME: Document me. In particular, note that the caller must define string
+#local ${ZESHY__PREPROCESSOR_CODE}.
 
-#FIXME: Document me.
-# :void :code.preprocess(^:string code_name)
-function :code.preprocess() {
+# :void ::code.preprocess(:void)
+function ::code.preprocess() {
     # Validate sanity.
-    (( # == 1 )) || :die 'Expected one string name.'
-    local code_name__cp=${1} code__cp
-    :var.die_unless_type_string "${code_name__cp}"
+    (( # == 0 )) || :die 'Expected no arguments.'
 
-    # For efficiency, cache such code.
-    code__cp=${(P)code_name__cp}
+    # Canonical string global ${ZPCRE_OP}, localized to avoid overwriting
+    # either global or caller-specific versions of such variable.
+    local ZPCRE_OP
+
+    # Byte index of the first non-whitespace character of such macro.
+    integer macro_byte_first
+
+    # Odd-sized list of integer triples, each a byte index into the "passed"
+    # string ${ZESHY__PREPROCESSOR_CODE} such that:
+    #
+    # * The first list item of each such triple is the byte index of the first
+    #   non-whitespace character of such macro (e.g., the ":" prefixing such
+    #   macro's name).
+    # * The second list item of each such triple is the byte index of the last
+    #   non-whitespace character of such macro name (e.g., the "c" in ":func").
+    # * The third list item of each such triple is the byte index of the last
+    #   non-whitespace character of such macro (e.g., the "}" suffixing such
+    #   macro's last block argument).
+    #
+    # Such list circumvents zsh's current inability to nest PCRE-based
+    # iteration, permitting matches in the first preprocessor phase to be
+    # accessed in the second preprocessor phase. (It's all rather droll.)
+    local -a macros_bytes_start_name_stop
+
+    # If such variable is undefined or not a string, throw an exception. See
+    # :var.die_unless_type_string().
+    [[ ${(t)ZESHY__PREPROCESSOR_CODE-} == 'scalar'('-'*|) ]] || :die\
+        'String ${ZESHY__PREPROCESSOR_CODE} undefined or not a string.'
 
     # If preprocessor PCREs have yet to be generated or require regeneration
     # (e.g., due to the declaration of new macros), do so.
     ::preprocessor_pcres.make_if_needed
 
-    # Due to zsh inadequacies, partition preprocessing into two distinct
-    # phases. Why? Subtleties! Consider the following causal chain of logic:
+    # Locally disable default zsh option "multibyte", permitting substrings
+    # matched by pcre_match() to be indexed by the " "-delimited byte indices
+    # written to ${ZPCRE_OP}.
     #
-    # * Since:
-    #   * Phase 1 *ALWAYS* performs PCRE-based iteration.
-    #   * Phase 2 *MAY* perform PCRE-based iteration, conditionally depending
-    #     on whether the macros such phase calls do so. (Notably, the :func()
-    #     macro does so.)
-    #   * zsh currently only permits one PCRE to be compiled at a time,
-    #     directly implying PCRE-based iteration cannot be nested.
-    # * Such phases cannot be combined into a single phase.
+    # Unfortunately, pcre_match() fails to set integer globals ${MBEGIN} and
+    # ${MEND} to the character indices of the start and end of the matched
+    # substring. Fortunately, it *DOES* set string global ${ZPCRE_OP} to the
+    # " "-delimited byte indices of the start and end of such substring.
+    # Unfortunately, multibyte strings (e.g., UTF8-encoded) are indexed by
+    # character rather than byte indices under default zsh option "multibyte".
+    # Fortunately, locally disabling such option permits all strings (multibyte
+    # or not) and hence such substring to be indexed by such byte indices.
+    setopt -- local_options no_multibyte
 
-    # Phase 1: find all matching macros in such code with PCRE-based iteration.
+    # ..................{ PHASE ~ macro : match              }..................
+    # Due to zsh inadequacies, partition preprocessing into multiple phases.
+    # Since "zsh" currently only permits one PCRE to be compiled at a time,
+    # PCRE-based iteration cannot be nested. Since the first two phases perform
+    # such iteration, such phases cannot be combined. (Q.E.D., sadly.)
+    #
+    # In the first phase, iteratively match all preprocessor macros in the
+    # passed code and append the corresponding match indices to list local
+    # ${macros_bytes_start_name_stop}.
+
+    # Compile and optimize such PCRE. See for_string_text_matching_pcre:().
+    pcre_compile -- "${ZESHY_MACRO_PCRE}"
+    pcre_study
+
+    # For each macro matched from such code...
+    ZPCRE_OP='0 0'
+    while {
+        pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__PREPROCESSOR_CODE}"
+    } {
+        #FIXME: Report this bug! This is currently affecting *EVERYONE*
+        #leveraging zsh module "zsh/pcre", which is probably *EVERYONE*.
+
+        # "man zshmodules" documents ${ZPCRE_OP} to be a " "-delimited integer
+        # pair such that:
+        #
+        # * The first such integer is the byte index of the first character of
+        #   the matched substring.
+        # * The second such integer is the byte index of the first character 
+        #   following such substring.
+        #
+        # Unfortunately, this is *NOT* the case. The documentation is "off by
+        # one" in both cases, a bug in either the current zsh implementation or
+        # documentation. Regardless of whether option "-n" is passed to
+        # pcre_match():
+        #
+        # * The first such integer is the byte index of the last character
+        #   preceding such substring.
+        # * The second such integer is the byte index of the last character of
+        #   such substring.
+        #
+        # However, the subtle entanglements don't end there. The byte index of
+        # the first character of such substring is the byte index of the next
+        # character following the first such integer. If such character is
+        # unibyte (i.e., encoded as a single byte), incrementing the latter by
+        # 1 suffices to calculate the former. If such character is multibyte
+        # (i.e., encoded as two or more bytes), however, this overly simplistic
+        # calculation fails.
+        #
+        # By PCRE design, the character preceding a matched macro name is
+        # guaranteed to be whitespace. Technically, UTF-8-encoded multibyte
+        # whitespace characters *DO* exist. Since no official scripts precedes
+        # a macro expansion by such characters *AND* since it appears
+        # vanishingly unlikely that third-party scripts would ever do so,
+        # assume such character to be unibyte for simplicity. In such case,
+        # simplistically incrementing the first such integer by 1 suffices.
+        macro_byte_first=$(( ${ZPCRE_OP[(w)1]} + 1 ))
+
+        # Append byte indices corresponding to such .
+        macros_bytes_start_name_stop+=(
+            ${macro_byte_first}
+            $(( macro_byte_first +\
+                ${#match[${ZESHY_MACRO_MATCH_INDEX_NAME}]} ))
+            ${ZPCRE_OP[(w)2]}
+        )
+    }
+
+    # ..................{ PHASE ~ macro : match              }..................
+
 
     #FIXME: Don't forget to strip suffixing line continuations (i.e.,
     #"\"-prefixed newlines) from macro arguments before calling such macros.
@@ -308,11 +401,51 @@ function :code.preprocess() {
 
     # Phase 2: call and replace all such macros by their output in such code.
 
-    # Set such code.
-    :string.set "${code_name__cp}" "${code__cp}"
 }
 
 # --------------------( WASTELANDS                         )--------------------
+        #FUXME: We probably also want to append the byte index of the last
+        #character of such macro name, to prevent having to match macro names
+        #in the next phase as well.
+
+    # For each such match, append the following integers to list local
+    # ${macros_bytes_start_name_stop}:
+    #
+    # * The index of the first non-whitespace byte of such macro (e.g., the ":"
+    #   prefixing such macro's name).
+    # * The index of the last non-whitespace byte of such macro (e.g., the "}"
+    #   suffixing such macro's last block argument).
+
+#and
+    # last bytes of such macro to a list local
+    # Fortunately, locally disabling such option permits all strings (multibyte
+    # or not) and hence such substring to be indexed by such byte indices.
+
+    #   * The first two phases *ALWAYS* perform PCRE-based iteration.
+    #   * Phase 2 *MAY* perform PCRE-based iteration, conditionally depending
+    #     on whether the macros such phase calls do so. (Notably, the :func()
+    #     macro does so.)
+    #
+    # Why? Subtleties! Consider the following causal chain of logic.
+    #
+    # * Since the first two phases *ALWAYS* perform PCRE-based iteration.
+    #   * zsh currently only permits one PCRE to be compiled at a time,
+    #     directly implying PCRE-based iteration cannot be nested.
+    # * Such phases cannot be combined into a single phase.
+
+# :void :code.preprocess(^:string code_name)
+    # (( # == 1 )) || :die 'Expected one string name.'
+    # local code_name__cp=${1} code__cp
+
+    # For efficiency, cache such code.
+    # code__cp=${(P)code_name__cp}
+
+    # Set such code.
+    # :string.set "${code_name__cp}" "${code__cp}"
+
+#FUXME: Ugh. Shift string setters and type checkers here we suppose. Let's
+#assume we've done that, for now.
+
     #FUXME: For readability, each line of such replacement should be manually
     #by the exact amount of indentation prefixing each such macro. This will
     #probably require matching such indentation into a new list local -- say,
