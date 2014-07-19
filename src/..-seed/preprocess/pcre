@@ -32,18 +32,6 @@ function ::preprocessor_pcres.make_if_needed() {
 #FIXME: Document me.
 # :void ::preprocessor_pcres.make()
 function ::preprocessor_pcres.make() {
-    #FIXME: Replace subroutine calls called in only one place with low-level
-    #variable expansions.
-    #FIXME: Compress PCREs together. For example, we don't benefit from
-    #separate ${pcre_macro_arg} and ${pcre_macro_args} PCREs.
-
-    #FIXME: Capture block arguments. 
-    #FIXME: Define match index globals. This is going to considerably more
-    #troublesome than it otherwise would, due to each named group being
-    #unconditionally captured. We'll have to ignore all such groups in a sane
-    #way -- probably by incrementing in integer local here immediately after
-    #defining any ignorable named group (which will be most if not all of them).
-
     # Validate sanity. Since subsequent locals often depend on prior locals
     # locals, define one local per line below.
     (( # == 0 )) || :die 'Expected no arguments.'
@@ -72,7 +60,37 @@ function ::preprocessor_pcres.make() {
     # never match and hence capture.
     local subroutines
 
+    # PCRE options. Dismantled, this is:
+    #
+    # * "(?s)", inducing "." to match all characters including newline. (By
+    #   vexsome default, "." matches all characters excluding newline.)
+    local pcre_options='(?s)'
+
+    # Empty group, typically used to align group indices in a list of
+    # "(?|"-driven alternatives.
+    local pcre_empty_group='()'
+
     # ..................{ MACRO                              }..................
+    #FIXME: Slightly erroneous. We make the dangerous assumption in
+    #::code.preprocess() that such PCRE matches only ASCII characters. Clearly,
+    #however, both "\h" and "\R" match multibyte characters. To correct this
+    #discrepancy, we'll want to match only the explicit ASCII characters
+    #satisfying horizontal and vertical whitespace requirements in a
+    #cross-platform portable manner (think Windows line endings) *AND* replace
+    #all instances of "\h" and "\R" below by similar constructs.
+    #
+    #Unfortunately, "libpcre" documentation notes that:
+    #
+    #"The choice of newline convention does not affect the interpretation of
+    # the \n or \r escape sequences or \R." This implies we'll need to:
+    #
+    # * Test the OS already detected by ={inspect}.
+    # * Define a new string local ${pcre_newline} expanding to the OS-specific
+    #   PCRE matching newlines.
+    #
+    # Annoying, but certainly feasible. For now, the current implementation
+    # appears to be basically acceptable.
+
     # One or more command-specific whitespace sequences (i.e., all substrings
     # connoting whitespace *NOT* terminating the current command), including
     # all whitespace except newlines *NOT* prefixed by "\". While "\"-prefixed
@@ -101,14 +119,18 @@ function ::preprocessor_pcres.make() {
     # mixable with standard arguments and hence unmatched here.
     subroutines+='(?<word>'${pcre_word_unquoted}'|(&quote)|(?&sub))'
 
-    # One or more runs of whitespace or shells words ending in a shell word.
-    # The latter condition prevents this PCRE from matching substrings ending
-    # in a run of whitespace, ensuring such whitespace will be matched only as
-    # the non-optional whitespace prefixing a subsequent block argument if any
-    # or otherwise unmatched. In both zsh and zeshy, unquoted whitespace is
-    # significant only for argument delimitation. Hence, trailing unmatched
-    # whitespace is safely ignorable.
+    # One or more shells words or horizontal whitespace characters, the last of
+    # which is a shell word. The latter condition prevents this PCRE from
+    # matching substrings ending in a run of whitespace, ensuring such
+    # whitespace will be matched only as the non-optional whitespace prefixing
+    # a subsequent block argument if any or otherwise unmatched. In both zsh
+    # and zeshy, unquoted whitespace is significant only for argument
+    # delimitation. Hence, trailing unmatched whitespace is safely ignorable.
     local pcre_words_sans_here='(?:(?&word)|(?&spaces))*(?&word)'
+
+    # One or more horizontal whitespace characters followed by zero or more
+    # shell words.
+    local pcre_spaces_words_sans_here_optional_grouped='((?&spaces)(?:'${pcre_words_sans_here}'(?&spaces))?)'
 
     # Single-quoted string *NOT* supporting escaped single quotes.
     local          pcre_quotes_single_inescapable="'[^']*+'"
@@ -224,9 +246,9 @@ function ::preprocessor_pcres.make() {
     local pcre_macro_arg_block_suffix='(?&blockend)'
     local pcre_macro_arg_block_nested_prefix=${pcre_macro_arg_block_prefix}
     local pcre_macro_arg_block_body='(?:(?!(?&blockend))(?&blockcode))*'
-    local pcre_macro_arg_block_body_grouped='('${pcre_macro_arg_block_body}')'
     local pcre_macro_arg_block_nested_body='(?&blockcode)*'
     local pcre_macro_arg_block=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_body}${pcre_macro_arg_block_suffix}
+    # local pcre_macro_arg_block_grouped='('${pcre_macro_arg_block}')'
     local pcre_macro_arg_block_nested=${pcre_macro_arg_block_nested_prefix}${pcre_macro_arg_block_nested_body}${pcre_macro_arg_block_suffix}
     subroutines+=(
         '(?<block>'${pcre_macro_arg_block_nested}')'
@@ -234,13 +256,16 @@ function ::preprocessor_pcres.make() {
         '(?<blockend>(?&spaces)\}(?:(?&spaces)|\Z))'
     )
 
-    # Block argument prefixed by one or more horizontal whitespace characters
-    # followed by zero or more shell words, capturing such block's body.
-    local pcre_macro_arg_block_match_prefix='(?&spaces)(?:'${pcre_words_sans_here}'(?&spaces))?'${pcre_macro_arg_block_prefix}
-    local pcre_macro_arg_block_match_grouped=${pcre_macro_arg_block_match_prefix}${pcre_macro_arg_block_body_grouped}${pcre_macro_arg_block_suffix}
-
-    # Zero or more arguments of any type.
-    local pcre_macro_args_optional='(?:(?&spaces)(?:'${pcre_words_sans_here}'|'${pcre_macro_arg_block}'))*'
+    # Zero or more arguments of any type. To assist the preprocessor in
+    # differentating between syntactically valid macros accepting no arguments
+    # and syntactically invalid macros accepting arguments, we embed an empty
+    # capturing group at an arbitrary position within such PCRE.
+    # Differentiating such cases then reduces to testing the length of
+    # canonical list global ${matches}. While we could also effect this by
+    # capturing the entire substring matched by such PCRE, doing so has no
+    # demonstrable benefit over the current approach while incurring minor
+    # time and space costs. So, the current approach reigns.
+    local pcre_macro_args_optional='(?:'${pcre_empty_group}'(?&spaces)(?:'${pcre_words_sans_here}'|'${pcre_macro_arg_block}'))*'
     # local pcre_macro_args_optional_grouped='('${pcre_macro_args_optional}')'
 
     # ..................{ FUNCTION PROTOTYPE                 }..................
@@ -253,12 +278,27 @@ function ::preprocessor_pcres.make() {
 
     # PCRE capturing the macro name and all block argument bodies in a
     # preprocessor macro. To distinguish syntactically valid from invalid
-    # preprocessor macros, render all syntax following the macro name is
-    # optional.
-    ZESHY_MACRO_PCRE=${pcre_macro_indentation}${pcre_macro_name_grouped}${pcre_macro_args_optional}${pcre_subroutines}
+    # preprocessor macros, all syntax following the macro name is optional.
+    ZESHY_MACRO_PCRE=${pcre_options}${pcre_macro_indentation}${pcre_macro_name_grouped}${pcre_macro_args_optional}${pcre_subroutines}
 
-    # PCRE capturing the next block argument body in a macro argument list.
-    ZESHY_MACRO_ARG_BLOCK_BODY_PCRE=${pcre_macro_arg_block_match_grouped}${pcre_subroutines}
+    # PCRE capturing the next block argument body in a macro argument list,
+    # prefixed by one or more horizontal whitespace characters followed by zero
+    # or more shell words. To assist user-defined macros accepting variadic
+    # arguments in distinguishing standard from block arguments, capture the
+    # entirety of such block including "{" and "}" delimiters.
+    #
+    # Such PCRE assists in finding the byte indices of the first and last
+    # characters of the next block argument passed to the currently matched
+    # macro. Unfortunately, unlike test operator "=~", pcre_match() sets
+    # neither canonical integer globals ${MBEGIN} or ${MEND} nor list globals
+    # ${mbegin} or ${mend}. Given such constraints, the only means of finding
+    # such byte indices is to:
+    #
+    # * Capture the substring preceding such block argument, including
+    #   otherwise ignorable whitespace.
+    # * Add the byte length of such substring to the byte index of the last
+    #   character of the prior block argument.
+    ZESHY_MACRO_ARG_BLOCK_PCRE=${pcre_options}${pcre_spaces_words_sans_here_optional_grouped}${pcre_macro_arg_block}${pcre_subroutines}
 
     # ..................{ INDICES                            }..................
     #FIXME: All such integers should be declared to be constants.
@@ -272,6 +312,8 @@ function ::preprocessor_pcres.make() {
     local match_index_name
     integer match_index
 
+    #FIXME: Document such indices.
+
     # Declare indices matched by ${ZESHY_MACRO_PCRE}, ignoring match groups
     # required only for internal use in such PCRE -- including:
     #
@@ -279,6 +321,7 @@ function ::preprocessor_pcres.make() {
     match_index=2
     for match_index_name (
         ZESHY_MACRO_MATCH_INDEX_NAME
+        ZESHY_MACRO_MATCH_INDEX_IS_VALID
     ) {
         integer -g ${match_index_name}=$(( match_index++ ))
         print -r ${match_index_name}': '${(P)match_index_name}
@@ -286,6 +329,34 @@ function ::preprocessor_pcres.make() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #To do so, see the section "Newline conventions" in "man pcrepattern".
+    #Specifically, to quote:
+    #
+    #"It is also possible to specify a newline convention by starting a  pat-
+    # tern string with one of the following five sequences:
+    #
+    #    (*CR)        carriage return
+    #    (*LF)        linefeed
+    #    (*CRLF)      carriage return, followed by linefeed
+    #    (*ANYCRLF)   any of the three above
+    #    (*ANY)       all Unicode newline sequences"
+    #prepend the appropriate pattern option to the PCRE globals we construct
+    #below.
+
+    # local pcre_macro_arg_block_body_grouped='('${pcre_macro_arg_block_body}')'
+
+    #FUXME: Replace subroutine calls called in only one place with low-level
+    #variable expansions.
+    #FUXME: Compress PCREs together. For example, we don't benefit from
+    #separate ${pcre_macro_arg} and ${pcre_macro_args} PCREs.
+
+    #FUXME: Capture block arguments. 
+    #FUXME: Define match index globals. This is going to considerably more
+    #troublesome than it otherwise would, due to each named group being
+    #unconditionally captured. We'll have to ignore all such groups in a sane
+    #way -- probably by incrementing in integer local here immediately after
+    #defining any ignorable named group (which will be most if not all of them).
+
     # ZESHY_MACRO_PCRE=${pcre_macro_indentation}${pcre_macro_name}${pcre_macro_args_optional_grouped}${pcre_subroutines}
 
     #FUXME: Convert ${pcre_macro_arg_block} into a subroutine.
@@ -326,10 +397,6 @@ function ::preprocessor_pcres.make() {
         # ZESHY_MACRO_MATCH_INDEX_ARG_1
         # ZESHY_MACRO_MATCH_INDEX_ARG_2
         # ZESHY_MACRO_MATCH_INDEX_ARG_3
-
-    # Empty group, typically used to align group indices in a list of
-    # "(?|"-driven alternatives.
-    # local pcre_empty_group='()'
 
     # local        pcre_macro_arg_block_nested_body='(?<blockb>(?:(?&spaces)(?&block)?|\\[''"$`<]|(?!<<)[^''"$`]|(?&code))*'
     # local pcre_macro_arg_block_body='(?:(?!'${pcre_macro_arg_block_suffix}')'${pcre_macro_arg_block_nested_body}')'

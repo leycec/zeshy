@@ -7,66 +7,6 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Preprocess zeshy-specific code into zsh-specific code.
 
-#FIXME: O.K.; so, implementing a zsh-capable in pure-PCRE is rather difficult
-#if not infeasible. For example, consider the complexity of merely
-#differentiating the following edge cases:
-#
-#:func ':void yum()' {
-#    print ${:-
-#    :func
-#    }
-#    { print $(:stdin.get) } <<'o''k'
-#:func
-#o'k
-#}
-#
-#Things get *VERY* tricky, *VERY* rapidly. Note the fact, for example, that
-#quoted here-doc words may contain quote escapes that then need to be matched
-#as their unescaped equivalents, which isn't really feasible to accomplish with
-#simplistic PCRE-based group capturing and back referencing.
-#
-#So, here's what we're going to do for now (and possibly always): we're going
-#to implement a genuine preprocessor in the sense that preprocessing will be a
-#distinct phase performed strictly *BEFORE* zsh interpretation. In the above
-#examples, such preprocessor would treat all macros ":func" regardless of zsh
-#context the same. While non-ideal, there's just no feasible means of
-#reimplementing robust zsh parsing with PCRE-based iteration.
-
-#FIXME: Uh-oh! How do we perform nested PCRE-based matching? We need to
-#perform iterative PCRE matching here to reliably match macros and, for each
-#such macro, call such macro's preprocessor -- which itself could (and at
-#least in the case of :func() absolutely will) also perform iterative PCRE
-#matching. In a conventional language, this would be no problem. Here, however,
-#we have a problem.
-#
-#While we *COULD* probably mitigate this by performing glob-based iteration
-#here instead, globs are unwieldy, inefficient, and ultimately infeasible.
-#Consider matching here-documents without back references, for example.
-#
-#Technically, we could simply call pcre_compile() *AFTER* calling each and
-#every macro preprocessor.
-#FIXME: O.K.; the solution, clearly, is to split preprocessing into two phases:
-#
-#1. In the first phase, PCRE-based iteration finds *ALL* macros to be replaced
-#   in the second phase. Specifically, for each macro, such iteration appends
-#   the byte indices of (in order):
-#   * The first character of such macro (e.g., the ":" prefixing such macro).
-#   * For each block argument passed to such macro (i.e., "{"- and
-#     "}"-delimited block of user-defined code):
-#     * The first character of such argument (i.e., such "{" delimiter).
-#     * The last character of such argument (i.e., such "}" delimiter).
-#   * The last character of such macro (e.g., the "}" suffixing such macro),
-#     prefixed by "e". Since the number of block arguments is variable, the
-#     second phase needs to differentiate this index from block
-#     argument-specific indices. This seems a simple way.
-#2. In the second phase, list-based iteration iterates over the previously
-#   appended byte indices in *REVERSE* order, ensuring macros appearing later
-#   in such code will be replaced before macros appearing earlier. Rather than
-#   explicitly reverse such list (which introduces other complications),
-#   implicitly reverse such list by ensuring the first item of such list is
-#   always the empty string and only appending immediately after such item.
-#   Assuming a linked list implementation, this is presumably efficient.
-
 #FIXME: O.K.; that's *EXACTLY* what we're going to do, but only as an interim
 #solution. The long-term solution, though a bit balls-crazy, is as follows:
 #
@@ -188,6 +128,9 @@ function :script.source() {
     #FIXME: Nontrivial. We'll need to refactor
     #get_shell_script_shebang_command_name_if_found() into a setter and shift
     #the resulting function into a new parcel at this level. *sigh*
+    #FIXME: Probably, no. Just inline the corresponding code here.
+    #FIXME: Strip the prefixing shebang line from such code. Such line does
+    #*NOT* constitute interpretable zeshy code and must not be treated as such.
 
     # If the first line of such code is *NOT* a shebang referencing the "zeshy"
     # interpreter, throw an exception. Preprocessing and evaluating arbitrary
@@ -203,10 +146,12 @@ function :script.source() {
 }
 
 # ....................{ PREPROCESSORS                      }....................
+#FIXME: Arguably shift to a new parcel ={code} devoted to such operation.
+#FIXME: Optimize by globalizing locals. (You know the code-cadenced drill.)
 #FIXME: Document me. In particular, note that the caller must define string
 #local ${ZESHY__PREPROCESSOR_CODE}.
 
-# :void ::code.preprocess(:void)
+# :void ::code.preprocess()
 function ::code.preprocess() {
     # Validate sanity.
     (( # == 0 )) || :die 'Expected no arguments.'
@@ -215,11 +160,27 @@ function ::code.preprocess() {
     # either global or caller-specific versions of such variable.
     local ZPCRE_OP
 
-    # Byte index of the first non-whitespace character of such macro.
-    integer macro_byte_first
+    #FIXME: Still require this? Excise us!
 
-    # Odd-sized list of integer triples, each a byte index into the "passed"
-    # string ${ZESHY__PREPROCESSOR_CODE} such that:
+    # Currently matched macro name.
+    # local macro_name
+
+    # Byte index into such code.
+    integer macro_byte
+
+    # Byte index of the last non-whitespace character of the current macro.
+    integer macro_byte_last
+    
+    # Byte index of the first and last characters of such macro's name.
+    integer macro_byte_name_first macro_byte_name_last
+
+    # Byte index of the last character of the previously matched block argument
+    # passed to such macro  if any or the first character following the last
+    # character of such macro's name otherwise.
+    integer macro_byte_arg_block_last
+
+    # List of positive integer triples, each a byte index into the passed code
+    # such that:
     #
     # * The first list item of each such triple is the byte index of the first
     #   non-whitespace character of such macro (e.g., the ":" prefixing such
@@ -230,10 +191,41 @@ function ::code.preprocess() {
     #   non-whitespace character of such macro (e.g., the "}" suffixing such
     #   macro's last block argument).
     #
+    # Such triples are listed in reverse lexical order (i.e., in the reverse
+    # order such macros appear in such code). The reason why is fairly subtle,
+    # as reasons go. To prevent the expansion of each macro from invalidating
+    # byte indices of subsequent macros, the third preprocessor phase must
+    # expand and hence iterate macros in reverse order. While there exist
+    # various means of ensuring this, persisting such macros in such order by
+    # prepending such indices to the head of this list with list operator "+="
+    # is arguably the simplest and most efficient. However, such operator
+    # requires a valid 1-based list index and hence cannot be used to prepend
+    # directly into the first list index (which would require "+=" to support
+    # appending to an imaginary list index 0). We circumvent this oddity by
+    # retaining the empty string as a "dummy" first list index to which we
+    # append all subsequent triples.
+    #
     # Such list circumvents zsh's current inability to nest PCRE-based
     # iteration, permitting matches in the first preprocessor phase to be
     # accessed in the second preprocessor phase. (It's all rather droll.)
-    local -a macros_bytes_start_name_stop
+    local -a macros_bytes_first_name_last
+             macros_bytes_first_name_last=( '' )
+
+    # List of ";"-terminated sublists of positive integer pairs, each a byte
+    # index into the passed code such that:
+    #
+    # * The first list item of each such pair is the byte index of the "{"
+    #   prefixing the next block argument passed to such macro.
+    # * The second list item of each such pair is the byte index of the "}"
+    #   suffixing the same block argument.
+    #
+    # Since zsh does *NOT* currently support type composition, terminate each
+    # such sublist by the arbitrary delimiter ";". (This is horrible.)
+    #
+    # Such list circumvents zsh's current inability to nest PCRE-based
+    # iteration, permitting matches in the second preprocessor phase to be
+    # accessed in the third preprocessor phase. (Angel of death, take us now.)
+    local -a macros_bytes_arg_block_first_last
 
     # If such variable is undefined or not a string, throw an exception. See
     # :var.die_unless_type_string().
@@ -258,28 +250,33 @@ function ::code.preprocess() {
     # or not) and hence such substring to be indexed by such byte indices.
     setopt -- local_options no_multibyte
 
-    # ..................{ PHASE ~ macro : match              }..................
+    # ..................{ PHASE ~ macro                      }..................
     # Due to zsh inadequacies, partition preprocessing into multiple phases.
     # Since "zsh" currently only permits one PCRE to be compiled at a time,
     # PCRE-based iteration cannot be nested. Since the first two phases perform
     # such iteration, such phases cannot be combined. (Q.E.D., sadly.)
-    #
-    # In the first phase, iteratively match all preprocessor macros in the
-    # passed code and append the corresponding match indices to list local
-    # ${macros_bytes_start_name_stop}.
 
     # Compile and optimize such PCRE. See for_string_text_matching_pcre:().
     pcre_compile -- "${ZESHY_MACRO_PCRE}"
     pcre_study
 
-    # For each macro matched from such code...
+    # For each macro matched from such code, record matched byte indices for
+    # the next preprocessor phase.
     ZPCRE_OP='0 0'
     while {
         pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__PREPROCESSOR_CODE}"
     } {
+        # Such macro's name.
+        macro_name=${match[${ZESHY_MACRO_MATCH_INDEX_NAME}]}
+
+        # If such name does *NOT* correspond to an existing function, throw an
+        # exception. (Macros are implemented as functions of the same name.)
+        (( ${+functions[${macro_name}]} )) || :die\
+            'Macro function '${macro_name}'() undefined.'
+
         #FIXME: Report this bug! This is currently affecting *EVERYONE*
         #leveraging zsh module "zsh/pcre", which is probably *EVERYONE*.
-
+        # Byte indices recorded for the next preprocessor phase. Note that
         # "man zshmodules" documents ${ZPCRE_OP} to be a " "-delimited integer
         # pair such that:
         #
@@ -313,53 +310,201 @@ function ::code.preprocess() {
         # vanishingly unlikely that third-party scripts would ever do so,
         # assume such character to be unibyte for simplicity. In such case,
         # simplistically incrementing the first such integer by 1 suffices.
-        macro_byte_first=$(( ${ZPCRE_OP[(w)1]} + 1 ))
+        macro_byte_name_first=$(( ${ZPCRE_OP[(w)1]} + 1 ))
+        macro_byte_last=${ZPCRE_OP[(w)2]}
+        macro_byte_name_last=$(( macro_byte_name_first + ${#macro_name} - 1 ))
 
-        # Append byte indices corresponding to such .
-        macros_bytes_start_name_stop+=(
-            ${macro_byte_first}
-            $(( macro_byte_first +\
-                ${#match[${ZESHY_MACRO_MATCH_INDEX_NAME}]} ))
-            ${ZPCRE_OP[(w)2]}
+        #FIXME: Shift parcel ={*-get} here and explicitly source above.
+
+        # If the empty group signifying such macro to be syntactically valid
+        # was *NOT* matched, such macro is syntactically invalid. In such case,
+        # throw an exception.
+        (( ${#match} >= ZESHY_MACRO_MATCH_INDEX_IS_VALID )) || {
+            # Line number of the current macro in such code, calculated by
+            # removing all non-newline characters preceding such macro and
+            # counting the number of newline characters that remain.
+            integer line_number="${#ZESHY__PREPROCESSOR_CODE[1,${macro_byte_name_first}]//[^$'\n']}"
+
+            # Throw such exception.
+            :die $(::parcel.get_current)'macro '${macro_name}'() on line '${line_number}' passed syntactically invalid arguments (e.g., due to unmatched braces or quotes).'
+        }
+
+        # Record matched byte indices for the next preprocessor phase.
+        macros_bytes_first_name_last[1]+=(
+            ${macro_byte_name_first}
+            ${macro_byte_name_last}
+            ${macro_byte_last}
         )
     }
 
-    # ..................{ PHASE ~ macro : match              }..................
+    # For simplicity, remove the placeholder empty string prefixing such list.
+    macros_bytes_first_name_last[1]=()
 
+    # ..................{ PHASE ~ block argument             }..................
+    # Compile and optimize such PCRE. See for_string_text_matching_pcre:().
+    pcre_compile -- "${ZESHY_MACRO_ARG_BLOCK_PCRE}"
+    pcre_study
 
+    # For each previously matched macro, match each block argument passed to
+    # such macro.
+    for macro_byte_name_first macro_byte_name_last macro_byte_last (
+        "${macros_bytes_first_name_last[@]}") {
+        # Begin searching for block arguments passed to the current macro
+        # immediately after the last character of such macro's name.
+        ZPCRE_OP='0 '${macro_byte_name_last}
+
+        # For each block argument matched from such code, record matched byte
+        # indices for the next preprocessor phase.
+        while {
+            # Byte index of the last character of the prior match if any or the
+            # first character following the last character of such macro's name
+            # otherwise.
+            macro_byte_arg_block_last=${ZPCRE_OP[(w)2]}
+
+            # While such index precedes the last byte index of such macro,
+            # attempt to match the next block argument passed to such macro.
+            (( macro_byte_arg_block_last < macro_byte_last )) &&
+                pcre_match -b -n ${macro_byte_arg_block_last} --\
+                "${ZESHY__PREPROCESSOR_CODE}"
+        } {
+            #FIXME: Actually, macro names can contain UTF-8-encoded characters.
+            #We should probably prohibit this, for the moment -- that, or
+            #reimplement this in a multibyte-aware manner. *sigh*
+
+            # Record matched byte indices for the next preprocessor phase.
+            #
+            # The last character preceding such match is either the last
+            # character of such macro's name *OR* the "}" delimiting the prior
+            # block argument and hence guaranteed to be ASCII. Given that,
+            # incrementing the byte index of such character by 1 gives the byte
+            # index of the first whitespace character of such match;
+            # incrementing such index by the byte length of the possibly empty
+            # substring of standard arguments preceding such block arguments
+            # gives the byte index of the "{" delimiting such block argument.
+            macros_bytes_arg_block_first_last+=(
+                $(( ${ZPCRE_OP[(w)1]} + ${match[1]} + 1 ))
+                    ${ZPCRE_OP[(w)2]}
+            )
+        }
+
+        # Append an arbitrary character constant terminating the sublist of
+        # argument block byte indices for such macro. (Hacks "R" Us.)
+        macros_bytes_arg_block_first_last+=';'
+    }
+
+    # ..................{ PHASE ~ expand                     }..................
     #FIXME: Don't forget to strip suffixing line continuations (i.e.,
     #"\"-prefixed newlines) from macro arguments before calling such macros.
+    #Efficiently straightforward using a simple global glob replacement. 
+    #FIXME: Actually, we pretty much *HAVE* to call eval() to ensure proper
+    #expansion of standard arguments. (Consider process substitutions embedded
+    #in such arguments, for example.) Simplifies things, anyway. *shrug*
+    #FIXME: Actually, couldn't we apply the presumably less expensive parameter
+    #expansion flag "(e)" *AFTER* stripping line continuations and performing
+    #shell word splitting with parameter expansion flag "(z)"? Although, at
+    #that point, simply calling eval() is probably more efficient.
+    #
+    #Note that, if we do take the eval() route, we'll need to apply at least
+    #parameter expansion flag "(q)" to each block argument. (Probably "(qq)").
 
-    #FIXME: We arguably need an intermediary validation phase -- call it
-    #"Phase 1.5", perhaps. This phase's sole purpose is to validate the passed
-    #code with respect to preprocessing -- that is, to ensure that all macros
-    #present in such code were syntactically valid and hence preprocessed.
-    #Naturally, such phase should be optimized away under optimized builds.
-    #
-    #To support such phase, phase 1 should append the starting byte index of
-    #each syntactically valid macro to a new list local -- say,
-    #${macro_valid_bytes_start}.
-    #
-    #In all non-optimized builds, phase 1.5 should then compile
-    #${ZESHY__MACRO_NAMES_PCRE} and iterate over all substrings matching such
-    #PCRE in such code. For each such match, such iteration should compare the
-    #starting byte index of such match with the next list item in
-    #${macro_valid_bytes_start}. If the two differ, the current macro must
-    #necessarily be syntactically invalid. In such case, throw an exception and
-    #immediately terminate preprocessing.
-    #
-    #Such validation does unavoidably introduce inefficiencies but must
-    #nonetheless be performed. Due to the complexities of such PCREs, such
-    #validation will be essential even for core debugging.
-    #FIXME: Actually, we can combine phases 1 and 1.5 via clever PCRE
-    #construction. How? By simply appending an alternative to the main
-    #macro-matching PCRE matching syntactically invalid macros as any substring
-    #beginning with a valid macro name. By listing such alternative *AFTER* the
-    #initial PCRE matching only syntactically valid macros, we effectively
-    #guarantee the former to only match invalid macros. (At least, that's the
-    #theory.) Well, this puts a brighter spin on validation.
+    # For each previously matched macro, replace such macro by its expansion
+    # "in place."
+}
 
-    #FIXME: Not quite right. We should note that zsh's inability to nest PCRE
+# --------------------( WASTELANDS                         )--------------------
+            # Since the character preceding such match is guaranteed to be a non-UTF-8 whitespace character, incrementing such byte
+            # index by 1 is safe.
+
+            # Since the character preceding such block argument is guaranteed
+            # to be a non-UTF-8 whitespace character, incrementing such byte
+            # index by 1 is safe.
+
+        # to the last character of the last argument passed to such macro.
+#FUXME: O.K.; so, implementing a zsh-capable in pure-PCRE is rather difficult
+#if not infeasible. For example, consider the complexity of merely
+#differentiating the following edge cases:
+#
+#:func ':void yum()' {
+#    print ${:-
+#    :func
+#    }
+#    { print $(:stdin.get) } <<'o''k'
+#:func
+#o'k
+#}
+#
+#Things get *VERY* tricky, *VERY* rapidly. Note the fact, for example, that
+#quoted here-doc words may contain quote escapes that then need to be matched
+#as their unescaped equivalents, which isn't really feasible to accomplish with
+#simplistic PCRE-based group capturing and back referencing.
+#
+#So, here's what we're going to do for now (and possibly always): we're going
+#to implement a genuine preprocessor in the sense that preprocessing will be a
+#distinct phase performed strictly *BEFORE* zsh interpretation. In the above
+#examples, such preprocessor would treat all macros ":func" regardless of zsh
+#context the same. While non-ideal, there's just no feasible means of
+#reimplementing robust zsh parsing with PCRE-based iteration.
+
+#FUXME: Uh-oh! How do we perform nested PCRE-based matching? We need to
+#perform iterative PCRE matching here to reliably match macros and, for each
+#such macro, call such macro's preprocessor -- which itself could (and at
+#least in the case of :func() absolutely will) also perform iterative PCRE
+#matching. In a conventional language, this would be no problem. Here, however,
+#we have a problem.
+#
+#While we *COULD* probably mitigate this by performing glob-based iteration
+#here instead, globs are unwieldy, inefficient, and ultimately infeasible.
+#Consider matching here-documents without back references, for example.
+#
+#Technically, we could simply call pcre_compile() *AFTER* calling each and
+#every macro preprocessor.
+#FUXME: O.K.; the solution, clearly, is to split preprocessing into two phases:
+#
+#1. In the first phase, PCRE-based iteration finds *ALL* macros to be replaced
+#   in the second phase. Specifically, for each macro, such iteration appends
+#   the byte indices of (in order):
+#   * The first character of such macro (e.g., the ":" prefixing such macro).
+#   * For each block argument passed to such macro (i.e., "{"- and
+#     "}"-delimited block of user-defined code):
+#     * The first character of such argument (i.e., such "{" delimiter).
+#     * The last character of such argument (i.e., such "}" delimiter).
+#   * The last character of such macro (e.g., the "}" suffixing such macro),
+#     prefixed by "e". Since the number of block arguments is variable, the
+#     second phase needs to differentiate this index from block
+#     argument-specific indices. This seems a simple way.
+#2. In the second phase, list-based iteration iterates over the previously
+#   appended byte indices in *REVERSE* order, ensuring macros appearing later
+#   in such code will be replaced before macros appearing earlier. Rather than
+#   explicitly reverse such list (which introduces other complications),
+#   implicitly reverse such list by ensuring the first item of such list is
+#   always the empty string and only appending immediately after such item.
+#   Assuming a linked list implementation, this is presumably efficient.
+
+    # Phase 2: call and replace all such macros by their output in such code.
+
+    # If such list size is *NOT* a factor of three, such list does *NOT*
+    # consist of byte index triples. In such case, throw an exception. (While
+    # this should never be the case, an ounce of prevention...)
+    # (( ${#macros_bytes_first_name_last} % 3 == 0 )) || :die
+    #     'List ${macros_bytes_first_name_last} size '${#macros_bytes_first_name_last}' indivisible by 3.'
+
+    #FUXME: Ugh. We really need the macro order of both
+    #${macros_bytes_first_name_last} and
+    #${macros_bytes_arg_block_first_last} to be synchronized, implying we
+    #should probably implement such reversal above where we append to the
+    #former. (Fairly clear, in hindsight.)
+
+    # For each previously matched macro, match each block argument passed to
+    # such macro. The next preprocessor phase replaces such macros by their
+    # expansions "in place." To prevent these expansions from invalidating the
+    # byte indices of block arguments passed to subsequent macros, the next
+    # preprocessor phase must iterate macros in reverse order. To ensure this,
+    # iterate such macros in reverse order here.
+    # for (( macro_byte=$(( ${#macros_bytes_first_name_last} - 2 ));
+    #        macro_byte > 1;
+    #        macro_byte+=-3 )) {
+
+    #FUXME: Not quite right. We should note that zsh's inability to nest PCRE
     #compilations is an excrutiating handicap. Basically, we really need to
     #explicitly match a sufficiently large finite number of block arguments --
     #say, 16? (This can always be artificially increased as needed.) The reason
@@ -384,8 +529,8 @@ function ::code.preprocess() {
     #It's hardly ideal, of course, but there is no ideal solution here. This
     #has the benefit of scaling to an arbitrary number of arguments, which is
     #blatantly preferable to the alternative -- even if it does incur minor
-    #inefficiencys and code complexities along the way.
-    #FIXME: Unfortunately, the above approach is complicated by the current
+    #inefficiencies and code complexities along the way.
+    #FUXME: Unfortunately, the above approach is complicated by the current
     #need to match macro-specific indentation prefixing the "}" delimiting such
     #block arguments, clearly infeasible with a single universal PCRE. Given
     #that, it's fairly clear that we either need to:
@@ -399,17 +544,73 @@ function ::code.preprocess() {
     #does not. Given that, we'd might as well implement it right the first
     #time. (You know what to do.)
 
-    # Phase 2: call and replace all such macros by their output in such code.
+    #FUXME: We arguably need an intermediary validation phase -- call it
+    #"Phase 1.5", perhaps. This phase's sole purpose is to validate the passed
+    #code with respect to preprocessing -- that is, to ensure that all macros
+    #present in such code were syntactically valid and hence preprocessed.
+    #Naturally, such phase should be optimized away under optimized builds.
+    #
+    #To support such phase, phase 1 should append the starting byte index of
+    #each syntactically valid macro to a new list local -- say,
+    #${macro_valid_bytes_start}.
+    #
+    #In all non-optimized builds, phase 1.5 should then compile
+    #${ZESHY__MACRO_NAMES_PCRE} and iterate over all substrings matching such
+    #PCRE in such code. For each such match, such iteration should compare the
+    #starting byte index of such match with the next list item in
+    #${macro_valid_bytes_start}. If the two differ, the current macro must
+    #necessarily be syntactically invalid. In such case, throw an exception and
+    #immediately terminate preprocessing.
+    #
+    #Such validation does unavoidably introduce inefficiencies but must
+    #nonetheless be performed. Due to the complexities of such PCREs, such
+    #validation will be essential even for core debugging.
+    #FUXME: Actually, we can combine phases 1 and 1.5 via clever PCRE
+    #construction. How? By simply appending an alternative to the main
+    #macro-matching PCRE matching syntactically invalid macros as any substring
+    #beginning with a valid macro name. By listing such alternative *AFTER* the
+    #initial PCRE matching only syntactically valid macros, we effectively
+    #guarantee the former to only match invalid macros. (At least, that's the
+    #theory.) Well, this puts a brighter spin on validation.
 
-}
+        # Begin searching for block arguments passed to the current macro from
+        # the first character following the last character of such macro's name
+        # to the last character of the last argument passed to such macro.
+        # ZPCRE_OP=$((
+        #     ${macros_bytes_first_name_last[$(( ${macro_byte} + 1 ))]} + 1
+        # ))' '$((
+        #     ${macros_bytes_first_name_last[$(( ${macro_byte} + 2 ))]}
+        # ))
 
-# --------------------( WASTELANDS                         )--------------------
+           # macro_byte < ({${#macros_bytes_first_name_last}..1}) {
+
+    # triple of
+    # previously recorderd byte indices, in
+    # reverse order.
+
+    # In the first phase, iteratively match all preprocessor macros in the
+    # passed code and append the corresponding match indices to list local
+    # ${macros_bytes_first_name_last}.
+
+        # If either the byte indices of the last character of such macro and
+        # such macro's name are equal, such macro is either a syntactically
+        # valid macro accepting no arguments *OR* . the character following the
+        # latter
+        # is a newline, such macro  *AND* 
+        # (( macro_byte_last == macro_byte_name_last )) ||
+        # ${ZESHY__PREPROCESSOR_CODE} ]] || 
+
+        #FUXME: Perform crude validation here.
+#of the first and last non-whitespace macro characters.
+        # Macro name.
+        # macro_name=${}
+
         #FUXME: We probably also want to append the byte index of the last
         #character of such macro name, to prevent having to match macro names
         #in the next phase as well.
 
     # For each such match, append the following integers to list local
-    # ${macros_bytes_start_name_stop}:
+    # ${macros_bytes_first_name_last}:
     #
     # * The index of the first non-whitespace byte of such macro (e.g., the ":"
     #   prefixing such macro's name).
