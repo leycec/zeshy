@@ -138,7 +138,7 @@ function :script.source() {
     # avoided at all costs.
 
     # Preprocess such code.
-    local ZESHY__PREPROCESSOR_CODE=${script_code}
+    local ZESHY__CODE_PREPROCESS=${script_code}
     ::code.preprocess
 
     # Run such preprocessed code.
@@ -149,35 +149,47 @@ function :script.source() {
 #FIXME: Arguably shift to a new parcel ={code} devoted to such operation.
 #FIXME: Optimize by globalizing locals. (You know the code-cadenced drill.)
 #FIXME: Document me. In particular, note that the caller must define string
-#local ${ZESHY__PREPROCESSOR_CODE}.
+#local ${ZESHY__CODE_PREPROCESS}.
 
 # :void ::code.preprocess()
 function ::code.preprocess() {
     # Validate sanity.
     (( # == 0 )) || :die 'Expected no arguments.'
 
+    # If such variable is undefined or not a string, throw an exception. See
+    # :var.die_unless_type_string().
+    [[ ${(t)ZESHY__CODE_PREPROCESS-} == 'scalar'('-'*|) ]] || :die\
+        'String ${ZESHY__CODE_PREPROCESS} undefined or not a string.'
+
     # Canonical string global ${ZPCRE_OP}, localized to avoid overwriting
     # either global or caller-specific versions of such variable.
     local ZPCRE_OP
 
-    #FIXME: Still require this? Excise us!
-
     # Currently matched macro name.
-    # local macro_name
+    local macro_name
 
-    # Byte index into such code.
-    integer macro_byte
+    # Function call replacing the current macro in the passed code by its
+    # expansion. The first shell word of this whitespace-delimited string is
+    # the name of such function (and hence such macro); all remaining shell
+    # words are the arguments to be passed to such function.
+    local ZESHY__MACRO_FUNC_CALL
+
+    # Byte indices of the first and last characters of such macro's name.
+    integer macro_byte_name_first macro_byte_name_last
 
     # Byte index of the last non-whitespace character of the current macro.
     integer macro_byte_last
-    
-    # Byte index of the first and last characters of such macro's name.
-    integer macro_byte_name_first macro_byte_name_last
+
+    # Byte indices of the first and last characters of the currently matched
+    # block argument passed to such macro. Since the former is a non-integer
+    # character constant on iterating past the last block argument passed to
+    # such macro, declare such indices to be strings rather than integers.
+    local macro_byte_arg_block_first macro_byte_arg_block_last
 
     # Byte index of the last character of the previously matched block argument
-    # passed to such macro  if any or the first character following the last
+    # passed to such macro if any or the first character following the last
     # character of such macro's name otherwise.
-    integer macro_byte_arg_block_last
+    integer macro_byte_arg_block_prior_last
 
     # List of positive integer triples, each a byte index into the passed code
     # such that:
@@ -208,8 +220,8 @@ function ::code.preprocess() {
     # Such list circumvents zsh's current inability to nest PCRE-based
     # iteration, permitting matches in the first preprocessor phase to be
     # accessed in the second preprocessor phase. (It's all rather droll.)
-    local -a macros_bytes_first_name_last
-             macros_bytes_first_name_last=( '' )
+    local -a macro_bytes_first_name_last
+             macro_bytes_first_name_last=( '' )
 
     # List of ";"-terminated sublists of positive integer pairs, each a byte
     # index into the passed code such that:
@@ -225,12 +237,7 @@ function ::code.preprocess() {
     # Such list circumvents zsh's current inability to nest PCRE-based
     # iteration, permitting matches in the second preprocessor phase to be
     # accessed in the third preprocessor phase. (Angel of death, take us now.)
-    local -a macros_bytes_arg_block_first_last
-
-    # If such variable is undefined or not a string, throw an exception. See
-    # :var.die_unless_type_string().
-    [[ ${(t)ZESHY__PREPROCESSOR_CODE-} == 'scalar'('-'*|) ]] || :die\
-        'String ${ZESHY__PREPROCESSOR_CODE} undefined or not a string.'
+    local -a macro_bytes_arg_block_first_last
 
     # If preprocessor PCREs have yet to be generated or require regeneration
     # (e.g., due to the declaration of new macros), do so.
@@ -264,7 +271,7 @@ function ::code.preprocess() {
     # the next preprocessor phase.
     ZPCRE_OP='0 0'
     while {
-        pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__PREPROCESSOR_CODE}"
+        pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__CODE_PREPROCESS}"
     } {
         # Such macro's name.
         macro_name=${match[${ZESHY_MACRO_MATCH_INDEX_NAME}]}
@@ -323,14 +330,15 @@ function ::code.preprocess() {
             # Line number of the current macro in such code, calculated by
             # removing all non-newline characters preceding such macro and
             # counting the number of newline characters that remain.
-            integer line_number="${#ZESHY__PREPROCESSOR_CODE[1,${macro_byte_name_first}]//[^$'\n']}"
+            integer line_number="${#ZESHY__CODE_PREPROCESS[
+                1,${macro_byte_name_first}]//[^$'\n']}"
 
             # Throw such exception.
             :die $(::parcel.get_current)'macro '${macro_name}'() on line '${line_number}' passed syntactically invalid arguments (e.g., due to unmatched braces or quotes).'
         }
 
         # Record matched byte indices for the next preprocessor phase.
-        macros_bytes_first_name_last[1]+=(
+        macro_bytes_first_name_last[1]+=(
             ${macro_byte_name_first}
             ${macro_byte_name_last}
             ${macro_byte_last}
@@ -338,7 +346,7 @@ function ::code.preprocess() {
     }
 
     # For simplicity, remove the placeholder empty string prefixing such list.
-    macros_bytes_first_name_last[1]=()
+    macro_bytes_first_name_last[1]=()
 
     # ..................{ PHASE ~ block argument             }..................
     # Compile and optimize such PCRE. See for_string_text_matching_pcre:().
@@ -348,7 +356,7 @@ function ::code.preprocess() {
     # For each previously matched macro, match each block argument passed to
     # such macro.
     for macro_byte_name_first macro_byte_name_last macro_byte_last (
-        "${macros_bytes_first_name_last[@]}") {
+        "${macro_bytes_first_name_last[@]}") {
         # Begin searching for block arguments passed to the current macro
         # immediately after the last character of such macro's name.
         ZPCRE_OP='0 '${macro_byte_name_last}
@@ -359,13 +367,13 @@ function ::code.preprocess() {
             # Byte index of the last character of the prior match if any or the
             # first character following the last character of such macro's name
             # otherwise.
-            macro_byte_arg_block_last=${ZPCRE_OP[(w)2]}
+            macro_byte_arg_block_prior_last=${ZPCRE_OP[(w)2]}
 
             # While such index precedes the last byte index of such macro,
             # attempt to match the next block argument passed to such macro.
-            (( macro_byte_arg_block_last < macro_byte_last )) &&
-                pcre_match -b -n ${macro_byte_arg_block_last} --\
-                "${ZESHY__PREPROCESSOR_CODE}"
+            (( macro_byte_arg_block_prior_last < macro_byte_last )) &&
+                pcre_match -b -n ${macro_byte_arg_block_prior_last} --\
+                "${ZESHY__CODE_PREPROCESS}"
         } {
             #FIXME: Actually, macro names can contain UTF-8-encoded characters.
             #We should probably prohibit this, for the moment -- that, or
@@ -381,7 +389,7 @@ function ::code.preprocess() {
             # incrementing such index by the byte length of the possibly empty
             # substring of standard arguments preceding such block arguments
             # gives the byte index of the "{" delimiting such block argument.
-            macros_bytes_arg_block_first_last+=(
+            macro_bytes_arg_block_first_last+=(
                 $(( ${ZPCRE_OP[(w)1]} + ${match[1]} + 1 ))
                     ${ZPCRE_OP[(w)2]}
             )
@@ -389,7 +397,7 @@ function ::code.preprocess() {
 
         # Append an arbitrary character constant terminating the sublist of
         # argument block byte indices for such macro. (Hacks "R" Us.)
-        macros_bytes_arg_block_first_last+=';'
+        macro_bytes_arg_block_first_last+=';'
     }
 
     # ..................{ PHASE ~ expand                     }..................
@@ -407,11 +415,126 @@ function ::code.preprocess() {
     #Note that, if we do take the eval() route, we'll need to apply at least
     #parameter expansion flag "(q)" to each block argument. (Probably "(qq)").
 
-    # For each previously matched macro, replace such macro by its expansion
-    # "in place."
+    #FIXME: Shift above.
+    integer macro_bytes_arg_block_first_last_index
+    macro_bytes_arg_block_first_last_index=1
+
+    # For each previously matched macro, replace such macro by its expansion.
+    for macro_byte_name_first macro_byte_name_last macro_byte_last (
+        "${macro_bytes_first_name_last[@]}") {
+        # Function call replacing such macro in such code by its expansion.
+        # Since such function's name is such macro's name, begin such call with
+        # the latter.
+        ZESHY__MACRO_FUNC_CALL=${ZESHY__CODE_PREPROCESS[
+            ${macro_byte_name_first},${macro_byte_name_last}]}
+
+        # Set the byte index of the last character of the prior block argument
+        # to the byte index of the last character of such macro's name,
+        # ensuring standard arguments following such name and preceding the
+        # first block argument are passed to such call in the customary way.
+        macro_byte_arg_block_prior_last=${macro_byte_name_last}
+
+        # For each previously matched block argument passed to such macro,
+        # convert such argument into a standard single-quoted argument.
+        # Since a variadic number of block arguments are supported, the prior
+        # phase terminates the last block argument passed to such macro with a
+        # character constant.
+        while {
+            # Byte index of the first character of such block argument if any
+            # or such character constant otherwise.
+            macro_byte_arg_block_first=${macro_bytes_arg_block_first_last[
+                ${macro_bytes_arg_block_first_last_index}]}
+
+            # If such index is *NOT* the terminating character, proceed.
+            [[ ${macro_byte_arg_block_first} != ';' ]]
+        } {
+            # Pass such call all standard arguments (i.e., non-block arguments)
+            # following the prior block argument and preceding the current
+            # block argument if any. (If no such arguments exist, this simply
+            # appends the empty string and hence reduces to a noop.)
+            #
+            # By PCRE design, such arguments are guaranteed to be both preceded
+            # and followed by non-empty whitespace.
+            ZESHY__MACRO_FUNC_CALL+=${ZESHY__CODE_PREPROCESS[
+                $(( macro_byte_arg_block_prior_last + 1 )),
+                $(( macro_byte_arg_block_first - 1 ))]}
+
+            # Preserve the byte index of the last character of such block
+            # argument for subsequent examination *AFTER* expanding the prior
+            # such index above.
+            macro_byte_arg_block_prior_last=${macro_bytes_arg_block_first_last[
+                $(( macro_bytes_arg_block_first_last_index + 1 ))]}
+
+            # Pass such call such block argument converted to a standard
+            # argument (i.e., as a single-quoted string, thus implicitly
+            # quote-protecting all shell-reserved characters in such block).
+            ZESHY__MACRO_FUNC_CALL+=${(qq)ZESHY__CODE_PREPROCESS[
+                ${macro_byte_arg_block_first},
+                ${macro_byte_arg_block_prior_last}]}
+        }
+
+        #FIXME: Append all remaining standard arguments preceding the optional
+        #suffixing here-document or -string.
+        if [[ ]] {
+            ZESHY__MACRO_FUNC_CALL+=
+        }
+    }
 }
 
 # --------------------( WASTELANDS                         )--------------------
+            # macro_byte_arg_block_last=${macro_bytes_arg_block_first_last[$((
+            #     macro_bytes_arg_block_first_last_index + 1 ))]}
+
+        # for macro_byte_arg_block_first macro_byte_arg_block_last (
+        #     "${macro_bytes_arg_block_first_last[,-1]}") {
+
+        #FUXME: Implement me.
+
+        # If such macro was passed a here-document or -string on standard
+        # input, pass such input to such call as a single-quoted here-string.
+        #FUXME: Correct me. We probably want to embed new byte indices
+        #corresponding to the first and last byte indices of such here string.
+        #The latter is simply ${ZPCRE_OP[(w)2]}; the former is the latter minus
+        #the byte length of such match.
+        #FUXME: Alternatively, perhaps we should simply copy such match into a
+        #string list item of the same list. Since empty standard input is
+        #indistinguishable from no standard input, perhaps this is the ideal
+        #approach. It certainly seems simpler, if slightly less efficient. (Or
+        #perhaps not, since we'll be taking a string slice and hence copy
+        #anyway later if not here?)
+        #FUXME: This necessitates modifying ${macro_byte_last} above to
+        #strictly precede such byte indices, implying such integer should be
+        #renamed to ${macro_byte_args_last}.
+
+        # If such macro was passed a here-document or -string on standard
+        # input, record such string for the third preprocessor phase.
+        # if [[ -n ${ZESHY__CODE_PREPROCESS[
+        #     ${ZESHY_MACRO_MATCH_INDEX_HERE_DOC_OR_STRING}]} ]] {
+        #     macro_byte_here_first=
+        #     macro_byte_here_last=
+        # }
+
+        # If such macro was passed a here-document or -string on standard
+        # input, record such string for the third preprocessor phase.
+        # if [[ -n ${ZESHY__CODE_PREPROCESS[
+        #     ${ZESHY_MACRO_MATCH_INDEX_HERE_DOC_OR_STRING}]} ]] {
+        #     macro_bytes_first_name_last[1]+=( )
+        # }
+
+  # delimited by
+            # "'" characters and properly
+            # internally escaped).
+# Hence, we need not add such
+            # whitespace manually.
+    # Byte indices of the first and last characters of the previously matched block argument
+    # passed to such macro  if any or the first character following the last
+    # character of such macro's name otherwise.
+
+    #FUXME: Still require this? Excise us!
+
+    # Byte index into such code.
+    # integer macro_byte
+
             # Since the character preceding such match is guaranteed to be a non-UTF-8 whitespace character, incrementing such byte
             # index by 1 is safe.
 
@@ -485,12 +608,12 @@ function ::code.preprocess() {
     # If such list size is *NOT* a factor of three, such list does *NOT*
     # consist of byte index triples. In such case, throw an exception. (While
     # this should never be the case, an ounce of prevention...)
-    # (( ${#macros_bytes_first_name_last} % 3 == 0 )) || :die
-    #     'List ${macros_bytes_first_name_last} size '${#macros_bytes_first_name_last}' indivisible by 3.'
+    # (( ${#macro_bytes_first_name_last} % 3 == 0 )) || :die
+    #     'List ${macro_bytes_first_name_last} size '${#macro_bytes_first_name_last}' indivisible by 3.'
 
     #FUXME: Ugh. We really need the macro order of both
-    #${macros_bytes_first_name_last} and
-    #${macros_bytes_arg_block_first_last} to be synchronized, implying we
+    #${macro_bytes_first_name_last} and
+    #${macro_bytes_arg_block_first_last} to be synchronized, implying we
     #should probably implement such reversal above where we append to the
     #former. (Fairly clear, in hindsight.)
 
@@ -500,7 +623,7 @@ function ::code.preprocess() {
     # byte indices of block arguments passed to subsequent macros, the next
     # preprocessor phase must iterate macros in reverse order. To ensure this,
     # iterate such macros in reverse order here.
-    # for (( macro_byte=$(( ${#macros_bytes_first_name_last} - 2 ));
+    # for (( macro_byte=$(( ${#macro_bytes_first_name_last} - 2 ));
     #        macro_byte > 1;
     #        macro_byte+=-3 )) {
 
@@ -577,12 +700,12 @@ function ::code.preprocess() {
         # the first character following the last character of such macro's name
         # to the last character of the last argument passed to such macro.
         # ZPCRE_OP=$((
-        #     ${macros_bytes_first_name_last[$(( ${macro_byte} + 1 ))]} + 1
+        #     ${macro_bytes_first_name_last[$(( ${macro_byte} + 1 ))]} + 1
         # ))' '$((
-        #     ${macros_bytes_first_name_last[$(( ${macro_byte} + 2 ))]}
+        #     ${macro_bytes_first_name_last[$(( ${macro_byte} + 2 ))]}
         # ))
 
-           # macro_byte < ({${#macros_bytes_first_name_last}..1}) {
+           # macro_byte < ({${#macro_bytes_first_name_last}..1}) {
 
     # triple of
     # previously recorderd byte indices, in
@@ -590,7 +713,7 @@ function ::code.preprocess() {
 
     # In the first phase, iteratively match all preprocessor macros in the
     # passed code and append the corresponding match indices to list local
-    # ${macros_bytes_first_name_last}.
+    # ${macro_bytes_first_name_last}.
 
         # If either the byte indices of the last character of such macro and
         # such macro's name are equal, such macro is either a syntactically
@@ -598,7 +721,7 @@ function ::code.preprocess() {
         # latter
         # is a newline, such macro  *AND* 
         # (( macro_byte_last == macro_byte_name_last )) ||
-        # ${ZESHY__PREPROCESSOR_CODE} ]] || 
+        # ${ZESHY__CODE_PREPROCESS} ]] || 
 
         #FUXME: Perform crude validation here.
 #of the first and last non-whitespace macro characters.
@@ -610,7 +733,7 @@ function ::code.preprocess() {
         #in the next phase as well.
 
     # For each such match, append the following integers to list local
-    # ${macros_bytes_first_name_last}:
+    # ${macro_bytes_first_name_last}:
     #
     # * The index of the first non-whitespace byte of such macro (e.g., the ":"
     #   prefixing such macro's name).
