@@ -267,6 +267,197 @@ function ::code.preprocess() {
     pcre_compile -- "${ZESHY_MACRO_PCRE}"
     pcre_study
 
+    #FIXME: "-n ${ZPCRE_OP[(w)2]}" isn't quite right. We absolutely need to
+    #record byte indices for macros expanded within block arguments passed to
+    #top-level macros: e.g.,
+    #
+    #    :func :void :outer() {
+    #        :func :void :inner() {
+    #            print "Me! It's me!"
+    #        }
+    #    }
+    #
+    #While we *COULD* force each and every macro to explicitly call this
+    #function with each and every passed block argument, that seems exceedingly
+    #ungainly. Instead, since macros are line-bounded, simply start the next
+    #match at any byte index inclusively between the first and last characters
+    #of such line. For efficiency, we'd might as well choose the byte index of
+    #the last character of such macro's name, which we have access to below.
+    #FIXME: O.K.! The above change is both simple and correct. Unfortunately,
+    #we need to do more. Alot more. The reason why, of course, is that
+    #expanding an inner macro invalidates the last (but not first) byte indices
+    #of all outer macros containing such inner macro. Consider the following
+    #fairly minimal example:
+    #
+    #    :func :void :outer1() {
+    #         :func :void :inner1() {
+    #         }
+    #    }
+    #
+    #    :func :void :outer2() {
+    #         :func :void :mid1() {
+    #             :func :void :inner2() {
+    #             }
+    #         } {
+    #             :func :void :inner3() {
+    #             }
+    #         } <<'/---
+    #    /---
+    #         :func :void :mid2() {
+    #             :func :void :inner4() {
+    #             }
+    #         } {
+    #             :func :void :inner5() {
+    #             }
+    #         } <<'/---
+    #    /---
+    #    } <<'/---
+    #    /---
+    #
+    #In the third prepreprocessor phase, the order of macro expansion will be
+    #as follows:
+    #
+    #1. :inner2(), invalidating the last byte indices (of both the macro and
+    #   block arguments) of :mid() and :outer(). For each such macro, note that
+    #   the last byte indices of such macro and their block arguments differ.
+    #2. :inner1(), invalidating the same byte indices.
+    #3. :mid().
+    #4. :outer(), invalidating the last byte indices (of both the macro and
+    #   block arguments) of :outer().
+    #
+    #Solving such issue (hopefully) only requires changes to the third
+    #preprocessor phase. To generalize our way into a solution, let's begin at
+    #the simplest possible example:
+    #
+    #    :func :void :outer() {
+    #        :func :void :inner() {
+    #            print "Me! It's me!"
+    #        }
+    #    } <<'/---
+    #    /---
+    #
+    #If all macros followed such form, the following would suffice:
+    #
+    #* Declare two new integer locals:
+    #  * ${macro_byte_prior_last}, the byte index of the previously expanded
+    #    macro.
+    #  * ${macro_byte_offset}, the number of bytes by which to offset all
+    #    lexically subsequent byte indices of outer macros.
+    #* After replacing *ANY* macro, unconditionally:
+    #  * Set ${macro_byte_prior_last} to the original last byte index of the
+    #    current macro.
+    #  * Increment ${macro_byte_offset} by the difference of such macro's prior
+    #    length (as provided by its recorded first and last byte indices) and
+    #    replacement length.
+    #* Before converting *ANY* block argument into a string:
+    #  * If such argument's first byte index is strictly greater than
+    #    ${macro_byte_prior_last}, increment both such argument's first *AND*
+    #    last byte indices by ${macro_byte_offset}.
+    #  * Else if such argument's last byte index is strictly greater than
+    #    ${macro_byte_prior_last}, increment only such argument's last byte
+    #    index by ${macro_byte_offset}.
+    #* After converting all block arguments for the current macro:
+    #  * If such macro's last byte index is strictly greater than
+    #    ${macro_byte_prior_last}, increment only such macro's last byte index
+    #    by ${macro_byte_offset}.
+    #
+    #Unfortunately, a quandry remains. (We knew the above was simply too
+    #simple!) We need to discover when the current macro cannot have embedded
+    #the prior macro, as, in such case, ${macro_byte_offset} must be reset to
+    #0. We cannot simply leave such integer as is, as subsequent incrementation
+    #of such offset must start from 0.
+    #
+    #O.K.; so, we probably need two LIFO integer stacks. How about this:
+    #
+    #* Declare new integer locals:
+    #  * ${macro_byte_stack_index}, the current index into both of the two
+    #    stacks below. Initially set to 1, implying the default index.
+    #* Declare new list locals:
+    #  * ${macro_byte_stack_prior_last}, listing the last byte indices of all
+    #    (?) previously expanded macros.
+    #  * ${macro_byte_stack_offset}, listing the number of bytes by which to
+    #    offset all lexically subsequent byte indices of outer macros (defined
+    #    as macros with byte indices exceeding the corresponding list item of
+    #    ${macro_byte_stack_prior_last}).
+    #
+    #O.K.; it's clear that, while we can extend the current approach to get
+    #this working, the interleaving of inner macros with multiple block
+    #arguments passed to an outer macro complicates things. Fortunately, there
+    #appears to be a simple solution: refactor everything. Just kidding! Well,
+    #only sort of. We *WILL* need to refactor the current approach we take to
+    #constructing the macro function call. Rather than appending the arguments
+    #to such function to a string local, we *REALLY* instead want to convert
+    #block arguments into single-quoted strings *IN-PLACE* in the code to be
+    #preprocessed -- in effect, using such code as a temporary storage buffer.
+    #What's sweet about this approach is that the macro function to be called
+    #needn't be programmatically constructed! After converting all block
+    #arguments for such function (and adjusting byte indices accordingly, of
+    #course), we simply evaluate the substring of such code identified by such
+    #delimiting byte indices.
+    #
+    #That said, is "adjusting byte indices accordingly" after converting a
+    #block argument as simple as we make it out to be? Probably, but consider.
+    #
+    #In any case, this approach requires that we *INTERLEAVE* byte indices for
+    #both entire macros and block arguments into a single list. For obvious
+    #reasons, byte indices for all block arguments passed to a macro will need
+    #to appear *BEFORE* byte indices for such macro in such list. To
+    #differentiate between byte indices for macros and byte indices for block
+    #arguments in such list, we'll need to suffix the former (of which there
+    #will presumably be fewer) with an identifying character -- say, ".".
+    #
+    #So, what does this give us? Well, since we've interleaved the two, we no
+    #probably longer need the excrutiatingly convoluted map-based data
+    #structures we were contemplating. Minor relief, anyway. We *WILL* still
+    #need the list-based stacks we were contemplating above, but such is life.
+    #
+    #Wait. We'll need to make additional changes to the second preprocessor
+    #phase to ensure that the byte indices for inner macros are interleaved
+    #with those of outer block arguments in a strictly increasing sorted
+    #manner. Ignoring "." suffixes (treat such strings as floats, perhaps?),
+    #the easiest means of achieving such ordering might be to simply sort such
+    #list afterwords with a zsh builtin. Although, that strikes us as fairly
+    #hacky. Or perhaps not? Yeah, probably not. After all, how the heck could
+    #we manually ensure such sorting during PCRE-based iteration?
+    #
+    #Additionally, one nice aspect of sorting after-the-fact is that we can
+    #retain all of our existing data structures and logic for the first two
+    #phases (well, don't forget to suffix macro indices by "."!) and simply
+    #define a new list local ${macro_bytes} into which we sort the contents of
+    #the existing two lists of byte indices. (Alternately, we could tryp to
+    #keep a second list of byte indices mostly-sorted by ...
+    #
+    #Wait. Conventional sorting doesn't work, as we need to group last and
+    #first byte indices in a balanced manner. That said, we *COULD* split last
+    #and first byte indices into two discrete lists and then sort *THOSE*
+    #lists. We think, anyway. Contemplate further.
+    #
+    #Right. We should note that the two lists will be ordered in opposite
+    #directions. Rather than explicitly reverse one of them, however, simply
+    #index one with the negation of the indices used to index the other. Done!.
+    #
+    #That's it. Hurrah, hurrah!
+    #
+    #The above algorithm appears to smoothly scale to *ALL* nesting depths,
+    #which is certainly a relief. Consider:
+    #
+    #    :func :void :outer() {
+    #    } {
+    #        :func :void :inner() {
+    #            print "Me! It's me!"
+    #        }
+    #    } <<'/---
+    #    /---
+    #
+    #In this case, such inner macro invalidates only the last byte index of the
+    #last block argument of the outer macro. As generalization:
+    #
+    #* 
+    #
+    #Specifically:
+    #
+    #* Declare a new list local ${stack} serving as a LIFO stack.
+
     # For each macro matched from such code, record matched byte indices for
     # the next preprocessor phase.
     ZPCRE_OP='0 0'
@@ -321,6 +512,19 @@ function ::code.preprocess() {
         macro_byte_last=${ZPCRE_OP[(w)2]}
         macro_byte_name_last=$(( macro_byte_name_first + ${#macro_name} - 1 ))
 
+        #FIXME: Insufficient, as this fails to distinguish syntactically valid
+        #macros accepting no arguments from syntactically invalid macros
+        #accepting arguments. Can we actually distinguish between the two? The
+        #answer is a resounding "yup." By fortuitous design, PCRE actually
+        #captures groups matched in positive lookahead! This means that we can
+        #amend the current PCRE with positive lookahead immediately following
+        #the matched macro name. Such lookahead must be made optional, and
+        #should attempt to look ahead for one or more horizontal whitespace
+        #characters followed by exactly one non-whitespace character: e.g.,
+        #    local pcre_='(?=('${pcre_spaces}'\S)?)'
+        #If such captured group is nonempty *AND* the empty group signifying
+        #such macro to be syntactically valid was *NOT* matched, then and only
+        #then have we positively identified such macro to be invalid. Sweet!
         #FIXME: Shift parcel ={*-get} here and explicitly source above.
 
         # If the empty group signifying such macro to be syntactically valid
@@ -482,6 +686,10 @@ function ::code.preprocess() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #Solving such issue can be split into two parts:
+    #
+    #1. Detecting such 
+
             # macro_byte_arg_block_last=${macro_bytes_arg_block_first_last[$((
             #     macro_bytes_arg_block_first_last_index + 1 ))]}
 
