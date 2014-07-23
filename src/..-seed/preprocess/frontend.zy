@@ -1,0 +1,187 @@
+#!/usr/bin/env zeshy
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "LICENSE" for additional details.
+#
+#FIXME: Convert into parcel documentation.
+# --------------------( SYNOPSIS                           )--------------------
+# Preprocess zeshy-specific code into zsh-specific code.
+
+#FIXME: Once we get a working preprocessor up, it becomes trivial to implement
+#support for eliding away debug-specific code under optimized builds. Simply
+#define a new macro :build.if_debug() accepting one and only one block
+#argument. Such macro behaves in the expected way:
+#
+#* If the current build is an optimized build, such macro unconditionally
+#  expands to the empty string.
+#* Else, such macro expands to the passed block argument verbatim.
+
+#FIXME: We'd *LOVE* to add support for command-line option-based syntax
+#checking (e.g., syntax checking scripts passed at the command-line when option
+#"--syntax-check" or some such is passed). Unfortunately, due to both
+#preprocessor macros and global aliases, getting from here to there will be
+#highly non-trivial. That said, we do have a few ideas on how to approach this.
+#
+#The fundamental issue is that of mapping from the post-processed line
+#numbers that zsh emits on syntax errors to the preprocessed line numbers
+#corresponding to the original scripts accepted by zeshy. On the face of it,
+#such issue would appear to be intractable -- until you conceive the crucial
+#trick, that is! So here we go. In full:
+#
+#* Define new command line options "-n" and "--syntax-check" acting as synonyms
+#  of each other. "-n" is the customary command-line option for syntax checking
+#  in literally *ALL* popular shells and hence should be followed here.
+#* On receiving either such option, do the following for each passed script (in
+#  exact order):
+#  . Prepreprocess such script's contents in a syntax validation-specific
+#    manner. Specifically (in exact order):
+#    . For each line of such contents *NOT* suffixed by the line continuation
+#      substring, suffix such line by:
+#      " # line ${line_number}", where ${line_number} is such line's number.
+#      Such comments serve as the basis for our subsequent mapping. (Clever.)
+#    . Prefix *ALL* such contents by the newline-delimited string list of
+#      all general aliases defined within the currently compiled digest file.
+#      We may also need to define *ALL* command aliases as well. Hopefully,
+#      however, it doesn't come to that.
+#  . Preprocess but do *NOT* evaluate such script's contents in the usual way.
+#  . Write the resulting code to a temporary file.
+#  . Syntax check such file by passing either option "-n" or "--no-exec"
+#    to zsh.
+#  . If zsh fails with nonzero exit status and reports an syntax error on
+#    standard error, such error will assume the following form:
+#    "${temporary_filename}:${line_number_plus_one}: ${error_message}"
+#    No surprises there, except for the ${line_number_plus_one}. zsh appears
+#    to emit a line number one greater than the actual line number of the
+#    erroneous line, as can be verified with a simple erroneous zsh script.
+#    So, we'll not only need to substract such line number by 1 but by the line
+#    length of all preceding general alias definitions. (Simple.)
+#  . In the event of a syntax error, examine the erroneous line of the
+#    postprocessed code string still in memory. If all went according to dismal
+#    plan, such line *SHOULD* be suffixed by a comment indicating the
+#    corresponding line number in the preprocessed original zeshy script,
+#    in which case we're done. If this is *NOT* the case, something went
+#    horribly wrong, implying the current zeshy process should probably throw
+#    a verbose exception.
+#
+#That actually doesn't seem terribly hard, now that we've purportedly uncovered
+#the essential trick of suffixing preprocessed lines by " # line" comments.
+#Give us a go, eh?
+
+# ....................{ DEPENDENCIES                       }....................
+::script_zsh.source_or_unwind_call_stack backend.zy pcre.zy
+
+# ....................{ GLOBALS                            }....................
+#FIXME: Document me.
+# Listset of all registered macros. 
+typeset -gaU ZESHY__MACRO_NAMES
+
+# ....................{ DECLARERS                          }....................
+#FIXME: Implement macro documentation support. This implies, of course, that
+#we'll need to shift early-time documentation functionality here. *sigh*
+#FIXME: Document me.
+
+# :void :macro[
+#     args =  (:string macro_name),
+#     stdin = (:string macro_asciidoc)]
+#
+# Declare the passed macro, documented by
+# http://asciidoc.org[AsciiDoc]-formatted standard input if passed or
+# undocumented otherwise. For convenience, consider passing such documentation
+# as a single- or double-quoted here-document: e.g.,
+#
+# == Macro Name Constraints ==
+#
+# For simplicity, macro names are constrained as follows: 
+function :macro() {
+    # Validate sanity.
+    (( # == 1 )) || :die 'Expected one macro name.'
+    local macro_name=${1}
+    [[ -n ${macro_name} ]] || :die 'Macro name empty.'
+
+    # If such name is *NOT* a valid macro name, throw an exception.
+    # Technically, we *COULD* permit *ANY* nonempty strings to be valid macro
+    # names (as is currently the case with alias and function names). Doing so,
+    # however, would substantially complicate subsequent:
+    #
+    # * PCRE generation. All "libpcre"-reserved characters in such name would
+    #   need to be explicitly escaped.
+    # * Code preprocessing. Since macro users would need to explicitly escape
+    #   all shell-reserved characters in such name *AND* since there exist
+    #   multiple means of escape such characters in zsh (e.g., "\"-prefixed
+    #   escapes and single- and double-quoted strings), matching all
+    #   permissible uses of such macro would require either:
+    #   * Matching all possible means of escape such characters.
+    #   * Matching only one such means, requiring macro users to only escape
+    #     such characters by such means.
+    #   * Matching *NO* such means, requiring macro users to *NEVER* escape
+    #     such characters. Since such preprocessing is *NOT* a zsh-compliant
+    #     parser, such requirement is implementable. Unfortunately, it also
+    #     introduces syntactic non-orthogonalities between the zsh parser and
+    #     zeshy preprocessor. In other words, it's highly problematic.
+    #
+    # The latter is, arguably, the greater concern. While correcting the former
+    # issue is certainly (albeit annoyingly) feasible, correcting the latter
+    # issue is considerably less feasible if not infeasible altogether. For the
+    # moment, sidestep such issues by prohibiting such characters.
+    [[ ${macro_name} == [a-zA-Z0-9-_:.]## ]] || :die\
+        'Macro name "'${macro_name}'" invalid. Consider renaming such macro to only contain letters and "_", "-", ".", and ":" characters.'
+
+    # If such macro has already been declared, throw an exception.
+    (( ${+ZESHY__MACRO_NAMES[${macro_name}]} == 0 )) || :die\
+        'Macro name "'${macro_name}'" already declared.'
+
+    # Declare such macro.
+    ZESHY__MACRO_NAMES+=${macro_name}
+
+    # Clear all previously generated preprocessor PCREs, forcing their
+    # regeneration on the next preprocessor call. Since such PCREs match and
+    # hence depend on the set of all macro names, declaring such macro
+    # invalidates such PCREs. (While we *COULD* do so here, deferring such
+    # regeneration prevents redundant regeneration in the common case of
+    # multiple adjacent macro declarations in a parcel.)
+    ::preprocessor_pcres.clear
+}
+
+# ....................{ SOURCERS                           }....................
+# :void :script.source(:string filename)
+function :script.source() {
+    # Validate sanity.
+    (( # == 1 )) || :die 'Expected one filename.'
+    local script_filename=${1} script_code
+    [[ -f ${script_filename} ]] || :die\
+        'Script "'${script_filename}'" not found or not a file.'
+
+    # To avoid modifying such script, localize such script's contents. For
+    # efficiency, do so via zsh module "mapfile" rather than customary
+    # alternatives (e.g., process substitution).
+    {
+        zmodload zsh/mapfile
+        script_code=${mapfile[${script_filename}]}
+    # Since such module is inherently unsafe, guarantee such module to be
+    # unloaded immediately after retrieving such code -- even in the event such
+    # retrieval induces an exception.
+    } always {
+        zmodload -ui zsh/mapfile
+    }
+
+    #FIXME: Nontrivial. We'll need to refactor
+    #get_shell_script_shebang_command_name_if_found() into a setter and shift
+    #the resulting function into a new parcel at this level. *sigh*
+    #FIXME: Probably, no. Just inline the corresponding code here.
+    #FIXME: Strip the prefixing shebang line from such code. Such line does
+    #*NOT* constitute interpretable zeshy code and must not be treated as such.
+
+    # If the first line of such code is *NOT* a shebang referencing the "zeshy"
+    # interpreter, throw an exception. Preprocessing and evaluating arbitrary
+    # bytes as valid zeshy code could have painful consequences and must be
+    # avoided at all costs.
+
+    # Preprocess such code.
+    local ZESHY__CODE_PREPROCESS=${script_code}
+    ::code.preprocess
+
+    # Execute such preprocessed code.
+    eval "${ZESHY__CODE_PREPROCESS}"
+}
+
+# --------------------( WASTELANDS                         )--------------------

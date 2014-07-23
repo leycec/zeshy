@@ -1,14 +1,353 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env zeshy
 # --------------------( LICENSE                            )--------------------
 # Copyright 2007-2014 by Cecil Curry.
-# See "COPYING" for additional details.
-#
-#FIXME: Convert into parcel documentation.
-# --------------------( SYNOPSIS                           )--------------------
-# Preprocess zeshy-specific code into zsh-specific code.
+# See "LICENSE" for additional details.
 
-#FIXME: O.K.; that's *EXACTLY* what we're going to do, but only as an interim
-#solution. The long-term solution, though a bit balls-crazy, is as follows:
+#FIXME: "-n ${ZPCRE_OP[(w)2]}" isn't quite right. We absolutely need to
+#record byte indices for macros expanded within block arguments passed to
+#top-level macros: e.g.,
+#
+#    :func :void :outer() {
+#        :func :void :inner() {
+#            print "Me! It's me!"
+#        }
+#    }
+#
+#While we *COULD* force each and every macro to explicitly call this
+#function with each and every passed block argument, that seems exceedingly
+#ungainly. Instead, since macros are line-bounded, simply start the next
+#match at any byte index inclusively between the first and last characters
+#of such line. For efficiency, we'd might as well choose the byte index of
+#the last character of such macro's name, which we have access to below.
+#FIXME: O.K.! The above change is both simple and correct. Unfortunately,
+#we need to do more. Alot more. The reason why, of course, is that
+#expanding an inner macro invalidates the last (but not first) byte indices
+#of all outer macros containing such inner macro. Consider the following
+#fairly minimal example:
+#
+#    :func :void :outer1() {
+#         :func :void :inner1() {
+#         }
+#    }
+#
+#    :func :void :outer2() {
+#         :func :void :mid1() {
+#             :func :void :inner2() {
+#             }
+#         } {
+#             :func :void :inner3() {
+#             }
+#         } <<'/---
+#    /---
+#         :func :void :mid2() {
+#             :func :void :inner4() {
+#             }
+#         } {
+#             :func :void :inner5() {
+#             }
+#         } <<'/---
+#    /---
+#    } <<'/---
+#    /---
+#
+#In the third prepreprocessor phase, the order of macro expansion will be
+#as follows:
+#
+#1. :inner2(), invalidating the last byte indices (of both the macro and
+#   block arguments) of :mid() and :outer(). For each such macro, note that
+#   the last byte indices of such macro and their block arguments differ.
+#2. :inner1(), invalidating the same byte indices.
+#3. :mid().
+#4. :outer(), invalidating the last byte indices (of both the macro and
+#   block arguments) of :outer().
+#
+#Solving such issue (hopefully) only requires changes to the third
+#preprocessor phase. To generalize our way into a solution, let's begin at
+#the simplest possible example:
+#
+#    :func :void :outer() {
+#        :func :void :inner() {
+#            print "Me! It's me!"
+#        }
+#    } <<'/---
+#    /---
+#
+#If all macros followed such form, the following would suffice:
+#
+#* Declare two new integer locals:
+#  * ${macro_byte_prior_last}, the byte index of the previously expanded
+#    macro.
+#  * ${macro_byte_offset}, the number of bytes by which to offset all
+#    lexically subsequent byte indices of outer macros.
+#* After replacing *ANY* macro, unconditionally:
+#  * Set ${macro_byte_prior_last} to the original last byte index of the
+#    current macro.
+#  * Increment ${macro_byte_offset} by the difference of such macro's prior
+#    length (as provided by its recorded first and last byte indices) and
+#    replacement length.
+#* Before converting *ANY* block argument into a string:
+#  * If such argument's first byte index is strictly greater than
+#    ${macro_byte_prior_last}, increment both such argument's first *AND*
+#    last byte indices by ${macro_byte_offset}.
+#  * Else if such argument's last byte index is strictly greater than
+#    ${macro_byte_prior_last}, increment only such argument's last byte
+#    index by ${macro_byte_offset}.
+#* After converting all block arguments for the current macro:
+#  * If such macro's last byte index is strictly greater than
+#    ${macro_byte_prior_last}, increment only such macro's last byte index
+#    by ${macro_byte_offset}.
+#
+#Unfortunately, a quandry remains. (We knew the above was simply too
+#simple!) We need to discover when the current macro cannot have embedded
+#the prior macro, as, in such case, ${macro_byte_offset} must be reset to
+#0. We cannot simply leave such integer as is, as subsequent incrementation
+#of such offset must start from 0.
+#
+#O.K.; so, we probably need two LIFO integer stacks. How about this:
+#
+#* Declare new integer locals:
+#  * ${macro_byte_stack_index}, the current index into both of the two
+#    stacks below. Initially set to 1, implying the default index.
+#* Declare new list locals:
+#  * ${macro_byte_stack_prior_last}, listing the last byte indices of all
+#    (?) previously expanded macros.
+#  * ${macro_byte_stack_offset}, listing the number of bytes by which to
+#    offset all lexically subsequent byte indices of outer macros (defined
+#    as macros with byte indices exceeding the corresponding list item of
+#    ${macro_byte_stack_prior_last}).
+#
+#O.K.; it's clear that, while we can extend the current approach to get
+#this working, the interleaving of inner macros with multiple block
+#arguments passed to an outer macro complicates things. Fortunately, there
+#appears to be a simple solution: refactor everything. Just kidding! Well,
+#only sort of. We *WILL* need to refactor the current approach we take to
+#constructing the macro function call. Rather than appending the arguments
+#to such function to a string local, we *REALLY* instead want to convert
+#block arguments into single-quoted strings *IN-PLACE* in the code to be
+#preprocessed -- in effect, using such code as a temporary storage buffer.
+#What's sweet about this approach is that the macro function to be called
+#needn't be programmatically constructed! After converting all block
+#arguments for such function (and adjusting byte indices accordingly, of
+#course), we simply evaluate the substring of such code identified by such
+#delimiting byte indices.
+#
+#That said, is "adjusting byte indices accordingly" after converting a
+#block argument as simple as we make it out to be? Probably, but consider.
+#
+#In any case, this approach requires that we *INTERLEAVE* byte indices for
+#both entire macros and block arguments into a single list. For obvious
+#reasons, byte indices for all block arguments passed to a macro will need
+#to appear *BEFORE* byte indices for such macro in such list. To
+#differentiate between byte indices for macros and byte indices for block
+#arguments in such list, we'll need to suffix the former (of which there
+#will presumably be fewer) with an identifying character -- say, ".".
+#
+#So, what does this give us? Well, since we've interleaved the two, we no
+#probably longer need the excrutiatingly convoluted map-based data
+#structures we were contemplating. Minor relief, anyway. We *WILL* still
+#need the list-based stacks we were contemplating above, but such is life.
+#
+#Wait. We'll need to make additional changes to the second preprocessor
+#phase to ensure that the byte indices for inner macros are interleaved
+#with those of outer block arguments in a strictly increasing sorted
+#manner. Ignoring "." suffixes (treat such strings as floats, perhaps?),
+#the easiest means of achieving such ordering might be to simply sort such
+#list afterwords with a zsh builtin. Although, that strikes us as fairly
+#hacky. Or perhaps not? Yeah, probably not. After all, how the heck could
+#we manually ensure such sorting during PCRE-based iteration?
+#
+#Additionally, one nice aspect of sorting after-the-fact is that we can
+#retain all of our existing data structures and logic for the first two
+#phases (well, don't forget to suffix macro indices by "."!) and simply
+#define a new list local ${macro_bytes} into which we sort the contents of
+#the existing two lists of byte indices. (Alternately, we could tryp to
+#keep a second list of byte indices mostly-sorted by ...
+#
+#Wait. Conventional sorting doesn't work, as we need to group last and
+#first byte indices in a balanced manner. That said, we *COULD* split last
+#and first byte indices into two discrete lists and then sort *THOSE*
+#lists. We think, anyway. Contemplate further.
+#
+#Right. We should note that the two lists will be ordered in opposite
+#directions. Rather than explicitly reverse one of them, however, simply
+#index one with the negation of the indices used to index the other. Done!
+#
+#Actually, not done. We can't both sorting such lists and expect them to
+#remain in sync. Clearly, only the following alternatives then apply:
+#
+#* Manually sort inner macro indices into outer macro and block argument
+#  indices. This would certainly work, but clearly incurs non-negligible
+#  time costs -- particularly as we begin employing more macros.
+#* Sort all indices after the fact by combining each pair of first and last
+#  indices into a single integer using fixed-point math. Somewhat
+#  astonishingly, zsh supports the full gamut of bit operations in
+#  arithmetic expansions. Moreover, there appears to be no meaningful upper
+#  limit on integer values. Sadly, we can't recall if there's a means of
+#  determining the maximum integer value programmatically. On my machine,
+#  here's what we find:
+#
+#  >>> :int j; (( j = (10*(10*10000000000000000)) )); print $(( [#10] j ))
+#  1000000000000000000
+#  >>> :int j; (( j = (10*(10*100000000000000000)) )); print $(( [#10] j ))
+#  -8446744073709551616
+#
+#We've clearly bisected the limit. This implies, however, that we can
+#divide the range. Ah; right. So, we're dealing with 64-bit integers (i.e.,
+#longs): e.g.,
+#
+#  >>> :int j; (( j = 1 << 63 )); print $(( [#16] j ))
+#  -0x8000000000000000
+#  >>> :int j; (( j = 1 << 64 )); print $(( [#16] j ))
+#  0x1
+#
+#This implies that we should reserve the upper 32 bits for the first byte
+#index and the lower 32 bits for the last byte index, further implying that
+#the maximum line number the zeshy preprocessor can support is:
+#
+#    4,294,967,295
+#
+#Clearly, such maximum will effectively guaranteeably *NEVER* be reached,
+#so we're actually fine here. (Still, that should be checked.)
+#
+#Oh, bother. We forgot about the terminating constant. (Ugh.) We'd somehow
+#need to ignore such constants for the purposes of sorting -- which isn't
+#going to happen, clearly. Alternatively, rather than embedding terminating
+#constants into such list, we *COULD* record the byte index pair of the
+#last block argument for each macro in a new map local for efficient
+#subsequent lookup. That should incur approximately the same costs as the
+#terminating integer approach, but allow us to sort the byte indices list.
+#
+#Oh, wait; that's silly. Simply embed the terminating constant as a boolean
+#bit in *EVERY* such integer.
+#
+#Oh, wait; under the new conception of aggregating macros and block
+#arguments together, we don't care *AT ALL* whether an argument is the last
+#or not. So, this whole issue goes up in fruitless smoke. Yay!
+#
+#Right. After contemplation, it's clear that we no longer care *AT ALL*
+#where the last block argument is. Instead, what we care about is
+#differentiating byte indice pairs for macros from block arguments. We
+#can't simply used floating point numbers for one, as floating point has
+#"holes" at larger integer ranges and hence behaves only as an
+#approximation. Instead, what we need to do is divide the 64-bit integer
+#space into an absurdly compact bit representation. While doing so, we must
+#take care to ensure that the resulting structure will remain sortable -- a
+#delicate balancing act. Can we do it? We believe we can. Consider:
+#
+#            First         Last        Boolean bits:
+#            byte index    byte index  01 if macro; 00 if block arg
+# 64 bit    /-----^-----\/-----^-----\/---^----\
+# integer =  High 31 bits Mid 31 bits Low 2 bits
+#
+#For sorting purposes, the first byte index must be allocated the high
+#bits. For orthogonality, the last byte index is allocated the middle
+#bits. The boolean bits are allocated all remaining space (despite
+#technically only requiring one bit of storage).
+#
+#Wait! Do we actually need boolean bits? Technically, no. Since the first
+#and last bytes of *ALL* block arguments are guaranteed to be "{" and "}",
+#testing such bytes suffices to distinguish macros from block arguments.
+#For simplicity, our first implementation should probably do exactly that.
+#Forego the boolean bits, for now! Going forward, however, it might be
+#prudent to optimize such testing with boolean bits. Contemplate later.
+#
+#Ah. Actually, we believe we *DO* need boolean bits -- but for hard
+#algorithmic purposes rather than merely optimization. In the algorithm
+#below, integer ${macro_byte_prior} records not merely the byte index pair
+#of the prior object but such object's *TYPE*, which must be conditionally
+#checked at certain points. So, there we have it: boolean bits to go.
+#
+#Ugh. Actually, we do appear to need at least three boolean values,
+#justifying the above allocation of two bits for such values. What's the
+#third such value? Here's a full list of all currently required bits:
+#
+#* "00", signifying a macro. The upper bits signify the byte index pair.
+#* "01", signifying a block argument. The upper bits signify the byte
+#  index pair.
+#* "10", signifying a terminating block argument. The upper bits signify
+#  only the byte index of such terminating block argument -- in whichever
+#  of the upper or middle 31 bits is more efficient to access. Oh! Right.
+#  For sorting purposes, we *MUST* use the upper 31 bits for this. 
+#
+#Yay! We no longer require boolean bits, as we've excised ${macro_byte_prior}
+#entirely. Given that, it's (more or less) trivial to simply test string bytes
+#instead to determine object types.
+#
+#Yes, we definitively need to record the positions of block arguments as a
+#"{"- and "}"-delimited conglomerate pair *AND* of only the latter such
+#delimiter. We require the former for expansion purposes, as we need to
+#know what to convert into a string. We require the latter for detection
+#purposes, because we otherwise have no means of detecting the depth to
+#which such objects are nested within other objects.
+#
+#Naturally, this implies that the second parse phase must now also record
+#the byte indices of individual terminating "}" delimiters. Simple.
+#
+#O.K.; integer precision depends on the machine but should always either
+#be 64 or 32 bits. As documented under "man zshmisc":
+#
+#"For integers, the shell is usually compiled to use 8-byte precision
+# where this is available, otherwise precision is 4 bytes. This can be
+# tested, for example, by giving the command
+# `print - $(( 12345678901 ))'; if the number appears unchanged, the
+# precision is at least 8 bytes."
+#
+#This can thus be tested as follows:
+#
+#    #FIXME: Define new function :int.set_system_bit_width() in the main
+#    #codebase implementing such logic. (Yay!)
+#    integer int_is_64_bit=$(( (1 << 31) > 0 ))
+#
+#Now, finally, the generalized solution to be applied in the third phase:
+#
+#* Declare new integer locals:
+#  * ${macro_byte_offset_stack_index}, the current index into the stack
+#    below. Initially set to 1, implying the default index. Actually, just
+#    name such integer ${macro_depth} -- as that's exactly what it is.
+#* Declare new list locals:
+#  * ${macro_byte_offset_stack}, listing the number of bytes by which to
+#    offset all lexically subsequent byte indices of outer macros (defined
+#    as macros with last byte indices exceeding that of
+#    ${macro_byte_prior}). Actually, perhaps name such list
+#    ${macro_depth_to_byte_offset}. It's *NOT* a stack under current usage.
+#    It does exactly what the new name reflects: it maps from deptch
+#    indices to byte offsets. Simple.
+#* On iterating to the next object:
+#  * If such object is a terminating "}" delimiter, then:
+#    * Increment ${macro_byte_offset_stack_index} by 1. (This is basically
+#      the only purpose of recording such delimiters.)
+#    * Immediately continue to the next object. Do *NOT* set
+#      ${macro_byte_prior} to such object's byte index pair, please.
+#  * Else if such object is a block argument, then (in order):
+#    . Set ${macro_byte_offset_stack[
+#          $(( macro_byte_offset_stack_index - 1 ))]} to
+#          ${macro_byte_offset_stack[${macro_byte_offset_stack_index}]}.
+#    . Set ${macro_byte_offset_stack[${macro_byte_offset_stack_index}]} to
+#      0.
+#    . Increment ${macro_byte_offset_stack_index} by -1. (For very minor
+#      efficiency, do this afterwards.)
+#    . Continue onward to expansion and glory!
+#* To expand either a macro *OR* block argument (in order):
+#  . Increment such object's *LAST* byte index by
+#    ${macro_byte_offset_stack[${macro_byte_offset_stack_index}]}.
+#    Its first byte index remains unchanged.
+#  . Expand such object in a type-specific manner, using such byte indices.
+#  . Increment ${macro_byte_offset_stack[${macro_byte_offset_stack_index}]}
+#    by the difference of such object's prior length (as provided by its
+#    recorded byte index pair) and replacement length.
+#
+#Hmm. Do we honestly still require ${macro_byte_prior}? That seems
+#increasingly superfluous; we only test it in one place above.
+#
+#O.K.; great! We've excised ${macro_byte_prior} and all (or most, anyway)
+#redundancies above, producing what would appear to be a very concise,
+#self-consistent algorithm. Let's give her a go, shall we?
+#
+#That's it. Hurrah, hurrah! The above algorithm appears to smoothly scale to
+#*ALL* nesting depths, which is certainly a relief.
+
+#FIXME: The long-term solution to function prototype optimization, though a bit
+#balls-crazy, is as follows:
 #
 #* Merge the principal PCRE (i.e., ${ZESHY_CALLABLE_PROTOTYPE_PCRE}) produced
 #  by ={*-soil/*-declare/*-pcre} into the principal PCRE produced by ={pcre}.
@@ -26,124 +365,6 @@
 #Only one way to find out whether "libpcre" will actually support a PCRE that
 #monstrously complex *AND* whether we can actually reliably debug that PCRE,
 #right? So, let's do this.
-#FIXME: Or perhaps not? The prior solution appears to work quite well, now.
-
-# ....................{ DEPENDENCIES                       }....................
-::script_zsh.source_or_unwind_call_stack pcre
-
-# ....................{ GLOBALS                            }....................
-#FIXME: Document me.
-# Listset of all registered macros. 
-typeset -gaU ZESHY__MACRO_NAMES
-
-# ....................{ DECLARERS                          }....................
-#FIXME: Implement macro documentation support. This implies, of course, that
-#we'll need to shift early-time documentation functionality here. *sigh*
-#FIXME: Document me.
-
-# :void :macro[
-#     args =  (:string macro_name),
-#     stdin = (:string macro_asciidoc)]
-#
-# Declare the passed macro, documented by
-# http://asciidoc.org[AsciiDoc]-formatted standard input if passed or
-# undocumented otherwise. For convenience, consider passing such documentation
-# as a single- or double-quoted here-document: e.g.,
-#
-# == Macro Name Constraints ==
-#
-# For simplicity, macro names are constrained as follows: 
-function :macro() {
-    # Validate sanity.
-    (( # == 1 )) || :die 'Expected one macro name.'
-    local macro_name=${1}
-    [[ -n ${macro_name} ]] || :die 'Macro name empty.'
-
-    # If such name is *NOT* a valid macro name, throw an exception.
-    # Technically, we *COULD* permit *ANY* nonempty strings to be valid macro
-    # names (as is currently the case with alias and function names). Doing so,
-    # however, would substantially complicate subsequent:
-    #
-    # * PCRE generation. All "libpcre"-reserved characters in such name would
-    #   need to be explicitly escaped.
-    # * Code preprocessing. Since macro users would need to explicitly escape
-    #   all shell-reserved characters in such name *AND* since there exist
-    #   multiple means of escape such characters in zsh (e.g., "\"-prefixed
-    #   escapes and single- and double-quoted strings), matching all
-    #   permissible uses of such macro would require either:
-    #   * Matching all possible means of escape such characters.
-    #   * Matching only one such means, requiring macro users to only escape
-    #     such characters by such means.
-    #   * Matching *NO* such means, requiring macro users to *NEVER* escape
-    #     such characters. Since such preprocessing is *NOT* a zsh-compliant
-    #     parser, such requirement is implementable. Unfortunately, it also
-    #     introduces syntactic non-orthogonalities between the zsh parser and
-    #     zeshy preprocessor. In other words, it's highly problematic.
-    #
-    # The latter is, arguably, the greater concern. While correcting the former
-    # issue is certainly (albeit annoyingly) feasible, correcting the latter
-    # issue is considerably less feasible if not infeasible altogether. For the
-    # moment, sidestep such issues by prohibiting such characters.
-    [[ ${macro_name} == [a-zA-Z0-9-_:.]## ]] || :die\
-        'Macro name "'${macro_name}'" invalid. Consider renaming such macro to only contain letters and "_", "-", ".", and ":" characters.'
-
-    # If such macro has already been declared, throw an exception.
-    (( ${+ZESHY__MACRO_NAMES[${macro_name}]} == 0 )) || :die\
-        'Macro name "'${macro_name}'" already declared.'
-
-    # Declare such macro.
-    ZESHY__MACRO_NAMES+=${macro_name}
-
-    # Clear all previously generated preprocessor PCREs, forcing their
-    # regeneration on the next preprocessor call. Since such PCREs match and
-    # hence depend on the set of all macro names, declaring such macro
-    # invalidates such PCREs. (While we *COULD* do so here, deferring such
-    # regeneration prevents redundant regeneration in the common case of
-    # multiple adjacent macro declarations in a parcel.)
-    ::preprocessor_pcres.clear
-}
-
-# ....................{ SOURCERS                           }....................
-# :void :script.source(:string filename)
-function :script.source() {
-    # Validate sanity.
-    (( # == 1 )) || :die 'Expected one filename.'
-    local script_filename=${1} script_code
-    [[ -f ${script_filename} ]] || :die\
-        'Script "'${script_filename}'" not found or not a file.'
-
-    # To avoid modifying such script, localize such script's contents. For
-    # efficiency, do so via zsh module "mapfile" rather than customary
-    # alternatives (e.g., process substitution).
-    {
-        zmodload zsh/mapfile
-        script_code=${mapfile[${script_filename}]}
-    # Since such module is inherently unsafe, guarantee such module to be
-    # unloaded immediately after retrieving such code -- even in the event such
-    # retrieval induces an exception.
-    } always {
-        zmodload -ui zsh/mapfile
-    }
-
-    #FIXME: Nontrivial. We'll need to refactor
-    #get_shell_script_shebang_command_name_if_found() into a setter and shift
-    #the resulting function into a new parcel at this level. *sigh*
-    #FIXME: Probably, no. Just inline the corresponding code here.
-    #FIXME: Strip the prefixing shebang line from such code. Such line does
-    #*NOT* constitute interpretable zeshy code and must not be treated as such.
-
-    # If the first line of such code is *NOT* a shebang referencing the "zeshy"
-    # interpreter, throw an exception. Preprocessing and evaluating arbitrary
-    # bytes as valid zeshy code could have painful consequences and must be
-    # avoided at all costs.
-
-    # Preprocess such code.
-    local ZESHY__CODE_PREPROCESS=${script_code}
-    ::code.preprocess
-
-    # Run such preprocessed code.
-    eval "${script_code}"
-}
 
 # ....................{ PREPROCESSORS                      }....................
 #FIXME: Arguably shift to a new parcel ={code} devoted to such operation.
@@ -181,10 +402,8 @@ function ::code.preprocess() {
     integer macro_byte_last
 
     # Byte indices of the first and last characters of the currently matched
-    # block argument passed to such macro. Since the former is a non-integer
-    # character constant on iterating past the last block argument passed to
-    # such macro, declare such indices to be strings rather than integers.
-    local macro_byte_arg_block_first macro_byte_arg_block_last
+    # block argument passed to such macro.
+    integer macro_byte_arg_block_first macro_byte_arg_block_last
 
     # Byte index of the last character of the previously matched block argument
     # passed to such macro if any or the first character following the last
@@ -266,197 +485,6 @@ function ::code.preprocess() {
     # Compile and optimize such PCRE. See for_string_text_matching_pcre:().
     pcre_compile -- "${ZESHY_MACRO_PCRE}"
     pcre_study
-
-    #FIXME: "-n ${ZPCRE_OP[(w)2]}" isn't quite right. We absolutely need to
-    #record byte indices for macros expanded within block arguments passed to
-    #top-level macros: e.g.,
-    #
-    #    :func :void :outer() {
-    #        :func :void :inner() {
-    #            print "Me! It's me!"
-    #        }
-    #    }
-    #
-    #While we *COULD* force each and every macro to explicitly call this
-    #function with each and every passed block argument, that seems exceedingly
-    #ungainly. Instead, since macros are line-bounded, simply start the next
-    #match at any byte index inclusively between the first and last characters
-    #of such line. For efficiency, we'd might as well choose the byte index of
-    #the last character of such macro's name, which we have access to below.
-    #FIXME: O.K.! The above change is both simple and correct. Unfortunately,
-    #we need to do more. Alot more. The reason why, of course, is that
-    #expanding an inner macro invalidates the last (but not first) byte indices
-    #of all outer macros containing such inner macro. Consider the following
-    #fairly minimal example:
-    #
-    #    :func :void :outer1() {
-    #         :func :void :inner1() {
-    #         }
-    #    }
-    #
-    #    :func :void :outer2() {
-    #         :func :void :mid1() {
-    #             :func :void :inner2() {
-    #             }
-    #         } {
-    #             :func :void :inner3() {
-    #             }
-    #         } <<'/---
-    #    /---
-    #         :func :void :mid2() {
-    #             :func :void :inner4() {
-    #             }
-    #         } {
-    #             :func :void :inner5() {
-    #             }
-    #         } <<'/---
-    #    /---
-    #    } <<'/---
-    #    /---
-    #
-    #In the third prepreprocessor phase, the order of macro expansion will be
-    #as follows:
-    #
-    #1. :inner2(), invalidating the last byte indices (of both the macro and
-    #   block arguments) of :mid() and :outer(). For each such macro, note that
-    #   the last byte indices of such macro and their block arguments differ.
-    #2. :inner1(), invalidating the same byte indices.
-    #3. :mid().
-    #4. :outer(), invalidating the last byte indices (of both the macro and
-    #   block arguments) of :outer().
-    #
-    #Solving such issue (hopefully) only requires changes to the third
-    #preprocessor phase. To generalize our way into a solution, let's begin at
-    #the simplest possible example:
-    #
-    #    :func :void :outer() {
-    #        :func :void :inner() {
-    #            print "Me! It's me!"
-    #        }
-    #    } <<'/---
-    #    /---
-    #
-    #If all macros followed such form, the following would suffice:
-    #
-    #* Declare two new integer locals:
-    #  * ${macro_byte_prior_last}, the byte index of the previously expanded
-    #    macro.
-    #  * ${macro_byte_offset}, the number of bytes by which to offset all
-    #    lexically subsequent byte indices of outer macros.
-    #* After replacing *ANY* macro, unconditionally:
-    #  * Set ${macro_byte_prior_last} to the original last byte index of the
-    #    current macro.
-    #  * Increment ${macro_byte_offset} by the difference of such macro's prior
-    #    length (as provided by its recorded first and last byte indices) and
-    #    replacement length.
-    #* Before converting *ANY* block argument into a string:
-    #  * If such argument's first byte index is strictly greater than
-    #    ${macro_byte_prior_last}, increment both such argument's first *AND*
-    #    last byte indices by ${macro_byte_offset}.
-    #  * Else if such argument's last byte index is strictly greater than
-    #    ${macro_byte_prior_last}, increment only such argument's last byte
-    #    index by ${macro_byte_offset}.
-    #* After converting all block arguments for the current macro:
-    #  * If such macro's last byte index is strictly greater than
-    #    ${macro_byte_prior_last}, increment only such macro's last byte index
-    #    by ${macro_byte_offset}.
-    #
-    #Unfortunately, a quandry remains. (We knew the above was simply too
-    #simple!) We need to discover when the current macro cannot have embedded
-    #the prior macro, as, in such case, ${macro_byte_offset} must be reset to
-    #0. We cannot simply leave such integer as is, as subsequent incrementation
-    #of such offset must start from 0.
-    #
-    #O.K.; so, we probably need two LIFO integer stacks. How about this:
-    #
-    #* Declare new integer locals:
-    #  * ${macro_byte_stack_index}, the current index into both of the two
-    #    stacks below. Initially set to 1, implying the default index.
-    #* Declare new list locals:
-    #  * ${macro_byte_stack_prior_last}, listing the last byte indices of all
-    #    (?) previously expanded macros.
-    #  * ${macro_byte_stack_offset}, listing the number of bytes by which to
-    #    offset all lexically subsequent byte indices of outer macros (defined
-    #    as macros with byte indices exceeding the corresponding list item of
-    #    ${macro_byte_stack_prior_last}).
-    #
-    #O.K.; it's clear that, while we can extend the current approach to get
-    #this working, the interleaving of inner macros with multiple block
-    #arguments passed to an outer macro complicates things. Fortunately, there
-    #appears to be a simple solution: refactor everything. Just kidding! Well,
-    #only sort of. We *WILL* need to refactor the current approach we take to
-    #constructing the macro function call. Rather than appending the arguments
-    #to such function to a string local, we *REALLY* instead want to convert
-    #block arguments into single-quoted strings *IN-PLACE* in the code to be
-    #preprocessed -- in effect, using such code as a temporary storage buffer.
-    #What's sweet about this approach is that the macro function to be called
-    #needn't be programmatically constructed! After converting all block
-    #arguments for such function (and adjusting byte indices accordingly, of
-    #course), we simply evaluate the substring of such code identified by such
-    #delimiting byte indices.
-    #
-    #That said, is "adjusting byte indices accordingly" after converting a
-    #block argument as simple as we make it out to be? Probably, but consider.
-    #
-    #In any case, this approach requires that we *INTERLEAVE* byte indices for
-    #both entire macros and block arguments into a single list. For obvious
-    #reasons, byte indices for all block arguments passed to a macro will need
-    #to appear *BEFORE* byte indices for such macro in such list. To
-    #differentiate between byte indices for macros and byte indices for block
-    #arguments in such list, we'll need to suffix the former (of which there
-    #will presumably be fewer) with an identifying character -- say, ".".
-    #
-    #So, what does this give us? Well, since we've interleaved the two, we no
-    #probably longer need the excrutiatingly convoluted map-based data
-    #structures we were contemplating. Minor relief, anyway. We *WILL* still
-    #need the list-based stacks we were contemplating above, but such is life.
-    #
-    #Wait. We'll need to make additional changes to the second preprocessor
-    #phase to ensure that the byte indices for inner macros are interleaved
-    #with those of outer block arguments in a strictly increasing sorted
-    #manner. Ignoring "." suffixes (treat such strings as floats, perhaps?),
-    #the easiest means of achieving such ordering might be to simply sort such
-    #list afterwords with a zsh builtin. Although, that strikes us as fairly
-    #hacky. Or perhaps not? Yeah, probably not. After all, how the heck could
-    #we manually ensure such sorting during PCRE-based iteration?
-    #
-    #Additionally, one nice aspect of sorting after-the-fact is that we can
-    #retain all of our existing data structures and logic for the first two
-    #phases (well, don't forget to suffix macro indices by "."!) and simply
-    #define a new list local ${macro_bytes} into which we sort the contents of
-    #the existing two lists of byte indices. (Alternately, we could tryp to
-    #keep a second list of byte indices mostly-sorted by ...
-    #
-    #Wait. Conventional sorting doesn't work, as we need to group last and
-    #first byte indices in a balanced manner. That said, we *COULD* split last
-    #and first byte indices into two discrete lists and then sort *THOSE*
-    #lists. We think, anyway. Contemplate further.
-    #
-    #Right. We should note that the two lists will be ordered in opposite
-    #directions. Rather than explicitly reverse one of them, however, simply
-    #index one with the negation of the indices used to index the other. Done!.
-    #
-    #That's it. Hurrah, hurrah!
-    #
-    #The above algorithm appears to smoothly scale to *ALL* nesting depths,
-    #which is certainly a relief. Consider:
-    #
-    #    :func :void :outer() {
-    #    } {
-    #        :func :void :inner() {
-    #            print "Me! It's me!"
-    #        }
-    #    } <<'/---
-    #    /---
-    #
-    #In this case, such inner macro invalidates only the last byte index of the
-    #last block argument of the outer macro. As generalization:
-    #
-    #* 
-    #
-    #Specifically:
-    #
-    #* Declare a new list local ${stack} serving as a LIFO stack.
 
     # For each macro matched from such code, record matched byte indices for
     # the next preprocessor phase.
@@ -599,9 +627,10 @@ function ::code.preprocess() {
             )
         }
 
-        # Append an arbitrary character constant terminating the sublist of
-        # argument block byte indices for such macro. (Hacks "R" Us.)
-        macro_bytes_arg_block_first_last+=';'
+        # Append an arbitrary non-positive integer constant terminating the
+        # sublist of block argument byte indices for such macro. (Hacks "R"
+        # Us.)
+        macro_bytes_arg_block_first_last+=0
     }
 
     # ..................{ PHASE ~ expand                     }..................
@@ -649,8 +678,9 @@ function ::code.preprocess() {
             macro_byte_arg_block_first=${macro_bytes_arg_block_first_last[
                 ${macro_bytes_arg_block_first_last_index}]}
 
-            # If such index is *NOT* the terminating character, proceed.
-            [[ ${macro_byte_arg_block_first} != ';' ]]
+            # If such index is *NOT* the terminating constant (i.e., zero),
+            # proceed.
+            (( macro_byte_arg_block_first ))
         } {
             # Pass such call all standard arguments (i.e., non-block arguments)
             # following the prior block argument and preceding the current
@@ -686,6 +716,60 @@ function ::code.preprocess() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#    :func :void :outer() {
+#    } {
+#        :func :void :inner() {
+#            print "Me! It's me!"
+#        }
+#    } <<'/---
+#    /---
+#
+#In this case, such inner macro invalidates only the last byte index of the
+#last block argument of the outer macro. As generalization:
+#
+#* 
+#
+#Specifically:
+#
+#* Declare a new list local ${stack} serving as a LIFO stack.
+
+    #* After converting all block arguments for the current macro:
+    #  * If such macro's last byte index is strictly greater than
+    #    ${macro_byte_prior_last}, increment only such macro's last byte index
+    #    by ${macro_byte_offset}.
+    #    . Increment such object's *LAST* byte index by
+    #      ${macro_byte_offset_stack[${macro_byte_offset_stack_index}]}.
+    #  . Add ${macro_byte_offset_stack[${macro_byte_offset_stack_index}]} to
+    #    such object's *LAST* byte index to obtain its new last byte index.
+    #  . Set ${macro_byte_prior} to such object's original byte index pair.
+    #  * Else if such object's *LAST* byte index is strictly greater than the
+    #    last byte index of ${macro_byte_prior} (which, in consideration,
+    #    should imply such object to be a block argument), then (in order):
+    #    . Increment such object's *LAST* byte index by
+    #      ${macro_byte_offset_stack[${macro_byte_offset_stack_index}]}.
+
+    #  * ${macro_byte_prior}, the byte index pair of the most recently expanded
+    #    macro preceding the current macro. A stack should *NOT* be required
+    #    here, if our meager analysis is correct.
+
+# Before expanding either a macro *OR* block argument (...although, :
+    #So, we make tests of whether a byte index pair refers to a block argument
+    #or not tests against 0 and hence more efficient than
+
+#    . Prefix *ALL* such contents by the following line:
+#      "${general_alias_definitions}
+#      "func ::script.code__${random_integer}() {"
+#    . Suffix *ALL* such contents by the following lines:
+#      "}
+#      ::script.code__${random_integer}", where:
+#      * ${random_integer} is a random integer guaranteeing the uniqueness of
+#        such
+
+#FUXME: Or perhaps not? The prior solution appears to work quite well, now.
+
+ # Since the former is a non-integer
+    # character constant on iterating past the last block argument passed to
+    # such macro, declare such indices to be strings rather than integers.
     #Solving such issue can be split into two parts:
     #
     #1. Detecting such 

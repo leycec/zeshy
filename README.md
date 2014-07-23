@@ -1,7 +1,7 @@
 zeshy
 ===========
 
-`zeshy` is a **dynamic high-level shell scripting language** both implemented *and* interpreted in pure `zsh`.
+`zeshy` is a **high-level shell scripting language** both implemented *and* interpreted in pure [zsh](http://zsh.org).
 
 ## An Open Letter (to an Unlikely Readership)
 
