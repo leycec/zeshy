@@ -346,6 +346,57 @@
 #That's it. Hurrah, hurrah! The above algorithm appears to smoothly scale to
 #*ALL* nesting depths, which is certainly a relief.
 
+#FIXME: O.K.; so, the above solution is actually fairly shoddy for a number of
+#reasons. For one, we don't actually need or even want to unconditionally
+#expand all nested macros. We only want to expand nested macros that survive
+#the expansion process. If one considers the typical macro accepting two or
+#more block arguments, it's fair to say that most nested macros will *NOT*
+#survive expansion and hence should be ignored rather than unconditionally
+#expanded before expansion.
+#
+#So, how we do effect that? Retain the existing algorithm in full, with the
+#following fairly minor tweaks:
+#
+#* Drop the use of terminating character constant ";". Instead, simply iterate
+#  block arguments until the first byte index of the current block argument
+#  exceeds the last byte index of the current macro, in which case such
+#  iteration should continue to the next macro.
+#* Wrap all *THREE* preprocessor phases in stack-based iteration (a while loop,
+#  perhaps?). This should be the *ONLY* stack-based iteration in the entire
+#  algorithm. Such iteration behaves as follows:
+#  * Declare a new list local ${ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST} (or
+#    some such). As with existing list locals, such list consists *ONLY* of
+#    consecutive pairs of first and last byte indices for substrings of the
+#    passed code to be preprocessed in reverse lexical order. (That last
+#    constraint is particularly critical; as elsewhere, iterating in reverse
+#    lexical order ensures we don't have to laboriously maintain byte offsets).
+#  * Initialize ${ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST} before iteration to
+#    the byte length of such code: e.g.,
+#    ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST=( 1 ${#ZESHY__CODE_PREPROCESS} )
+#  * Iterate such list in a manner respecting the fact that such list will be
+#    updated in-place during iteration: e.g.,
+#    integer ZESHY__MACRO_BYTE_PREPROCESS_FIRST
+#    integer ZESHY__MACRO_BYTE_PREPROCESS_LAST
+#    while (( ${#ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST} )) {
+#        # At the very beginning of such iteration, pop the top pair of # byte
+#        # indices off such stack.
+#        ZESHY__MACRO_BYTE_PREPROCESS_FIRST=${ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST[1]}
+#        ZESHY__MACRO_BYTE_PREPROCESS_LAST=${ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST[2]}
+#        ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST[1,2]=()
+#
+#        # Inject the three existing preprocessor phases here...
+#    }
+#  * Immediately after expanding a macro in-place into the passed code, append
+#    the first and last byte indices of the resulting expansion in such code
+#    to the end of ${ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST}. (O.K.; so we're
+#    actually employing such list as a queue rather than stack.) Since the
+#    third phase iterates in reverse order, appending onto such list implicitly
+#    preserves reverse order, ensuring the first list item will remain the
+#    indices of the last expansion in such code. Yay!
+#
+# And... that's it. Extraordinarily simpler, isn't it? A shame we didn't
+# stumble onto this technique sooner, but later is better than never.
+
 #FIXME: The long-term solution to function prototype optimization, though a bit
 #balls-crazy, is as follows:
 #
@@ -370,7 +421,6 @@
 #FIXME: Document me.
 
 # ....................{ PREPROCESSORS                      }....................
-#FIXME: Arguably shift to a new parcel ={code} devoted to such operation.
 #FIXME: Optimize by globalizing locals. (You know the code-cadenced drill.)
 #FIXME: Document me. In particular, note that the caller must define string
 #local ${ZESHY__CODE_PREPROCESS}.
@@ -379,6 +429,13 @@
 function ::code.preprocess() {
     # Validate sanity.
     (( # == 0 )) || :die 'Expected no arguments.'
+
+    # If this function call is recursive, throw an exception. For both
+    # efficiency and implementation sanity, this function assumes macro
+    # expansions to *NOT* call this function. See TRAPZERR().
+    (( ${funcstack[(I)::code.preprocess]-1} == 1 )) ||
+    [[ ${funcsourcetrace[${funcstack[(I)::code.preprocess]}]-} == *':0' ]] ||
+        :die 'Non-recursive function ::code.preprocess() called recursively.'
 
     # If such variable is undefined or not a string, throw an exception. See
     # :var.die_unless_type_string().
@@ -459,67 +516,7 @@ function ::code.preprocess() {
     # Such list circumvents zsh's current inability to nest PCRE-based
     # iteration, permitting matches in the second preprocessor phase to be
     # accessed in the third preprocessor phase. (Angel of death, take us now.)
-
-    #FIXME: Excise.
     local -a macro_bytes_arg_block_first_last
-
-    # List of byte indices of the first characters of parsed constructs in
-    # reverse lexical order (i.e., reverse of the order such constructs
-    # appear in the passed code). There exist three types of constructs:
-    #
-    # * Macros, comprising such macros' name and all arguments passed to such
-    #   macros.
-    # * Block arguments, comprising all text inclusive between such arguments'
-    #   prefixing "{" and suffixing "}" delimiters.
-    # * Block arguments' "}" delimiters, comprising only such characters.
-    #
-    # The second phase creates such list; the third phase iterates such list,
-    # circumventing the current inability to nest PCRE-based iterations in zsh.
-    #
-    # Listing byte indices for both block arguments as a whole *AND* the "}"
-    # characters delimiting such arguments permits the code iterating such list
-    # to detect and respond to changes in macro nesting depth (i.e., the number
-    # of macros in which the current construct is nested).
-    #
-    # For each byte index of the first character of a parsed macro or block
-    # argument, the corresponding byte index of the last character of such
-    # construct is available from map ${ZESHY__MACRO_BYTE_FIRST_TO_LAST}.
-    local -a ZESHY__MACRO_BYTES_FIRST
-
-    # Map from the byte index of the first character of each parsed macro and
-    # block argument to the byte index of the last character of such construct.
-    #
-    # If such construct is a:
-    #
-    # * Macro:
-    #   * The first byte index is the index of the first character of such
-    #     macro's name.
-    #   * The last byte index is:
-    #     * If one or more arguments were passed to such macro, the last
-    #       character of the last such argument.
-    #     * Else, the last character of such macro's name.
-    # * Block argument:
-    #   * The first byte index is the index of the "{" prefixing such argument.
-    #   * The last byte index is the index of the "}" suffixing such argument.
-    # * Block argument "}" delimiter, the first *AND* last byte indices are the
-    #   index of such delimiter.
-    #
-    # Since block argument "}" delimiters comprise only a single ASCII
-    # character and hence byte, the first and last byte indices for such
-    # delimiters are guaranteed to be the same. For efficiency, this map omits
-    # such identity mappings.
-    local -A ZESHY__MACRO_BYTE_FIRST_TO_LAST
-
-    # 1-based index into list ${ZESHY__MACRO_DEPTH_TO_BYTE_OFFSET}, signifying
-    # the current block argument depth (i.e., number of block arguments in
-    # which the currently parsed construct is nested).
-    integer ZESHY__MACRO_DEPTH=1
-
-    # Map from block argument depth to parent byte offset (i.e., number of
-    # bytes by which the last byte index of constructs containing the current
-    # construct should be offset). Since such depth is guaranteed to be
-    # 1-based, such map is implemented as a list for efficiency.
-    local -a ZESHY__MACRO_DEPTH_TO_BYTE_OFFSET
 
     # If preprocessor PCREs have yet to be generated or require regeneration
     # (e.g., due to the declaration of new macros), do so.
@@ -779,6 +776,74 @@ function ::code.preprocess() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # List of byte indices of the first characters of parsed constructs in
+    # reverse lexical order (i.e., reverse of the order such constructs
+    # appear in the passed code). There exist three types of constructs:
+    #
+    # * Macros, comprising such macros' name and all arguments passed to such
+    #   macros.
+    # * Block arguments, comprising all text inclusive between such arguments'
+    #   prefixing "{" and suffixing "}" delimiters.
+    # * Block arguments' "}" delimiters, comprising only such characters.
+    #
+    # The second phase creates such list; the third phase iterates such list,
+    # circumventing the current inability to nest PCRE-based iterations in zsh.
+    #
+    # Listing byte indices for both block arguments as a whole *AND* the "}"
+    # characters delimiting such arguments permits the code iterating such list
+    # to detect and respond to changes in macro nesting depth (i.e., the number
+    # of macros in which the current construct is nested).
+    #
+    # For each byte index of the first character of a parsed macro or block
+    # argument, the corresponding byte index of the last character of such
+    # construct is available from map ${ZESHY__MACRO_BYTE_FIRST_TO_LAST}.
+    # local -a ZESHY__MACRO_BYTES_FIRST
+
+    # Map from the byte index of the first character of each parsed macro and
+    # block argument to the byte index of the last character of such construct.
+    #
+    # If such construct is a:
+    #
+    # * Macro:
+    #   * The first byte index is the index of the first character of such
+    #     macro's name.
+    #   * The last byte index is:
+    #     * If one or more arguments were passed to such macro, the last
+    #       character of the last such argument.
+    #     * Else, the last character of such macro's name.
+    # * Block argument:
+    #   * The first byte index is the index of the "{" prefixing such argument.
+    #   * The last byte index is the index of the "}" suffixing such argument.
+    # * Block argument "}" delimiter, the first *AND* last byte indices are the
+    #   index of such delimiter.
+    #
+    # Since block argument "}" delimiters comprise only a single ASCII
+    # character and hence byte, the first and last byte indices for such
+    # delimiters are guaranteed to be the same. For efficiency, this map omits
+    # such identity mappings.
+    # local -A ZESHY__MACRO_BYTE_FIRST_TO_LAST
+
+    # 1-based index into list ${ZESHY__MACRO_DEPTH_TO_BYTE_OFFSET}, signifying
+    # the current block argument depth (i.e., number of block arguments in
+    # which the currently parsed construct is nested).
+    # integer ZESHY__MACRO_DEPTH=1
+
+    # Map from block argument depth to parent byte offset (i.e., number of
+    # bytes by which the last byte index of constructs containing the current
+    # construct should be offset). Since such depth is guaranteed to be
+    # 1-based, such map is implemented as a list for efficiency.
+    # local -a ZESHY__MACRO_DEPTH_TO_BYTE_OFFSET
+
+    #FUXME: Guard against reentrancy; that is, throw an exception if the
+    #current function is already on the function call stack. See :die().
+
+#FUXME: Arguably shift to a new parcel ={code} devoted to such operation.
+
+#FUXME: There exists one possible large-scale optimization remaining -- but
+#it's only an optimization and not at all required for proper algorithm
+#iteration. Rather than expanding in-place into the passed code, it could
+#conceivably be more efficient to 
+
     #FUXME: The current approach basically doesn't work on systems providing
     #only 32-bit integers. Why? Because subdividing 32 bits in half only
     #permits us to index zeshy scripts at most 16KB in size. (Think
