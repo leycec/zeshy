@@ -7,15 +7,6 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Define PCREs required by preprocessors.
 
-#FIXME: We should probably augment such PCREs to also capture optional here-
-#documents and -strings passed to such macros and then pass either sort of
-#string to such macro function on standard input as a simple here-string. The
-#current approach is rather kludgy, it should be admitted. It's also not
-#terribly general; after all, macros should be able to modify their output
-#based on whether or not they were passed standard input as well as the exact
-#content of that input. (It's only sensible, and not terribly difficult to
-#implement, given current here-document and -string syntax support.)
-
 #FIXME: ${ZESHY_MACRO_PCRE} should be generalized to explicitly match all
 #ignorable code containing macro-like syntax (e.g., strings, variable
 #expansions) preceding non-ignorable macros. However, this is also fraught with
@@ -68,16 +59,6 @@ function ::preprocessor_pcres.make() {
     #the backtracking-capable version working first and then attempt to
     #optimize into the backtracking-incapable version.
     #FIXME: Similarly, most instances of "*" and "+" may be suffixed by "+".
-
-    #FIXME: Sadly, we're fairly confident we need to back out most subroutine
-    #calls below. The reason, of course, is inefficiency. PCRE appears to treat
-    #subroutines as genuine boundaries for certain purposes; in particular,
-    #PCRE copies all match groups prior to a subroutine call and then restores
-    #such groups after such call. Hence, while subroutines are a fantastic
-    #means of enabling recursion *AND* isolating match groups, they should be
-    #avoided for all other purposes. Since we extensively leverage recursion
-    #below, we *DO* need to retain subroutine support -- but only for these
-    #specific purposes.
 
     # PCRE options. Dismantled, this is:
     #
@@ -141,6 +122,58 @@ function ::preprocessor_pcres.make() {
     # but must still be matched as a variable expansion. This prevents
     # unmatched syntactically invalid constructs from being catastrophically
     # matched as syntactically valid delimiters.
+    #
+    # The PCRE matching double-quoted strings provides a minimum length example
+    # correcting such issues:
+    #
+    #     local pcre_quotes_double='"(?:\\[\\"$`]|[^"$`]|(?&sub)|[^"])*"'
+    #
+    # Let's pick this apart. In order:
+    #
+    # 1. "\\[\\"$`]", matching any relevant escaped character, where the
+    #    meaning of "relevant" depends on the current syntactic construct.  In
+    #    the case of double-quoted strings, these are:
+    #    * An escaped backslash, preventing such backslash from escaping the
+    #      following character.
+    #    * An escaped '"' delimiter, preventing such delimiter from terminating
+    #      such match.
+    #    * An escaped "$" or "`" character, preventing such character from
+    #      initiating a variable expansion, arithmetic substitution, or process
+    #      substitution (as matched by the following subroutine call).
+    # 2. "[^"$`]", matching any irrelevant character, where the meaning of
+    #    "irrelevant" is the inverse of the meaning of "relevant" above
+    #    excluding backslashes. Since the prior alternative matched all
+    #    relevant escaped characters, all remaining escaped characters and
+    #    hence backslashes are irrelevant. Since the last alternative is a
+    #    fallback matching all characters excluding '"' delimiters, this
+    #    alternative is technically redundant. However, the following
+    #    alternative is a PCRE subroutine call -- which, by definition, incurs
+    #    non-negligible space and time costs. Since such call should be
+    #    performed *ONLY* if necessary, this alternative matches all characters
+    #    guaranteed *NOT* to be matched by such call.
+    # 3. "(?&sub)", matching any variable expansion, arithmetic substitution,
+    #    or process substitution. All such syntactic constructs are recursively
+    #    nestable and hence matchable only with subroutine calls. (Since
+    #    double-quoted strings are only indirectly recursively nestable, such
+    #    call is replacable in this specific case by the contents of the
+    #    corresponding PCRE ${pcre_substitutable}. In the general case,
+    #    however, subroutine calls are typically required.)
+    # 4. "[^"]", a fallback matching any unmatched character *NOT* the
+    #    terminating '"' delimiter. Assuming the prior alternatives matched
+    #    such syntactic construct correctly, this should be equivalent to
+    #    matching any unescaped "$" or "`" character. For robustness, it's
+    #    simplest to match any non-delimiter.
+    #
+    # Syntactic constructs delimited by substrings longer than a single
+    # character require negative lookahead to properly match. Since such
+    # lookahead is comparatively inefficient, defer such lookahead to the final
+    # alternative in the PCRE matching such constructs: e.g.,
+    #
+    #     # Instead of this...
+    #     local pcre_math_substitution_new='\$\(\((?:\\[\\)$`]|(?!\)\))(?:[^)$`]|(?&sub)|.))*\)\)'
+    #
+    #     # ...just do this.
+    #     local pcre_math_substitution_new='\$\(\((?:\\[\\)$`]|[^)$`]|(?&sub)|(?!\)\)).)*\)\)'
 
     # Line continuation (i.e., an unescaped backslash followed by a newline),
     # continuing the command corresponding to the current line to the next
@@ -149,7 +182,7 @@ function ::preprocessor_pcres.make() {
     local pcre_line_continuation='(?<!\\)\\\R'
 
     # Zero or more consecutive line continuations.
-    local pcre_line_continuations_optional='(?:'${pcre_line_continuation}')*'
+    local pcre_line_continuations_optional='(?:'${pcre_line_continuation}'(?:\\\R)*)?'
 
     #FIXME: Slightly erroneous. We make the dangerous assumption in
     #::code.preprocess() that such PCRE matches only ASCII characters. Clearly,
@@ -180,13 +213,50 @@ function ::preprocessor_pcres.make() {
     local pcre_spaces=${pcre_line_continuations_optional}'\h'${pcre_spaces_optional}
 
     # ..................{ MACRO ~ sub                        }..................
+    # Possibly recursively nested variable expansion. While we would prefer
+    # *NOT* to capture such expansion, recursive pattern matching in "libpcre"
+    # requires interior back references to the outermost syntactic construct
+    # recapitulating such recursion. Such groups are recursion-specific and
+    # hence *MUST* be explicitly ignored for all other purposes.
+    #
+    # Since we prefix such PCRE by "$" below, avoid doing so here.
+    local pcre_var_expansion='\{(?:\\[\\}$`]|[^}$`]|(?&sub)|[^}])*\}'
+
+    # Possibly recursively nested arithmetic substitution.
+    local pcre_math_substitution_new='\((?:\\[\\)$`]|[^)$`]|(?&sub)|(?!\)\)).)*\)'
+    local pcre_math_substitution_old='\[(?:\\[\\]$`]|[^]$`]|(?&sub)|[^]])*\]'
+
+    # Possibly recursively nested process substitution.
+    local pcre_process_substitution_recursive='(?:\\[\\)''"$<`]|(?:[^)''"$<`]|(?&code)|[^)]))*'
+
+    # Possibly recursively nested arithmetic or process substitution.
+    local pcre_parens_substitution='\((?:'${pcre_math_substitution_new}'|'${pcre_process_substitution_recursive}')\)'
+
+    # Possibly recursively nested variable expansion or arithmetic or process
+    # substitution.
+    local pcre_dollar_substitution='\$(?:'${pcre_var_expansion}'|'${pcre_parens_substitution}'|'${pcre_math_substitution_old}')'
+
+    # Non-recursive process substitution. Since the named group "<sub>" matches
+    # non-recursive process substitution, such group *CANNOT* be referenced
+    # here. (Doing so would permit such substitutions to be recursively
+    # nested.) Instead, match all groups matched by such group excluding
+    # non-recursive process substitution.
+    local pcre_process_substitution_nonrecursive='`(?:\\[\\''"$<`]|(?!`)(?:[^''"$<`]|(?&code)|.))*`'
+
+    # Recursively substitutable or expandable syntactic construct. Since
+    # arithmetic substitution syntax greedily overlaps that of process
+    # substitution, the former *MUST* be matched prior to the latter.
+    local pcre_substitutable=${pcre_dollar_substitution}'|'${pcre_process_substitution_nonrecursive}
+    pcre_subroutines_body+='(?<sub>'${pcre_substitutable}')'
+
+    # ..................{ MACRO ~ code                       }..................
     # Single-quoted string *NOT* supporting escaped single quotes.
     local          pcre_quotes_single_inescapable="'[^']*+'"
     local pcre_quotes_single_inescapable_grouped="'([^']*+)'"
 
     # Double-quoted string *NOT* supporting escape prefix "\".
-    local          pcre_quotes_double_inescapable='"[^"]*+"'
-    local pcre_quotes_double_inescapable_grouped='"([^"\]*+)"'
+    local          pcre_quotes_double_inescapable='"[^"\\]*+"'
+    local pcre_quotes_double_inescapable_grouped='"([^"\\]*+)"'
 
     # Single-quoted string in zsh format and hence supporting escaped single
     # quotes (i.e., "''").
@@ -202,58 +272,14 @@ function ::preprocessor_pcres.make() {
     # a bug or unreliable implementation detail, however, we match
     # substitutables embedded in double quotes in the same manner as that of
     # substitutables embedded in other syntax (e.g., arithmetic substitutions).
-
-    #FIXME: Not right either here or below. All PCRE fragments of the form
-    #"[^"$`]|(?&sub)" *NEED* to be switched to
-    #"(?&sub)|[^"]". Simple, thankfully.
-    local pcre_quotes_double='"(?:\\[\\"$`]|[^"$`]|(?&sub))*"'
+    local pcre_quotes_double_prefix='"(?:\\[\\"$`]|[^"$`]|'
+    local pcre_quotes_double_suffix='|[^"])*"'
+    local pcre_quotes_double=${pcre_quotes_double_prefix}${pcre_substitutable}${pcre_quotes_double_suffix}
+    local pcre_quotes_double_noncode=${pcre_quotes_double_prefix}${pcre_substitutable_noncode}${pcre_quotes_double_suffix}
 
     # Single- or double-quoted string.
-    local pcre_quotes='(?:'${pcre_quotes_single}'|'${pcre_quotes_double}')'
+    local pcre_quotes=${pcre_quotes_single}'|'${pcre_quotes_double}
 
-    # Possibly recursively nested variable expansion. While we would prefer
-    # *NOT* to capture such expansion, recursive pattern matching in "libpcre"
-    # requires interior back references to the outermost syntactic construct
-    # recapitulating such recursion. Such groups are recursion-specific and
-    # hence *MUST* be explicitly ignored for all other purposes.
-    #
-    # Since we prefix such PCRE by "$" below, avoid doing so here.
-    local pcre_var_expansion_recursive='\{(?:\\[\\$}`]|[^$}`]|(?&sub))*\}'
-
-    #FIXME: Pointless. Excise, please.
-
-    # Non-recursive variable expansion *OR* a literal "$" character. To match
-    # the latter, match zero or more such characters. See
-    # ${ZESHY_VAR_NAME_GLOB}.
-    #
-    # Since we prefix such PCRE by "$" below, avoid doing so here.
-    local pcre_var_expansion_nonrecursive='[a-zA-Z_][a-zA-Z0-9_]*+'
-
-    # Variable expansion.
-    local pcre_var_expansion='(?:'${pcre_var_expansion_nonrecursive}'|'${pcre_var_expansion_recursive}')'
-
-    # Possibly recursively nested arithmetic substitution.
-    local pcre_math_substitution_new='\(\((?:\\[\\$`]|(?!\)\))[^$`]|(?&sub))*\)\)'
-    local pcre_math_substitution_old='\[(?:\\[\\]$`]|[^]$`]|(?&sub))*\]'
-    local pcre_math_substitution='(?:'${pcre_math_substitution_new}'|'${pcre_math_substitution_old}')'
-
-    # Possibly recursively nested process substitution.
-    local pcre_process_substitution_recursive='\((?:\\[\\)''"$<`]|(?!<<)[^)''"$`]|(?&code))*\)'
-
-    # Non-recursive process substitution. Since the named group "<sub>" matches
-    # non-recursive process substitution, such group *CANNOT* be referenced
-    # here. (Doing so would permit such substitutions to be recursively
-    # nested.) Instead, match all groups matched by such group excluding
-    # non-recursive process substitution.
-    local pcre_process_substitution_nonrecursive='`(?:\\[\\''"$<`]|(?!<<)[^''"$`]|(?!`)(?&code))*`'
-
-    # Recursively substitutable or expandable syntactic construct. Since
-    # arithmetic substitution syntax greedily overlaps that of process
-    # substitution syntax, match the former prior to the latter.
-    local pcre_substitutable='(?:\$(?:'${pcre_var_expansion}'|'${pcre_math_substitution}'|'${pcre_process_substitution_recursive}')|'${pcre_process_substitution_nonrecursive}')'
-    pcre_subroutines_body+='(?<sub>'${pcre_substitutable}')'
-
-    # ..................{ MACRO ~ code                       }..................
     # Character class matching shell-reserved characters.
     local char_class_reserved='''"$<>{}|`'
 
@@ -302,23 +328,28 @@ function ::preprocessor_pcres.make() {
     local pcre_spaces_with_words_nonhere_optional=${pcre_spaces}'(?:'${pcre_word_nonhere}${pcre_spaces}')*'
     local pcre_spaces_with_words_nonhere_optional_grouped='('${pcre_spaces_with_words_nonhere_optional}')'
 
-    # Here-document or -string. Unfortunately, matching all possible
-    # here-document strings is infeasible within the purview of a pure PCRE.
-    # Matching here-document delimiters embedding escaped characters (e.g.,
-    # '<<"mother\"destroyer"') requires unescaping such characters -- a simple
-    # operation that, by definition, exceeds the purview of pure PCREs.
+    # Here-document. Unfortunately, matching all possible here-document strings
+    # is infeasible within the purview of a pure PCRE.  Matching here-document
+    # delimiters embedding escaped characters (e.g., '<<"mother\"destroyer"')
+    # requires unescaping such characters -- a simple operation that, by
+    # definition, exceeds the purview of pure PCREs.
     #
     # Hence, match only the proper subset of here-document strings with
     # delimiters containing no escaped characters. Since few to no real-world
     # here-document strings (certainly, none zeshy itself leverages) require
     # delimiters containing escaped characters, this is moderately ignorable.
-    local pcre_here_doc_prefix='-?\s*+(?|'${pcre_quotes_single_inescapable_grouped}'|'${pcre_quotes_double_inescapable_grouped}'|'${pcre_word_unquoted_inescapable_grouped}')\R'
+    local pcre_here_doc_prefix_ignore='-?\s*+'
+    local pcre_here_doc_prefix=${pcre_here_doc_prefix_ignore}'(?|'${pcre_quotes_single_inescapable_grouped}'|'${pcre_quotes_double_inescapable_grouped}'|'${pcre_word_unquoted_inescapable_grouped}')\R'
+    local pcre_here_doc_quotes_prefix=${pcre_here_doc_prefix_ignore}'(?|'${pcre_quotes_single_inescapable_grouped}'|'${pcre_quotes_double_inescapable_grouped}')\R'
     local pcre_here_doc_body='.*?'
     local pcre_here_doc_suffix='\R(?-1)'
     local pcre_here_doc=${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
+    local pcre_here_doc_quotes=${pcre_here_doc_quotes_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
+
+    # Here-string.
     local pcre_here_string='<\s*+'${pcre_words_nonhere}
-    #FIXME: Implement me for use below.
-    local pcre_here_string_quotes_single='<\s*+'${pcre_words_nonhere}
+
+    # Here-document or -string.
     local pcre_here_prefix='<<'
     local pcre_here=${pcre_here_prefix}'(?:'${pcre_here_doc}'|'${pcre_here_string}')'
     local pcre_spaces_optional_here_optional='(?:'${pcre_spaces_optional}${pcre_here}')?'
@@ -328,7 +359,9 @@ function ::preprocessor_pcres.make() {
     # Unlike shell word matching, this does *NOT* include unquoted characters.
     pcre_subroutines_body+='(?<code>'${pcre_quotes}'|'${pcre_substitutable}'|'${pcre_here}')'
 
-    # ..................{ MACRO ~ name                       }..................
+    # ..................{ MACRO ~ macro                      }..................
+    #FIXME: Correct documentation.
+
     # Zero or more non-macro lines preceding a macro, ensuring macro-like lines
     # embedded in multi-line string contexts are ignored. Ideally, this would
     # comprise *ALL* such contexts, including double-quoted strings and
@@ -356,23 +389,23 @@ function ::preprocessor_pcres.make() {
     #
     # While non-ideal, it's unclear whether we can readily do better.
 
-    #FIXME: Incomplete, alas.
-    local pcre_macro_prefix='(?:'${pcre_quotes_single}'|'')'
-
-    #FIXME: Incorrect. We want to ignore preceding newlines prefixed by "\"
-    #(i.e., line continuations).
-
     # Macro indentation. Since *ALL* zeshy scripts are currently guaranteed to
     # be prefixed by a shebang line, all non-shebang and hence macro lines are
-    # guaranteed to be prefixed by a newline.
-    local pcre_macro_indentation='\R\h*+'
+    # guaranteed to be prefixed by a newline *NOT* prefixed by an unescaped
+    # backslash (i.e., line continuation).
+    local pcre_macro_prefix='\R\h*+'
 
     # Macro name, dynamically constructed from the current set of all declared
     # macro names. By macro design, such names are guaranteed to contain no
     # PCRE-reserved characters and hence require no escaping here. See :macro()
     # and :list.join_to_string_on_char().
-    local pcre_macro_name_grouped='((?&macro))'
-    pcre_subroutines_body+='(?<macro>'${(j:|:)ZESHY__MACRO_NAMES}')'
+
+    #FIXME: A minor issue. If ${ZESHY__MACRO_NAMES} is empty, the resulting
+    #PCRE will match in a fairly disastrous manner. Guard against such inept
+    #edge cases, please.
+
+    local pcre_macro_name=${(j:|:)ZESHY__MACRO_NAMES}
+    local pcre_macro_name_grouped='('${pcre_macro_name}')'
 
     # Block argument (i.e., "{"- and "}"-delimited substring containing
     # arbitrary zeshy code, including block arguments nested at deeper
@@ -383,15 +416,15 @@ function ::preprocessor_pcres.make() {
     #
     # Such "}" must be suffixed by at least one horizontal space or the end of
     # such code. To support macros accepting two or more consecutive argument
-    # blocks, merely assert this constraint with positive lookahead.
-    local pcre_macro_arg_block_prefix='\{'${pcre_spaces}''
-    local pcre_macro_arg_block_suffix=${pcre_spaces}'\}(?:'${pcre_spaces}'|\Z)'
-    local pcre_macro_arg_block_nested_body=${pcre_spaces}'(?&block)?|\\[\\{}''"$<`]|(?!<<)[^{}''"$`]|(?&code))'
-    local pcre_macro_arg_block_body='(?:(?!'${pcre_macro_arg_block_suffix}')'${pcre_macro_arg_block_nested_body}')*'
+    # blocks, avoid matching suffixing whitespace matched as prefixing
+    # whitespace by the subsequent such block by merely asserting this
+    # constraint with positive lookahead.
+    local pcre_macro_arg_block_prefix='\{'
+    local pcre_macro_arg_block_suffix_lookahead=${pcre_spaces}'|\Z'
+    local pcre_macro_arg_block_suffix='\}(?='${pcre_macro_arg_block_suffix_lookahead}')'
+    local pcre_macro_arg_block_body='(?:\\[\\}''"$<`]|'${pcre_spaces}'(?&block)?|[^}''"$<`]|(?&code)|[^}]|\}(?!'${pcre_macro_arg_block_suffix_lookahead}'))*'
     local pcre_macro_arg_block=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_body}${pcre_macro_arg_block_suffix}
-    # local pcre_macro_arg_block_grouped='('${pcre_macro_arg_block}')'
-    local pcre_macro_arg_block_nested=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_nested_body}${pcre_macro_arg_block_suffix}
-    pcre_subroutines_body+='(?<block>'${pcre_macro_arg_block_nested}')'
+    pcre_subroutines_body+='(?<block>'${pcre_macro_arg_block}')'
 
     # Zero or more arguments of any type. To assist the preprocessor in
     # differentating between syntactically valid macros accepting no arguments
@@ -404,6 +437,22 @@ function ::preprocessor_pcres.make() {
     # approach reigns.
     local pcre_macro_args_optional='(?:'${pcre_empty_group}${pcre_spaces}'(?:'${pcre_words_nonhere}'|'${pcre_macro_arg_block}'))*'
 
+    # Macro, comprising such macro's name and all passed arguments. To
+    # distinguish syntactically valid from invalid macros, all syntax following
+    # such name *MUST* be optional. For efficiency, such macro's mandatory
+    # prefixing newline is matched below.
+    local pcre_macro_grouped=${pcre_macro_name_grouped}${pcre_macro_args_optional}${pcre_spaces_optional_here_optional}
+
+    #FIXME: Actually, we *CAN* readily do better -- but doing so will require
+    #quite a bit of work. Basically, we'll need to duplicate each syntactic
+    #construct embedding other such constructs and prohibit embedding of
+    #process substitutions of any type. This doesn't necessarily need to entail
+    #PCRE duplication. It will, however, probably mean a doubling in the number
+    #of PCREs. See ${pcre_quotes_double_noncode} for a sensible approach, after
+    #we've completed an initial draft by the current approach.
+
+    local pcre_zsh_grouped='(?:\\[\v\\''<]|'${pcre_macro_prefix}'(?:'${pcre_macro_grouped}')?|[^''<]|'${pcre_quotes_single}'|'${pcre_here_doc_quotes}'|.))*'
+
     # ..................{ FUNCTION PROTOTYPE                 }..................
     #FIXME: Shift here from ={*-start/*-declare/*-pcre}.
 
@@ -415,7 +464,7 @@ function ::preprocessor_pcres.make() {
     # PCRE capturing the macro name and all block argument bodies in a
     # preprocessor macro. To distinguish syntactically valid from invalid
     # preprocessor macros, all syntax following the macro name is optional.
-    ZESHY_MACRO_PCRE=${pcre_options}${pcre_macro_indentation}${pcre_macro_name_grouped}${pcre_macro_args_optional}${pcre_spaces_optional_here_optional}${pcre_subroutines}
+    ZESHY_MACRO_PCRE=${pcre_options}${pcre_zsh_grouped}${pcre_subroutines}
 
     # PCRE capturing the next block argument body in a macro argument list,
     # prefixed by one or more horizontal whitespace characters followed by zero
@@ -462,6 +511,86 @@ function ::preprocessor_pcres.make() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: Incorrect. We want to ignore preceding newlines prefixed by "\"
+    #(i.e., line continuations). Hence, explicitly match line continuations in
+    #the PCRE immediately above.
+
+    #FUXME: ${pcre_line_continuations_optional} is somewhat inefficient here.
+    #By PCRE definition, we should't need to lookbehind. Or perhaps we do still
+    #need lookbehind? It's either that or lookahead. Hm; honestly, cutting
+    #${${pcre_line_continuations_optional}} *ENTIRELY* and then prefixing
+    #${pcre_macro_prefix} by a negative lookbehind assertion ensuring such
+    #newline to *NOT* be preceded by an unescaped backslash seems like the
+    #somewhat simpler and hence more efficient implementation, yes?
+#(?!'${pcre_macro_arg_block_suffix}')
+# ${pcre_spaces}${pcre_macro_arg_block_prefix}'|'
+
+#(?!<<)(?:
+#'${pcre_line_continuations_optional}'|
+    #FUXME: Implement me for use below.
+    # local pcre_here_string_quotes_single='<\s*+'${pcre_words_nonhere}
+
+    # local pcre_zsh_grouped='(?:'${pcre_line_continuations_optional}'|'${pcre_macro_prefix}'(?:'${pcre_macro_grouped}')?|(?!<<)(?:[^'']|'${pcre_quotes_single}'|.))*'
+
+# local pcre_line_continuations_optional='(?<!\\)(?:\\\R)*'
+    # local pcre_line_continuations_optional='(?:'${pcre_line_continuation}')*'
+
+    #FUXME: Improve similar negative lookahead assertions elsewhere.
+
+    #FUXME: Honestly, "(?!<<)" seems a bit silly. Ideally, since neither
+    #here-documents or strings are recursive, such substrings should be matched
+    #by an embedded PCRE here rather than a subroutine call.
+
+    # local pcre_math_substitution=${pcre_math_substitution_new}'|'${pcre_math_substitution_old}
+    #FUXME: For efficiency, combine this with ${pcre_math_substitution_new}.
+
+    #FUXME: Sadly, we're fairly confident we need to back out most subroutine
+    #calls below. The reason, of course, is inefficiency. PCRE appears to treat
+    #subroutines as genuine boundaries for certain purposes; in particular,
+    #PCRE copies all match groups prior to a subroutine call and then restores
+    #such groups after such call. Hence, while subroutines are a fantastic
+    #means of enabling recursion *AND* isolating match groups, they should be
+    #avoided for all other purposes. Since we extensively leverage recursion
+    #below, we *DO* need to retain subroutine support -- but only for these
+    #specific purposes.
+
+#FUXME: We should probably augment such PCREs to also capture optional here-
+#documents and -strings passed to such macros and then pass either sort of
+#string to such macro function on standard input as a simple here-string. The
+#current approach is rather kludgy, it should be admitted. It's also not
+#terribly general; after all, macros should be able to modify their output
+#based on whether or not they were passed standard input as well as the exact
+#content of that input. (It's only sensible, and not terribly difficult to
+#implement, given current here-document and -string syntax support.)
+
+    #FUXME: Not right either here or below. All PCRE fragments of the form
+    #"[^"$`]|(?&sub)" *NEED* to be switched to
+    #"(?&sub)|[^"]". Simple, thankfully.
+    #FUXME: Actually, we can achieve the best of both worlds as follows:
+    #    [^"$`]|(?&sub)|[^"]
+
+    # local pcre_macro_arg_block_prefix='\{'${pcre_spaces}''
+    # local pcre_macro_arg_block_suffix=${pcre_spaces}'\}(?:'${pcre_spaces}'|\Z)'
+    # local pcre_macro_arg_block_body='(?:(?!'${pcre_macro_arg_block_suffix}')'${pcre_macro_arg_block_nested_body}')*'
+    # local pcre_macro_arg_block_nested=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_nested_body}${pcre_macro_arg_block_suffix}
+    # pcre_subroutines_body+='(?<block>'${pcre_macro_arg_block_nested}')'
+
+    # pcre_subroutines_body+='(?<macro>'${(j:|:)ZESHY__MACRO_NAMES}')'
+
+    # local pcre_math_substitution='(?:'${pcre_math_substitution_new}'|'${pcre_math_substitution_old}')'
+
+    #FUXME: Pointless. Excise, please.
+
+    # Non-recursive variable expansion *OR* a literal "$" character. To match
+    # the latter, match zero or more such characters. See
+    # ${ZESHY_VAR_NAME_GLOB}.
+    #
+    # Since we prefix such PCRE by "$" below, avoid doing so here.
+    # local pcre_var_expansion_nonrecursive='[a-zA-Z_][a-zA-Z0-9_]*+'
+
+    # Variable expansion.
+    # local pcre_var_expansion='(?:'${pcre_var_expansion_nonrecursive}'|'${pcre_var_expansion_recursive}')'
+
     #FUXME: We probably expand such locals above. Correct circularities.
     #FUXME: Shift back above, actually.
 
