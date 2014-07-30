@@ -116,7 +116,23 @@ function ::preprocessor_pcres.make() {
     local pcre_subroutines_suffix=')'
     local pcre_subroutines_body
 
-    # ..................{ MACRO ~ space                      }..................
+    # ..................{ MACRO ~ class                      }..................
+    # Character class matching shell-reserved characters. Since vertical
+    # whitespace delimits commands and horizontal whitespace command arguments,
+    # this class matches *ALL* whitespace characters as well.
+    #
+    # Note that this class omits the conditionally shell-reserved characters
+    # "{" and "}". "{" is only shell-reserved when preceded by horizontal
+    # whitespace; "}" is only shell-reserved when followed by horizontal
+    # whitespace. Since this class is only interpolated into negative character
+    # classes, such classes exclude horizontal whitespace and hence "{" as a
+    # shell-reserved character. Hence, "{" need (and indeed *MUST*) not be
+    # listed in this class. "}", however, *MUST* be explicitly listed here and
+    # then subsequently matched outside such classes when *NOT* suffixed by
+    # horizontal whitespace. (Oh, shell life is complicated.) See below.
+    local char_class_reserved='\s''"$}<>|`'
+
+    # ..................{ MACRO ~ string                     }..................
     # Note that escaped backslashes (i.e., "\\") should *ALWAYS* be match
     # before attempting to match other escaped characters, as escaped
     # backslashes are *NOT* escape characters (e.g., "\\n" is an escaped
@@ -180,45 +196,32 @@ function ::preprocessor_pcres.make() {
     #     # ...just do this.
     #     local pcre_math_substitution_new='\$\(\((?:\\[\\)$`]|[^)$`]|(?&sub)|(?!\)\)).)*\)\)'
 
-    #FIXME: O.K.; so we're not necessarily convinced that lookbehinds are
-    #sufficient to match line continuations. Consider:
-    #
-    #    # Not a line continuation, due to being commented out.
-    #    >>> # \
-    #
-    #We need to closely examine where we're using such continuations.
+    # Block delimiter "{". As ${char_class_reserved} documents, such "{" must
+    # be prefixed by at least one horizontal whitespace character. Since *ALL*
+    # PCREs embedding such PCRE guarantee this, avoid matching whitespace here.
+    local pcre_block_prefix='\{'
 
-    # Line continuation (i.e., an unescaped backslash followed by a newline),
-    # continuing the command corresponding to the current line to the next
-    # line. As discussed above, newlines preceded by two backslashes are *NOT*
-    # line continuations and must *NOT* be matched as such.
-    local pcre_line_continuation='(?<!\\)\\$'
+    # Block delimiter "}". As ${char_class_reserved} documents, such "}" must
+    # be suffixed by at least one horizontal whitespace or newline character
+    # (optionally preceded by zero or more line continuations). To support
+    # macros accepting two or more consecutive argument blocks, avoid matching
+    # suffixing whitespace matched as prefixing whitespace by the next such
+    # block by merely asserting this constraint with positive lookahead.
+    local pcre_block_suffix_lookahead=${pcre_line_continuations_optional}'(?:\h|$)'
+    local pcre_block_suffix='\}(?='${pcre_block_suffix_lookahead}')'
 
-    # Zero or more consecutive line continuations.
-    local pcre_line_continuations_optional='(?:'${pcre_line_continuation}'(?:\\$)*)?'
+    # Non-block delimiter "}" (i.e., a "}" *NOT* followed by the syntax
+    # qualifying such "}" as a block delimiter).
+    local pcre_brace_right='\}(?!'${pcre_block_suffix_lookahead}')'
 
-    # One or more command-specific whitespace sequences (i.e., all substrings
-    # connoting whitespace *NOT* terminating the current command), including
-    # all whitespace except newlines *NOT* prefixed by "\". While "\"-prefixed
-    # newlines are line continuations preserving the current command,
-    # unprefixed newlines are effectively semicolons terminating such command.
-    local pcre_spaces_optional='(?:\h|'${pcre_line_continuation}')*'
-    local pcre_spaces=${pcre_line_continuations_optional}'\h'${pcre_spaces_optional}
+    # Unquoted shell word, comprising one or more shell-unreserved characters.
+    # As ${char_class_reserved} documents, character "}" when conditionally
+    # followed by horizontal whitespace is shell-reserved and must be excluded.
+    local pcre_word_unquoted='[^'${char_class_reserved}']++|'${pcre_brace_right}
 
-    # ..................{ MACRO ~ string                     }..................
-    # Character class matching shell-reserved characters.
-    local char_class_reserved='''"$<>{}|`'
-
-    # Unquoted shell word.
-    local pcre_word_unquoted+='[^\s'${char_class_reserved}']++'
-
-    # Unquoted inescapable shell word, comprising one or more arbitrary
-    # characters excluding:
-    #
-    # * Whitespace characters.
-    # * Shell-reserved characters.
-    # * Escape prefix "\".
-    local pcre_word_unquoted_literal='[^\s\\'${char_class_reserved}']++'
+    # Unquoted literal shell word, comprising one or more shell-unreserved,
+    # "\"-unescaped characters.
+    local pcre_word_unquoted_literal='[^'${char_class_reserved}'\\]++|'${pcre_brace_right}
     local pcre_word_unquoted_literal_grouped='('${pcre_word_unquoted_literal}')'
 
     # Single-quoted string *NOT* supporting escaped single quotes (i.e., "''").
@@ -229,7 +232,7 @@ function ::preprocessor_pcres.make() {
     # Double-quoted string containing no embedded constructs, including 
     # escape prefix "\", variable expansions, arithmetic substitutions, or
     # process substitutions.
-    local pcre_quotes_double_literal_body='[^"\\$`]*+'
+    local pcre_quotes_double_literal_body='[^"$\\`]*+'
     local pcre_quotes_double_literal='"'${pcre_quotes_double_literal_body}'"'
     local pcre_quotes_double_literal_grouped='"('${pcre_quotes_double_literal_body}')"'
 
@@ -247,7 +250,7 @@ function ::preprocessor_pcres.make() {
     # a bug or unreliable implementation detail, however, we match
     # substitutables embedded in double quotes in the same manner as that of
     # substitutables embedded in other syntax (e.g., arithmetic substitutions).
-    local pcre_quotes_double_prefix='"(?:\\[\\"$`]|[^"$`]|'
+    local pcre_quotes_double_prefix='"(?:[^"$\\`]++|\\["$\\`]|'
     local pcre_quotes_double_suffix='|[^"])*"'
     local pcre_quotes_double=${pcre_quotes_double_prefix}'(?&sub)'${pcre_quotes_double_suffix}
     local pcre_quotes_double_noncode=${pcre_quotes_double_prefix}'(?&varormath)'${pcre_quotes_double_suffix}
@@ -263,13 +266,10 @@ function ::preprocessor_pcres.make() {
     # here-document strings (certainly, none zeshy itself leverages) require
     # delimiters containing escaped characters, this is moderately ignorable.
     local pcre_here_doc_prefix_ignore='-?\s*+'
-    local pcre_here_doc_prefix=${pcre_here_doc_prefix_ignore}'(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}'|'${pcre_word_unquoted_literal_grouped}')$'
-    #FIXME: Excise this and ${pcre_here_doc_quotes}, when no longer required.
-    local pcre_here_doc_quotes_prefix=${pcre_here_doc_prefix_ignore}'(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}')$'
+    local pcre_here_doc_prefix=${pcre_here_doc_prefix_ignore}'(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}'|'${pcre_word_unquoted_literal_grouped}')\v'
     local pcre_here_doc_body='.*?'
-    local pcre_here_doc_suffix='$(?-1)'
+    local pcre_here_doc_suffix='^(?-1)'
     local pcre_here_doc=${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
-    local pcre_here_doc_quotes=${pcre_here_doc_quotes_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
 
     # Here-string prefix. Since here-strings are syntactically identical to
     # standard arguments (i.e., as one or more shell words) *AND* since
@@ -282,28 +282,24 @@ function ::preprocessor_pcres.make() {
     local pcre_here_prefix='<<'
     local pcre_here_doc_or_string_prefix=${pcre_here_prefix}'(?:'${pcre_here_string_prefix}'|'${pcre_here_doc}')'
 
-    #FIXME: We're fairly certain that our comment prefix still isn't quite
-    #right. Investigate: are comments immediately prefixed by line
-    #continuations comments? We suspect not. That said, the zeshy codebase
-    #doesn't currently contain any such monstrosities, so we can probably
-    #neglect this.
-
     # Comment, necessarily prefixed by either one or more horizontal whitespace
-    # characters *OR* the start of the current line. Note that the former
-    # constraint implies that comments must be explicitly matched *BEFORE*
-    # matching negative character classes implicitly matching whitespace.
-    local pcre_comment_prefix='(?:\h++|^\h*+)'
+    # characters *OR* the start of the current line. The former constraint
+    # implies that comments must be explicitly matched *BEFORE* horizontal
+    # whitespace. Likewise, the latter constraint implies that line
+    # continuations must be explicitly matched *BEFORE* comments.
+    local pcre_comment_prefix_spaces='\h++'
+    local pcre_comment_prefix='(?:'${pcre_comment_prefix_spaces}'|^\h*+)'
     local pcre_comment_body='#[^\v]*+$'
     local pcre_comment_body_optional='(?:'${pcre_comment_body}')?+'
     local pcre_comment_optional=${pcre_comment_prefix}${pcre_comment_body_optional}
 
-    #FIXME: And comments, please! Wait. Actually, comments probably have to be
-    #embedded directly into PCREs below due to matching prefixing whitespace.
-    #FIXME: Substitute me below for all instances of "(?&code)".
-
     # Shell code, comprising all syntactic constructs obstructing zeshy
     # preprocessing. Since unquoted shell words do *NOT* obstruct such
-    # preprocessing, ignore such words.
+    # preprocessing, ignore such words. Ideally, such PCRE would match
+    # comments. As comments require prefixing whitespace more efficiently
+    # matched together with similar prefixing whitespace required by other
+    # syntactic constructs (e.g., block arguments), however, comments are best
+    # matched explicitly by each PCRE below embedding this PCRE.
     local pcre_code=${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_here}'|(?&sub)'
 
     # ..................{ MACRO ~ sub                        }..................
@@ -314,18 +310,24 @@ function ::preprocessor_pcres.make() {
     # hence *MUST* be explicitly ignored for all other purposes.
     #
     # Since we prefix such PCRE by "$" below, avoid doing so here.
-    local pcre_var_expansion='\{(?:\\[\\}$`]|[^}$`]|(?&sub)|[^}])*\}'
 
-    # Possibly recursively nested arithmetic substitution.
-    local pcre_math_substitution_new='\((?:\\[\\)$`]|[^)$`]|(?&sub)|(?!\)\)).)*\)'
-    local pcre_math_substitution_old='\[(?:\\[\\]$`]|[^]$`]|(?&sub)|[^]])*\]'
+    #FIXME: Refactor inefficient negative character classes as follows both
+    #here and below, wherever applied:
 
-    #FIXME: The inefficient subroutine call "(?&code)" matches non-recursive
-    #constructs (e.g., single-quoted strings, here-documents, here-strings).
-    #Such constructs should simply be matched here with an embedded PCRE.
+    local pcre_var_expansion='\{(?:[^}$\\`]++|\\[}$\\`]|(?&sub)|[^}])*\}'
+
+    # Possibly recursively nested arithmetic substitution in both current
+    # (i.e., "$(("- and "))"-delimited) and obsolete (i.e., "$["- and "]"-
+    # delimited) forms.
+
+    #FIXME: Avoid repetition. We're seeing the following character classes
+    #heavily reused. Abstract out to a sensible string local above.
+
+    local pcre_math_substitution_new='\((?:[^)$\\`]++|\\[)$\\`]|(?&sub)|[^)]|\)(?!\))*\)'
+    local pcre_math_substitution_old='\[(?:[^\]$\\`]++|\\[\]$\\`]|(?&sub)|[^\]])*\]'
 
     # Possibly recursively nested process substitution.
-    local pcre_process_substitution_recursive='(?:\\[\\\s)''"$<#`]|'${pcre_comment_optional}'|(?:[^)''"$<#`]|(?&code)|[^)]))*'
+    local pcre_process_substitution_recursive='(?:[^\s)''"$\\<`]++|\\[\s)''"$\\<`]|'${pcre_comment_optional}'|'${pcre_code}'|[^)])*'
 
     # Possibly recursively nested arithmetic or process substitution.
     local pcre_parens_substitution='\((?:'${pcre_math_substitution_new}'|'${pcre_process_substitution_recursive}')\)'
@@ -339,9 +341,10 @@ function ::preprocessor_pcres.make() {
     # here. (Doing so would permit such substitutions to be recursively
     # nested.) Instead, match all groups matched by such group excluding
     # non-recursive process substitution.
-    local pcre_process_substitution_nonrecursive='`(?:\\[\\\s''"$<`]|'${pcre_comment_optional}'|(?!`)(?:[^''"$<`]|(?&code)|.))*`'
-
-    #FIXME: Still require ${pcre_substitutable}?
+    
+    #FIXME: Somewhat inefficient. The "(?!`)" really only needs to prefix the
+    #"(?&sub)" and "." alternatives.
+    local pcre_process_substitution_nonrecursive='`(?:[^\s''"$\\<`]++|\\[\s''"$\\<`]|'${pcre_comment_optional}'|(?!`)(?:'${pcre_code}'|.))*`'
 
     # Recursively substitutable or expandable syntactic construct. Since
     # arithmetic substitution syntax greedily overlaps that of process
@@ -349,47 +352,64 @@ function ::preprocessor_pcres.make() {
     local pcre_substitutable=${pcre_dollar_substitution}'|'${pcre_process_substitution_nonrecursive}
     pcre_subroutines_body+='(?<sub>'${pcre_substitutable}')'
 
-    # ..................{ MACRO ~ code                       }..................
-    # Shell word excluding here-documents and -strings, comprising one of the
-    # prior syntactic constructs. Ideally, this matches any standard argument
-    # passable to a zsh command. Here-documents and -strings are *NOT* freely
-    # mixable with standard arguments and hence unmatched here.
-    #
-    # Such PCRE interpolates the PCRE matching substitutables and hence must be
-    # declared *AFTER* the latter rather than with
-    local pcre_word_nonhere='(?:'${pcre_word_unquoted}'|'${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_substitutable}')'
-
-    # One or more such words.
-    local pcre_words_nonhere=${pcre_word_nonhere}'+'
-
-    # Such word *OR* one or more horizontal whitespace characters.
-    local pcre_word_nonhere_or_spaces='(?:'${pcre_word_nonhere}'|'${pcre_spaces}')'
-
-    # One or more such words *OR* horizontal whitespace characters, the first
-    # and last of which are also such words, thus permitting whitespace only
-    # between such words.
-    #
-    # The latter condition prevents this PCRE from matching substrings ending
-    # in a run of whitespace, ensuring such whitespace will be matched only as
-    # the non-optional whitespace prefixing a subsequent block argument if any
-    # or otherwise unmatched. In both zsh and zeshy, unquoted whitespace is
-    # significant only for argument delimitation. Hence, trailing unmatched
-    # whitespace is safely ignorable.
-    local pcre_words_nonhere_with_spaces_optional=${pcre_word_nonhere}'(?:'${pcre_spaces_optional}${pcre_word_nonhere}')*'
-
-    # One or more horizontal whitespace characters followed by zero or more
-    # such words. If one or more such words match, such words must be suffixed
-    # by one or more horizontal whitespace characters.
-    local pcre_spaces_with_words_nonhere_optional=${pcre_spaces}'(?:'${pcre_word_nonhere}${pcre_spaces}')*'
-    local pcre_spaces_with_words_nonhere_optional_grouped='('${pcre_spaces_with_words_nonhere_optional}')'
+    #FIXME: Fixmeplz. Actually, we're fairly certain we can excise this such
+    #subroutine, convert this back into a PCRE local, and shift above.
 
     # Shell code, comprising all syntactic constructs obstructing zeshy
     # preprocessing and hence parsing of unquoted "{" and "}" characters.
     # Unlike shell word matching, this does *NOT* include unquoted characters.
+    # pcre_subroutines_body+='(?<code>'${pcre_quotes_single}'|'${pcre_here}'|'${pcre_quotes_double}'|'${pcre_substitutable}')'
 
-    #FIXME: Fixmeplz. Actually, we're fairly certain we can excise this now.
+    # ..................{ MACRO ~ code                       }..................
+    #FIXME: O.K.; so we're not necessarily convinced that lookbehinds are
+    #sufficient to match line continuations. Consider:
+    #
+    #    # Not a line continuation, due to being commented out.
+    #    >>> # \
+    #
+    #We need to closely examine where we're using such continuations.
 
-    pcre_subroutines_body+='(?<code>'${pcre_quotes_single}'|'${pcre_here}'|'${pcre_quotes_double}'|'${pcre_substitutable}')'
+    # Line continuation (i.e., an unescaped backslash followed by a newline),
+    # continuing the command corresponding to the current line to the next
+    # line. As discussed above, newlines preceded by two backslashes are *NOT*
+    # line continuations and must *NOT* be matched as such.
+    local pcre_line_continuation='\\\v'
+    # local pcre_line_continuation='(?<!\\)\\\v'
+
+    # Zero or more consecutive line continuations.
+    local pcre_line_continuations_optional='(?:'${pcre_line_continuation}')*'
+
+    # One or more command-specific whitespace sequences (i.e., all substrings
+    # connoting whitespace *NOT* terminating the current command), including
+    # all whitespace except newlines *NOT* prefixed by "\". While "\"-prefixed
+    # newlines are line continuations preserving the current command,
+    # unprefixed newlines are effectively semicolons terminating such command.
+    local pcre_word_spaces_optional='(?:\h|'${pcre_line_continuation}')*'
+    local pcre_word_spaces=${pcre_line_continuations_optional}'\h'${pcre_word_spaces_optional}
+
+    # Shell word, comprising any of the prior syntactic constructs *NOT*
+    # prefixed by syntactic primitives. Such primitives break the standard
+    # "flow of control" that zsh parses arguments with. Since "<" is such a
+    # primitive, this excludes here-documents and -strings. Ideally, this
+    # includes all strings passable as a standard argument to a zsh command.
+    local pcre_word='(?:'${pcre_word_unquoted}'|'${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_substitutable}')'
+
+    # One or more shell words.
+    local pcre_words=${pcre_word}'+'
+
+    # One or more standard arguments, comprising one or more shell words all of
+    # which are delimited by shell word-specific whitespace. Such condition
+    # prevents whitespace suffixing the last such argument from being matched,
+    # ensuring such whitespace will be matched only as the mandatory whitespace
+    # prefixing a subsequent block argument if any or otherwise ignored. (Since
+    # unquoted whitespace is significant only for argument delimitation in both
+    # zsh and zeshy, trailing unmatched whitespace is safely ignorable.)
+    local pcre_args_zsh=${pcre_word}'(?:'${pcre_word_spaces_optional}${pcre_word}')*'
+
+    # Shell word-specific whitespace suffixed by zero or more standard
+    # arguments, each (including the last) suffixed by such whitespace.
+    local pcre_word_spaces_and_args_zsh_optional=${pcre_word_spaces}'(?:'${pcre_word}${pcre_word_spaces}')*'
+    local pcre_word_spaces_and_args_zsh_optional_grouped='('${pcre_word_spaces_and_args_zsh_optional}')'
 
     # ..................{ MACRO ~ macro                      }..................
     #FIXME: Correct documentation.
@@ -421,11 +441,13 @@ function ::preprocessor_pcres.make() {
     #
     # While non-ideal, it's unclear whether we can readily do better.
 
-    # Macro indentation. Since *ALL* zeshy scripts are currently guaranteed to
-    # be prefixed by a shebang line, all non-shebang and hence macro lines are
-    # guaranteed to be prefixed by a newline *NOT* prefixed by an unescaped
-    # backslash (i.e., line continuation).
+    # Macro prefix, anchoring the start of a macro to the start of a line
+    # followed by optional indentation (i.e., horizontal whitespace).
     local pcre_macro_prefix='^\h*+'
+
+    # Macro suffix, anchoring the end of a macro to the end of a line preceded
+    # by zero or more horizontal whitespace characters.
+    local pcre_macro_suffix='\h*+$'
 
     # Macro name, dynamically constructed from the current set of all declared
     # macro names. By macro design, such names are guaranteed to contain no
@@ -446,13 +468,10 @@ function ::preprocessor_pcres.make() {
     # blocks, avoid matching suffixing whitespace matched as prefixing
     # whitespace by the subsequent such block by merely asserting this
     # constraint with positive lookahead.
-    local pcre_macro_arg_block_prefix='\{'
-    local pcre_macro_arg_block_suffix_lookahead=${pcre_spaces}'|\Z'
-    local pcre_macro_arg_block_suffix='\}(?='${pcre_macro_arg_block_suffix_lookahead}')'
-    local pcre_macro_arg_block_or_comment_optional=${pcre_spaces}'(?:'${pcre_comment_body}'|'${pcre_macro_arg_block_prefix}'(?&block))?'
-    local pcre_macro_arg_block_body='(?:\\[\\\h}''"$<`]|'${pcre_macro_arg_block_or_comment_optional}'|[^}''"$<`]|(?&code)|[^}]|\}(?!'${pcre_macro_arg_block_suffix_lookahead}'))*'
-    local pcre_macro_arg_block=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_body}${pcre_macro_arg_block_suffix}
-    pcre_subroutines_body+='(?<block>'${pcre_macro_arg_block_body}${pcre_macro_arg_block_suffix}')'
+    local pcre_macro_arg_block_or_comment_optional=${pcre_word_spaces}'(?:'${pcre_comment_body}'|'${pcre_block_prefix}'(?&block))?'
+    local pcre_macro_arg_block_body='(?:[^\h}''"$\\<`]++|\\[\h}''"$\\<`]|'${pcre_macro_arg_block_or_comment_optional}'|'${pcre_code}'|[^}]|'${pcre_brace_right}')*'
+    local pcre_macro_arg_block=${pcre_block_prefix}${pcre_macro_arg_block_body}${pcre_block_suffix}
+    pcre_subroutines_body+='(?<block>'${pcre_macro_arg_block_body}${pcre_block_suffix}')'
 
     # Zero or more arguments of any type. To assist the preprocessor in
     # differentating between syntactically valid macros accepting no arguments
@@ -463,23 +482,22 @@ function ::preprocessor_pcres.make() {
     # by such PCRE, doing so has no demonstrable benefit over the current
     # approach while incurring minor time and space costs. So, the current
     # approach reigns.
-    local pcre_macro_args_optional='(?:'${pcre_empty_group}${pcre_spaces}'(?:'${pcre_words_nonhere}'|'${pcre_macro_arg_block}'))*'
+    local pcre_macro_args_optional='(?:'${pcre_empty_group}'(?:'${pcre_word_spaces}'(?:'${pcre_args_zsh}'|'${pcre_macro_arg_block}'))*)'
 
     # Here-string. While the here-string prefix "<<<" is ignorable for most
     # preprocessing purposes, here-strings suffixing macros *MUST* be matched
     # in full. Why? Because such here-strings *MUST* be passed on standard
     # input to such macros at expansion time.
-    local pcre_here_string=${pcre_here_string_prefix}${pcre_words_nonhere}
+    local pcre_here_string=${pcre_here_string_prefix}${pcre_words}
 
     # Here-document or -string.
     local pcre_here=${pcre_here_prefix}'(?:'${pcre_here_doc}'|'${pcre_here_string}')'
-    local pcre_spaces_optional_here_optional='(?:'${pcre_spaces_optional}${pcre_here}')?'
+    local pcre_word_spaces_optional_here_optional='(?:'${pcre_word_spaces_optional}${pcre_here}')?'
 
     # Macro, comprising such macro's name and all passed arguments. To
     # distinguish syntactically valid from invalid macros, all syntax following
-    # such name *MUST* be optional. For efficiency, such macro's mandatory
-    # prefixing newline is matched below.
-    local pcre_macro_grouped=${pcre_macro_name_grouped}${pcre_macro_args_optional}${pcre_spaces_optional_here_optional}
+    # such name is optional. For efficiency, match such macro's prefix below.
+    local pcre_macro_grouped=${pcre_macro_name_grouped}${pcre_macro_args_optional}${pcre_word_spaces_optional_here_optional}${pcre_macro_suffix}
 
     #FIXME: Actually, we *CAN* readily do better -- but doing so will require
     #quite a bit of work. Basically, we'll need to duplicate each syntactic
@@ -518,13 +536,9 @@ function ::preprocessor_pcres.make() {
     #let's do this, execrable though it may be.
 
     # Zero or more macros *OR* zsh syntax possibly containing macro-like
-    # substrings. Sadly, disambiguating the two requires explicitly matching
-    # both the former and latter.
-
-    #FIXME: Shift such "\h++" up into a new comment prefix PCRE.
-
-    local pcre_macro_or_comment_optional_grouped=${pcre_macro_prefix}'(?:'${pcre_comment_body}'|'${pcre_macro_grouped}')?|\h++(?:'${pcre_comment_body}')?'
-    local pcre_macros_or_code_optional_grouped='\A(?:\\[\\\s''"$<`]|'${pcre_macro_or_comment_optional_grouped}'|[^''"$<`]|(?&code)|.)*\Z'
+    # substrings. (Disambiguating the two requires explicitly matching both.)
+    local pcre_macro_or_comment_optional_grouped=${pcre_macro_prefix}'(?:'${pcre_comment_body}'|'${pcre_macro_grouped}')?|'${pcre_comment_prefix_spaces}'(?:'${pcre_comment_body}')?'
+    local pcre_macros_or_code_optional_grouped='\A(?:[^\s''"$\\<`]++|\\[\s''"$\\<`]|'${pcre_macro_or_comment_optional_grouped}'|'${pcre_code}'|.)*\Z'
 
     # If *NO* macros were previously registered, clear the prior PCRE to
     # prevent spurious or scurrilous preprocessor behaviour.
@@ -562,7 +576,7 @@ function ::preprocessor_pcres.make() {
     #   otherwise ignorable whitespace.
     # * Add the byte length of such substring to the byte index of the last
     #   character of the prior block argument.
-    ZESHY_MACRO_ARG_BLOCK_PCRE=${pcre_options_anchored}${pcre_spaces_with_words_nonhere_optional_grouped}${pcre_macro_arg_block}${pcre_subroutines}
+    ZESHY_MACRO_ARG_BLOCK_PCRE=${pcre_options_anchored}${pcre_word_spaces_and_args_zsh_optional_grouped}${pcre_macro_arg_block}${pcre_subroutines}
 
     # ..................{ INDICES                            }..................
     #FIXME: All such integers should be declared to be constants.
@@ -590,22 +604,104 @@ function ::preprocessor_pcres.make() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: And comments, please! Wait. Actually, comments probably have to be
+    #embedded directly into PCREs below due to matching prefixing whitespace.
+    #FUXME: Wait. Can't we just insert comments here and be done with it?
+    #FUXME: Substitute me below for all instances of "(?&code)".
+
+    #FUXME: The inefficient subroutine call "(?&code)" matches non-recursive
+    #constructs (e.g., single-quoted strings, here-documents, here-strings).
+    #Such constructs should simply be matched here with an embedded PCRE.
+
+    # One or more horizontal whitespace characters followed by zero or more
+    # such words. If one or more such words match, such words must be suffixed
+    # by one or more horizontal whitespace characters.
+
+#  Since the first
+    # and last such substrings are constrained to also be shell words,
+    # whitespace is permitted only between shell words.
+    # Such word *OR* word-delimiting whitespace.
+    # local pcre_word_or_spaces='(?:'${pcre_word}'|'${pcre_word_spaces}')'
+
+    # Such PCRE interpolates the PCRE matching substitutables and hence must be
+    # declared *AFTER* the latter.
+
+    # Here-documents and -strings are *NOT*
+    # freely mixable with standard arguments and hence unmatched here.
+
+    # ..................{ MACRO ~ space                      }..................
+
+    #FUXME: We're fairly certain that our comment prefix still isn't quite
+    #right. Investigate: are comments immediately prefixed by line
+    #continuations comments? We suspect not. That said, the zeshy codebase
+    #doesn't currently contain any such monstrosities, so we can probably
+    #neglect this.
+    #FUXME: We're fairly sure we match line continuations anywhere where we
+    #would also match comments. Verify this below.
+
+    #FUXME: Excise this and ${pcre_here_doc_quotes}, when no longer required.
+    # local pcre_here_doc_quotes_prefix=${pcre_here_doc_prefix_ignore}'(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}')$'
+    # local pcre_here_doc_quotes=${pcre_here_doc_quotes_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
+
+    #FUXME: "{" and "}" are *ONLY* shell-reserved when preceded and followed
+    #(respectively) by whitespace. This requires correcting. To ascertain a
+    #proper fix, examine where this character class is actually used.
+    #FUXME: Right. 
+
+#  excluding "}" as a shell-reserved
+    # character requires somewhat more finesse. ${pcre_word_unquoted}.
+    # local pcre_block_suffix_lookahead='$|'${pcre_word_spaces}
+    #FUXME: Use line continuation PCREs instead, once we correct them.
+
+    # local pcre_line_continuations_optional='(?:'${pcre_line_continuation}'(?:\\\v)*)?'
+
+    #FUXME: Use of ${pcre_word_spaces} is somewhat inefficient here. We only need to
+    #match up to the first horizontal whitespace.
+    #FUXME: Actually, it's also wrong. As the comment above indicates, such "}"
+    #must be suffixed by at least one horizontal whitespace *OR* newline
+    #character (optionally preceded by zero or more line continuations).
+    # local pcre_line_continuation='(?<!\\)\\\v'
+    # local pcre_line_continuations_optional='(?:'${pcre_line_continuation}'(?:\\\v)*)?'
+    # local pcre_word_spaces_optional='(?:\h|'${pcre_line_continuation}')*'
+    # local pcre_word_spaces=${pcre_line_continuations_optional}'\h'${pcre_word_spaces_optional}
+
+    #FUXME: Shift such "\h++" up into a new comment prefix PCRE.
+
+    # local pcre_macro_arg_block_prefix='\{'
+    # local pcre_macro_arg_block_suffix_lookahead=${pcre_word_spaces}'|\Z'
+    # local pcre_macro_arg_block_suffix='\}(?='${pcre_macro_arg_block_suffix_lookahead}')'
+
+#  Since *ALL* zeshy scripts are currently guaranteed to
+    # be prefixed by a shebang line, all non-shebang and hence macro lines are
+    # guaranteed to be prefixed by a newline *NOT* prefixed by an unescaped
+    # backslash (i.e., line continuation).
+    # excluding the escape prefix "\".
+# excluding:
+    #
+    # * Whitespace characters.
+    # * Shell-reserved characters
+    #FUXME: Still require ${pcre_substitutable}?
+
+    # local pcre_math_substitution_new='\((?:\\[\\)$`]|[^)$`]|(?&sub)|(?!\)\)).)*\)'
+    # local pcre_math_substitution_old='\[(?:\\[\\]$`]|[^]$`]|(?&sub)|[^]])*\]'
+    # local pcre_var_expansion='\{(?:\\[\\}$`]|[^}$`]|(?&sub)|[^}])*\}'
+
     #FUXME: Prefixing whitespace will need to be integrated with other PCREs.
 
     # local pcre_macros_or_code_optional_grouped='\A(?:\\[\v\\''<]|'${pcre_macro_prefix}'(?:'${pcre_macro_grouped}')?|[^''<]|'${pcre_quotes_single}'|'${pcre_here_doc_quotes}'|.)*\Z'
 
     #FUXME: Not quite right. We don't need to confine 
-    # local pcre_spaces_optional='(?:\h|'${pcre_line_continuation}')*'
-    # local pcre_spaces=${pcre_line_continuations_optional}'\h'${pcre_spaces_optional}
+    # local pcre_word_spaces_optional='(?:\h|'${pcre_line_continuation}')*'
+    # local pcre_word_spaces=${pcre_line_continuations_optional}'\h'${pcre_word_spaces_optional}
     # local pcre_comment_optional='\h++'${pcre_comment_body}
 
     #FUXME: Comment support, please!
-    # local pcre_macro_arg_block_nested=${pcre_spaces}'(?:'${pcre_macro_arg_block_prefix}'(?&block))?'
-    # local pcre_spaces_optional='(?:\h|'${pcre_line_continuation}')*'
-    # local pcre_spaces=${pcre_line_continuations_optional}'\h'${pcre_spaces_optional}
+    # local pcre_macro_arg_block_nested=${pcre_word_spaces}'(?:'${pcre_macro_arg_block_prefix}'(?&block))?'
+    # local pcre_word_spaces_optional='(?:\h|'${pcre_line_continuation}')*'
+    # local pcre_word_spaces=${pcre_line_continuations_optional}'\h'${pcre_word_spaces_optional}
     # local pcre_comment_optional='\h++'${pcre_comment_body}
 
-    # local pcre_macro_arg_block_nested=${pcre_spaces}'(?:'${pcre_macro_arg_block_prefix}'(?&block))?'
+    # local pcre_macro_arg_block_nested=${pcre_word_spaces}'(?:'${pcre_macro_arg_block_prefix}'(?&block))?'
     # local pcre_macro_arg_block_body='(?:\\[\\\h}''"$<`]|'${pcre_macro_arg_block_nested}'|[^}''"$<`]|(?&code)|[^}]|\}(?!'${pcre_macro_arg_block_suffix_lookahead}'))*'
 
     # local pcre_code_or_comment=${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_here}'|(?&sub)'
@@ -675,12 +771,12 @@ function ::preprocessor_pcres.make() {
     #newline to *NOT* be preceded by an unescaped backslash seems like the
     #somewhat simpler and hence more efficient implementation, yes?
 #(?!'${pcre_macro_arg_block_suffix}')
-# ${pcre_spaces}${pcre_macro_arg_block_prefix}'|'
+# ${pcre_word_spaces}${pcre_macro_arg_block_prefix}'|'
 
 #(?!<<)(?:
 #'${pcre_line_continuations_optional}'|
     #FUXME: Implement me for use below.
-    # local pcre_here_string_quotes_single='<\s*+'${pcre_words_nonhere}
+    # local pcre_here_string_quotes_single='<\s*+'${pcre_words}
 
     # local pcre_zsh_grouped='(?:'${pcre_line_continuations_optional}'|'${pcre_macro_prefix}'(?:'${pcre_macro_grouped}')?|(?!<<)(?:[^'']|'${pcre_quotes_single}'|.))*'
 
@@ -721,8 +817,8 @@ function ::preprocessor_pcres.make() {
     #FUXME: Actually, we can achieve the best of both worlds as follows:
     #    [^"$`]|(?&sub)|[^"]
 
-    # local pcre_macro_arg_block_prefix='\{'${pcre_spaces}''
-    # local pcre_macro_arg_block_suffix=${pcre_spaces}'\}(?:'${pcre_spaces}'|\Z)'
+    # local pcre_macro_arg_block_prefix='\{'${pcre_word_spaces}''
+    # local pcre_macro_arg_block_suffix=${pcre_word_spaces}'\}(?:'${pcre_word_spaces}'|\Z)'
     # local pcre_macro_arg_block_body='(?:(?!'${pcre_macro_arg_block_suffix}')'${pcre_macro_arg_block_nested_body}')*'
     # local pcre_macro_arg_block_nested=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_nested_body}${pcre_macro_arg_block_suffix}
     # pcre_subroutines_body+='(?<block>'${pcre_macro_arg_block_nested}')'
@@ -804,21 +900,21 @@ function ::preprocessor_pcres.make() {
     #    /---
 
     #FUXME: Not quite right. Rather than ineptly trying to coerce
-    #${pcre_words_nonhere_with_spaces_optional} and ${pcre_spaces} together, we probably
+    #${pcre_args_zsh} and ${pcre_word_spaces} together, we probably
     #probably want a new PCRE adroitly aggregating both.
-    # local pcre_spaces_words_nonhere_optional_grouped='('${pcre_spaces}'(?:'${pcre_words_nonhere_with_spaces_optional}${pcre_spaces}')?)'
+    # local pcre_word_spaces_words_optional_grouped='('${pcre_word_spaces}'(?:'${pcre_args_zsh}${pcre_word_spaces}')?)'
 
-    # local pcre_words_nonhere_with_spaces_optional=${pcre_word_nonhere}'(?:'$pcre_word_nonhere_or_spaces'*'${pcre_word_nonhere}')?'
-    # local pcre_words_nonhere_with_spaces_optional='(?:'${pcre_word_nonhere}'(?:(?:'${pcre_word_nonhere}'|'${pcre_spaces}')*'${pcre_spaces}')?)?'
+    # local pcre_args_zsh=${pcre_word}'(?:'$pcre_word_or_spaces'*'${pcre_word}')?'
+    # local pcre_args_zsh='(?:'${pcre_word}'(?:(?:'${pcre_word}'|'${pcre_word_spaces}')*'${pcre_word_spaces}')?)?'
 
     # Such PCRE implicitly requires backtracking and hence cannot be optimized
     # with atomic grouping.
-    # local pcre_spaces='(?:\h|\\\R)*\h(?:\h|\\\R)*'
+    # local pcre_word_spaces='(?:\h|\\\R)*\h(?:\h|\\\R)*'
 
         # ZESHY_MACRO_MATCH_INDEX_HERE_DOC_OR_STRING
-    # local pcre_words_nonhere_with_spaces_optional='(?:'${pcre_word_nonhere}'|'${pcre_spaces}')*'${pcre_word_nonhere}
+    # local pcre_args_zsh='(?:'${pcre_word}'|'${pcre_word_spaces}')*'${pcre_word}
 
-    #FUXME: We've mucked up, it would appear. Expansions of ${pcre_word_nonhere}
+    #FUXME: We've mucked up, it would appear. Expansions of ${pcre_word}
     #should have been expansions of this PCRE. (Ugh.)
 
     # local pcre_macro_args_optional_grouped='('${pcre_macro_args_optional}')'
@@ -876,33 +972,33 @@ function ::preprocessor_pcres.make() {
     # Zero or more arguments of any type. Since we match a run of shell words
     # greedily, avoid matching consecutive runs of shell words for efficiency.
 
-    # local pcre_macro_args_optional='(?:'${pcre_spaces}'(?:'${pcre_words_nonhere}'(?:(?&spaces)'${pcre_macro_arg_block}')?|'${pcre_macro_arg_block}'))*'
+    # local pcre_macro_args_optional='(?:'${pcre_word_spaces}'(?:'${pcre_words}'(?:(?&spaces)'${pcre_macro_arg_block}')?|'${pcre_macro_arg_block}'))*'
 
-    #FUXME: This may be optimizable by noting that ${pcre_words_nonhere}
+    #FUXME: This may be optimizable by noting that ${pcre_words}
     #matches greedily and hence cannot by definition match consecutively.
-    # local pcre_macro_args_optional_grouped='((?:'${pcre_spaces}'(?:'${pcre_words_nonhere}'|'${pcre_macro_arg_block}'))*)'
+    # local pcre_macro_args_optional_grouped='((?:'${pcre_word_spaces}'(?:'${pcre_words}'|'${pcre_macro_arg_block}'))*)'
 
-# local pcre_macro_args_optional_grouped='((?:'${pcre_spaces}'(?:'${pcre_macro_arg_block}'|'${pcre_words_nonhere}'(?&spaces))?'${pcre_macro_arg_block}'))*)'
+# local pcre_macro_args_optional_grouped='((?:'${pcre_word_spaces}'(?:'${pcre_macro_arg_block}'|'${pcre_words}'(?&spaces))?'${pcre_macro_arg_block}'))*)'
     # Zero or more runs of whitespace or shells words ending in a shell word.
-    # local pcre_words_nonhere_optional='(?:'${pcre_words_nonhere}')?'
+    # local pcre_words_optional='(?:'${pcre_words}')?'
 
     # Argument of any type prefixed by one or more horizontal whitespace
     # characters followed by zero or more shell words.
     # local         pcre_macro_arg=${pcre_macro_arg_block}
-    # local pcre_macro_arg_grouped=''${pcre_spaces}''${pcre_words_nonhere_optional}${pcre_macro_arg_block_grouped}
+    # local pcre_macro_arg_grouped=''${pcre_word_spaces}''${pcre_words_optional}${pcre_macro_arg_block_grouped}
 
 #matched from a previously captured macro argument list
-#''${pcre_spaces}''
-    #FUXME: For efficiency, split the "'${pcre_spaces}'" prefixing each such PCRE out
+#''${pcre_word_spaces}''
+    #FUXME: For efficiency, split the "'${pcre_word_spaces}'" prefixing each such PCRE out
     #into this PCRE instead.
 
-    # local pcre_macro_arg_block_prefix=''${pcre_spaces}'\{(?&spaces)'
-    # local    pcre_macro_arg_block_nested_prefix='\{'${pcre_spaces}''
+    # local pcre_macro_arg_block_prefix=''${pcre_word_spaces}'\{(?&spaces)'
+    # local    pcre_macro_arg_block_nested_prefix='\{'${pcre_word_spaces}''
 
-    # local        pcre_macro_arg_block_suffix=''${pcre_spaces}'\}(?:(?&spaces)|\Z)'
-    # local pcre_macro_arg_block_nested_suffix=''${pcre_spaces}'\}(?&spaces)'
+    # local        pcre_macro_arg_block_suffix=''${pcre_word_spaces}'\}(?:(?&spaces)|\Z)'
+    # local pcre_macro_arg_block_nested_suffix=''${pcre_word_spaces}'\}(?&spaces)'
 
-    # local pcre_words_nonhere=''${pcre_spaces}'(?:'${pcre_word_nonhere}'|(?&spaces))*(?&word)'
+    # local pcre_words=''${pcre_word_spaces}'(?:'${pcre_word}'|(?&spaces))*(?&word)'
 
     #FUXME: Define all remaining ${ZESHY_MACRO_MATCH_INDEX_ARG_*} globals.
 
@@ -910,10 +1006,10 @@ function ::preprocessor_pcres.make() {
         # ZESHY_MACRO_MATCH_INDEX_ARG_2
         # ZESHY_MACRO_MATCH_INDEX_ARG_3
 
-    # local        pcre_macro_arg_block_nested_body='(?<blockb>(?:'${pcre_spaces}'(?&block)?|\\[''"$`<]|(?!<<)[^''"$`]|(?&code))*'
+    # local        pcre_macro_arg_block_nested_body='(?<blockb>(?:'${pcre_word_spaces}'(?&block)?|\\[''"$`<]|(?!<<)[^''"$`]|(?&code))*'
     # local pcre_macro_arg_block_body='(?:(?!'${pcre_macro_arg_block_suffix}')'${pcre_macro_arg_block_nested_body}')'
 
-    # local        pcre_macro_arg_block_body='(?:'${pcre_spaces}'(?&block)?|\\[''"$`<]|(?!<<)[^)''"$`]|(?&code))*?'
+    # local        pcre_macro_arg_block_body='(?:'${pcre_word_spaces}'(?&block)?|\\[''"$`<]|(?!<<)[^)''"$`]|(?&code))*?'
     # local pcre_macro_arg_block_nested_body=${pcre_macro_arg_block_body}
 
  # While we would prefer
@@ -940,15 +1036,15 @@ function ::preprocessor_pcres.make() {
     # Such "}" must be suffixed by at least one horizontal space or the end of
     # such code. To support macros accepting two or more consecutive argument
     # blocks, merely assert this constraint with positive lookahead.
-    # local pcre_macro_arg_block_prefix=''${pcre_spaces}'\{(?&spaces)'
+    # local pcre_macro_arg_block_prefix=''${pcre_word_spaces}'\{(?&spaces)'
     # local pcre_macro_arg_block_body='.*?'
     # local pcre_macro_arg_block_body_grouped='('${pcre_macro_arg_block_body}')'
-    # local pcre_macro_arg_block_suffix='\g1\}(?:'${pcre_spaces}'|\Z)'
+    # local pcre_macro_arg_block_suffix='\g1\}(?:'${pcre_word_spaces}'|\Z)'
     # local         pcre_macro_arg_block=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_body}${pcre_macro_arg_block_suffix}
     # local pcre_macro_arg_block_grouped=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_body_grouped}${pcre_macro_arg_block_suffix_ahead}
 
-    # local pcre_macro_arg_block_suffix='\g1\}(?:'${pcre_spaces}'|\Z)'
-    # local pcre_macro_arg_block_suffix_ahead='\g1\}(?='${pcre_spaces}'|\Z)'
+    # local pcre_macro_arg_block_suffix='\g1\}(?:'${pcre_word_spaces}'|\Z)'
+    # local pcre_macro_arg_block_suffix_ahead='\g1\}(?='${pcre_word_spaces}'|\Z)'
     # local         pcre_macro_arg_block=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_body}${pcre_macro_arg_block_suffix}
     # local pcre_macro_arg_block_grouped=${pcre_macro_arg_block_prefix}${pcre_macro_arg_block_body_grouped}${pcre_macro_arg_block_suffix_ahead}
 
@@ -964,7 +1060,7 @@ function ::preprocessor_pcres.make() {
 
     # '(?:'${pcre_words}'|'${pcre_macro_arg_block_grouped}')*'
     # '(?:'${pcre_macro_args_optional_grouped}')?'${pcre_subroutines}
-    # ZESHY_MACRO_PCRE=${pcre_macro_indentation_grouped}${pcre_macro_name}'(?:'${pcre_spaces}${pcre_macro_args_grouped}')?'${pcre_subroutines}
+    # ZESHY_MACRO_PCRE=${pcre_macro_indentation_grouped}${pcre_macro_name}'(?:'${pcre_word_spaces}${pcre_macro_args_grouped}')?'${pcre_subroutines}
 
     # One or more runs of whitespace or shells words both initiating and
     # terminating in a shell word.
@@ -1081,7 +1177,7 @@ function ::preprocessor_pcres.make() {
 
  # Right? Wrong. There appears to be a bug in either
     #"libpcre" or zsh (...guess which, presumably?) forcing
-    # local pcre_spaces='(?:\h|\\\R)++'
+    # local pcre_word_spaces='(?:\h|\\\R)++'
 
  # all macros (including names and block arguments) in
     # arbitrary code.
@@ -1107,17 +1203,17 @@ function ::preprocessor_pcres.make() {
     #FUXME: Excise me.
 
     # One or more whitespace-delimited shells words.
-    # local pcre_words='(?:'${pcre_spaces}'|'${pcre_word}')+'
+    # local pcre_words='(?:'${pcre_word_spaces}'|'${pcre_word}')+'
 
     #FUXME: Match only whitespace delimiting such words -- *NOT* prefixing such
     #words. This should simplify matching of block arguments a bit.
-    # local pcre_words='(?:(?:'${pcre_word}'(?:\\\R)?\h++(?:\\\R)?))*'${pcre_word_nonhere}')?'
+    # local pcre_words='(?:(?:'${pcre_word}'(?:\\\R)?\h++(?:\\\R)?))*'${pcre_word}')?'
 
     # local pcre_macro_arg_block_prefix='(?<=[ \t]|\\\v)\{'
 
-    #FUXME: This is actually used. ${pcre_spaces}, however, doesn't really
+    #FUXME: This is actually used. ${pcre_word_spaces}, however, doesn't really
     #appear to be. Excise the latter and shift such documentation here.
-    # local pcre_spaces='(?:\h|\\\R)+'
+    # local pcre_word_spaces='(?:\h|\\\R)+'
 
     # local pcre_macro_arg_block_prefix='(?:\h(?:\\\R)?|(?:\\\R)?\h)\{'
 
@@ -1182,7 +1278,7 @@ function ::preprocessor_pcres.make() {
     # local pcre_here_doc=${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}
 
     # Here-string.
-    # local pcre_here_string='<<<\s*+'${pcre_word_nonhere}''
+    # local pcre_here_string='<<<\s*+'${pcre_word}''
 
     #FUXME: Excise the above? Shift documentation here!
 
@@ -1218,9 +1314,9 @@ function ::preprocessor_pcres.make() {
     #arguments. Hence, we can probably generalize ${pcre_macro_arg_command} above
     #with whitespace as follows:
     #
-    #    local pcre_macro_arg_command='(?:'${pcre_spaces}'|'${pcre_sans_quotes_spaces}'|'${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_var_expansion}')+'
+    #    local pcre_macro_arg_command='(?:'${pcre_word_spaces}'|'${pcre_sans_quotes_spaces}'|'${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_var_expansion}')+'
     #
-    #Of course, that immediately suggests we combine ${pcre_spaces} and
+    #Of course, that immediately suggests we combine ${pcre_word_spaces} and
     #${pcre_sans_quotes_spaces} -- probably by omitting "\s" from the
     #definition of the latter. (In any case, it's all for the morrow!)
 
