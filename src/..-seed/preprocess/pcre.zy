@@ -189,20 +189,25 @@ function ::preprocessor_pcres.make() {
     # command-terminating characters signify additional semantics, some do not
     # (e.g., newline, ":").
 
-    #FIXME: Wait. Even a simple character class is insufficient. We'll want to
-    #additionally support the following command terminating substrings:
-    #* Either "<", ">", or "&" preceded by a nonnegative digit.
-    #* A "}" delimiting a code block.
-    #* A process substitution of the form "=(...)".
-    #
-    #In short, "Ugh." Hopefully, merely improving matching elsewhere will
-    #implicitly correct for such shortfalls.
-
-    local char_command_end_semantic='<>|&'
-
     # Character class matching ASCII punctuation characters that unconditionally
-    # terminate the preceding command.
-    local char_command_end=${char_command_end_semantic}';'
+    # terminate the preceding command. This class matches only the commonest
+    # terminators and hence does *NOT* suffice to match all possible command
+    # terminators. For example, a non-negative integer optionally followed by
+    # "&" mandatorily followed by either "<" or ">" and a shell word redirects
+    # and hence terminates the preceding command (e.g., "1&>2").
+    #
+    # Of course, the prior paragraph is a lie: redirections may be freely
+    # interspersed with typical command arguments. However, since supporting such
+    # uncommon edge cases in the preprocessor would probably prove to be non-
+    # trivially expensive, redirections must strictly suffix rather than be
+    # freely interspersed with macro arguments.
+    local char_command_end='&<>|;'
+
+    # Character class matching command terminators *NOT* prefixing syntactic
+    # constructs possibly containing macro-like substrings.  Currently, this
+    # includes only "<<<"-delimited here-documents; hence, this class is simply
+    # ${char_command_end} excluding "<".
+    local char_command_end_not_code_prefix='&>|;'
 
     # Character class matching embeddable-reserved characters, including:
     #
@@ -275,16 +280,6 @@ function ::preprocessor_pcres.make() {
     # in unquoted shell words when strictly balanced (e.g., "like(this)" but
     # not "like(this("), this class includes such characters.
     local char_not_word_arg_unquoted=${char_space}${char_command_end}'''"()$\\`'
-
-    # Character class matching invalid characters in unquoted shell words
-    # embedded in syntactic constructs (e.g., blocks, process substitutions).
-    # Since such words are matched merely to correctly parse the substrings
-    # delimiting such constructs, this class excludes invalid characters
-    # irrelevant to such parsing (e.g., "<", ">", "|").
-    #
-    # Since unquoted "(" and ")" characters are only permitted when balanced
-    # (e.g., ":glob *.zy(.)"), such characters are excluded as above.
-    local char_not_word_embedded_unquoted='()'${char_not_code_prefix}
 
     # ..................{ MACRO ~ space                      }..................
     # One horizontal ASCII whitespace character (i.e., space or tab). For
@@ -485,6 +480,8 @@ function ::preprocessor_pcres.make() {
     # Any escaped character (i.e., "\"-prefixed character).
     local pcre_char_escaped='\\.'
 
+    #FIXME: Shift this and the following PCREs up to "space" above.
+
     # Start of the current line, consuming one or more prefixing vertical
     # whitespace characters if any. "^" is a zero-width assertion consuming no
     # characters and hence inappropriate for use below (excluding lookahead).
@@ -501,57 +498,15 @@ function ::preprocessor_pcres.make() {
     # characters *OR* one or more horizontal whitespace characters.
     local pcre_line_start_or_spaces_horizontal='(?:'${pcre_spaces_horizontal}'|'${pcre_line_start}${pcre_spaces_horizontal_optional}')'
 
+    # One or more command terminators *NOT* prefixing syntactic constructs
+    # possibly containing macro-like substrings.
+    local pcre_chars_command_end_not_code_prefix='['${char_command_end_not_code_prefix}']++'
+
     # One or more unquoted characters *NOT* prefixing syntactic constructs
     # conflicting with general-purpose macro preprocessing. Such characters
     # include all ASCII whitespace characters but neither "{" or "}", which
     # must be matched in a much more cautious manner.
-    local pcre_chars_unquoted='[^'${char_not_code_prefix}']++'
-
-    # Command terminator, comprising either the end of the current line *OR*
-    # any of the several standard syntactic primitives that terminate commands.
-
-    #FIXME: This may be incorrect. In fact, it almost certainly is. Why?
-    #Because we currently treat the last byte of the currently matched
-    #substring as synonymous with the last byte of the currently matched
-    #*MACRO*. However, by consuming such command terminator here, we interfere
-    #with such interpretation. Ideally, such terminator should be captured but
-    #*NOT* consumed via positive lookahead. Note our explicit use of "captured"
-    #here yes, we do actually need to inspect the contents of such command
-    #terminator programmatically in ={backend}. Why? Well, it's fairly simple:
-    #
-    #* If the captured command terminator group is nonempty, then such macro's
-    #  expansion is intended to be piped or redirected elsewhere. How can we
-    #  ensure that any arbitrary expansion can be piped or redirected? For now,
-    #  the simplest solution is almost certainly the best. ={backend} must
-    #  check for the following conditions *AFTER* expanding such macro:
-    #  * If such captured group is nonempty *AND* the expansion returned by
-    #    such macro's function is *NOT* delimited by "{" and "}", then
-    #    delimit such expansion by "{" and "}".
-    #
-    #That's hopefully it.
-    #FIXME: Moreover, this fails to account for possible line continuations
-    #preceding such command terminator (e.g., ":macro\
-    #| :piped_to_something"). How about something resembling:
-    #
-    #     local pcre_command_end=${pcre_word_spaces_optional}'(?:'${pcre_line_end}'|(?=(['${char_command_end}'])))'
-    #
-    #Of course, we probably haven't even defined ${pcre_word_spaces_optional}
-    #by this point, requiring this PCRE be shifteb below.
-    #FIXME: Actually, ";" is equivalent to a newline for command termination
-    #purposes and hence ignorable. So, the above should be augmented to read:
-    #
-    #     local pcre_command_end=${pcre_word_spaces_optional}'(?:'${pcre_line_end}'|(?=;|([<>|])))'
-    #
-    #Of course, that suggests definition of a new character class above -- say:
-    #    local char_command_end_semantic='<>|'
-    #FIXME: We'll need to add a new global match index for such captured group.
-    #FIXME: Actually, this strikes us as overkill. The existing
-    #${pcre_macro_args_zsh_optional} should *NEVER* match a command-terminating
-    #subsequence, for obvious reasons. That said, the current definition of
-    #such PCRE currently does and hence is clearly insufficient. See
-    #${char_command_end_semantic} for details. Consider excising this PCRE.
-
-    local pcre_command_end='(?:'${pcre_line_end}'|['${char_command_end}'])'
+    local pcre_chars_not_code_prefix='[^'${char_not_code_prefix}']++'
 
     # Single-quoted string *NOT* supporting escaped single quotes (i.e., "''").
     local pcre_quotes_single_literal_body="[^']*+"
@@ -613,6 +568,24 @@ function ::preprocessor_pcres.make() {
     local pcre_block_prefix='\{'
     local pcre_block_suffix='\}'
 
+    # zeshy-specific command terminator implemented as a global alias. By
+    # PCRE design, all zsh command terminators (e.g., "<", "|") are excluded
+    # from unquoted shell words and hence need *NOT* be listed here.
+
+    #FIXME: Any others, or are those the only two ones?
+    #FIXME: Wait. For a truly general implementation, don't we need to join the
+    #set of all global alias names... No. Well, possibly? Do all global aliases
+    #terminate commands? They don't *NEED* to, of course, but they probably
+    #almost certainly do. Hmm; contemplate further. Perhaps we want a new
+    #subtype of global alias that when declared adds the name of such alias to
+    #a global private list recording the names of all global aliases that also
+    #terminate commands -- say, a new declarer
+    #:alias_general_command_terminator().
+    #
+    #Clearly, implement this all *LATER*. For now, this suffices.
+
+    local pcre_command_terminator=':(?:or|and)'
+
     # Redirection prefixed by a file descriptor specified as a non-negative
     # integer (e.g., "1>&2"). Such redirections conflict with unquoted shell
     # word syntax and hence *MUST* be matched for disambiguation. Note that
@@ -620,7 +593,7 @@ function ::preprocessor_pcres.make() {
     # delimited variable names are prefixed by "{" and hence already prevented
     # from matching unquoted shell word syntax. See section "REDIRECTION" of
     # "man zshexpn".
-    local pcre_redirect_prefix='[0-9]++&?[<>]'
+    local pcre_redirect_prefix='[0-9]++&?[<>].'
 
     # "=("- and ")"-delimited process substitution prefix, conflicting with
     # unquoted shell word syntax (which otherwise permits unquoted "=" and
@@ -629,16 +602,14 @@ function ::preprocessor_pcres.make() {
 
     # Negative lookahead preventing substrings that would otherwise be matched
     # as unquoted shell words from being matched as such.
-    local pcre_word_lookahead='(?!'${pcre_block_prefix}'|'${pcre_redirect_prefix}'|'${pcre_process_substitution_equals_prefix}')'
+    local pcre_word_lookahead='(?!'${pcre_block_prefix}'|'${pcre_command_terminator}'|'${pcre_redirect_prefix}'|'${pcre_process_substitution_equals_prefix}')'
 
     # Negative lookbehind preventing substrings that would otherwise be matched
     # as unquoted shell words from being matched as such.
     local pcre_word_lookbehind='(?<!'${pcre_block_suffix}')'
 
-    # ..................{ MACRO ~ word : arg                 }..................
-    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    # Synchronize with embedded word PCREs below.
-    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # ..................{ MACRO ~ word                       }..................
+    #FIXME: Eliminate the "_arg" from all PCRE names below.
 
     # One or more characters of unquoted shell words signifying arguments
     # passed to macros.
@@ -679,56 +650,13 @@ function ::preprocessor_pcres.make() {
     # (e.g., "<", ">", "|").
     local pcre_word_arg=${pcre_word_lookahead}${pcre_word_arg_substrings_balanced}${pcre_word_lookbehind}
 
+    # Zero or more shell words, whitespace characters, or comments.
+    local pcre_words_arg_or_comments_optional='(?:'${pcre_word_arg}'|'${pcre_comment_optional}')*'
+
     # ..................{ MACRO ~ word : literal             }..................
     # Unquoted literal shell word, comprising only unreserved characters.
     local pcre_word_unquoted_literal=${pcre_word_lookahead}${pcre_word_arg_unquoted_chars}${pcre_word_lookbehind}
     local pcre_word_unquoted_literal_grouped='('${pcre_word_unquoted_literal}')'
-
-    # ..................{ MACRO ~ word : embed               }..................
-    #FIXME: Optimizable by eliminating extraneous "(?:" and ")" groupings.
-    #FIXME: Actually, we want to revert to the prior approach. See above.
-    #FIXME: Actually, this is probably *ALL* eliminatable by noting that
-    #${pcre_word_arg} pretty much suffices for both this and the
-    #parens-specific PCREs below. Honestly, why did we go to such extreme
-    #lengths to differentiate the three? It's rather difficult to say, now.
-    #FIXME: Hmm; perhaps it *IS* useful to at least maintain the distinction
-    #between ${pcre_word_arg} and a new sort of word encompassing both braces
-    #and parens words -- say, ${pcre_word_embedded}.
-    #FIXME: O.K.; we've implemented a new ${char_not_word_embedded_unquoted}
-    #character class. Use below in place of the current approach!
-
-    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    # Synchronize with argument word PCREs above.
-    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-    #FIXME: O.K.; we've excised all ${pcre_word_braces*} and ${pcre_word_parens*}
-    #definitions. Now, we need to replace all use of such PCREs by these PCREs.
-
-    # One or more characters of unquoted shell words embedded in syntactic
-    # constructs.
-    local pcre_word_embedded_unquoted_char='[^'${char_not_word_embedded_unquoted}']'
-    local pcre_word_embedded_unquoted_chars=${pcre_word_embedded_unquoted_char}'++'
-
-    # Syntactic construct embedded in shell words themselves embedded in
-    # syntactic constructs.
-    local pcre_word_embedded_substring=${pcre_word_embedded_unquoted_chars}'|'${pcre_char_escaped}'|'${pcre_substitutable_or_quotes}
-
-    # Zero or much such constructs.
-    local pcre_word_embedded_substrings_optional='(?:'${pcre_word_embedded_substring}')*'
-
-    # "("- and ")"-balanced substrings in shell words signifying embeddeduments
-    # passed to macros. See ${pcre_word_arg_unquoted_balanced} above.
-    local pcre_word_embedded_unquoted_balanced='\('${pcre_word_embedded_substrings_optional}'\)'
-
-    # One or much such constructs *OR* "("- and ")"-balanced substrings.
-    local pcre_word_embedded_substrings_balanced='(?:'${pcre_word_embedded_substring}'|'${pcre_word_embedded_unquoted_balanced}')+'
-
-    # Shell word embedded in a syntactic construct.
-    local pcre_word_embedded=${pcre_word_lookahead}${pcre_word_embedded_substrings_balanced}${pcre_word_lookbehind}
-
-    # Zero or more shell words, whitespace characters, or comments embedded in
-    # a syntactic construct.
-    local pcre_words_embedded_or_comments_optional='(?:'${pcre_word_embedded}'|'${pcre_comment_optional}')*'
 
     # ..................{ MACRO ~ here                       }..................
     # Here-document. Unfortunately, matching all possible here-document strings
@@ -760,11 +688,19 @@ function ::preprocessor_pcres.make() {
     # the here-string here. Subsequent parsing does so for us.
     local pcre_here_string_prefix='<'${pcre_spaces_horizontal_optional}
 
-    # Here-document in full or here-string prefix. Since the here-string prefix
-    # overlaps that of the here-document prefix, the former *MUST* be matched
-    # before the latter.
+    # Here-document or here-string prefix. Since the latter overlaps the
+    # here-document prefix, the former *MUST* be matched first.
     local pcre_here_prefix='<<'
-    local pcre_here_doc_or_string_prefix=${pcre_here_prefix}'(?:'${pcre_here_string_prefix}'|(&here))'
+    local pcre_here_doc_or_string_prefix_optional=${pcre_here_prefix}'(?:'${pcre_here_string_prefix}'|(&here))?'
+
+    # Shell word, here-document or -string prefix, or one or more command
+    # terminators *NOT* prefixing syntactic constructs. For convenience,
+    # consider using this PCRE rather than ${pcre_word_arg} for matching
+    # shell words in syntactic constructs. Since the "<" of the "<("- and
+    # ")"-delimited process substitution matched in shell words conflicts with
+    # the "<" unconditionally matched in here-documents or -string prefixes,
+    # the former *MUST* be matched first.
+    local pcre_word_arg_embedded=${pcre_chars_command_end_not_code_prefix}'|'${pcre_word_arg}'|'${pcre_here_doc_or_string_prefix_optional}
 
     #FIXME: Wait. Do we *REALLY* require this? Even here-documents and -strings
     #passed to macros should (arguably) be interpreted and passed to the
@@ -791,13 +727,13 @@ function ::preprocessor_pcres.make() {
     # ..................{ MACRO ~ sub : process              }..................
     # List assignment, whose delimiting ")" conflicts with the ")" delimiting
     # possibly recursively nested process substitutions.
-    local pcre_list_assignment_optional=${pcre_var_name}'(?:=\('${pcre_words_embedded_or_comments_optional}'\))?'
+    local pcre_list_assignment_optional=${pcre_var_name}'(?:=\('${pcre_words_arg_or_comments_optional}'\))?'
 
     # Possibly recursively nested process substitution contents, omitting
     # prefixing and suffixing delimiters. Since list assignments are prefixed
     # by variable names indistinguishable from unquoted shell words, match the
     # former before the latter.
-    local pcre_process_substitution_parens_body='(?:'${pcre_list_assignment_optional}'|'${pcre_word_embedded}'|'${pcre_comment_optional}'|'${pcre_here_doc_or_string_prefix}'|[^)])*'
+    local pcre_process_substitution_parens_body='(?:'${pcre_list_assignment_optional}'|'${pcre_comment_optional}'|'${pcre_word_embedded}'|[^)])*'
 
     # "$("- and ")"-delimited possibly recursively nested process substitution,
     # omitting such delimiters.
@@ -808,7 +744,7 @@ function ::preprocessor_pcres.make() {
     local pcre_process_substitution_file='[=<>]\('${pcre_process_substitution_parens_body}'\)'
 
     # "`"-delimited non-recursive process substitution.
-    local pcre_process_substitution_backtick='`(?:'${pcre_chars_unquoted}'|'${pcre_comment_optional}'|'${pcre_char_escaped}'|'${pcre_here_doc_or_string_prefix}'|(?!`)(?:'${pcre_substitutable_or_quotes}'|.))*`'
+    local pcre_process_substitution_backtick='`(?:'${pcre_chars_not_code_prefix}'|'${pcre_comment_optional}'|'${pcre_char_escaped}'|'${pcre_here_doc_or_string_prefix_optional}'|(?!`)(?:'${pcre_substitutable_or_quotes}'|.))*`'
 
     # ..................{ MACRO ~ sub : math                 }..................
     # Possibly recursively nested "$(("- and "))"-delimited arithmetic
@@ -897,7 +833,7 @@ function ::preprocessor_pcres.make() {
     # whitespace by the subsequent such block by merely asserting this
     # constraint with positive lookahead.
     local pcre_macro_arg_block_or_comment_optional='(?:'${pcre_comment_body}'|'${pcre_block_prefix}'(?&block))?'
-    local pcre_macro_arg_block_body='(?:'${pcre_word_braces}'|'${pcre_line_start_or_spaces_horizontal}${pcre_macro_arg_block_or_comment_optional}'|'${pcre_here_doc_or_string_prefix}'|[^}])*'
+    local pcre_macro_arg_block_body='(?:'${pcre_line_start_or_spaces_horizontal}${pcre_macro_arg_block_or_comment_optional}'|'${pcre_word_arg_embedded}'|[^}])*'
     local pcre_macro_arg_block=${pcre_block_prefix}${pcre_macro_arg_block_body}${pcre_block_suffix}
     pcre_macro_subroutines_body+='(?<block>'${pcre_macro_arg_block_body}${pcre_block_suffix}')'
 
@@ -955,7 +891,7 @@ function ::preprocessor_pcres.make() {
     #and hence ${pcre_word} and hence ${pcre_macro_arg} already implicitly
     #matches line continuations.
 
-    local pcre_macro_args_optional='(?:'${pcre_macro_arg}'(?:'${pcre_word_spaces}${pcre_macro_arg}')*'${pcre_word_spaces_optional}')?'${pcre_here_optional}${pcre_command_end}
+    local pcre_macro_args_optional='(?:'${pcre_macro_arg}'(?:'${pcre_word_spaces}${pcre_macro_arg}')*'${pcre_word_spaces_optional}')?'${pcre_here_optional}
 
     # Zero or more standard or block arguments optionally followed by a here-
     # document or -string, the end of the current line, *OR* the nonempty
@@ -963,7 +899,21 @@ function ::preprocessor_pcres.make() {
     # ensuring that syntactically invalid macros are uniquely identifiable by
     # testing whether or not the corresponding match group exists (e.g., by
     # testing the length of canonical list global ${matches}).
-    local pcre_macro_body_optional='(?:'${pcre_word_spaces}'(?:'${pcre_macro_args_optional}'|'${pcre_non_spaces_vertical_grouped}')|'${pcre_command_end}')'
+
+    #FIXME: Macros accepting no arguments should be matchable in a
+    #significantly more generalized, zsh-like manner. While matching
+    #${pcre_line_end} is helpful, it fails to suffice; we'd also like to match
+    #argumentless macros terminated by:
+    #
+    #* A standard command terminator (e.g., "<", "|") *WITHOUT* matching such
+    #  terminator (i.e., use positive lookahead).
+    #* A zeshy-specific command terminator (e.g., ":or", ":and"). Any others,
+    #  or are those the only two ones?
+    #
+    #This should only be required for argumentless macros. Macros accepting one
+    #or more arguments already follow the above stricture.
+
+    local pcre_macro_body_optional='(?:'${pcre_word_spaces}'(?:'${pcre_macro_args_optional}'|'${pcre_non_spaces_vertical_grouped}')|'${pcre_line_end}')'
 
     # Zero or more arguments passed to a macro. Success is reported immediately
     # after matching the last character of the last such argument to notify the
@@ -1052,7 +1002,7 @@ function ::preprocessor_pcres.make() {
 
     # PCRE fragment prefixing ${ZESHY_MACRO_PCRE}, matching zero or more macros
     # *OR* syntactic constructs possibly containing macro-like substrings.
-    ZESHY__MACRO_PCRE_IF_NONEMPTY_PREFIX=${pcre_options_anchored}'(?:'${pcre_chars_unquoted}'|'${pcre_macro_prefix}'(?:'${pcre_comment_body}'|'
+    ZESHY__MACRO_PCRE_IF_NONEMPTY_PREFIX=${pcre_options_anchored}'(?:'${pcre_chars_not_code_prefix}'|'${pcre_macro_prefix}'(?:'${pcre_comment_body}'|'
 
     # PCRE fragment suffixing ${ZESHY_MACRO_PCRE}.
 
@@ -1117,6 +1067,145 @@ function ::preprocessor_pcres.make() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Command terminator, comprising either the end of the current line *OR*
+    # any of the several standard syntactic primitives that terminate commands.
+
+    #FUXME: This may be incorrect. In fact, it almost certainly is. Why?
+    #Because we currently treat the last byte of the currently matched
+    #substring as synonymous with the last byte of the currently matched
+    #*MACRO*. However, by consuming such command terminator here, we interfere
+    #with such interpretation. Ideally, such terminator should be captured but
+    #*NOT* consumed via positive lookahead. Note our explicit use of "captured"
+    #here yes, we do actually need to inspect the contents of such command
+    #terminator programmatically in ={backend}. Why? Well, it's fairly simple:
+    #
+    #* If the captured command terminator group is nonempty, then such macro's
+    #  expansion is intended to be piped or redirected elsewhere. How can we
+    #  ensure that any arbitrary expansion can be piped or redirected? For now,
+    #  the simplest solution is almost certainly the best. ={backend} must
+    #  check for the following conditions *AFTER* expanding such macro:
+    #  * If such captured group is nonempty *AND* the expansion returned by
+    #    such macro's function is *NOT* delimited by "{" and "}", then
+    #    delimit such expansion by "{" and "}".
+    #
+    #That's hopefully it.
+    #FUXME: Moreover, this fails to account for possible line continuations
+    #preceding such command terminator (e.g., ":macro\
+    #| :piped_to_something"). How about something resembling:
+    #
+    #     local pcre_command_end=${pcre_word_spaces_optional}'(?:'${pcre_line_end}'|(?=(['${char_command_end}'])))'
+    #
+    #Of course, we probably haven't even defined ${pcre_word_spaces_optional}
+    #by this point, requiring this PCRE be shifteb below.
+    #FUXME: Actually, ";" is equivalent to a newline for command termination
+    #purposes and hence ignorable. So, the above should be augmented to read:
+    #
+    #     local pcre_command_end=${pcre_word_spaces_optional}'(?:'${pcre_line_end}'|(?=;|([<>|])))'
+    #
+    #Of course, that suggests definition of a new character class above -- say:
+    #    local char_command_end_semantic='<>|'
+    #FUXME: We'll need to add a new global match index for such captured group.
+    #FUXME: Actually, this strikes us as overkill. The existing
+    #${pcre_macro_args_zsh_optional} should *NEVER* match a command-terminating
+    #subsequence, for obvious reasons. That said, the current definition of
+    #such PCRE currently does and hence is clearly insufficient. See
+    #${char_command_end_semantic} for details. Consider excising this PCRE.
+    # local pcre_command_end='(?:'${pcre_line_end}'|['${char_command_end}'])'
+
+    #FUXME: For efficiency, rename to ${pcre_here_doc_or_string_prefix_optional}
+    #and suffix by "?".
+
+    # ..................{ MACRO ~ word : embed               }..................
+    #FUXME: Optimizable by eliminating extraneous "(?:" and ")" groupings.
+    #FUXME: Actually, we want to revert to the prior approach. See above.
+    #FUXME: Actually, this is probably *ALL* eliminatable by noting that
+    #${pcre_word_arg} pretty much suffices for both this and the
+    #parens-specific PCREs below. Honestly, why did we go to such extreme
+    #lengths to differentiate the three? It's rather difficult to say, now.
+    #FUXME: Hmm; perhaps it *IS* useful to at least maintain the distinction
+    #between ${pcre_word_arg} and a new sort of word encompassing both braces
+    #and parens words -- say, ${pcre_word_embedded}.
+    #FUXME: O.K.; we've implemented a new ${char_not_word_embedded_unquoted}
+    #character class. Use below in place of the current approach!
+    #FUXME: O.K.; we've excised all ${pcre_word_braces*} and ${pcre_word_parens*}
+    #definitions. Now, we need to replace all use of such PCREs by these PCREs.
+    #FUXME: Actually, we want to excise all PCREs in this section as well as
+    #${char_not_word_embedded_unquoted}, replacing both with their argument
+    #word equivalents above. Then rename "word_arg" to "word" everywhere. As an
+    #optimization, we can largely retain the benefits of using the approach
+    #below by defining a new ${char_command_end_not_code_prefix} character
+    #class probably defined something like so:
+    #
+    #    local char_command_end_not_code_prefix='&>|;'
+    #
+    #Such class explicitly omits "<", the here-document and -string prefix,
+    #which must be matched in a more complex manner than a simple character
+    #class. Given such class, we may then match all unquoted command
+    #terminators in an efficient manner in all PCREs previously embedding
+    #${pcre_word_embedded}, which seems rather nice.
+
+    #FUXME: Arguably suffix by "'|'${pcre_here_doc_or_string_prefix}".
+
+    # Character class matching invalid characters in unquoted shell words
+    # embedded in syntactic constructs (e.g., blocks, process substitutions).
+    # Since such words are matched merely to correctly parse the substrings
+    # delimiting such constructs, this class excludes invalid characters
+    # irrelevant to such parsing (e.g., "<", ">", "|").
+    #
+    # Since unquoted "(" and ")" characters are only permitted when balanced
+    # (e.g., ":glob *.zy(.)"), such characters are excluded as above.
+    # local char_not_word_embedded_unquoted='()'${char_not_code_prefix}
+
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with argument word PCREs above.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # One or more characters of unquoted shell words embedded in syntactic
+    # constructs.
+    # local pcre_word_embedded_unquoted_char='[^'${char_not_word_embedded_unquoted}']'
+    # local pcre_word_embedded_unquoted_chars=${pcre_word_embedded_unquoted_char}'++'
+    #
+    # # Syntactic construct embedded in shell words themselves embedded in
+    # # syntactic constructs.
+    # local pcre_word_embedded_substring=${pcre_word_embedded_unquoted_chars}'|'${pcre_char_escaped}'|'${pcre_substitutable_or_quotes}
+    #
+    # # Zero or much such constructs.
+    # local pcre_word_embedded_substrings_optional='(?:'${pcre_word_embedded_substring}')*'
+    #
+    # # "("- and ")"-balanced substrings in shell words signifying embeddeduments
+    # # passed to macros. See ${pcre_word_arg_unquoted_balanced} above.
+    # local pcre_word_embedded_unquoted_balanced='\('${pcre_word_embedded_substrings_optional}'\)'
+    #
+    # # One or much such constructs *OR* "("- and ")"-balanced substrings.
+    # local pcre_word_embedded_substrings_balanced='(?:'${pcre_word_embedded_substring}'|'${pcre_word_embedded_unquoted_balanced}')+'
+    #
+    # # Shell word embedded in a syntactic construct.
+    # local pcre_word_embedded=${pcre_word_lookahead}${pcre_word_embedded_substrings_balanced}${pcre_word_lookbehind}
+    #
+    # # Zero or more shell words, whitespace characters, or comments embedded in
+    # # a syntactic construct.
+    # local pcre_words_embedded_or_comments_optional='(?:'${pcre_word_embedded}'|'${pcre_comment_optional}')*'
+
+    #FUXME: Wait. Even a simple character class is insufficient. We'll want to
+    #additionally support the following command terminating substrings:
+    #* Either "<", ">", or "&" preceded by a nonnegative digit.
+    #* A "}" delimiting a code block.
+    #* A process substitution of the form "=(...)".
+    #
+    #In short, "Ugh." Hopefully, merely improving matching elsewhere will
+    #implicitly correct for such shortfalls.
+    # local char_command_end_semantic='<>|&'
+
+    # local char_command_end_semantic='<>|&'
+
+    # Character class matching ASCII punctuation characters that unconditionally
+    # terminate the preceding command. 
+    # local char_command_end=${char_command_end_semantic}';'
+
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with embedded word PCREs below.
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
     #FUXME: Excise below.
 
     # # First, middle, and last unquoted substrings of unquoted shell words
