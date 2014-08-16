@@ -317,7 +317,6 @@ function ::preprocessor_pcres.make() {
     # are insignificant (e.g., comments, single-quoted strings).
     local pcre_chars_sans_space_vertical=${pcre_char_sans_space_vertical}'++'
     local pcre_chars_sans_space_vertical_optional=${pcre_char_sans_space_vertical}'*+'
-    local pcre_chars_sans_space_vertical_grouped='('${pcre_chars_sans_space_vertical}')'
 
     # Line continuation (i.e., an unescaped backslash followed by a newline),
     # continuing the command corresponding to the current line to the next
@@ -350,6 +349,16 @@ function ::preprocessor_pcres.make() {
     # to consume the same character would prevent either from matching in a
     # general-purpose manner. (That's bad.)
     local pcre_line_end='$'
+
+    # Line, including:
+    #
+    # * Prefixing newline if *NOT* the first line of such code as
+    # * All non-newline characters on such line.
+    #
+    # To comply with ${pcre_line_end}, such PCRE does *NOT* match a suffixing
+    # newline if any.
+    local pcre_line=${pcre_line_start}${pcre_chars_sans_space_vertical_optional}${pcre_line_end}
+    local pcre_line_optional='(?:'${pcre_line}')?'
 
     # Start of the current line followed by zero or more horizontal whitespace
     # characters *OR* one or more horizontal whitespace characters.
@@ -877,68 +886,70 @@ function ::preprocessor_pcres.make() {
     # by zero or more horizontal whitespace characters.
     local pcre_macro_suffix=${pcre_spaces_horizontal_optional}${pcre_line_end}
 
-    # Standard zsh argument *OR* zeshy-specific block argument.
-    local pcre_macro_arg='(?:'${pcre_word_arg}'|'${pcre_macro_arg_block}')'
-
-    # Zero or more standard or block arguments, each prefixed by one or more
-    # horizontal whitespace characters, optionally followed by a here-document
-    # or -string. To ensure that such macro is passed no unmatched
-    # syntactically invalid arguments and hence is syntactically valid, such
-    # match is anchored to the end of the current line.
-    local pcre_macro_args_optional='(?:'${pcre_macro_arg}'(?:'${pcre_spaces_horizontal}${pcre_macro_arg}')*)?'
-
-    # End of a macro accepting no arguments, comprising either the end of the
-    # current line *OR* a command terminator. Since this PCRE is guaranteed
-    # to *NOT* be preceded by horizontal whitespace *AND* since zeshy-specific
-    # command terminators (e.g., :or(), :and()) must be preceded by such
-    # whitespace, matching only zsh command terminators suffices here.
+    # End of a macro suffixed by no horizontal whitespace characters and
+    # accepting no arguments, comprising either the end of the current line
+    # *OR* a zsh-specific command terminator. Since zeshy-specific command
+    # terminators (e.g., :or(), :and()) must be preceded by such whitespace,
+    # matching only zsh-specific command terminators suffices.
     #
-    # Since ={backend} expects the last byte of the substring matched by
+    # Since the preprocessor expects the last byte of the substring matched by
     # PCRE-based iteration to be the last byte of a macro, this PCRE must *NOT*
     # match any bytes following such macro -- including the command terminator
     # terminating such macro if any. To ensure this, this PCRE must consume no
     # characters and hence contain *ONLY* zero-width assertions.
-    local pcre_macro_sans_arguments_lookahead=${pcre_line_end}'|'${pcre_char_command_end}
-    local pcre_macro_sans_arguments='(?='${pcre_macro_sans_arguments_lookahead}')'
+    local pcre_macro_sans_args_unspaced_lookahead=${pcre_line_end}'|'${pcre_char_command_end}
+    local pcre_macro_sans_args_unspaced='(?='${pcre_macro_sans_args_unspaced_lookahead}')'
 
-    #FIXME: For error reporting purposes, it would probably be *FAR* more
-    #helpful to shift ${pcre_macro_args_invalid} into ${pcre_macro_arg} rather
-    #than interpolated below, renaming such PCRE to ${pcre_macro_arg_invalid}:
-    #e.g.,
-    #
-    #    local pcre_macro_arg='(?:'${pcre_word_arg}'|'${pcre_macro_arg_block}'|'${pcre_macro_arg_invalid}')'
-    #
-    #For that to work, however, we'll need to append ${pcre_macro_arg_invalid}
-    #by ${pcre_report_failure}. Will that suffice to terminate the entire
-    #current match, however? Wait. No, we don't want to report failure, as that
-    #would unconditionally terminate the current iteration -- at least, as
-    #currently implemented. Perhaps append ${pcre_report_success} instead?
-    #
-    #Since further research is clearly required here, implement such
-    #refactoring after we have a tolerable, working first draft.
-    #FIXME: Right. Appending ${pcre_report_success} will *DEFINITELY* work, as
-    #the PCRE below demonstrates. Let's do this now, yes?
+    # End of a macro suffixed by one or more horizontal whitespace characters
+    # and accepting zero or more arguments, comprising either the end of the
+    # current line *OR* a zeshy- or zsh-specific command terminator.
+    local pcre_macro_args_optional_suffix='(?='${pcre_macro_sans_args_unspaced_lookahead}'|'${pcre_zeshy_command_end}')'
 
-    # Syntactically invalid macro arguments capturing the remainder of the
-    # first line of such arguments. This PCRE is necessarily preceded by
-    # horizontal whitespace and hence must match both zeshy- and zsh-specific
-    # command terminators, unlike the above lookahead.
-    local pcre_macro_args_invalid='(?!'${pcre_macro_sans_arguments_lookahead}'|'${pcre_zeshy_command_end}')'${pcre_chars_sans_space_vertical_grouped}
+    # Syntactically invalid macro argument, capturing the remainder of the
+    # first line (and following line if any) of such argument and immediately
+    # terminating PCRE matching.
+    #
+    # Capturing such argument assists the preprocessor in distinguishing
+    # syntactically valid from invalid arguments (e.g., by testing the length
+    # of canonical list global ${matches}). This PCRE non-intuitively
+    # terminates matching by reporting success. ensuring the corresponding 
+    # code throws an exception due to such syntactically invalid macro. Hence,
+    # each macro match attempt results in three possible states:
+    #
+    # * A syntactically valid macro was matched, in which case such match
+    #   succeeds and the syntactically invalid match group is empty.
+    # * A syntactically invalid macro was matched, in which case such match
+    #   succeeds and the syntactically invalid match group is non-empty.
+    # * No further macros were matched, in which case such match fails.
+    #
+    # Such argument is preceded by horizontal whitespace and hence could
+    # erroneously match syntactically valid zeshy- or zsh-specific command
+    # terminators. To prevent this, such match attempt must be prefixed by
+    # negative lookahead preventing such terminators from matching.
+    local pcre_macro_arg_invalid_lookahead='(?!'${pcre_macro_sans_args_spaced_lookahead}')'
+    local pcre_macro_arg_invalid_body_grouped='('${pcre_chars_sans_space_vertical}${pcre_line_optional}')'
+    local pcre_macro_arg_invalid_grouped=${pcre_macro_arg_invalid_lookahead}${pcre_macro_arg_invalid_body_grouped}${pcre_report_success}
 
-    # Zero or more standard or block arguments optionally followed by a here-
-    # document or -string, the end of the current line, *OR* the nonempty
-    # remainder of the current line. The latter substring if any is captured,
-    # ensuring that syntactically invalid macros are uniquely identifiable by
-    # testing whether or not the corresponding match group exists (e.g., by
-    # testing the length of canonical list global ${matches}).
-    local pcre_macro_body_optional=${pcre_line_continuations_optional}'(?:'${pcre_spaces_horizontal}'(?:'${pcre_macro_args_optional}'|'${pcre_macro_args_invalid}')|'${pcre_macro_sans_arguments}')'
+    # Syntactically valid or invalid block or standard argument.
+    local pcre_macro_arg_grouped='(?:'${pcre_macro_arg_block}'|'${pcre_word_arg}'|'${pcre_macro_arg_invalid_grouped}')'
+
+    # Zero or more standard or block arguments.
+    local pcre_macro_args_optional_grouped='(?:'${pcre_macro_arg_grouped}'(?:'${pcre_spaces_horizontal}${pcre_macro_arg_grouped}')*)?'
+
+    # One or more horizontal whitespace characters followed by zero or more
+    # standard or block arguments.
+    local pcre_macro_args_optional_spaced_grouped=${pcre_spaces_horizontal}${pcre_macro_args_optional_grouped}${pcre_macro_args_optional_suffix}
+
+    # Macro body, comprising all arguments passed to such macro as well as
+    # line continuations and whitespace cementing the former to the latter.
+    local pcre_macro_body=${pcre_line_continuations_optional}'(?:'${pcre_macro_args_optional_spaced_grouped}'|'${pcre_macro_sans_args_unspaced}')'
 
     # Zero or more arguments passed to a macro. Success is reported immediately
     # after matching the last character of the last such argument to notify the
     # preprocessor phase iterating over such PCRE that such macro has been
     # fully matched. To distinguish syntactically valid from invalid macros,
     # *ALL* matched substrings must be optional.
-    local pcre_macro_body_optional_report_success=${pcre_macro_body_optional}${pcre_macro_suffix}${pcre_report_success}
+    local pcre_macro_body_report_success=${pcre_macro_body}${pcre_macro_suffix}${pcre_report_success}
 
     # ..................{ MACROS ~ subroutine                }..................
     # PCRE subroutines defined above, concatenated in a manner preventing
@@ -1026,7 +1037,7 @@ function ::preprocessor_pcres.make() {
 
     #FIXME: Excise ${pcre_code} here.
 
-    ZESHY__MACRO_PCRE_IF_NONEMPTY_SUFFIX=${pcre_macro_body_optional_report_success}')?|'${pcre_spaces_horizontal}'(?:'${pcre_comment_body}')?|'${pcre_char_escaped}'|'${pcre_code}'|.)*'${pcre_report_failure}${pcre_macro_subroutines}
+    ZESHY__MACRO_PCRE_IF_NONEMPTY_SUFFIX=${pcre_macro_body_report_success}')?|'${pcre_spaces_horizontal}'(?:'${pcre_comment_body}')?|'${pcre_char_escaped}'|'${pcre_code}'|.)*'${pcre_report_failure}${pcre_macro_subroutines}
 
     # PCRE capturing the next block argument body in a macro argument list,
     # prefixed by one or more horizontal whitespace characters followed by zero
@@ -1085,6 +1096,88 @@ function ::preprocessor_pcres.make() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#this PCRE is guaranteed
+    # to *NOT* be preceded by horizontal whitespace *AND* since 
+    # If one or more such arguments
+    # were passed, such arguments must be preceded by at least one horizontal
+    # whitespace character; else, no such arguments were passed, in which case 
+    # such macro must either be:
+    #
+    # * Suffixed by one or more horizontal whitespace characters followed by a
+    #   command terminator. Since command terminators are *NOT* valid macro
+    #   arguments, ${pcre_macro_args_optional} implicitly halts matching
+    #   immediately prior to such terminator.
+    # * Suffixed directly by a command terminator. Since
+    #   ${pcre_macro_args_optional} only matches when preceded by one or more
+    #   horizontal whitespace characters, this case must be explicitly matched.
+
+    #FUXME: No longer quite right. We *REALLY* don't want this to be optional,
+    #as the resulting semantics are... wierd, and probably wrong. Instead, we
+    #probably need to explicitly match a command terminator here.
+
+    # Zero or more standard or block arguments. If one or more such arguments
+    # were passed, such arguments must be preceded by at least one horizontal
+    # whitespace character; else, no such arguments were passed, in which case 
+    # such macro must either be:
+    #
+    # * Suffixed by one or more horizontal whitespace characters followed by a
+    #   command terminator. Since command terminators are *NOT* valid macro
+    #   arguments, ${pcre_macro_args_optional} implicitly halts matching
+    #   immediately prior to such terminator.
+    # * Suffixed directly by a command terminator. Since
+    #   ${pcre_macro_args_optional} only matches when preceded by one or more
+    #   horizontal whitespace characters, this case must be explicitly matched.
+
+    #FUXME: No longer quite right. We *REALLY* don't want this to be optional,
+    #as the resulting semantics are... wierd, and probably wrong. Instead, we
+    #probably need to explicitly match a command terminator here.
+
+    # local pcre_macro_args_optional='(?:'${pcre_macro_arg}'(?:'${pcre_spaces_horizontal}${pcre_macro_arg}')*)?'
+    # local pcre_macro_body_optional=${pcre_line_continuations_optional}'(?:'${pcre_spaces_horizontal}${pcre_macro_args_optional}'|'${pcre_macro_sans_args}')'
+
+    # Zero or more standard or block arguments, each prefixed by one or more
+    # horizontal whitespace characters, optionally followed by a here-document
+    # or -string. To ensure that such macro is passed no unmatched
+    # syntactically invalid arguments and hence is syntactically valid, such
+    # match is anchored to the end of the current line.
+
+    # rather than silently terminating such iteration.
+    # Zero or more standard or block arguments optionally followed by a here-
+    # document or -string, the end of the current line, *OR* the nonempty
+    # remainder of the current line. The latter substring if any is captured,
+    # ensuring that syntactically invalid macros are uniquely identifiable by
+    # testing whether or not the corresponding match group exists (e.g., by
+    # testing the length of canonical list global ${matches}).
+
+#'|'${pcre_macro_args_invalid}'
+    # local pcre_chars_sans_space_vertical_grouped='('${pcre_chars_sans_space_vertical}')'
+    #FUXME: Erronious. We probably no longer require
+    #${pcre_chars_sans_space_vertical_grouped}; instead, refactor this to use
+    #${pcre_chars_sans_space_vertical}. Arguably, shift the latter PCRE
+    #fragment below to a new PCRE ${pcre_line_optional} above.
+    #FUXME: We'll probably also need to define
+    #${pcre_chars_sans_space_vertical_optional} above.
+
+    # local pcre_macro_arg_invalid_body_grouped=${pcre_chars_sans_space_vertical_grouped}'{1,3}'
+    #FUXME: Document me.
+
+    #FUXME: For error reporting purposes, it would probably be *FAR* more
+    #helpful to shift ${pcre_macro_args_invalid} into ${pcre_macro_arg} rather
+    #than interpolated below, renaming such PCRE to ${pcre_macro_arg_invalid}:
+    #e.g.,
+    #
+    #    local pcre_macro_arg='(?:'${pcre_word_arg}'|'${pcre_macro_arg_block}'|'${pcre_macro_arg_invalid}')'
+    #
+    #For that to work, however, we'll need to append ${pcre_macro_arg_invalid}
+    #by ${pcre_report_failure}. Will that suffice to terminate the entire
+    #current match, however? Wait. No, we don't want to report failure, as that
+    #would unconditionally terminate the current iteration -- at least, as
+    #currently implemented. Perhaps append ${pcre_report_success} instead?
+    #Since further research is clearly required here, implement such
+    #refactoring after we have a tolerable, working first draft.
+    #FUXME: Right. Appending ${pcre_report_success} will *DEFINITELY* work, as
+    #the PCRE below demonstrates. Let's do this now, yes?
+
     #FUXME: Ugh! How do we distinguish between a syntactically invalid macro
     #and an argumentless macro suffixed by a command terminator? Argumentative
     #macros suffixed by command terminators are no issue, as in that case at
@@ -1103,7 +1196,7 @@ function ::preprocessor_pcres.make() {
     #inappropriately triggered. One way of handling this would be to define a
     #PCRE used below in lieu of ${pcre_chars_sans_space_vertical_grouped}:
     #
-    #    local pcre_macro_args_invalid='(?!'${pcre_macro_sans_arguments_lookahead}'|'${pcre_zeshy_command_end}')'${pcre_chars_sans_space_vertical_grouped}
+    #    local pcre_macro_args_invalid='(?!'${pcre_macro_sans_args_lookahead}'|'${pcre_zeshy_command_end}')'${pcre_chars_sans_space_vertical_grouped}
     #
     #We'll need to define ${pcre_zeshy_command_end}, of course. (Didn't we
     #already define a PCRE matching zeshy-specific command terminators?)
@@ -1116,7 +1209,7 @@ function ::preprocessor_pcres.make() {
     #FUXME: Hmm. Right. O.K.; so, we need to extract
     #${pcre_line_continuations_optional} out as follows.
 
-    # local pcre_macro_sans_arguments_end=${pcre_spaces_horizontal_optional}'(?:'${pcre_line_end}'|(?='${pcre_char_command_end}'))'
+    # local pcre_macro_sans_args_end=${pcre_spaces_horizontal_optional}'(?:'${pcre_line_end}'|(?='${pcre_char_command_end}'))'
 
     #FUXME: We increasingly regard the dichotomy between ${pcre_word_spaces}
     #and ${pcre_spaces_horizontal} as bath false and harmful. Ideally, we
