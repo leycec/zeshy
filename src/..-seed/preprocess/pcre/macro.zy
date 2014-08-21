@@ -364,6 +364,10 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # whitespace.
     local pcre_line_continuations_spaceable_horizontal_optional='(?:'${pcre_line_continuation_spaceable_horizontal}')*'
 
+    # One horizontal whitespace character optionally prefixed by line
+    # continuations. This PCRE is principally intended for lookahead.
+    local pcre_space_horizontal_continuable=${pcre_line_continuations_optional}${pcre_space_horizontal}
+
     # One or more whitespace characters optionally interspersed with line
     # continuations.
     local pcre_spaces_continuable=${pcre_line_continuations_optional}${pcre_spaces}${pcre_line_continuations_spaceable_optional}
@@ -513,8 +517,20 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # "&<"- and "&>"-formatted redirections.
     local pcre_command_end_ampersand='&[&!]?'
 
+    #FIXME: Since both ${pcre_command_end_unspaced} and
+    #${pcre_command_end_spaced} match prefixing whitespace (albeit the former
+    #optional and the latter mandatory), we can probably optimize such matching
+    #by extracting out the optional portions from both into
+    #${pcre_command_end}: namely, the matching of optional prefixing line
+    #continuations. Is that it? Well, something is something.
+    #FIXME: Actually, forego that. Since shell words require prefixing
+    #whitespace, we'll be combining ${pcre_command_end_spaced} with
+    #${pcre_word_or_redirect} at some point to match any syntactic construct
+    #necessarily prefixed by whitespace, implying that we'll probably be
+    #removing ${pcre_command_end} at some point as well. *shrug*
+
     # Command terminator not requiring prefixing whitespace characters.
-    local pcre_command_end_unspaced=${pcre_command_end_vanilla}'|'${pcre_boolean}'|'${pcre_command_end_pipe}'|'${pcre_command_end_ampersand}'|'${pcre_string_start}
+    local pcre_command_end_unspaced=${pcre_spaces_horizontal_continuable_optional}'(?:'${pcre_command_end_vanilla}'|'${pcre_boolean}'|'${pcre_command_end_pipe}'|'${pcre_command_end_ampersand}'|'${pcre_string_start}')'
 
     # ..................{ PREFIX ~ spaced                    }..................
     #FIXME: Any others, or are those the only two ones?
@@ -532,33 +548,51 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #FIXME: Such syntax clearly conflicts with the same syntax embedded in
     #":is"-, "[["-, and "(("-prefixed tests, implying we'll need to begin
     #matching such tests for disambiguation. *sigh*
-
-    #FIXME: Actually, suffixing whitespace must be matched with positive
-    #lookahead, instead.
+    #FIXME: Oh, right. We *DEFINITELY* need to match such tests to avoid
+    #accidentally matching macro-like unquoted substrings in such tests.
 
     # Boolean zeshy-specific command terminators, prefixed by one or more
     # shell-words and suffixed by one or more whitespace characters optionally
-    # interspersed with line continuations.
-    local pcre_boolean_zeshy=':(?:or|and)'${pcre_spaces_continuable}
+    # interspersed with line continuations. Since numerous syntactic constructs
+    # are matched by consuming prefixing whitespace, avoid consuming such
+    # whitespace here with positive lookaheads.
+    local pcre_boolean_zeshy=':(?:or|and)(?='${pcre_space_horizontal_continuable}')'
 
     # Command terminator prefixed by one or more whitespace characters.
     local pcre_command_end_spaced=${pcre_spaces_horizontal_continuable}'(?:'${pcre_boolean_zeshy}')'
 
     # ..................{ PREFIX                             }..................
     # Command terminator (i.e., substring terminating the command preceding
-    # such terminator), necessarily preceding preprocessor macros.
+    # such terminator), optionally suffixed by one or more whitespace
+    # characters. Such terminators necessarily precede preprocessor macros and
+    # hence *MUST* be matched with syntactic accuracy.
 
     #FIXME: O.K.; so, *ALL* command terminators may be suffixed by newline
-    #and optional horizontal whitespace. Some, however, may also be suffixed by
-    #semicolon (e.g., ${pcre_redirects}).
+    #and optional horizontal whitespace. Some, however, may also be optionally
+    #suffixed by one or more semicolons -- including semicolon and vertical
+    #whitespace terminators.
+    #FIXME: Optimize. Substrings prefixed or suffixed by mandatory whitespace
+    #should be grouped together.
+    #FIXME: While matching suffixing whitespace *IS* great, it also conflicts
+    #with matching prefixing whitespace. We need to rethink this. We should
+    #probably shift ${pcre_spaces_continuable_optional} into
+    #${pcre_commands_end_optional} instead, where we can ensure that such
+    #whitespace is consumed only after all command terminators have been
+    #matched.
+
+    local pcre_command_end='(?:'${pcre_command_end_spaced}'|'${pcre_command_end_unspaced}')'
+    # local pcre_command_end='(?:'${pcre_command_end_spaced}'|'${pcre_command_end_unspaced}')'${pcre_spaces_continuable_optional}
 
     #FIXME: Actually use below in lieu of current start-of-line-based parsing
     #of macro prefixes.
 
-    #FIXME: Optimize. Substrings prefixed or suffixed by mandatory whitespace
-    #should be grouped together.
-
-    local pcre_command_end='(?:'${pcre_command_end_spaced}'|'${pcre_command_end_unspaced}')'${pcre_spaces_continuable_optional}
+    # One or more command terminators. Technically, only a proper subset of
+    # command terminators are repeatable -- namely, only those connoting no
+    # additional semantics (i.e., newline, ";"). All others are *NOT*
+    # repeatable (e.g., "|| ||"). Nonetheless, preprocessor parsing is largely
+    # unconcerned with the syntactic validity of non-macros. Hence, ignoring
+    # such technicalities here is appropriate.
+    local pcre_commands_end_optional='(?:'${pcre_command_end}')*'${pcre_spaces_continuable_optional}
 
     # ..................{ SUBSTITUTABLE                      }..................
     # Recursively embeddable syntactic construct (i.e., embeddable only in
@@ -626,12 +660,17 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # interspersed with redirections, redirections must be disambiguated from
     # command terminators with overlapping syntax (e.g., redirection "&>" and
     # command terminators "&", "&!", and "&&").
+    #
+    # This PCRE matches the following such punctuation: "<", "<>", ">", ">|",
+    # ">!", ">>", ">>|", ">>!", "<&", ">&", "&>", ">&|", ">&!", "&>|", "&>!",
+    # ">>&", "&>>", ">>&|", ">>&!", "&>>|", and "&>>!". Since here-documents
+    # are syntactically rich enough to warrant special consideration, such
+    # punctuation excludes "<<"-prefixed here-documents (and, by extension,
+    # here-strings). See section "REDIRECTION" of "man zshmisc".
 
-    #FIXME: Insufficient. Since unquoted words prohibit "<" and ">", we also
-    #need to match such characters *AND* all other shell-reserved
-    #redirection-related characters (e.g., a suffixing optional "!").
+    #FIXME: Actually use me.
 
-    local pcre_redirect_punctuation='&[<>]'
+    local pcre_redirect_punctuation='(?:<[&>]?|>>?&?[!|]?|&>>?[!|]?)'
 
     # Redirection prefixed by a file descriptor specified as an integer.  Such
     # redirections conflict with unquoted shell word syntax and hence *MUST* be
@@ -739,6 +778,10 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_here_doc_suffix=${pcre_space_vertical}'(?-1)'${pcre_line_end}
     pcre_macro_subroutines_body+='(?<here>'${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}')'
 
+    #FIXME: Actually, let's just revert to the prior form. This form fails to
+    #match syntactically invalid here-strings (e.g., "<<<&"), which we'd rather
+    #match for generality. The prior form is also simpler, which is nice.
+
     # Here-string.
     local pcre_here_string='<'${pcre_spaces_horizontal_continuable_optional}${pcre_word}
 
@@ -794,6 +837,11 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # "$("- and ")"-delimited possibly recursively nested process substitution,
     # omitting such delimiters.
     local pcre_process_substitution_dollar=${pcre_process_substitution_parens_body}
+
+    #FIXME: Actually, "<("- and ">)"-prefixed process substitutions are
+    #redirections and hence *MUST* be embedded in ${pcre_word_or_redirect}
+    #rather than ${pcre_word}. "=("-prefixed process substitutions are *NOT*
+    #redirections and hence applicable here.
 
     # "=("-, "<("-, *OR* ">("- and ")"-delimited possibly recursively nested
     # process substitution.
@@ -1144,6 +1192,27 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: Actually, suffixing whitespace must be matched with positive
+    #lookahead, instead.
+
+    #FUXME: Inappropriate. *SOME* command terminators may be indefinitely
+    #repeated -- perhaps, only those lacking additional semantics (e.g.,
+    #vertical whitespace, semicolon)? Others, however, may *NOT* be (e.g.,
+    #"||", "&!"). Though, to be fair, do we particularly care
+
+    #FUXME: Actually, suffixing whitespace must be matched with positive
+    #lookahead, instead.
+    # Since numerous syntactic
+    # constructs are matched by consuming prefixing whitespace, avoid consuming
+    # such whitespace here with positive lookaheads.
+
+    #FUXME: "[<>]++" is overly simplistic. We need to exclude here-documents.
+    # local pcre_redirect_punctuation='&?[<>]++&?[!|]?'
+
+    #FUXME: Insufficient. Since unquoted words prohibit "<" and ">", we also
+    #need to match such characters *AND* all other shell-reserved
+    #redirection-related characters (e.g., a suffixing optional "!").
+
     #FUXME: Matching merely ${pcre_char_command_end} does *NOT* suffice here.
     #We need to match ${pcre_command_end}, in which case
     #${pcre_char_command_end} is probably unused and hence excisable.
