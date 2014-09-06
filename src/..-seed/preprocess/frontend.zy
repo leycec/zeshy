@@ -7,6 +7,31 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Preprocess zeshy-specific code into zsh-specific code.
 
+#FIXME: Alias expansions containing macro expansions pove a slight issue,
+#though certainly solvable. Consider a macro :macro and alias :alias expanding
+#as follows:
+#
+#    alias ":alias"=":macro"
+#
+#Simple, right? Right. Unfortunately, the current approach expands macros
+#*BEFORE* evaluating the result and hence expands such macro. Thus, such
+#approach fails to preprocess alias-embedded macros. Fortunately, there exists
+#a simple alternative:
+#
+#* Before preprocessing, define a temporary singleton function (e.g.,
+#  ::preprocess.code()) whose body is *EXACTLY* the code to be preprocessed:
+#  e.g.,
+#     functions[::preprocess.code]={preprocessed_code}
+#* After definition, since function's body is such code with all aliases
+#  expanded to their results.
+#* Preprocess such function's body rather than the original code: e.g.,
+#     ::preprocess ${functions[::preprocess.code]}
+#* Undefine such function to avoid unexpected side effects.
+#
+#Inefficient? Yes. But, again, *ALL* digest compilations except the first will
+#be backgrounded. Hence, we generally don't care *TOO* much about compilation
+#times -- so long as they're not apallingly horrific, anyway.
+
 #FIXME: Once we get a working preprocessor up, it becomes trivial to implement
 #support for eliding away debug-specific code under optimized builds. Simply
 #define a new macro :build.if_debug() accepting one and only one block
@@ -73,7 +98,9 @@
 # ....................{ GLOBALS                            }....................
 #FIXME: Document me.
 # From from macro name to the name of the function expanding such macro.
-typeset -gA ZESHY__MACRO_TO_FUNC_NAME
+typeset -gA\
+    ZESHY__MACRO_PREFIX_SEMICOLON_TO_FUNC_NAME\
+    ZESHY__MACRO_PREFIX_NON_SEMICOLON_TO_FUNC_NAME
 
 # ....................{ DECLARERS                          }....................
 #FIXME: Implement macro documentation support. This implies, of course, that
@@ -140,10 +167,6 @@ function :macro() {
     [[ ${macro_name} =~ ${ZESHY__MACRO_NAME_VALID_PCRE} ]] || :die\
         'Macro name "'${macro_name}'" invalid (i.e., not matched by PCRE /'${ZESHY__MACRO_NAME_VALID_PCRE}'/).'
 
-    # If such macro already exists, throw an exception.
-    (( ${+ZESHY__MACRO_TO_FUNC_NAME[${macro_name}]} == 0 )) || :die\
-        'Macro '${macro_name}'() already defined, expanding to function '${ZESHY__MACRO_TO_FUNC_NAME[${macro_name}]}'().'
-
     #FIXME: For identical reasons, we need to also ensure on alias and function
     #declaration that there exists no macro of the same name. In other words,
     #macros should be considered to share the same namespace as callables, even
@@ -167,8 +190,24 @@ function :macro() {
     (( ${+functions[${func_name}]} )) || :die\
         'Macro '${macro_name}'() function '${func_name}'() not found.'
 
-    # Declare such macro.
-    ZESHY__MACRO_TO_FUNC_NAME[${macro_name}]=${func_name}
+    # If the first character of such macro is ":", declare such macro
+    # accordingly. Since this is the case for all official zeshy macros and
+    # hence most macros, this is an optimization for the common case.
+    if [[ ${macro_name[1]} == ':' ]] {
+        # If such macro already exists, throw an exception.
+        (( ${+ZESHY__MACRO_PREFIX_SEMICOLON_TO_FUNC_NAME[${macro_name}]} == 0 )) || :die\
+            'Macro '${macro_name}'() already defined, expanding to function '${ZESHY__MACRO_PREFIX_SEMICOLON_TO_FUNC_NAME[${macro_name}]}'().'
+
+        # Else, declare such macro. For simplicity elsewhere (e.g., when
+        # subsequently joining all such names together), omit the ":" prefix.
+        ZESHY__MACRO_PREFIX_SEMICOLON_TO_FUNC_NAME[${macro_name[2,-1]}]=${func_name}
+    # Else, the first character of such macro is any character *NOT* ":". Again,
+    # declare such macro accordingly.
+    } else {
+        (( ${+ZESHY__MACRO_PREFIX_NON_SEMICOLON_TO_FUNC_NAME[${macro_name}]} == 0 )) || :die\
+            'Macro '${macro_name}'() already defined, expanding to function '${ZESHY__MACRO_PREFIX_NON_SEMICOLON_TO_FUNC_NAME[${macro_name}]}'().'
+        ZESHY__MACRO_PREFIX_NON_SEMICOLON_TO_FUNC_NAME[${macro_name}]=${func_name}
+    }
 
     # Clear all previously generated preprocessor PCREs, forcing their
     # regeneration on the next preprocessor call. Since such PCREs match and

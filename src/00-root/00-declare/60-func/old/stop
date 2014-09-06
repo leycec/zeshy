@@ -8,306 +8,6 @@ Handle *function prototype parsers* (i.e., functions parsing function
 prototypes, typically as a prerequisite to processing function declarations).
 /---
 
-#FIXME: Sooo... We've had a number of exciting revelations concerning zeshy
-#syntax -- namely, whether we *REALLY* want to support syntax resembling:
-#
-#     :dir.in: /var/tmp :dir.in{
-#         :string.output "current dir: ${PWD}"
-#     }:dir.in
-#
-#Let's be honest: this is ugly as sin. But it's not *JUST* ugly; it's also
-#cumbersome to both read and write. Ideally, we want code resembling:
-#
-#     :dir.in: /var/tmp {
-#         :string.output "current dir: ${PWD}"
-#     }
-#
-#Can we actually reliably produce such code, however? The answer, of course, is
-#yes. But before we get there, we should note that the following discussion
-#intrinsically pertains to function declaration as well, which currently
-#employs similar syntax and hence could benefit from its obsoletion.
-#
-#So. How do we do it? To answer that general question, let's consider the
-#specific case of :dir.in(). Suppose :dir.in() to be an alias expanding as:
-#
-#    :alias_command :dir.in='
-#        :alias_block.placeholder :dir.in
-#        cd --'
-#
-#:alias_block.placeholder() is, as the name suggests, a placeholder alias
-#expanding to a noop-style string designed to survive alias expansion and then
-#subsequestly be removed from the final expansion for :dir.in() by
-#zeshy-specific alias parsing. The string such alias expands to is in a
-#zeshy-specific format intended to be searched for by a new zeshy preprocessor.
-#Here is one possible definition for such alias:
-#
-#    :alias_block.placeholder=': ::zeshy'
-#
-#Hence, the above alias ultimately expands to:
-#
-#    :alias_command :dir.in='
-#        : ::zeshy :dir.in
-#        cd --'
-#
-#Of course, we don't *HAVE* a zeshy preprocessor yet. We haven't needed one.
-#But we do now. Such a preprocessor will be the first incremental step towards
-#distinguishing zeshy as a genuine language distinct from zsh. That said, as we
-#shall see, such preprocessor *MUST* be implemented at the top-level as a new
-#parcel distinct from ={compile} -- call it, say, ={preprocess}.
-#
-#Why distinct from ={compile}? Because such preprocessor must be run on *ALL*
-#zeshy code before handing such code to zsh for final parsing. Since the
-#"zeshy" CLI sources all non-option arguments as zeshy scripts, ={main} will
-#need to source ={preprocess} in order to preprocess such scripts. Indeed,
-#we're afraid we won't be able to call such low-level zsh functions as source()
-#or eval() on general zeshy code, anymore. This should largely be fine, as we
-#already have zeshy-specific alternatives into which an additional preprocess
-#step can easily be injected.
-#
-#So what exactly is ={preprocess} preprocessing and into what? Simple. Such
-#parcel defines a public function with prototype:
-#
-#    :void :code.preprocess(^:string target_code, :string source_code)
-#
-#Note such function does *NOT* operate on a single string variable in-place, to
-#avoid modifying file contents passed via ${mapfile} to such function.
-#
-#Given a string of arbitrary zeshy code, such function iteratively searches
-#such code with a non-regular, context-free, line-oriented PCRE matching:
-#
-#    '^\s*+'${aliases[:alias_block.placeholder]}'\s++(.++)$'
-#
-#Hence, such PCRE matches lines prefixed by ": ::zeshy ", capturing all
-#remaining text on such line into match group 1. In the above case, such group
-#would match the alias name ":dir.in"). (Note this implies block alias names
-#must be prohibited from containing newlines -- which should, hopefully, be the
-#only constraint on such names.)
-#
-#Great. So, each iteration of matching with such PCRE sets ${match[1]} to
-#whatever follows the ": ::zeshy" prefix on the current line. Now here's where
-#things get a little wild. Bear with us.
-#
-#Now, before we get to the algorithmic details, we should note that we've
-#already implemented something similar in
-#:replace_scalar_text_matching_pcre_with_text() -- a horrifically complex but
-#efficient function performing iterative PCRE search-and-replacement. So, see
-#that function for implementation details.
-#
-#Now. Here we go. On each successful match of ": ::zeshy":
-#
-#* Perform a non-regular, context-free global search-and-replace *AFTER* the current match position
-#  (available as the second word of string global ${ZPCRE_OP}, subject to the
-#  bizarre caveats extensively documented in the body of
-#  :replace_scalar_text_matching_pcre_with_text()), replacing:
-#  * The next *UNQUOTED* "{" character with "${match[1]}{" (e.g., "{" with
-#    ":dir.in{" in the above example).
-#  * The next *UNQUOTED* "}" character balanced with such "{" character with
-#    "}${match[1]}" (e.g., "}" with "}:dir.in" in the above example).
-#
-# Fortunately, libpcre is more than capable of performing non-regular
-# search-and-replacements. (Google will be our esteemable friend here.)
-#
-# And that's it. That's the entire preprocessor -- most of which, frankly,
-# reduces to optimizing two PCREs. While unfortunate that we can't have two
-# compiled regexes at the same time, there's little we can do about that.
-#
-# *HOWEVER*, that's merely the preprocessor. We need to run such preprocessor
-# an *ALL* zeshy code -- not merely functions to be declared. In particular,
-# we'll need to refactor ={compile} to preprocess all zeshy scripts to be run.
-# But again, things get a bit tricky: source() expects a filename. Unless we
-# want to produce temporary files (we don't), we'll thus need an alternative.
-#
-# Such alternative must define a temporary singleton function whose body is the
-# body of such script -- no more, no less. Why? Because that's pretty the only
-# way to induce zeshy to expand aliases and no more. eval() both expands
-# aliases *AND* executes the results, whereas we need to preprocess the result
-# before execution. Hence, this is pretty much the only way. *shrug*
-#
-# * Use module "mapfile" to render the contents of the desired script
-#   accessible to zsh manipulation -- say, as ${mapfile[${filename}]}.
-# * Call :preprocess() with "${mapfile[${filename}]}", where such function has
-#   prototype:
-#   :void :preprocess(
-#       ^:string postprocessed_code_name, :string preprocessed_code)
-# * Within such function:
-#   * Define temporary singleton function
-#     ::preprocess.code() to run such preprocessed code: e.g.,
-#     functions[::preprocess.code]={preprocessed_code}
-#   * Doing so implicitly expands all aliases in such function. Hence, we can now
-#     parse the contents of "${functions[::preprocess.code]}" in-place. Oh,
-#     wait; no, don't do that, as that would implicitly redefine such function
-#     on every modification. Perhaps just copy such now-expanded code back into
-#     the source local variable (guaranteed to be safe): e.g.,
-#     preprocessed_code="${functions[::preprocess.code]}"
-# * After calling :preprocess(), pass the post-processed result to eval().
-#
-#Inefficient? Yes. But, again, *ALL* digest compilations except the first will
-#be backgrounded. Hence, we generally don't care *TOO* much about compilation
-#times -- so long as they're not apallingly horrific, anyway.
-#
-#Now. Here's where we finally come to this parcel. Consider doing as follows:
-#
-#* Refactor function :func_() into an alias :func() internally expanding
-#  :alias_block.placeholder() as the second-to-last line.
-#* Calling such function as follows:
-#
-#    :func ':void my_func(:string yum)' {
-#        :string.output "${yum}: yes, this should actually work."
-#    } <<'/---'
-#    Yumminess is indeed... yummy.
-#    /---
-#
-#You have to admit: that's pretty hot.
-#
-#[IGNORE EVERYTHING BELOW: We're done! Yay.]
-#
-#Note, however, that prototype quoting remains necessary. Why? Because we used
-#"{" and "}" characters in prototype syntax (for better or possibly worse).
-#Even if we hadn't, however, default values could still contain such
-#characters, requiring parsing. That said, if prototype syntax did *NOT*
-#leverage such characters, we could fairly easily ignore such characters with a
-#simple PCRE. Hmm; interesting. We have to do that *ANYWAY* in our current
-#preprocessor, so it'd be "no skin off our teeth" (so to glibly speak).
-#
-#Given that, perhaps we should genuinely consider eliminating "{" and "}"
-#syntax from callable prototypes. Currently, we *ONLY* employ such syntax to
-#denote alias and function name synonyms. While such characters are arguably
-#the ideal syntax for such task, we could just as well leverage either
-#delimiters "(" and ")" *OR* "[" and "]" for such task. In such case, we could:
-#
-#* Suffix the expansion for :func() by "'"...
-#
-#Oh, wait; obviously, that doesn't work, as the user would then assume "'"
-#characters to be usable as is in such prototype -- which, they're not. Hence,
-#we'd have to quote-protect such prototype to ensure it could be passed to such
-#function. Honestly, when we begin walking down *THAT* road, we're no longer
-#implementing a (hopefully!) trivial, general-purpose preprocessor: we're
-#implementing a non-trivial, special-cased behemoth. Do we want to go there?
-#Probably not. Certainly not initially, anyway; if need be, we could always
-#implement a new :func2() function declarer (or some such) leveraging such
-#quote handling.
-#
-#But, honestly: requiring the user quote alias and function
-#prototypes is hardly an onorous weight, unlike requiring the use of ":func{"
-#and "}:func" everywhere. So, let's just ignore the former for now.
-#FIXME: Actually, declaring an alias :alias_block.placeholder() is somewhat
-#overkill, as global variable expansion would suffice just as well and require
-#no intermediate alias expansion. Hence, define a global instead at the head of
-#={preprocess} resembling:
-#
-#    typeset -g ZESHY__ALIAS_BLOCK_DECLARER=': ::zeshy'
-#FIXME: Actually, as a first approximation of such functionality, function
-#:script.load() in ={preprocess} should implement a dramatically simpler
-#solution:
-#
-#* Define a new function :byword(), permitting subsequent parcels to
-#  declare and document new bywords at the top-level. Bywords are
-#  zeshy-specific shell words that, when in command position, will be
-#  subsequent to the following processing. For example, ={*-func/start} would
-#  call :byword() at the top-level, passing such function:
-#  * ":func" as a conventional argument.
-#  * Documentation for such byword on standard input.
-#* For all previously registered bywords (e.g., ':func', ':dir.in'),
-#  :script.load() should replace in the in-memory contents of such script:
-#  * The first bare shell word "{" on any line after such keywoard by
-#    "${byword}{".
-#  * The first line after such "{" prefixed by the same amount of whitespace
-#    prefixing such byword followed by "}" by "}${byword}".
-#
-#Note that even detecting whether a byword is in command position is
-#non-trivial, requiring parsing of all:
-#
-#* Variable expansions, which lexically behave much like strings.
-#* Here-documents and -strings.
-#* Single- and double-quoted strings.
-#* Any others?
-#
-#Wow. While parsing the latter two requires only regular parsing, the former
-#requires context-free parsing. Given that, let's say, for the moment:
-#
-#* Perform such logic *ONLY* for bywords matching the PCRE
-#  "^(\s*+':')(func|in_dir|...)" -- that is, for bywords prefixed only by
-#  optional whitespace on a line. Since we apply the same constraints to the
-#  suffixing "}", this more than suffices for now..
-#
-#Such simplistic PCRE-based replacement requires no context-free parsing *OR*
-#alias expansion. While overly simplistic, such solution should serve as an
-#adequate first draft implementation.
-#FIXME: There's one final matter: block contents. We currently apply *VERY*
-#kludgy and inefficient techniques for capturing such contents into accessible
-#strings (namely, defining temporary functions with bodies such contents).
-#Given a proper preprocessor, however, we can eliminate such inefficiencies
-#entirely, which should help ameliorate the inefficiency of such preprocessing.
-#
-#To do so, the preprocessor should replace *ALL* block contents with either:
-#
-#* An assignment of such block contents to some string global and subsequent
-#  calling of an associated terminating callable (e.g., :func.stop()), which
-#  would then internally access such global.
-#* Simply passing such global directly to such callable -- probably the simpler
-#  and hence better move, honestly.
-#
-#Assuming the latter approach, the preprocessor would then replace:
-#
-#    # This...
-#    :func ':void yum()' {
-#        :string.output 'Yay!'
-#    }
-#
-#    # ...with this.
-#    :func.start ':void yum()'
-#    :func.stop ':string.output ''Yay!'''
-#
-#To ensure proper quoting, preprocessing will presumably pass such block
-#contents expanded with parameter expansion flag "(qq)" (or similar).
-#
-#Note also that, given such preprocessing, we don't even *NEED* a callable
-#:func(), as all instances of :func() compile down to calls to :func.start()
-#and :func.stop(). (Of course, for documentation purposes, it might be nice to
-#define some sort of documentation-specific pseudo-construct housing
-#documentation for such byword. Ah! Right; of course. :func() is a byword and
-#hence is certainly an operable. We'd simply need to define a new
-#:byword.document() function in ={*-help/document} or some such.)
-#FIXME: We can and should actually go one step further, both for efficiency and
-#code coherence. Rather than expand the relevant shell words "{" and "}" to
-#merely ":func.start" and ":func.stop", we probably want to instead replace
-#such words by the actual desired output:
-#
-#* Call the following function:
-#    :void ::preprocess.set_code_replacing_body,args_for_byword_:func(
-#        ^:string output_code_name,
-#        :string input_code,
-#        :string... args)
-#  Pass such function the name of a string local to which such function
-#  will write the output code replacing *ALL* text between ":func" and "}"
-#  (including the user-defined input code block, and the user-defined list of
-#  arguments passed to :func() preceding "{").
-#* Replace *ALL* text between and including ":func" and "}" by the expansion of
-#  "${(P)output_code_name}". Pretty awesome, no?
-#
-#Hence, the single function
-#::preprocess.set_code_replacing_body,args_for_byword_:func()
-#effectively provides a zeshy-specific analogue to zsh aliases; given a block
-#of input code, such function sets a block of output code replacing that
-#specific input code. Awesomeness, really!
-#FIXME: Right; so, that's pretty awesome for conventional bywords. For bywords
-#intended to be expanded only at the top-level (e.g., ":func"), it's unclear
-#what if any advantage that provides. That said, it doesn't appear to provide
-#any disadvantage, either. Given that and the need to have a single unified
-#implementation, we should probably just go with
-#::preprocess.set_code_replacing_body,args_for_byword_:*() for all bywords.
-#That said, how do we handle documentation? We quite like the current approach
-#of separating the prototype from AsciiDoc. O.K.; this is quite trivial,
-#actually. Simply suffix such function definition by a call to
-#::func.document_prototype_with_stdin_if_nonempty_or_noop(), passed the
-#appropriate arguments. Simple, really. (Glad we didn't inline that logic now,
-#aren't we! Though, we *SHOULD* still optimize it. *sigh*)
-#FIXME: Right. So, we've had the obvious realization that the byword concept is
-#substantially superior to the prior conception of expanding aliases; the
-#former requires no such expansion and clearly suffices just as well. Hence,
-#we'll probably always retain this core concept of bywords, even if and when we
-#improve the lexical parsing surrounding such bywords.
-
 #FIXME: In reflection, there's no demonstrable reason to prohibit function
 #prototypes from requesting both defaultable and variadic arguments. After all,
 #Ruby supports heterogenous mixings of the two by simply binding defaultable
@@ -372,9 +72,31 @@ function ::func_.stop() {
 
     # For efficiency, cache frequently expanded function attributes.
     #
-    # For efficiency at expansion time, define such global to be a two-valued
-    # string rather than strictly boolean. See usage below.
-    ZESHY__FUNC_ARGS_IS_HANDLING=${ZESHY__FUNC_ATTRS[is_args_unhandled]+1}
+    # For efficiency when expanding such global below, define such global to be
+    # a two-valued string rather than strictly boolean. Specifically:
+    #
+    # * If such function is attributed as handling *NO* arguments, set such
+    #   global to the empty string. In such case, expanding such global with
+    #   expansion pattern ":+" expands such global to the empty string.
+    # * Else, set such global to an arbitrary non-empty string. In such case,
+    #   expanding such global with expansion pattern ":+" expands such global
+    #   to the right-hand side of such pattern.
+
+    #
+    # Note that such pattern's documentation is incorrect, reading:
+    #
+    #     "If name is set, or in the second form is non-null, then substitute
+    #      word; otherwise substitute nothing."
+    #
+    # Such pattern's documentation *SHOULD* read:
+    #
+    #     "If name is set *AND* in the second form is also non-null, then
+    #      substitute word; otherwise substitute nothing."
+    if (( ${+ZESHY__FUNC_ATTRS[is_args_unhandled]} )) {
+        ZESHY__FUNC_ARGS_IS_HANDLING=
+    } else {
+        ZESHY__FUNC_ARGS_IS_HANDLING=x
+    }
 
     # Parse the minimum and maximum number of arguments such function accepts
     # *BEFORE* parsing such arguments. All reasonably sane implementations of
@@ -680,7 +402,8 @@ function ::func_.stop() {
                 #
                 # * "${...:+...}", if defaulting all defaultable arguments,
                 #   test whether such argument is specifically defaultable.
-                } elif [[ -z ${ZESHY__FUNC_ARGS_IS_HANDLING:+${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE_IS_RELAXED}]-}} ]] {
+                } elif [[ -z ${ZESHY__FUNC_ARGS_IS_HANDLING:+${match[
+                    ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE_IS_RELAXED}]-}} ]] {
                     # If this is the first argument to be defaulted for the
                     # current argument count, prefix such default by an if
                     # conditional applying such default only under such count.
@@ -744,9 +467,13 @@ function ::func_.stop() {
             }
 
             # If localizing such argument, do so.
-            if [[ -z ${ZESHY__FUNC_ARGS_IS_HANDLING:+${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]}} ]] {
+            if [[ -z ${ZESHY__FUNC_ARGS_IS_HANDLING:+${match[
+                     ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]}} ]] {
                 # Name of the local variable binding such argument.
-                ZESHY__FUNC_ARG_NAME=${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_MAJOR}]:-${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_HELP}]}}${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_MINOR}]-}
+                ZESHY__FUNC_ARG_NAME=${match[
+                    ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_MAJOR}]:-${match[
+                    ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_HELP}]}}${match[
+                    ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_MINOR}]-}
 
                 # If such argument is *NOT* variadic, localize such argument in
                 # the expected way (i.e., via a local scalar variable).
@@ -1264,6 +991,324 @@ function ::func_.stop() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Expanding such global with expansion pattern ":+" then replaces such
+    # global by the right-hand side of such pattern only in the latter case,
+    # ensuring
+
+    #FUXME: This strikes me as incredibly wrong. This reads "If this function
+    #attribute is defined, set this variable to 1; else, set this variable to
+    #the empty string." Clearly, we need *MUCH* clearer commentary here. I've
+    #grepped below, and I still have little how or why this works (if, indeed,
+    #it does at all.)
+    #
+    #We should note that, if we need to invert such value, this can be
+    #efficiently achieved by subtraction from 1: e.g.,
+    #
+    #    ZESHY__FUNC_ARGS_IS_HANDLING=$((
+    #       1 - ${ZESHY__FUNC_ATTRS[is_args_unhandled]+1} ))
+    # ZESHY__FUNC_ARGS_IS_HANDLING=${ZESHY__FUNC_ATTRS[is_args_unhandled]+1}
+
+#FUXME: Sooo... We've had a number of exciting revelations concerning zeshy
+#syntax -- namely, whether we *REALLY* want to support syntax resembling:
+#
+#     :dir.in: /var/tmp :dir.in{
+#         :string.output "current dir: ${PWD}"
+#     }:dir.in
+#
+#Let's be honest: this is ugly as sin. But it's not *JUST* ugly; it's also
+#cumbersome to both read and write. Ideally, we want code resembling:
+#
+#     :dir.in: /var/tmp {
+#         :string.output "current dir: ${PWD}"
+#     }
+#
+#Can we actually reliably produce such code, however? The answer, of course, is
+#yes. But before we get there, we should note that the following discussion
+#intrinsically pertains to function declaration as well, which currently
+#employs similar syntax and hence could benefit from its obsoletion.
+#
+#So. How do we do it? To answer that general question, let's consider the
+#specific case of :dir.in(). Suppose :dir.in() to be an alias expanding as:
+#
+#    :alias_command :dir.in='
+#        :alias_block.placeholder :dir.in
+#        cd --'
+#
+#:alias_block.placeholder() is, as the name suggests, a placeholder alias
+#expanding to a noop-style string designed to survive alias expansion and then
+#subsequestly be removed from the final expansion for :dir.in() by
+#zeshy-specific alias parsing. The string such alias expands to is in a
+#zeshy-specific format intended to be searched for by a new zeshy preprocessor.
+#Here is one possible definition for such alias:
+#
+#    :alias_block.placeholder=': ::zeshy'
+#
+#Hence, the above alias ultimately expands to:
+#
+#    :alias_command :dir.in='
+#        : ::zeshy :dir.in
+#        cd --'
+#
+#Of course, we don't *HAVE* a zeshy preprocessor yet. We haven't needed one.
+#But we do now. Such a preprocessor will be the first incremental step towards
+#distinguishing zeshy as a genuine language distinct from zsh. That said, as we
+#shall see, such preprocessor *MUST* be implemented at the top-level as a new
+#parcel distinct from ={compile} -- call it, say, ={preprocess}.
+#
+#Why distinct from ={compile}? Because such preprocessor must be run on *ALL*
+#zeshy code before handing such code to zsh for final parsing. Since the
+#"zeshy" CLI sources all non-option arguments as zeshy scripts, ={main} will
+#need to source ={preprocess} in order to preprocess such scripts. Indeed,
+#we're afraid we won't be able to call such low-level zsh functions as source()
+#or eval() on general zeshy code, anymore. This should largely be fine, as we
+#already have zeshy-specific alternatives into which an additional preprocess
+#step can easily be injected.
+#
+#So what exactly is ={preprocess} preprocessing and into what? Simple. Such
+#parcel defines a public function with prototype:
+#
+#    :void :code.preprocess(^:string target_code, :string source_code)
+#
+#Note such function does *NOT* operate on a single string variable in-place, to
+#avoid modifying file contents passed via ${mapfile} to such function.
+#
+#Given a string of arbitrary zeshy code, such function iteratively searches
+#such code with a non-regular, context-free, line-oriented PCRE matching:
+#
+#    '^\s*+'${aliases[:alias_block.placeholder]}'\s++(.++)$'
+#
+#Hence, such PCRE matches lines prefixed by ": ::zeshy ", capturing all
+#remaining text on such line into match group 1. In the above case, such group
+#would match the alias name ":dir.in"). (Note this implies block alias names
+#must be prohibited from containing newlines -- which should, hopefully, be the
+#only constraint on such names.)
+#
+#Great. So, each iteration of matching with such PCRE sets ${match[1]} to
+#whatever follows the ": ::zeshy" prefix on the current line. Now here's where
+#things get a little wild. Bear with us.
+#
+#Now, before we get to the algorithmic details, we should note that we've
+#already implemented something similar in
+#:replace_scalar_text_matching_pcre_with_text() -- a horrifically complex but
+#efficient function performing iterative PCRE search-and-replacement. So, see
+#that function for implementation details.
+#
+#Now. Here we go. On each successful match of ": ::zeshy":
+#
+#* Perform a non-regular, context-free global search-and-replace *AFTER* the current match position
+#  (available as the second word of string global ${ZPCRE_OP}, subject to the
+#  bizarre caveats extensively documented in the body of
+#  :replace_scalar_text_matching_pcre_with_text()), replacing:
+#  * The next *UNQUOTED* "{" character with "${match[1]}{" (e.g., "{" with
+#    ":dir.in{" in the above example).
+#  * The next *UNQUOTED* "}" character balanced with such "{" character with
+#    "}${match[1]}" (e.g., "}" with "}:dir.in" in the above example).
+#
+# Fortunately, libpcre is more than capable of performing non-regular
+# search-and-replacements. (Google will be our esteemable friend here.)
+#
+# And that's it. That's the entire preprocessor -- most of which, frankly,
+# reduces to optimizing two PCREs. While unfortunate that we can't have two
+# compiled regexes at the same time, there's little we can do about that.
+#
+# *HOWEVER*, that's merely the preprocessor. We need to run such preprocessor
+# an *ALL* zeshy code -- not merely functions to be declared. In particular,
+# we'll need to refactor ={compile} to preprocess all zeshy scripts to be run.
+# But again, things get a bit tricky: source() expects a filename. Unless we
+# want to produce temporary files (we don't), we'll thus need an alternative.
+#
+# Such alternative must define a temporary singleton function whose body is the
+# body of such script -- no more, no less. Why? Because that's pretty the only
+# way to induce zeshy to expand aliases and no more. eval() both expands
+# aliases *AND* executes the results, whereas we need to preprocess the result
+# before execution. Hence, this is pretty much the only way. *shrug*
+#
+# * Use module "mapfile" to render the contents of the desired script
+#   accessible to zsh manipulation -- say, as ${mapfile[${filename}]}.
+# * Call :preprocess() with "${mapfile[${filename}]}", where such function has
+#   prototype:
+#   :void :preprocess(
+#       ^:string postprocessed_code_name, :string preprocessed_code)
+# * Within such function:
+#   * Define temporary singleton function
+#     ::preprocess.code() to run such preprocessed code: e.g.,
+#     functions[::preprocess.code]={preprocessed_code}
+#   * Doing so implicitly expands all aliases in such function. Hence, we can now
+#     parse the contents of "${functions[::preprocess.code]}" in-place. Oh,
+#     wait; no, don't do that, as that would implicitly redefine such function
+#     on every modification. Perhaps just copy such now-expanded code back into
+#     the source local variable (guaranteed to be safe): e.g.,
+#     preprocessed_code="${functions[::preprocess.code]}"
+# * After calling :preprocess(), pass the post-processed result to eval().
+#
+#Inefficient? Yes. But, again, *ALL* digest compilations except the first will
+#be backgrounded. Hence, we generally don't care *TOO* much about compilation
+#times -- so long as they're not apallingly horrific, anyway.
+#
+#Now. Here's where we finally come to this parcel. Consider doing as follows:
+#
+#* Refactor function :func_() into an alias :func() internally expanding
+#  :alias_block.placeholder() as the second-to-last line.
+#* Calling such function as follows:
+#
+#    :func ':void my_func(:string yum)' {
+#        :string.output "${yum}: yes, this should actually work."
+#    } <<'/---'
+#    Yumminess is indeed... yummy.
+#    /---
+#
+#You have to admit: that's pretty hot.
+#
+#[IGNORE EVERYTHING BELOW: We're done! Yay.]
+#
+#Note, however, that prototype quoting remains necessary. Why? Because we used
+#"{" and "}" characters in prototype syntax (for better or possibly worse).
+#Even if we hadn't, however, default values could still contain such
+#characters, requiring parsing. That said, if prototype syntax did *NOT*
+#leverage such characters, we could fairly easily ignore such characters with a
+#simple PCRE. Hmm; interesting. We have to do that *ANYWAY* in our current
+#preprocessor, so it'd be "no skin off our teeth" (so to glibly speak).
+#
+#Given that, perhaps we should genuinely consider eliminating "{" and "}"
+#syntax from callable prototypes. Currently, we *ONLY* employ such syntax to
+#denote alias and function name synonyms. While such characters are arguably
+#the ideal syntax for such task, we could just as well leverage either
+#delimiters "(" and ")" *OR* "[" and "]" for such task. In such case, we could:
+#
+#* Suffix the expansion for :func() by "'"...
+#
+#Oh, wait; obviously, that doesn't work, as the user would then assume "'"
+#characters to be usable as is in such prototype -- which, they're not. Hence,
+#we'd have to quote-protect such prototype to ensure it could be passed to such
+#function. Honestly, when we begin walking down *THAT* road, we're no longer
+#implementing a (hopefully!) trivial, general-purpose preprocessor: we're
+#implementing a non-trivial, special-cased behemoth. Do we want to go there?
+#Probably not. Certainly not initially, anyway; if need be, we could always
+#implement a new :func2() function declarer (or some such) leveraging such
+#quote handling.
+#
+#But, honestly: requiring the user quote alias and function
+#prototypes is hardly an onorous weight, unlike requiring the use of ":func{"
+#and "}:func" everywhere. So, let's just ignore the former for now.
+#FIXME: Actually, declaring an alias :alias_block.placeholder() is somewhat
+#overkill, as global variable expansion would suffice just as well and require
+#no intermediate alias expansion. Hence, define a global instead at the head of
+#={preprocess} resembling:
+#
+#    typeset -g ZESHY__ALIAS_BLOCK_DECLARER=': ::zeshy'
+#FIXME: Actually, as a first approximation of such functionality, function
+#:script.load() in ={preprocess} should implement a dramatically simpler
+#solution:
+#
+#* Define a new function :byword(), permitting subsequent parcels to
+#  declare and document new bywords at the top-level. Bywords are
+#  zeshy-specific shell words that, when in command position, will be
+#  subsequent to the following processing. For example, ={*-func/start} would
+#  call :byword() at the top-level, passing such function:
+#  * ":func" as a conventional argument.
+#  * Documentation for such byword on standard input.
+#* For all previously registered bywords (e.g., ':func', ':dir.in'),
+#  :script.load() should replace in the in-memory contents of such script:
+#  * The first bare shell word "{" on any line after such keywoard by
+#    "${byword}{".
+#  * The first line after such "{" prefixed by the same amount of whitespace
+#    prefixing such byword followed by "}" by "}${byword}".
+#
+#Note that even detecting whether a byword is in command position is
+#non-trivial, requiring parsing of all:
+#
+#* Variable expansions, which lexically behave much like strings.
+#* Here-documents and -strings.
+#* Single- and double-quoted strings.
+#* Any others?
+#
+#Wow. While parsing the latter two requires only regular parsing, the former
+#requires context-free parsing. Given that, let's say, for the moment:
+#
+#* Perform such logic *ONLY* for bywords matching the PCRE
+#  "^(\s*+':')(func|in_dir|...)" -- that is, for bywords prefixed only by
+#  optional whitespace on a line. Since we apply the same constraints to the
+#  suffixing "}", this more than suffices for now..
+#
+#Such simplistic PCRE-based replacement requires no context-free parsing *OR*
+#alias expansion. While overly simplistic, such solution should serve as an
+#adequate first draft implementation.
+#FIXME: There's one final matter: block contents. We currently apply *VERY*
+#kludgy and inefficient techniques for capturing such contents into accessible
+#strings (namely, defining temporary functions with bodies such contents).
+#Given a proper preprocessor, however, we can eliminate such inefficiencies
+#entirely, which should help ameliorate the inefficiency of such preprocessing.
+#
+#To do so, the preprocessor should replace *ALL* block contents with either:
+#
+#* An assignment of such block contents to some string global and subsequent
+#  calling of an associated terminating callable (e.g., :func.stop()), which
+#  would then internally access such global.
+#* Simply passing such global directly to such callable -- probably the simpler
+#  and hence better move, honestly.
+#
+#Assuming the latter approach, the preprocessor would then replace:
+#
+#    # This...
+#    :func ':void yum()' {
+#        :string.output 'Yay!'
+#    }
+#
+#    # ...with this.
+#    :func.start ':void yum()'
+#    :func.stop ':string.output ''Yay!'''
+#
+#To ensure proper quoting, preprocessing will presumably pass such block
+#contents expanded with parameter expansion flag "(qq)" (or similar).
+#
+#Note also that, given such preprocessing, we don't even *NEED* a callable
+#:func(), as all instances of :func() compile down to calls to :func.start()
+#and :func.stop(). (Of course, for documentation purposes, it might be nice to
+#define some sort of documentation-specific pseudo-construct housing
+#documentation for such byword. Ah! Right; of course. :func() is a byword and
+#hence is certainly an operable. We'd simply need to define a new
+#:byword.document() function in ={*-help/document} or some such.)
+#FIXME: We can and should actually go one step further, both for efficiency and
+#code coherence. Rather than expand the relevant shell words "{" and "}" to
+#merely ":func.start" and ":func.stop", we probably want to instead replace
+#such words by the actual desired output:
+#
+#* Call the following function:
+#    :void ::preprocess.set_code_replacing_body,args_for_byword_:func(
+#        ^:string output_code_name,
+#        :string input_code,
+#        :string... args)
+#  Pass such function the name of a string local to which such function
+#  will write the output code replacing *ALL* text between ":func" and "}"
+#  (including the user-defined input code block, and the user-defined list of
+#  arguments passed to :func() preceding "{").
+#* Replace *ALL* text between and including ":func" and "}" by the expansion of
+#  "${(P)output_code_name}". Pretty awesome, no?
+#
+#Hence, the single function
+#::preprocess.set_code_replacing_body,args_for_byword_:func()
+#effectively provides a zeshy-specific analogue to zsh aliases; given a block
+#of input code, such function sets a block of output code replacing that
+#specific input code. Awesomeness, really!
+#FIXME: Right; so, that's pretty awesome for conventional bywords. For bywords
+#intended to be expanded only at the top-level (e.g., ":func"), it's unclear
+#what if any advantage that provides. That said, it doesn't appear to provide
+#any disadvantage, either. Given that and the need to have a single unified
+#implementation, we should probably just go with
+#::preprocess.set_code_replacing_body,args_for_byword_:*() for all bywords.
+#That said, how do we handle documentation? We quite like the current approach
+#of separating the prototype from AsciiDoc. O.K.; this is quite trivial,
+#actually. Simply suffix such function definition by a call to
+#::func.document_prototype_with_stdin_if_nonempty_or_noop(), passed the
+#appropriate arguments. Simple, really. (Glad we didn't inline that logic now,
+#aren't we! Though, we *SHOULD* still optimize it. *sigh*)
+
+#FUXME: Right. So, we've had the obvious realization that the byword concept is
+#substantially superior to the prior conception of expanding aliases; the
+#former requires no such expansion and clearly suffices just as well. Hence,
+#we'll probably always retain this core concept of bywords, even if and when we
+#improve the lexical parsing surrounding such bywords.
+
  # )) {
  #        
  #    } else {
