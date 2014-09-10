@@ -279,17 +279,27 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 
     # Character class matching unconditionally invalid characters in unquoted
     # shell words, corresponding one-for-one to the set of all unconditionally
-    # shell- reserved operators conflicting with preprocessing parsing (i.e.,
+    # shell-reserved operators conflicting with preprocessing parsing (i.e.,
     # ASCII punctuation syntactically parsed in an unconditional manner,
-    # typically terminating the prior command).
+    # typically terminating the prior command). This class omits
+    # unconditionally shell-reserved operators *NOT* conflicting with
+    # preprocessing, including "*", "!", "^", and "?".
     #
-    # This class omits unconditionally shell-reserved operators *NOT* 
-    # conflicting with preprocessing, including "*", "!", "^", and "?".
-    #
-    # This class omits conditionally shell-reserved characters, including:
+    # This class also omits conditionally shell-reserved characters, including:
     #
     # * "{", a block prefix when the first character of unquoted shell words.
     # * "}", a block suffix when the last character of unquoted shell words.
+    # * "#", a comment prefix when the first character of unquoted shell words.
+    #   In all other instances, "#" is a glob operator.
+    #
+    # Matching such characters as shell-reserved requires more than merely a
+    # character class.
+    local char_not_subword_unquoted_with_parens_arbitrary=${char_space}'''"$&;\\<>|`'
+
+    # Character class matching unconditionally invalid characters in unquoted
+    # shell words as well as the conditionally valid "(" and ")" characters.
+    # Specifically, this class additionally omits:
+    #
     # * "(", either:
     #   * A list assignment prefix when the last character of unquoted shell
     #     words preceded by a valid variable name followed by "=".
@@ -297,16 +307,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #     unquoted shell word.
     # * ")", a glob qualifier suffix when balanced by a prior "(" in the same
     #   unquoted shell word.
-    # * "#", a comment prefix when the first character of unquoted shell words.
-    #   In all other instances, "#" is a glob operator.
-    #
-    # In either case, matching such characters as shell-reserved requires
-    # considerably more than a mere character class.
-    local char_not_subword_unquoted_with_parens_balanced=${char_space}'''"$&;\\<>|`'
-
-    # Character class matching unconditionally invalid characters in unquoted
-    # shell words, left parens "(", and right parens ")".
-    local char_not_subword_unquoted_with_parens_arbitrary=${char_not_subword_unquoted_with_parens_balanced}'()'
+    local char_not_subword_unquoted_with_parens_balanced=${char_not_subword_unquoted_with_parens_balanced}'()'
 
     # Character class matching additionally invalid characters in the first
     # character of unquoted shell words. For use in negative lookahead, such
@@ -516,6 +517,34 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_chars_not_code_prefix='[^'${char_not_code_prefix}']++'
 
     # ..................{ SUBSTITUTABLE                      }..................
+    #FIXME: Document why the lookahead is more complex than that below --
+    #namely, because we need to match "$("- and ")"-delimited process
+    #substitutions as command terminators rather than as shell words.
+    #FIXME: Hmm; this fails to match "$"-prefixed variable names, which it
+    #probably should, since we probably have no other means of matching such
+    #names in the context of top-level parsing. Do we?
+    #
+    #Taken together, this and the prior FIXME suggest that we probably want to
+    #suffix the "\$" in such lookahead instead by a single negative character
+    #class explicitly preventing matching of process substitutions (and other
+    #undesirable syntactic constructs). That addresses both concerns with one
+    #single code stone.
+    #
+    #The question then becomes: exactly which prefixes do we need to prohibit?
+
+    # Recursively expandable syntactic construct, comprising:
+    #
+    # * "$"-prefixed non-recursive variable expansions.
+    # * "${"- and "}"-delimited possibly recursive variable expansions.
+    # * "$["- and "]"- *AND* "$(("- and "))"-delimited possibly recursive
+    #   arithmetic substitutions.
+    # * "(("- and "))"-delimited arithmetic test.
+    #
+    # To avoid matching "$("- and ")"-delimited process substitutions while
+    # yet matching "$(("- and "))"-delimited arithmetic substitutions,
+    # lookahead in a more complex manner than character classes used below.
+    local pcre_expandable='(?=\$(?:[^(]|\(\()|\(\(|'${pcre_string_end}')(?&exp)'
+
     # Recursively embeddable syntactic construct (i.e., embeddable only in
     # arithmetic substitutions, double-quoted strings, or variable expansions).
     # Since recursive syntax is matchable *ONLY* via subroutine calls, this
@@ -525,13 +554,6 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # will consume such character if called, we non-consumptively test such
     # character with positive lookahead. See ${pcre_macro_subroutines_body}.
     local pcre_embeddable='(?=['${char_embeddable_prefix}'])(?&bed)'
-
-    #FIXME: Correct documentation.
-
-    # Recursively interpretable syntactic construct (i.e., replaceable with
-    # any arbitrary unquoted shell word, regardless of whether such word is
-    # passed to a preprocessor macro or not).
-    local pcre_expandable_non_macro='(?=\$(?:[{\[]|\(\()(?&exp)'
 
     # Recursively substitutable syntactic construct (i.e., replaceable with
     # any arbitrary unquoted shell word passed to a preprocessor macro and
@@ -732,7 +754,9 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_word_lookbehind='(?<!'${pcre_char_block_suffix}')'
 
     # ..................{ WORD ~ unquoted                    }..................
-    # One or more unquoted shell word characters.
+    # One or more unquoted shell word characters. Matching strictly balanced
+    # parens requires more than merely a character class and hence is deferred
+    # to more complex PCREs embedding this PCRE.
     local pcre_chars_subword_unquoted_with_parens_balanced='[^'${char_not_subword_unquoted_with_parens_balanced}']++'
 
     # One or more unquoted shell word or parens characters.
@@ -859,18 +883,38 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # specific "("- and ")"-balanced glob qualifiers.
     local pcre_subword_interpretable_sans_backtick_qualified=${pcre_subword_qualified_optional_prefix}${pcre_subword_interpretable_sans_backtick_unqualified}${pcre_subword_qualified_optional_suffix}
 
+    #FIXME: The concluding alternative "`[^`]*+`?+" is a temporary hack.
+    #When we add support for parsing macros in both double quotes-embedded
+    #process substitutions *AND* "`"-prefixed process substitutions, excise
+    #such hack. For now, it should suffice for a working first draft.
+
     # Syntactic construct optionally containing balanced and/or unbalanced
     # parens.
-    local pcre_subword_with_parens_arbitrary=${pcre_chars_subword_unquoted_with_parens_arbitrary}'|'${pcre_char_escaped_optional}'|'${pcre_quotes}'|'${pcre_redirect}'|'${pcre_expandable_non_macro}
+    local pcre_subword_expandable=${pcre_chars_subword_unquoted_with_parens_arbitrary}'|'${pcre_char_escaped_optional}'|'${pcre_quotes}'|'${pcre_redirect}'|'${pcre_expandable}'|`[^`]*+`?+'
+
+    #FIXME: Add support for parens-balanced qualified subwords.
+
+    # Syntactic construct optionally containing strictly balanced parens.
+    local pcre_subword_interpretable_with_parens_balanced=${pcre_chars_subword_unquoted_with_parens_balanced}'|'${pcre_char_escaped_optional}'|'${pcre_quotes}'|'${pcre_redirect}'|'${pcre_interpretable}
+
+    #FIXME: Define in a similar manner to
+    #${pcre_subword_interpretable_with_parens_balanced} above.
+
+    # Syntactic construct optionally containing strictly balanced braces.
+    local pcre_subword_interpretable_with_braces_balanced
 
     # One or more syntactic constructs optionally containing balanced and/or
     # unbalanced parens.
-    local pcre_subwords_with_parens_arbitrary=='(?:'${pcre_subword_with_parens_arbitrary}')++'
+    local pcre_subwords_expandable='(?:'${pcre_subword_expandable}')++'
+
+    # One or more syntactic constructs optionally containing strictly balanced
+    # parens.
+    local pcre_subwords_with_parens_balanced='(?:'${pcre_subword_interpretable_with_parens_balanced}')++'
 
     # One or more substitutable syntactic constructs in a shell word.
     local pcre_subwords_substitutable='(?:'${pcre_subword_substitutable_unqualified}'|'${pcre_subword_substitutable_qualified}')++'
 
-    #FIXME: Excise. This has been replaced by ${pcre_subwords_with_parens_arbitrary}.
+    #FIXME: Excise. This has been replaced by ${pcre_subwords_expandable}.
 
     # One or more interpretable syntactic constructs in a shell word *OR*
     # redirections.
@@ -880,8 +924,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # "`"-delimited process substitutions *OR* redirections.
     local pcre_subwords_interpretable_sans_backtick='(?:'${pcre_subword_interpretable_sans_backtick_unqualified}'|'${pcre_subword_sans_backtick_interpretable_qualified}'|'${pcre_redirect_punctuation}')++'
 
-    # ..................{ WORD ~ word                        }..................
-
+    # ..................{ WORD                               }..................
     # Substitutable shell word, signifying an argument passed to a macro.
     # While this PCRE excludes redirections, zsh technically permits
     # redirections to be arbitrarily interspersed with arguments passed to
@@ -901,23 +944,31 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_word_substitutable=${pcre_word_lookahead}${pcre_subwords_substitutable}${pcre_word_lookbehind}
 
     # Shell word containing one or more syntactic constructs optionally
-    # containing block suffix "}" *OR* balanced and/or unbalanced parens.
+    # containing block suffix "}" and/or balanced and/or unbalanced parens.
     # Note that matching the former only requires omitting negative lookbehind.
-    local pcre_word_with_brace_right_and_parens_arbitrary=${pcre_word_lookahead}${pcre_subwords_with_parens_arbitrary}
+    local pcre_word_expandable=${pcre_word_lookahead}${pcre_subwords_expandable}
+
+    # Shell word containing one or more syntactic constructs optionally
+    # containing block suffix "}" and/or strictly balanced parens.
+    local pcre_word_interpretable_with_parens_balanced=${pcre_word_lookahead}${pcre_subwords_with_parens_balanced}
+
+    # ..................{ WORDS                              }..................
+    # Zero or more substitutable shell words, whitespace characters, or comments.
+    local pcre_words_substitutable_or_comments_spaced_optional='(?:'${pcre_word_substitutable}'|'${pcre_comment_optional_spaced}')*'
 
     # Zero or more shell words containing one or more syntactic constructs
     # optionally containing balanced and/or unbalanced parens. Each such
     # construct is delimited by one or more horizontal whitespace characters
     # optionally interspersed by line continuations.
-    local pcre_words_with_brace_right_and_parens_arbitrary_optional='(?:'${pcre_word_with_brace_right_and_parens_arbitrary}'(?:'${pcre_spaces_horizontal_continuable_after}${pcre_word_with_brace_right_and_parens_arbitrary}')*+)?+'
+    local pcre_words_expandable_optional='(?:'${pcre_word_expandable}'(?:'${pcre_spaces_horizontal_continuable_after}${pcre_word_expandable}')*+)?+'
 
-    #FIXME: This is probably the PCRE we should use to match macro arguments.
+    #FIXME: Match macro arguments with this PCRE, yes?
 
     # Zero or more shell words containing one or more syntactic constructs
     # optionally containing strictly balanced parens.
-    local pcre_words_with_brace_right_and_parens_balanced_optional='(?:'${pcre_word_with_brace_right_and_parens_balanced}'(?:'${pcre_spaces_horizontal_continuable_after}${pcre_word_with_brace_right_and_parens_balanced}')*+)?+'
+    local pcre_words_interpretable_with_parens_balanced_optional='(?:'${pcre_word_interpretable_with_parens_balanced}'(?:'${pcre_spaces_horizontal_continuable_after}${pcre_word_interpretable_with_parens_balanced}')*+)?+'
 
-    #FIXME: Excise. This has been replaced by ${pcre_word_with_parens_arbitrary}.
+    #FIXME: Excise. This has been replaced by ${pcre_word_expandable}.
 
     # Interpretable shell word *OR* block suffix "}".
     local pcre_word_interpretable_or_block_suffix=${pcre_word_lookahead}${pcre_subwords_interpretable}
@@ -935,10 +986,34 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # continuations.
     local pcre_words_substitutable_spaced_optional='(?:'${pcre_word_substitutable}${pcre_spaces_horizontal_continuable}')*'
 
-    # Zero or more substitutable shell words, whitespace characters, or comments.
-    local pcre_words_substitutable_or_comments_optional_spaced='(?:'${pcre_words_interpretable}'|'${pcre_comment_optional_spaced}')*'
+    # ..................{ COMMANDS ~ braces                  }..................
+    #FIXME: Define me similarly as below.
 
-    # ..................{ COMMANDS                           }..................
+    # ..................{ COMMANDS ~ parens                  }..................
+    # List assignment, whose syntax frequently conflicts with that of parent
+    # syntactic constructs and hence must be explicitly matched. Specifically:
+    #
+    # * The delimiting ")" conflicts with the ")" delimiting possibly
+    #   recursively nested process substitutions.
+    # * List assignments prohibit syntax otherwise permitted in such parents
+    #   (e.g., "<("- and ")"-delimited process substitutions).
+    local pcre_list_assignment_optional=${ZESHY_VAR_NAME_PCRE}'(?:=\('${pcre_words_substitutable_or_comments_spaced_optional}'\))?+'
+
+    #FIXME: Actually use in process substitutions.
+
+    # One or more commands, matching "(" and ")" characters in a strictly
+    # balanced manner. This PCRE is appropriate for use in "("- and
+    # ")"-delimited process substitutions.
+    #
+    # "("- and ")"-delimited list assignments are commands consisting of
+    # multiple shell words rather than subwords of a shell word and hence are
+    # matched here rather than in
+    # ${pcre_words_interpretable_with_parens_balanced_optional}. Since such
+    # assignments are prefixed by variable names indistinguishable from and
+    # hence conflicting with unquoted shell words, the former is matched first.
+    local pcre_commands_with_parens_balanced_optional='(?:(?:'${pcre_list_assignment_optional}'|'${pcre_words_interpretable_with_parens_balanced_optional}')'${pcre_command_ends}')*+'
+
+    # ..................{ MACRO                              }..................
     # Macro.
     local pcre_macro=${ZESHY__MACRO_NAME_PLACEHOLDER_PCRE}
     local pcre_macro_optional='(?:'${pcre_macro}')?+'
@@ -965,28 +1040,11 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #
     # Since "{" is a command terminator whereas "}" is not,
     # ${pcre_command_ends} matches the former whereas
-    # ${pcre_words_with_brace_right_and_parens_arbitrary_optional} the latter.
+    # ${pcre_words_expandable_optional} the latter.
 
-    local pcre_macros_or_commands_optional='(?:'${pcre_macro_optional}${pcre_words_with_brace_right_and_parens_arbitrary_optional}${pcre_command_ends}')*+'
-
-    #FIXME: Define ${pcre_words_with_brace_right_and_parens_balanced_optional}.
-    #FIXME: Actually use in process substitutions.
-
-    # One or more commands, matching "(" and ")" characters in a strictly
-    # balanced manner. This PCRE is appropriate for use in "("- and
-    # ")"-delimited process substitutions.
-    local pcre_commands_with_brace_right_and_parens_balanced_optional='(?:'${pcre_words_with_brace_right_and_parens_balanced_optional}${pcre_command_ends}')*+'
+    local pcre_macros_or_commands_expandable_optional='(?:'${pcre_macro_optional}${pcre_words_expandable_optional}${pcre_command_ends}')*+'
 
     # ..................{ CODE                               }..................
-    # List assignment, whose syntax frequently conflicts with that of parent
-    # syntactic constructs and hence must be explicitly matched. Specifically:
-    #
-    # * The delimiting ")" conflicts with the ")" delimiting possibly
-    #   recursively nested process substitutions.
-    # * List assignments prohibit syntax otherwise permitted in such parents
-    #   (e.g., "<("- and ")"-delimited process substitutions).
-    local pcre_list_assignment_optional_var_name=${ZESHY_VAR_NAME_PCRE}'(?:=\('${pcre_words_substitutable_or_comments_optional_spaced}'\))?+'
-
     #FIXME: How many of the following PCREs do we still use? Investigate.
     #Right. So, this current approach appears increasingly horrific. While it
     #was pleasant, in concept, to believe that we could generalize a set of
@@ -1009,10 +1067,10 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # Since the "<" of the "<("- and ")"-delimited process substitution matched
     # in shell words conflicts with the "<" unconditionally matched in
     # here-documents or -string prefixes, the former *MUST* be matched first.
-    local pcre_code_sans_comment_or_command_end_or_parens_right_prefix=${pcre_list_assignment_optional_var_name}'|'
+    local pcre_code_sans_comment_or_command_end_or_parens_right_prefix=${pcre_list_assignment_optional}'|'
     local pcre_code_sans_comment_or_command_end_or_parens_right_suffix='|'${pcre_here_optional}
 
-    local pcre_code_sans_comment_or_command_end_prefix=${pcre_list_assignment_optional_var_name}'|'
+    local pcre_code_sans_comment_or_command_end_prefix=${pcre_list_assignment_optional}'|'
     local pcre_code_sans_comment_or_command_end_suffix='|'${pcre_here_optional}
     local pcre_code_sans_comment_or_command_end=${pcre_code_sans_comment_or_command_end_prefix}${pcre_word_interpretable_or_block_suffix}${pcre_code_sans_comment_or_command_end_suffix}
 
@@ -1187,9 +1245,6 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # beyond the scope of current work, the current approach and hence
     # limitations stand.
 
-    #FIXME: Eliminate this PCRE in favor of merely embedding
-    #${pcre_codes_optional} directly below.
-
     # Possibly recursively nested process substitution content, omitting
     # prefixing and suffixing delimiters.
     local pcre_process_substitution_parens_body=${pcre_codes_optional}
@@ -1252,27 +1307,29 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # Since we prefix such PCRE by "$" below, avoid doing so here.
     local pcre_var_expansion_optional='\{(?:[^}'${char_not_embeddable_prefix}']++|'${pcre_char_escaped_optional}'|'${pcre_embeddable}')*+\}?+'
 
-    # Possibly recursively nested arithmetic or process substitution.  Since
-    # the "$((" delimiting arithmetic substitutions greedily overlaps the "$("
-    # delimiting process substitutions, the former *MUST* be matched first.
-    local pcre_dollar_parens_substitution_optional='\((?:'${pcre_math_substitution_parens_optional}'|'${pcre_process_substitution_dollar_optional}')'
-
-    # "$"-prefixed syntactic construct *NOT* a process substitution, comprising
-    # variable expansions and arithmetic substitutions. To match syntactically
-    # valid variable expansions undelimited by "{" and "}" *AND* syntactically
-    # invalid "$"-prefixed strings, such syntax is matched optionally.
-    local pcre_dollar_expansion_optional='\$(?:'${pcre_var_expansion_optional}'|'${pcre_math_substitution_optional}')?+'
-
     # "$"-prefixed syntactic construct, comprising variable expansions *AND*
     # arithmetic and process substitutions.
-    local pcre_dollar_substitution_optional='\$(?:'${pcre_var_expansion_optional}'|'${pcre_dollar_parens_substitution_optional}'|'${pcre_math_substitution_braces_optional}')?+'
+    local pcre_dollar_construct_optional='\$(?:'${pcre_var_expansion_optional}'|'${pcre_dollar_parens_substitution_optional}'|'${pcre_math_substitution_braces_optional}')?+'
+
+    # "$"-prefixed syntactic construct *NOT* a process substitution, comprising
+    # variable expansions and arithmetic substitutions.
+    local pcre_dollar_expansion_optional='\$(?:'${pcre_var_expansion_optional}'|'${pcre_math_substitution_optional}')?+'
+
+    # "$("-prefixed syntactic construct, comprising:
+    #
+    # * "$("- and ")"-delimited recursive process substitutions.
+    # * "$(("- and "))"-delimited recursive arithmetic substitutions.
+    #
+    # Since the "$((" delimiting the latter greedily overlaps the "$("
+    # delimiting the former, the former *MUST* be matched first.
+    local pcre_dollar_parens_substitution_optional='\((?:'${pcre_math_substitution_parens_optional}'|'${pcre_process_substitution_dollar_optional}')'
 
     # ..................{ SUBSTITUTION                       }..................
     # Recursively expandable syntactic construct.
     pcre_macro_subroutines_body+='(?<exp>'${pcre_dollar_expansion_optional}'|'${pcre_math_test_optional}')'
 
     # Recursively embeddable syntactic construct.
-    pcre_macro_subroutines_body+='(?<emb>'${pcre_dollar_substitution_optional}'|'${pcre_process_substitution_backtick_optional}')'
+    pcre_macro_subroutines_body+='(?<emb>'${pcre_dollar_construct_optional}'|'${pcre_process_substitution_backtick_optional}')'
 
     #FIXME: We need to make sure that macro argument parsing halts immediately
     #before the first redirection passed to such argument (rather than
@@ -1282,10 +1339,10 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #
     # Since shell words passed as arguments to preprocessor macros accept
     # neither arithmetic tests *OR* redirections, such constructs are omitted.
-    pcre_macro_subroutines_body+='(?<sub>'${pcre_dollar_substitution_optional}'|'${pcre_process_substitution_file_optional}'|'${pcre_process_substitution_backtick_optional}')'
+    pcre_macro_subroutines_body+='(?<sub>'${pcre_dollar_construct_optional}'|'${pcre_process_substitution_file_optional}'|'${pcre_process_substitution_backtick_optional}')'
 
     # Recursively interpretable syntactic construct.
-    pcre_macro_subroutines_body+='(?<int>'${pcre_dollar_substitution_optional}'|'${pcre_math_test_optional}'|'${pcre_process_substitution_file_optional}'|'${pcre_process_substitution_redirect_optional}'|'${pcre_process_substitution_backtick_optional}')'
+    pcre_macro_subroutines_body+='(?<int>'${pcre_dollar_construct_optional}'|'${pcre_math_test_optional}'|'${pcre_process_substitution_file_optional}'|'${pcre_process_substitution_redirect_optional}'|'${pcre_process_substitution_backtick_optional}')'
 
     # ..................{ ARG                                }..................
     # Zero or more standard arguments matched in a manner assuming that a block
@@ -1582,6 +1639,69 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: O.K.; we can't prefix this by ${pcre_list_assignment_optional}, due
+    #to chicken-and-egg issues. Instead, we'll need to manually prefix
+    #${pcre_words_interpretable_with_parens_balanced} by
+    #"${pcre_list_assignment_optional}|".
+    #
+    #Actually, that doesn't really work. No, the current approach is sound; we
+    #simply need to define *ALL* substitutable word constructs before *ALL*
+    #interpretable word constructs, implying a slight restructuring. But that
+    #should it.
+    #
+    #Actually, that's a terrible idea. While it probably *WOULD* work, the core
+    #issue here is that treating a list assignment consisting of multiple shell
+    #words like a single shell word is fundamentally wrong. So, we *DO* need to
+    #revert to the prior conception and prepend
+    #"${pcre_list_assignment_optional}'|'" at the highest PCRE level possible.
+#
+    #FUXME: So, this is clearly munted. What's the best way to restore this?
+    #There's no recursive nesting of such assignments, so this should be
+    #feasible parseable without much effort. We're inclined to agree with the
+    #prior approach: that is, ${pcre_list_assignment_optional} needs to be
+    #defined as late (and hence as far below) as possible. That should get us
+    #most of the way there, yes?
+    # local pcre_subword_substitutable_unqualified=${pcre_subword_unqualified}'|'${pcre_substitutable}
+    # local pcre_subword_substitutable_qualified=${pcre_subword_qualified_optional_prefix}${pcre_subword_substitutable_unqualified}${pcre_subword_qualified_optional_suffix}
+    # local pcre_subwords_substitutable='(?:'${pcre_subword_substitutable_unqualified}'|'${pcre_subword_substitutable_qualified}')++'
+    # local pcre_word_substitutable=${pcre_word_lookahead}${pcre_subwords_substitutable}${pcre_word_lookbehind}
+    # local pcre_words_substitutable_or_comments_spaced_optional='(?:'${pcre_word_substitutable}'|'${pcre_comment_optional_spaced}')*'
+
+    # While matching "("- and ")"-delimited list assignments is essential to
+    # such balancing, the typical chicken-and-egg issues require we defer such
+    # inclusion to PCREs embedding this PCRE. *collective shrug*
+
+    #FUXME: This currently fails to match backticks. That appears to be the
+    #only significant omission, which is mildly great.
+    #FUXME: O.K.; so, we're going to need to split this into two PCREs:
+    #
+    #1. A PCRE specific to matching macros -- say,
+    #   ${pcre_subword_expandable}. The current approach is pretty much
+    #   already there. We only need to temporarily match backticks as unquoted
+    #   characters. They aren't, of course; but until we at least get double
+    #   quotes-embedded process substitutions to work, backticks will have to
+    #   take a back seat here. To do so, just match "`[^`]*+`" manually at the
+    #   very end of such PCRE and add a FUXME comment reminding ourselves to
+    #   eliminate such hackiness at some future date.
+    #2. A PCRE specific to matching braces -- say,
+    #   ${pcre_subword_interpretable_with_braces_balanced}.
+
+#  To match syntactically
+    # valid variable expansions undelimited by "{" and "}" *AND* syntactically
+    # invalid "$"-prefixed strings, such syntax is matched optionally.
+    #FUXME: Eliminate this PCRE in favor of merely embedding
+    #${pcre_codes_optional} directly below.
+    # local pcre_expandable='(?=\$(?:[{\[]|\(\())(?&exp)'
+
+    #FUXME: The lookahead strikes us as inherently wrong. Investigate.
+    #Shouldn't we simply use a character class, as above and below -- or, if
+    #only matching "$"-prefixed constructs, merely a "$"?
+    #FUXME: Rather than a mere character class, wouldn't it ultimately 
+
+    #FUXME: Honestly, defining separate ${pcre_subwords_expandable}
+    #PCREs strikes us as overkill. Embed such PCREs directly here and then
+    #excise such PCREs entirely.
+
     #FUXME: Uhm; ${pcre_macro_optional} appears to be undefined. Oh, right. The
     #reason why is that macro PCREs are necessarily split up into a prefix and
     #suffix to account for the fact that macro names are dynamically
@@ -1757,7 +1877,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #FUXME: The above suggests we should just omit "(" and ")" from a new
     #negative character class -- say, ${char_sans_word_macroable} or some such.
     #In such case, we can efficiently omit both
-    #${pcre_list_assignment_optional_var_name} *AND* the qualified (i.e.,
+    #${pcre_list_assignment_optional} *AND* the qualified (i.e.,
     #"("- and ")"-balanced) variant of such PCRE from ${pcre_code_macroable}.
     #Which is great! Of course, process substitutions still require the current
     #version of ${pcre_code} matching such constructs. Right; in terms of clear
@@ -1770,7 +1890,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #  and ")". Hence, rename ${pcre_code} to
     #  ${pcre_code_with_parens_balanced}.
     #
-    #Sensible, yes? Actually, how about just ${pcre_words_with_parens_arbitrary}. Let's face it:
+    #Sensible, yes? Actually, how about just ${pcre_words_expandable}. Let's face it:
     #this PCRE is specific to matching non-macro syntactic constructs. That's
     #all it will ever do, and that's all it *SHOULD* ever do.
 
@@ -1888,16 +2008,16 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #${pcre_spaces_horizontal_optional} below -- which would be a good thing.
 
     # local pcre_macro_command_end='(?:'${pcre_spaces_horizontal_continuable_after}${pcre_command_end_spaced_body}'|'${pcre_command_end_unspaced}')'
-    # local pcre_macro_spaces_or_words_optional='(?|'${pcre_spaces_horizontal_grouped}${pcre_line_continuations_spaceable_horizontal_optional}'|'${pcre_word_with_parens_arbitrary}${pcre_empty_group}')*+'
-    # local pcre_word_with_parens_arbitrary_optional='(?:'${pcre_word_with_parens_arbitrary}')?'
+    # local pcre_macro_spaces_or_words_optional='(?|'${pcre_spaces_horizontal_grouped}${pcre_line_continuations_spaceable_horizontal_optional}'|'${pcre_word_expandable}${pcre_empty_group}')*+'
+    # local pcre_word_expandable_optional='(?:'${pcre_word_expandable}')?'
     # local pcre_macro_optional='(?:'${pcre_macro}')?+'
-    # local pcre_macro_suffix_optional='(?|'${pcre_word_with_parens_arbitrary_optional}${pcre_spaces_horizontal}${pcre_line_continuations_spaceable_horizontal_optional}'(?:('${pcre_command_end_spaced_body}')?)*+'
-    # ${pcre_command_end_spaced_optional_grouped}'|'${pcre_words_with_parens_arbitrary}${pcre_empty_group}')?+'
+    # local pcre_macro_suffix_optional='(?|'${pcre_word_expandable_optional}${pcre_spaces_horizontal}${pcre_line_continuations_spaceable_horizontal_optional}'(?:('${pcre_command_end_spaced_body}')?)*+'
+    # ${pcre_command_end_spaced_optional_grouped}'|'${pcre_words_expandable}${pcre_empty_group}')?+'
     # local pcre_command_end_spaced_prefix=${pcre_spaces_horizontal}${pcre_line_continuations_spaceable_horizontal_optional}
     # local pcre_command_end_spaced_optional=${pcre_command_end_spaced_prefix}'(?:'${pcre_command_end_spaced_body}')?'
     # local pcre_command_end_spaced_optional_grouped=${pcre_command_end_spaced_prefix}'('${pcre_command_end_spaced_body}')?'
-    # local pcre_words_with_parens_arbitrary=${pcre_word_with_parens_arbitrary}'('${pcre_spaces_horizontal}${pcre_word_with_parens_arbitrary}')*+'
-    # local pcre_macro_suffix_optional='(?|'${pcre_command_end_spaced_optional_grouped}'|'${pcre_words_with_parens_arbitrary}${pcre_empty_group}')?+'
+    # local pcre_words_expandable=${pcre_word_expandable}'('${pcre_spaces_horizontal}${pcre_word_expandable}')*+'
+    # local pcre_macro_suffix_optional='(?|'${pcre_command_end_spaced_optional_grouped}'|'${pcre_words_expandable}${pcre_empty_group}')?+'
     # local pcre_macro_command_end='(?(-1)|'${pcre_command_end_unspaced}')'
 
     #FUXME: This can be slightly optimized by noting that 
@@ -1914,7 +2034,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #guarantees frequent backtracking. To avoid this, this PCRE should be
     #inlined directly into ${pcre_macro} and the prefixing whitespace unified
     #with ${pcre_command_end_spaced_optional}.
-    # local pcre_words_with_parens_arbitrary=${pcre_word_with_parens_arbitrary}'('${pcre_spaces_horizontal}${pcre_word_with_parens_arbitrary}')*+'
+    # local pcre_words_expandable=${pcre_word_expandable}'('${pcre_spaces_horizontal}${pcre_word_expandable}')*+'
 
     # local pcre_command_end_spaced_prefix=${pcre_spaces_horizontal}${pcre_line_continuations_spaceable_horizontal_optional}
     # local pcre_command_end_spaced_optional=${pcre_command_end_spaced_prefix}'(?:'${pcre_command_end_spaced_body}')?'
@@ -1928,10 +2048,10 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 
     # Code atom matching all syntactic constructs *NOT* preprocessor macros.
 
-    #FUXME: Define ${pcre_word_with_parens_arbitrary} as
+    #FUXME: Define ${pcre_word_expandable} as
     #${pcre_word_interpretable_or_block_suffix}; then excise the latter.
     #FUXME: It seems increasingly likely that ${pcre_here_optional} should be
-    #embedded directly into ${pcre_word_with_parens_arbitrary}.
+    #embedded directly into ${pcre_word_expandable}.
     #FUXME: Still not quite right. We want to be able to match macros suffixed
     #by... well, nothing (i.e., the string end optionally preceded by ignorable
     #horizontal whitespace).
@@ -2124,7 +2244,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #new PCRE ${pcre_codes_sans_command_end} to be embedded in
     #${pcre_macro_command_optional} instead?
 
-    # local pcre_code_sans_comment_prefix=${pcre_chars_command_end_not_code_prefix}'|'${pcre_list_assignment_optional_var_name}'|'
+    # local pcre_code_sans_comment_prefix=${pcre_chars_command_end_not_code_prefix}'|'${pcre_list_assignment_optional}'|'
     # local pcre_code_sans_comment_suffix='|'${pcre_here_optional}
 
 # delimiting (i.e., neither prefixing nor suffixing)
@@ -2458,7 +2578,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #${pcre_word_interpretable} should clearly omit such lookahead.
 
     #FUXME: Consider renaming to
-    #${pcre_words_interpretable_or_comments_optional_spaced} instead and
+    #${pcre_words_interpretable_or_comments_spaced_optional} instead and
     #embedding ${pcre_words_interpretable} here instead.
 
     #FUXME: Incorrect. Must use interpretables rather than substitutables.
@@ -2695,7 +2815,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #simpler solution of matching adjacent backticks in a nested recursive
     #manner by refactoring this to exactly resemble the above process
     #substitution syntax.
-    #FUXME: Fold ${pcre_list_assignment_optional_var_name} directly into
+    #FUXME: Fold ${pcre_list_assignment_optional} directly into
     #${pcre_code_sans_comment}.
     #This is fairly important, as such syntax prohibits syntax otherwise
     #permitted in the parent syntactic construct (e.g., "<("- and ")"-delimited
@@ -3180,7 +3300,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #*TOO* terribly hard to gin up something that works. This should do it:
     #
     #${pcre_code_sans_comment}'|'${pcre_comment_optional_spaced}
-    # local pcre_list_assignment_optional_var_name=${pcre_var_name}'(?:=\('${pcre_words_parens_optional}'\))?'
+    # local pcre_list_assignment_optional=${pcre_var_name}'(?:=\('${pcre_words_parens_optional}'\))?'
 
     #FUXME: This didn't even work under the prior definition, since it failed
 
@@ -3403,7 +3523,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #replace all current instances of such substring by such PCRE.
     #FUXME: Abstract out [^'${char_not_code_prefix}']++.
 
-    # local pcre_process_substitution_dollar='(?:'${pcre_list_assignment_optional_var_name}'|'${pcre_word_parens}'|'${pcre_comment_optional_spaced}'|'${pcre_here_doc_or_string_prefix}'|[^)])*'
+    # local pcre_process_substitution_dollar='(?:'${pcre_list_assignment_optional}'|'${pcre_word_parens}'|'${pcre_comment_optional_spaced}'|'${pcre_here_doc_or_string_prefix}'|[^)])*'
 
     # Redirection prefixed by a file descriptor specified as either a
     # non-negative integer *OR* "{"- and "}"-delimited variable name. Such
@@ -3605,7 +3725,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # local pcre_macro_arg_block_body='(?:[^{}'${char_not_code_prefix}']++|'${pcre_char_escaped_optional}'|'${pcre_line_start_or_spaces_horizontal}${pcre_macro_arg_block_or_comment_optional}'|'${pcre_code}'|[^}]|'${pcre_brace_right}')*'
 
     # escaping characters, including the above such prefixes.
-    # local pcre_embeddable=${pcre_dollar_substitution}'|'${pcre_process_substitution_dollar_nonrecursive}
+    # local pcre_embeddable=${pcre_dollar_construct}'|'${pcre_process_substitution_dollar_nonrecursive}
     # pcre_macro_subroutines_body+='(?<sub>'${pcre_embeddable}')'
 
     # local pcre_embeddable_or_quotes=${pcre_quotes_single}'|'${pcre_quotes_double}'|'${pcre_embeddable}
@@ -4407,7 +4527,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #discouraged anyway, efficiency is of little to no concern.
 
     # Any of the above "$"-prefixed syntactic constructs.
-    # local pcre_dollar_substitution+=
+    # local pcre_dollar_construct+=
 
     #FUXME: Woops. Wherever we match an escaped character (e.g., "\\[)]"), we
     #need to match a an escaped "\\" *BEFORE* matching such character. Why?
