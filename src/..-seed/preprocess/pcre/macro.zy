@@ -316,7 +316,6 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 
     # One or more horizontal whitespace characters.
     local pcre_spaces_horizontal=${pcre_space_horizontal}'++'
-    local pcre_spaces_horizontal_grouped='('${pcre_spaces_horizontal}')'
 
     # Zero or more horizontal whitespace characters.
     local pcre_spaces_horizontal_optional=${pcre_space_horizontal}'*+'
@@ -391,6 +390,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # One or more horizontal whitespace characters *NOT* preceded by line
     # continuations, optionally interspersed by line continuations.
     local pcre_spaces_horizontal_continuable=${pcre_spaces_horizontal}${pcre_line_continuations_spaceable_horizontal_optional}
+    local pcre_spaces_horizontal_continuable_grouped='('${pcre_spaces_horizontal_continuable}')'
 
     # One or more whitespace characters optionally interspersed with line
     # continuations.
@@ -399,6 +399,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # One or more horizontal whitespace characters optionally interspersed with
     # line continuations, comprising *ALL* whitespace delimiting one shell word.
     local pcre_continuable_spaces_horizontal=${pcre_line_continuations_optional}${pcre_spaces_horizontal_continuable}
+    local pcre_continuable_spaces_horizontal_grouped='('${pcre_continuable_spaces_horizontal}')'
 
     # Zero or more whitespace characters *OR* line continuations.
     local pcre_spaces_continuable_optional='(?:'${pcre_spaces}'|'${pcre_line_continuation}')*+'
@@ -409,11 +410,27 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # Start of the subject string (i.e., the string currently being matched).
     local pcre_string_start='\A'
 
-    # End of the subject string. To facilitate detection of such zero-width
-    # assertion, the character immediately preceding such end is grouped.
-    # Naturally, this assumes a non-empty subject string.
+    # End of the subject string.
     local pcre_string_end='\z'
-    local pcre_string_end_grouped='(?<(.))'${pcre_string_end}
+
+    #FIXME: Shift elsewhere.
+    # Previously matched character captured with negative lookbehind.
+    local pcre_char_prior_grouped='(?<(.))'
+
+    # End of the subject string, capturing the character immediately preceding
+    # such end *AND* immediately reporting success from this match attempt.
+    #
+    # Capturing such character facilitate detection of syntactically
+    # invalid constructs in subsequent PCREs (e.g., double-quoted strings
+    # lacking a prefixing double-quotes). Note that this assumes a non-empty
+    # subject string.
+    #
+    # Reporting success prevents spurious match successs *AND* mildly improves
+    # efficiency after detecting such invalid constructs (e.g., by preventing
+    # matching command terminators). While reporting failure would be
+    # samentically preferable, doing so inhibits zsh from setting canonical
+    # list global ${match} to such groups, which rather defeats the purpose.
+    local pcre_string_end_report_success_grouped=${pcre_empty_group}${pcre_char_prior_grouped}${pcre_string_end}${pcre_report_success}
 
     # Start of the current line, consuming one or more prefixing vertical
     # whitespace characters if any. "^" is a zero-width assertion consuming no
@@ -621,19 +638,26 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # "#"-prefixed command terminating comment.
     local pcre_command_end_comment=${pcre_comment_body}'(?:'${pcre_command_end_spaces_vertical}'|'${pcre_string_end}')'
 
-    # Command terminator *NOT* requiring prefixing or suffixing whitespace,
-    # excluding single-character command terminators.
-    local pcre_command_end_unspaced_body=${pcre_command_end_spaces_vertical}'|'${pcre_command_end_comment}'|'${pcre_command_end_process_prefix_sans_backtick}'|'${pcre_command_end_pipe}'|'${pcre_command_end_ampersand}'|'${pcre_string_end}
+    # Command terminator excluding single characters *NOT* requiring prefixing
+    # or suffixing whitespace, excluding single-character command terminators.
+    local pcre_command_end_unspaced_body_sans_char=${pcre_command_end_spaces_vertical}'|'${pcre_command_end_comment}'|'${pcre_command_end_process_prefix_sans_backtick}'|'${pcre_command_end_pipe}'|'${pcre_command_end_ampersand}'|'${pcre_string_end}
 
-    # Command terminator neither a "}" block suffix or requiring prefixing
-    # or suffixing whitespace, optionally suffixed by horizontal whitespace
-    # optionally interspersed by line continuations.
-    local pcre_command_end_unspaced_sans_block_prefix='(?:'${pcre_command_end_char_sans_block_prefix}'|'${pcre_command_end_unspaced_body}')'${pcre_spaces_horizontal_continuable_optional}
+    # Command terminator *NOT* requiring prefixing or suffixing whitespace.
+    local pcre_command_end_unspaced_body='(?:'${pcre_command_end_char}'|'${pcre_command_end_unspaced_body_sans_char}')'
+
+    # Command terminator excluding "{" block prefixes *NOT* requiring prefixing
+    # or suffixing whitespace.
+    local pcre_command_end_unspaced_body_sans_block_prefix='(?:'${pcre_command_end_char_sans_block_prefix}'|'${pcre_command_end_unspaced_body_sans_char}')'
 
     # Command terminator *NOT* requiring prefixing or suffixing whitespace,
     # optionally suffixed by horizontal whitespace optionally interspersed by
     # line continuations.
-    local pcre_command_end_unspaced='(?:'${pcre_command_end_char}'|'${pcre_command_end_unspaced_body}')'${pcre_spaces_horizontal_continuable_optional}
+    local pcre_command_end_unspaced=${pcre_command_end_unspaced_body}${pcre_spaces_horizontal_continuable_optional}
+
+    # Command terminator excluding "}" block suffixes *NOT* requiring prefixing
+    # or suffixing whitespace, optionally suffixed by horizontal whitespace
+    # optionally interspersed by line continuations.
+    local pcre_command_end_unspaced_sans_block_prefix=${pcre_command_end_unspaced_body_sans_block_prefix}${pcre_spaces_horizontal_continuable_optional}
 
     # ..................{ TERMINATOR                         }..................
     # Command terminator optionally prefixed by horizontal whitespace
@@ -731,8 +755,45 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #encapsulate this in a subroutine anymore. For simplicity, however, retain
     #the current approach until arriving at the testing phase.
 
+    #FIXME: In reflection, the current approach is fairly bad. We *NEVER* want
+    #to treat here-document bodies like arbitrary code, as doing so could
+    #readily induce pathological parser behavior; instead, we need to attempt
+    #to match a grouped ${pcre_word_parenable} here (probably in an optional
+    #manner also matching the end-of-string: e.g.,
+    #"(${pcre_word_parenable}|${pcre_string_end_grouped})") and then simply
+    #attempt to match the same word as the closing delimiter. Incidentally,
+    #this permits us to excise all ${pcre_*_literal_grouped} PCREs, which is
+    #mildly nice. More importantly, this ensures that for edge-case here-
+    #documents *NOT* supported by the zeshy preprocessor (e.g.,
+    #"<<$(print ugh)
+    #ugh"), an explicit fatal exception will be thrown. Which is a *FANTASTIC*
+    #thing. Indeed, such exception message could even be improved by grouping
+    #${pcre_string_end_grouped} in such PCRE into a unique group, permitting
+    #the preprocessor to disambiguate ordinary syntactic invalidities from
+    #non-preprocessable, ossibly syntactically valid here-documents. Which is
+    #fairly important, though hardly required for a first working draft.
+    #FIXME: Wait. We can do considerably better than even that. Consider:
+    #   local pcre_here_doc_prefix_report_success_grouped=${pcre_char_prior_grouped}${pcre_empty_group}${pcre_report_success}
+    #   local pcre_here_doc_prefix_delimiter_grouped='(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}'|'${pcre_word_literal_grouped}'|'${pcre_string_end_report_success_grouped}'|'${pcre_here_doc_prefix_report_success_grouped}')'
+    #   local pcre_here_doc_prefix_grouped='-?'${pcre_spaces_horizontal_continuable_optional}${pcre_here_doc_prefix_delimiter_grouped}${pcre_space_vertical}
+    #
+    #This is fairly clever. In the event of no sanely matchable here-document
+    #delimiter *OR* end-of-string being matched, we report success with a new
+    #group capturing the previous -- which, since we've just matched at least
+    #"<<", obviously exists. This permits us to differentiate between error
+    #conditions, which is... well, great!
+    #FIXME: There's just one tiny issue with the prior approach: subroutine
+    #calls occlude captured groups, requiring that this be extracted out of
+    #such calls and into the mainstream PCRE. Shouldn't pose any issues; we
+    #just need to do so, as postulated above. *shrug*
+
     local pcre_here_doc_prefix='-?'${pcre_spaces_horizontal_continuable_optional}'(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}'|'${pcre_word_literal_grouped}')'${pcre_space_vertical}
     local pcre_here_doc_body='.*?'
+
+    #FIXME: Hmm; since this suffixing ${pcre_line_end} *NEEDS* to be consumed as
+    #a command terminator instead, we'll need to match such constraint with
+    #only positive lookahead.
+
     local pcre_here_doc_suffix='(?:'${pcre_space_vertical}'(?-1)'${pcre_line_end}'|'${pcre_string_end}')'
     pcre_macro_subroutines_body+='(?<doc>'${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_suffix}')'
 
@@ -1163,8 +1224,31 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #
     # To detect unbalanced and hence syntactically invalid block arguments, the
     # last character of the subject string is captured from such arguments.
+
+    #FIXME: Clever. To distinguish unexpected PCRE match errors from expected
+    #end-of-string matches, we *REALLY* want to unconditionally capture the
+    #character immediately preceding the end-of-string at the topmost PCRE
+    #level external to macro matching. That, in turn, implies we do *NOT* need
+    #to group such character. Instead, since we'll be grouping such character
+    #elsewhere, all we need to do to detect a missing "}" is to see whether...
+    #err, O.K.; so, we won't be able to readily discern between scalar and
+    #block arguments in exception messages, but... eh? Who terribly cares.
+    #Given that, implement the following:
+    #
+    #* Replace ${pcre_string_end} by ${pcre_string_end_grouped} in *ALL* PCREs,
+    #  ensuring that the non-emptiness of final capture group "${match[-1]}"
+    #  reliably indicates whether the end-of-string has been reached. By using
+    #  "-1" rather than a positive index, we should be guaranteed of the
+    #  validity of this working regardless of context.
+    #* Add sufficient empty groups to macro matches below to ensure that the
+    #  corresponding group index is *ALWAYS* empty for valid macro matches.
+    #
+    #Pretty darn sweet, no? What's particularly awesome about this is that it
+    #permits us to transparently detect invalidities in *BOTH* scalar and block
+    #macro arguments without any heavy lifting, which is great.
+
     local pcre_block_suffix='\}'
-    local pcre_block_suffix_grouped='(?:'${pcre_block_suffix}'|'${pcre_string_end_grouped}')'
+    local pcre_block_suffix_grouped='(?:'${pcre_block_suffix}'|'${pcre_string_end_report_success_grouped}')'
 
     # "{"- and "}"-delimited block. Blocks are recursively nestable and hence
     # matchable only with subroutine calls. Since such calls isolate groups
@@ -1290,21 +1374,40 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_macro_arg='(?:'${pcre_block_continuable}'|'${pcre_word_passable}')'
 
     # One or more macro arguments.
-    # local pcre_macro_args=${pcre_macro_arg}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_arg}')*+'
-    local pcre_macro_args_optional='(?:'${pcre_macro_arg}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_arg}')*+)?+'
-    # local pcre_macro_args_optional_grouped='('${pcre_macro_args_optional}')'
+    local pcre_macro_args=${pcre_macro_arg}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_arg}')*+'
+    local pcre_macro_args_optional_grouped='('${pcre_macro_args_optional}')?+'
 
-    # Zero or more macro arguments preceded by one or more horizontal
-    # whitespace characters optionally interspersed by line continuations.
-    local pcre_macro_args_spaced_optional_grouped='('${pcre_continuable_spaces_horizontal}${pcre_macro_args_optional}'|'${pcre_string_end}')'
+    # One or more grouped horizontal whitespace characters optionally
+    # interspersed by line continuations followed by zero or more grouped macro
+    # arguments. To identify the last byte indices of macros, all characters
+    # comprising such macro following such macro's name are captured --
+    # including whitespace delimiting such name from subsequent arguments.
+    local pcre_macro_spaced_grouped=${pcre_spaces_horizontal_continuable_grouped}${pcre_macro_args_optional_grouped}
+
+    # End of a macro accepting no arguments *AND* suffixed by no horizontal
+    # whitespace characters, thus consisting of a zsh-specific command
+    # terminator. Since zeshy-specific command terminators (e.g., :or())
+    # *MUST* be preceded by such whitespace, only zsh-specific command
+    # terminators are valid here. Such terminator is subsequently consumed by
+    # the PCRE embedding this PCRE and hence *MUST* be matched by positive
+    # lookahead rather than simply consumed here.
+    local pcre_macro_unspaced_lookahead='(?='${pcre_command_end_unspaced_body}')'
+
+    #FIXME: Still not quite right, due to grouping. We want line continuations
+    #following such name to be grouped *IF AND ONLY IF* such continuations are
+    #then followed by horizontal whitespace followed by one or more arguments.
+    #We'll probably need to shift ${pcre_line_continuations_optional} directly
+    #into each such PCRE above.
+    #
+    #Ah; alternatively, (and probably the better solution) simply group such
+    #continuations here. A bit silly, yes; but probably the simplest *AND* most
+    #efficient approach. We'll need a new index as well, naturally. *sigh*
+
+    # Macro body, comprising all arguments passed to such macro as well as
+    # line continuations and whitespace cementing the former to the latter.
+    local pcre_macro_body=${pcre_line_continuations_optional}'(?:'${pcre_macro_spaced_grouped}'|'${pcre_macro_unspaced_lookahead}')'
 
     # ..................{ MACRO                              }..................
-    #FIXME: Actually use below.
-
-    # Macro suffix, anchoring the end of a macro to the end of a line preceded
-    # by zero or more horizontal whitespace characters.
-    local pcre_macro_suffix=${pcre_spaces_horizontal_optional}${pcre_line_end}
-
     #FIXME: Rename to ${pcre_macro}? What? Help! HE-LLLP!
 
     # Zero or more arguments passed to a macro. Success is reported immediately
@@ -1490,6 +1593,8 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     match_index=1
     for match_index_name (
         ZESHY_MACRO_MATCH_INDEX_NAME
+        ZESHY_MACRO_MATCH_INDEX_SPACES_HORIZONTAL
+        ZESHY_MACRO_MATCH_INDEX_ARGS
         ZESHY_MACRO_MATCH_INDEX_ARG_BLOCK_IS_INVALID
     ) {
         integer -g ${match_index_name}=$(( match_index++ ))
@@ -1498,6 +1603,47 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #Note first that we embed "?+" rather than "'|'${pcre_string_end}", as the
+    #former matches both end
+
+    #FUXME: Rename ${pcre_string_end_grouped} to
+    #${pcre_string_end_report_success_grouped} and refactor such PCRE to
+    #*IMMEDIATELY* halt matching. Failing to do this could induce match
+    #failure and, in any case, inefficiency (e.g., as subsequent command
+    #terminators will attempt to be matched).
+
+    # To facilitate detection of such constraint, the character immediately preceding such end is grouped.
+    #Likewise, we only want such whitespace to be grouped
+    #when followed by one or more arguments; when *NOT* followed by such
+    #arguments, such whitespace should be matched in a positive look.
+    #Moreover, we only want such whitespace to be *MATCHED* (let alone grouped)
+    #when followed by one or more arguments; when *NOT* followed by such
+    #arguments, such whitespace should be matched in a positive look.
+    # local pcre_macro_args_optional='(?:'${pcre_macro_arg}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_arg}')*+)?+'
+    # Zero or more macro arguments preceded by one or more horizontal
+    # whitespace characters optionally interspersed by line continuations.
+    # local pcre_macro_body_grouped='(?:'${pcre_macro_args_optional_spaced_grouped}'|'${pcre_macro_sans_args_unspaced_lookahead}')'
+
+    # To comply with PCRE design expecting such
+    # terminators to be subsequently consumable, this PCRE non-consumpctively
+    # matches such terminator with a zero-width assertion.
+    #FUXME: Add additional global index for whitespace below.
+    # local pcre_macro_args_spaced_optional_grouped='('${pcre_continuable_spaces_horizontal}${pcre_macro_args_optional}')'
+
+    # Argumentless macro suffix, comprising zero or more horizontal whitespace
+    # characters optionally interspersed by line continuations followed by
+    # the prior positive lookahead.
+    # local pcre_macro_unspaced_spaced_optional=${pcre_continuable_spaces_horizontal_optional}${pcre_macro_unspaced_lookahead}
+
+    # local pcre_macro_args=${pcre_macro_arg}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_arg}')*+'
+    # local pcre_macro_args_optional_grouped='('${pcre_macro_args_optional}')'
+    # local pcre_macro_args_spaced_optional_grouped='('${pcre_continuable_spaces_horizontal}${pcre_macro_args_optional}')?+'
+
+    #FUXME: Actually use below.
+    # Macro suffix, anchoring the end of a macro to the end of a line preceded
+    # by zero or more horizontal whitespace characters.
+    # local pcre_macro_suffix=${pcre_spaces_horizontal_optional}${pcre_line_end}
+
     # local pcre_macro_args_spaced_optional_grouped=${pcre_line_continuations_optional}'('${pcre_spaces_horizontal}${pcre_macro_args}')?+'
 
     #FUXME: Everything that fallows requires intense refactoring. Should be
