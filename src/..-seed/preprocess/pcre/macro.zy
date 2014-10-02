@@ -261,7 +261,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # such classes must *ALWAYS* contain the character escape "\".
     #
     # This is significant enough to warrant repeating, in bold plaintext:
-    # *ALL NEGATIVE CHARACTER CLASSES MUST CONTAIN "\".*
+    # *ALL NEGATIVE CHARACTER CLASSES OPERATING ON ZSH CODE MUST CONTAIN "\".*
 
     # Character class matching the subset of shell-reserved characters whose
     # corresponding syntactic constructs conflict with macro preprocessing.
@@ -269,10 +269,13 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # delimits command arguments, this includes *ALL* whitespace characters.
     local char_not_code_prefix=${char_space}'''"$<\\`'
 
-    # Character class matching embeddable- and substitutable-reserved
-    # characters for use in negative character classes -- and hence including
-    # character escape "\".
+    # Character class matching embeddable-reserved characters for negative
+    # character classes.
     local char_not_embeddable_prefix=${char_embeddable_prefix}'\\'
+
+    # Character class matching both embeddable-reserved *AND* vertical
+    # whitespace characters for negative character classes.
+    local char_not_embeddable_prefix_or_space_vertical=${char_space_vertical}${char_not_embeddable_prefix}
 
     # Character class matching unconditionally invalid characters in unquoted
     # shell words, corresponding one-for-one to the set of all unconditionally
@@ -291,7 +294,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #
     # Matching such characters as shell-reserved requires more than merely a
     # character class.
-    local char_not_subword_unquoted=${char_space}'''"$&;\\<>|`'
+    local char_not_subword_unquoted=${char_space}'''"$&;<>|\\`'
 
     # Character class matching unconditionally invalid characters in unquoted
     # shell words as well as the conditionally valid "(" but *NOT* ")"
@@ -337,6 +340,10 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 
     # Invalid character in the first character of unquoted shell words.
     local pcre_char_not_subword_unquoted_char_first='['${char_not_subword_unquoted_char_first}']'
+
+    # One or more characters excluding both embeddable-reserved *AND* vertical
+    # whitespace characters.
+    local pcre_chars_not_embeddable_prefix_or_space_vertical='[^'${char_not_embeddable_prefix_or_space_vertical}']++'
 
     # One or more unquoted shell word characters.
     local pcre_chars_subword_unquoted='[^'${char_not_subword_unquoted}']++'
@@ -469,11 +476,14 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_string_end_report_success=${pcre_string_end}${pcre_empty_group}${pcre_report_success}
 
     # End of the subject string, capturing the character immediately preceding
+    # such end. Capturing such character facilitates detection of syntactically
+    # invalid constructs in subsequent PCREs (e.g., double-quoted strings
+    # lacking a prefixing '"'). Note this assumes a non-empty subject string.
+    local pcre_string_end_grouped=${pcre_char_prior_grouped}${pcre_string_end}
+
+    # End of the subject string, capturing the character immediately preceding
     # such end *AND* immediately reporting success from this match attempt.
-    # Capturing such character facilitate detection of syntactically invalid
-    # constructs in subsequent PCREs (e.g., double-quoted strings lacking a
-    # prefixing double-quotes). Note this assumes a non-empty subject string.
-    local pcre_string_end_report_success_grouped=${pcre_string_end_report_success}${pcre_report_success}
+    local pcre_string_end_report_success_grouped=${pcre_string_end_grouped}${pcre_report_success}
 
     # ..................{ SPACE ~ line                       }..................
     # Start of the current line, consuming one or more prefixing vertical
@@ -570,8 +580,9 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # implies that comments must be explicitly matched *BEFORE* horizontal
     # whitespace. Likewise, the latter constraint implies that line
     # continuations must be explicitly matched *BEFORE* comments.
-    local pcre_comment_body='#'${pcre_chars_sans_space_vertical_optional}
-    local pcre_comment=${pcre_comment_body}${pcre_line_end}
+    local pcre_comment_prefix='#'
+    local pcre_comment_body=${pcre_chars_sans_space_vertical_optional}
+    local pcre_comment=${pcre_comment_prefix}${pcre_comment_body}${pcre_line_end}
     local pcre_comment_optional='(?:'${pcre_comment}')?+'
 
     # One or more whitespace characters followed by an optional comment.
@@ -675,8 +686,43 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # former case, the corresponding capture group will be absent.
     local pcre_command_end_string_end=${pcre_string_end_report_success_grouped}
 
-    # "#"-prefixed command terminating comment.
-    local pcre_command_end_comment=${pcre_comment_body}'(?:'${pcre_command_end_spaces_vertical}'|'${pcre_command_end_string_end}')'
+    # "#"-prefixed comment suffix, comprising either one or more vertical
+    # whitespace characters one the end of the subject string. While matching
+    # trailing whitespace is typically discouraged, negative lookahead in
+    # unquoted shell strings ensure such matching to be safe.
+    local pcre_command_end_comment_suffix='(?:'${pcre_command_end_spaces_vertical}'|'${pcre_command_end_string_end}')'
+
+    # "#"-prefixed comment *NOT* prefixed by "# " and hence excluding zeshy-
+    # specific "WASTELANDS" comments. (This condition is guaranteed below by
+    # the order of PCRE inclusion.)
+    local pcre_command_end_comment_unspaced=${pcre_comment_body}${pcre_command_end_comment_suffix}
+
+    #FIXME: ={backend} should then be improved to:
+    #
+    #* If such group contains a string of length greater than 1, indicating a
+    #  "WASTELANDS"-formatted comment block, removing such block from such
+    #  code: e.g.,
+    #
+    #    if (( ${match[
+    #        ${ZESHY_MACRO_MATCH_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS}]-} > 1 )) {
+    #        ZESHY__CODE[-${match[
+    #            ${ZESHY_MACRO_MATCH_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS}]},-1]=
+    #    }
+    #
+    #Simple, and should dramatically improve preprocessing speed on the
+    #official zeshy codebase.
+
+    # "#"-prefixed zeshy-specific "WASTELANDS" comment, capturing the remainder
+    # of the subject string into the last capture group and reporting success
+    # from the current match attempt. This is an optional optimization intended
+    # principally for use on the official zeshy codebase.
+    local pcre_command_end_comment_wastelands='-{20}\( WASTELANDS {25}\)-{20}'${pcre_empty_group}'(?|('${pcre_space_vertical}'.*+)|'${pcre_string_end_grouped}')'${pcre_report_success}
+
+    # "# "-prefixed comment.
+    local pcre_command_end_comment_spaced=' (?:'${pcre_command_end_comment_wastelands}'|'${pcre_command_end_comment_unspaced}')'
+
+    # "#"-prefixed comment.
+    local pcre_command_end_comment=${pcre_comment_prefix}'(?:'${pcre_command_end_comment_spaced}'|'${pcre_command_end_comment_unspaced}')'
 
     # Command terminator excluding single characters *NOT* requiring prefixing
     # or suffixing whitespace, excluding single-character command terminators.
@@ -724,7 +770,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     #be to:
     #
     #* Add "(" to ${pcre_char_not_subword_unquoted_char_first}, ensuring that
-    #  both that *AND* "(("- and ")"-delimited arithmetic tests are not matched.
+    #  both that *AND* "(("- and "))"-delimited arithmetic tests are not matched.
     #* Reduce ${pcre_word_lookahead_parens} to the following definition:
     #    local pcre_word_lookahead_process_substitution_equals_prefix='=\('
 
@@ -782,10 +828,19 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_word_literal_grouped='('${pcre_word_literal}')'
 
     # ..................{ REDIRECTION                        }..................
-    #FIXME: Comment me. This *REALLY* needs it. Also, note that this will be
-    #ignored in nested invalid here-documents. Since that's *VERY* edge-casey,
-    #however, we don't except that to be of terribly much concern.
-    local pcre_here_doc_invalid_grouped='(.*+)'${pcre_empty_group}${pcre_string_end_report_success}
+    #FIXME: Actually handle such error condition with fatal exceptions in
+    #={backend}. Shouldn't be terribly hard, though we may need to generalize
+    #our current exception handling approach in such parcel.
+
+    # Unsupported here-document excluding prefixing "<<" *AND* all subsequent
+    # text in the subject string, captured for subsequent identification of
+    # such here-document's line in such string (e.g., for use in exception
+    # messages). Unfortunately, since subroutine calls isolate captured groups,
+    # Unsupported here-documents embedded in syntactic constructs cannot be
+    # precisely identified in this manner. Happily, the overwhelming majority
+    # of here-documents in zeshy code appear at the top level (e.g., as
+    # operable documentation), somewhat mitigating such concerns.
+    local pcre_here_doc_unsupported_grouped='(.*+)'${pcre_empty_group}${pcre_string_end_report_success}
 
     #FIXME: Correct documentation. We no longer ignore unsupported
     #here-document delimiters: we force failure. This pretty much changes
@@ -807,7 +862,7 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # suffix will be matched by subsequent PCREs as arbitrary code, implying
     # that here-document text will be preprocessed for macros. While hardly
     # ideal, this is (arguably) the ideal solution achievable via PCREs.
-    local pcre_here_optional='<(?:<|(?&doc)|'${pcre_here_doc_invalid_grouped}')'
+    local pcre_here_optional='<(?:<|(?&doc)|'${pcre_here_doc_unsupported_grouped}')'
 
     # Redirections are largely incidental to preprocessor parsing but must
     # nonetheless be partially matched for disambiguation with command
@@ -959,53 +1014,6 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_commands_backtickable_optional='(?:'${pcre_words_backtickable_optional}${pcre_command_ends}')*+'
 
     # ..................{ HERE                               }..................
-    # Here-document. Unfortunately, matching all possible here-document strings
-    # is infeasible within the purview of a pure PCRE.  Matching here-document
-    # delimiters embedding escaped characters (e.g., '<<"mother\"destroyer"')
-    # requires unescaping such characters -- a simple operation that, by
-    # definition, exceeds the purview of pure PCREs.
-    #
-    # Consequently, only the proper subset of here-documents with delimiters
-    # containing no escaped characters is matchable. Since few to no real-world
-    # here-documents (certainly none zeshy itself leverages) require delimiters
-    # containing such characters, this is largely ignorable.
-
-    #FIXME: Given that grouped macros are now always matched first and all
-    #capture groups matched in a relative manner, we probably don't need to
-    #encapsulate this in a subroutine anymore. For simplicity, however, retain
-    #the current approach until arriving at the testing phase.
-    #FIXME: In reflection, the current approach is fairly bad. We *NEVER* want
-    #to treat here-document bodies like arbitrary code, as doing so could
-    #readily induce pathological parser behavior; instead, we need to attempt
-    #to match a grouped ${pcre_word_parenable} here (probably in an optional
-    #manner also matching the end-of-string: e.g.,
-    #"(${pcre_word_parenable}|${pcre_string_end_grouped})") and then simply
-    #attempt to match the same word as the closing delimiter. Incidentally,
-    #this permits us to excise all ${pcre_*_literal_grouped} PCREs, which is
-    #mildly nice. More importantly, this ensures that for edge-case here-
-    #documents *NOT* supported by the zeshy preprocessor (e.g.,
-    #"<<$(print ugh)
-    #ugh"), an explicit fatal exception will be thrown. Which is a *FANTASTIC*
-    #thing. Indeed, such exception message could even be improved by grouping
-    #${pcre_string_end_grouped} in such PCRE into a unique group, permitting
-    #the preprocessor to disambiguate ordinary syntactic invalidities from
-    #non-preprocessable, ossibly syntactically valid here-documents. Which is
-    #fairly important, though hardly required for a first working draft.
-    #FIXME: Wait. We can do considerably better than even that. Consider:
-    #   local pcre_here_doc_prefix_report_success_grouped=${pcre_char_prior_grouped}${pcre_empty_group}${pcre_report_success}
-    #   local pcre_here_doc_prefix_delimiter_grouped='(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}'|'${pcre_word_literal_grouped}'|'${pcre_string_end_report_success_grouped}'|'${pcre_here_doc_prefix_report_success_grouped}')'
-    #   local pcre_here_doc_prefix_grouped='-?'${pcre_spaces_horizontal_continuable_optional}${pcre_here_doc_prefix_delimiter_grouped}${pcre_space_vertical}
-    #
-    #This is fairly clever. In the event of no sanely matchable here-document
-    #delimiter *OR* end-of-string being matched, we report success with a new
-    #group capturing the previous -- which, since we've just matched at least
-    #"<<", obviously exists. This permits us to differentiate between error
-    #conditions, which is... well, great!
-    #FIXME: There's just one tiny issue with the prior approach: subroutine
-    #calls occlude captured groups, requiring that this be extracted out of
-    #such calls and into the mainstream PCRE. Shouldn't pose any issues; we
-    #just need to do so, as postulated above. *shrug*
-
     # Here-document prefix common to both quoted and unquoted here-documents,
     # consisting of an ignorable optional hyphen (signifying leading tabs to be
     # insignificant) followed by zero or more horizontal whitespace characters
@@ -1013,20 +1021,31 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     local pcre_here_doc_prefix='-?'${pcre_continuable_spaces_horizontal_optional} 
 
     # Here-document suffix, matching the previously captured delimiter.
-    local pcre_here_doc_suffix='(?:'${pcre_space_vertical}'(?-1)'${pcre_line_end}'|'${pcre_string_end_report_success}')'
+    local pcre_here_doc_suffix_body=${pcre_space_vertical}'(?-1)'${pcre_line_end}
+    local pcre_here_doc_suffix='(?:'${pcre_here_doc_suffix_body}'|'${pcre_string_end_report_success}')'
 
-    # Quoted here-document.
-    local pcre_here_doc_quoted_delimiter='(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}')'${pcre_space_vertical}
+    # *NOT* a here-document suffix.
+    local pcre_here_doc_not_suffix='(?!'${pcre_here_doc_suffix_body}')'
+
+    # Quoted here-document and hence *NOT* embedding syntactic constructs.
+    #
+    # Unfortunately, matching all possible here-document delimiters is
+    # infeasible within the purview of a pure PCRE. Matching delimiters
+    # embedding escaped characters (e.g., '<<"mother\"destroyer"') requires
+    # unescaping such characters -- a simple operation that, by definition,
+    # cannot be performed by a pure PCRE.
+    #
+    # Only the proper subset of here-document delimiters containing no escaped
+    # characters are matchable. Since no here-documents in the zeshy codebase
+    # leverage such delimiters, such concerns are largely ignorable.
+    local pcre_here_doc_quoted_delimiter_grouped='(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}')'${pcre_space_vertical}
     local pcre_here_doc_quoted_body='.*?'
-    local pcre_here_doc_quoted=${pcre_here_doc_quoted_delimiter}${pcre_here_doc_quoted_body}
+    local pcre_here_doc_quoted_grouped=${pcre_here_doc_quoted_delimiter_grouped}${pcre_here_doc_quoted_body}
 
-    #FIXME: Implement ${pcre_here_doc_unquoted_body} in an analogous fashion to
-    #"{"- and "}"-delimited variable expansions.
-
-    # Unquoted here-document.
-    local pcre_here_doc_unquoted_delimiter=${pcre_word_literal_grouped}${pcre_space_vertical}
-    local pcre_here_doc_unquoted_body='.*?'
-    local pcre_here_doc_unquoted=${pcre_here_doc_unquoted_delimiter}${pcre_here_doc_unquoted_body}
+    # Unquoted here-document and hence *NOT* embedding syntactic constructs.
+    local pcre_here_doc_unquoted_delimiter_grouped=${pcre_word_literal_grouped}${pcre_space_vertical}
+    local pcre_here_doc_unquoted_body='(?:'${pcre_chars_not_embeddable_prefix_or_space_vertical}'|'${pcre_char_escaped_optional}'|'${pcre_embeddable}'|'${pcre_here_doc_not_suffix}${pcre_spaces}')'
+    local pcre_here_doc_unquoted_grouped=${pcre_here_doc_unquoted_delimiter_grouped}${pcre_here_doc_unquoted_body}
 
     # Here-document. Such matching requires capturing and then subsequently
     # backreferencing the here-document delimiter, fundamentally interfering
@@ -1034,7 +1053,8 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # a subroutine call. (Similar to function-scoped local variables, such
     # calls isolate capture groups by storing the current set of such groups on
     # entering such call and restoring such set on returning from such call.)
-    pcre_macro_subroutines_body+='(?<doc>'${pcre_here_doc_prefix}'(?:'${pcre_here_doc_quoted}'|'${pcre_here_doc_unquoted}'|'${pcre_string_end_report_success}')'${pcre_here_doc_unquoted_suffix}')'
+    local pcre_here_doc_body='(?:'${pcre_here_doc_quoted_grouped}'|'${pcre_here_doc_unquoted_grouped}'|'${pcre_string_end_report_success}')'
+    pcre_macro_subroutines_body+='(?<doc>'${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_unquoted_suffix}')'
 
     # ..................{ SUBSTITUTION ~ process             }..................
     #FIXME: Actually, we can also match macros in process substitutions
@@ -1532,16 +1552,16 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # preprocessor phase iterating over such PCRE that such macro has been
     # fully matched. To distinguish syntactically valid from invalid macros,
     # *ALL* matched substrings must be optional.
-    local pcre_macro_body_report_success=${pcre_macro_body}${pcre_macro_suffix}${pcre_report_success}
+    local pcre_macro_body_report_success_grouped=${pcre_macro_body}${pcre_empty_group}${pcre_empty_group}${pcre_report_success}
 
     # Macro name.
-    local pcre_macro_name=${ZESHY__MACRO_NAME_PLACEHOLDER_PCRE}
-    local pcre_macro_name_grouped='('${pcre_macro_name}')'
+    local pcre_macro_name_grouped='('${ZESHY__MACRO_NAME_PLACEHOLDER_PCRE}')'
 
-    #FIXME: This... this is completely insufficient. Renovate, please.
+    #FIXME: This... this is probably completely insufficient. Renovate, please.
 
     # Macro.
-    local pcre_macro_optional_grouped='(?:'${pcre_macro_name_grouped}')?+'
+    local pcre_macro_grouped=${pcre_macro_name_grouped}${pcre_macro_body_report_success_grouped}
+    local pcre_macro_optional_grouped='(?:'${pcre_macro_grouped}')?+'
 
     # Zero or more macros or commands. To preferentially match shell words as macro names
     # rather than mere shell words, the former is matched before the latter.
@@ -1720,8 +1740,8 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
     # Declare negative relative indices matched by ${ZESHY_MACRO_PCRE}.
     match_index=-1
     for match_index_name (
+        ZESHY_MACRO_MATCH_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS
         ZESHY_MACRO_MATCH_INDEX_HERE_DOC_DELIMITER_INVALID_REMAINDER
-        ZESHY_MACRO_MATCH_INDEX_CODE_VALID_CHAR_LAST
     ) {
         integer -g ${match_index_name}=$(( match_index-- ))
         # print -r ${match_index_name}': '${(P)match_index_name}
@@ -1729,6 +1749,60 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: Implement ${pcre_here_doc_unquoted_body} in an analogous fashion to
+    #"{"- and "}"-delimited variable expansions.
+
+# -- and hence including character escape "\".
+# local pcre_here_doc_unquoted_not_delimiter='(?!'${pcre_here_doc_delimiter_current}')'
+    #FUXME: Given that grouped macros are now always matched first and all
+    #capture groups matched in a relative manner, we probably don't need to
+    #encapsulate this in a subroutine anymore. For simplicity, however, retain
+    #the current approach until arriving at the testing phase.
+    #FUXME: In reflection, the current approach is fairly bad. We *NEVER* want
+    #to treat here-document bodies like arbitrary code, as doing so could
+    #readily induce pathological parser behavior; instead, we need to attempt
+    #to match a grouped ${pcre_word_parenable} here (probably in an optional
+    #manner also matching the end-of-string: e.g.,
+    #"(${pcre_word_parenable}|${pcre_string_end_grouped})") and then simply
+    #attempt to match the same word as the closing delimiter. Incidentally,
+    #this permits us to excise all ${pcre_*_literal_grouped} PCREs, which is
+    #mildly nice. More importantly, this ensures that for edge-case here-
+    #documents *NOT* supported by the zeshy preprocessor (e.g.,
+    #"<<$(print ugh)
+    #ugh"), an explicit fatal exception will be thrown. Which is a *FANTASTIC*
+    #thing. Indeed, such exception message could even be improved by grouping
+    #${pcre_string_end_grouped} in such PCRE into a unique group, permitting
+    #the preprocessor to disambiguate ordinary syntactic invalidities from
+    #non-preprocessable, ossibly syntactically valid here-documents. Which is
+    #fairly important, though hardly required for a first working draft.
+    #FUXME: Wait. We can do considerably better than even that. Consider:
+    #   local pcre_here_doc_prefix_report_success_grouped=${pcre_char_prior_grouped}${pcre_empty_group}${pcre_report_success}
+    #   local pcre_here_doc_prefix_delimiter_grouped='(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}'|'${pcre_word_literal_grouped}'|'${pcre_string_end_report_success_grouped}'|'${pcre_here_doc_prefix_report_success_grouped}')'
+    #   local pcre_here_doc_prefix_grouped='-?'${pcre_spaces_horizontal_continuable_optional}${pcre_here_doc_prefix_delimiter_grouped}${pcre_space_vertical}
+    #
+    #This is fairly clever. In the event of no sanely matchable here-document
+    #delimiter *OR* end-of-string being matched, we report success with a new
+    #group capturing the previous -- which, since we've just matched at least
+    #"<<", obviously exists. This permits us to differentiate between error
+    #conditions, which is... well, great!
+    #FUXME: There's just one tiny issue with the prior approach: subroutine
+    #calls occlude captured groups, requiring that this be extracted out of
+    #such calls and into the mainstream PCRE. Shouldn't pose any issues; we
+    #just need to do so, as postulated above. *shrug*
+
+    #FUXME: Comment me. This *REALLY* needs it. Also, note that this will be
+    #ignored in nested invalid here-documents. Since that's *VERY* edge-casey,
+    #however, we don't except that to be of terribly much concern.
+
+    #FUXME: Substantially optimize this by expliciting detecting "WASTELANDS"-
+    #formatted comments and, where detected, capturing all remaining text
+    #including such comment to the last numbered group. ={backend} should then
+
+    #FUXME: Hmm; by matching vertical whitespace here, aren't we prohibiting
+    #matching of such 
+
+# captured without
+    # preprocessing 
 #FUXME: Ultimately, we arguably need to post a patch to zsh-workers adding 
     # local pcre_here_optional='<(?:<|(?&doc)?+)'
 
