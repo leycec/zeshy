@@ -571,8 +571,11 @@ function ::code.preprocess() {
     # such iteration, such phases cannot be combined. (Q.E.D., sadly.)
 
     # Compile and optimize such PCRE. See for_string_text_matching_pcre:().
-    pcre_compile -- "${ZESHY_MACRO_PCRE}"
+    pcre_compile -- "${ZESHY__MACRO_PCRE}"
     pcre_study
+
+    #FIXME: Consider renaming ${ZESHY__CODE_PREPROCESS} to
+    #${ZESHY__PREPROCESS_CODE}.
 
     # For each macro matched from such code, record matched byte indices for
     # the next preprocessor phase.
@@ -580,14 +583,132 @@ function ::code.preprocess() {
     while {
         pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__CODE_PREPROCESS}"
     } {
-        #FIXME: Implement me.
+        #FIXME: Despite zsh and libpcre constraints, we believe we've uncovered
+        #a means of reliability discerning the starting and ending byte indices
+        #of arbitrarily nested syntactically invalid syntactic cnstructs. How?
+        #For each syntactic construct PCRE:
+        #
+        #* If such PCRE identifies a syntactic invalidity (e.g., by hetting the
+        #  end of the string), such PCRE should report an error by backtracking
+        #  to the character immediately preceding the offending syntactic
+        #  construct and (mildly ironically) reporting success (with no
+        #  additional capture groups). This ensures that ${ZPCRE_OP[(w)2]} will
+        #  provide the byte index of such construct. Yay!
+        #
+        #  *WAIT*. To differentiate invalid from valid macros, we do
+        #  arbitrarily require an additional non-empty capture group -- say,
+        #  capturing the character immediately preceding the invalid syntactic
+        #  construct via positive lookbehind into a trailing capture group.
+        #  Call such global
+        #  ${ZESHY__MACRO_GROUP_INDEX_INVALIDITY_CHAR_LAST}.
+        #
+        #  *WAIT*. If a macro argument is syntactically invalid, that should
+        #  imply that... Ah-ha! O.K.; we should actually instead capture the
+        #  last character (or perhaps all characters) of the set of all
+        #  arguments passed to a macro into a trailing capture group.  Call
+        #  such global ${ZESHY__MACRO_GROUP_INDEX_ARGS_CHAR_LAST}.
+        #
+        #  Since macros are *NEVER* recursive, such group is guaranteed to be
+        #  non-empty if such macro is valid.
+        #* ={backend} may then reliably detect such invalidity by performing
+        #  the following logic:
+        #  * If match group ${ZESHY__MACRO_GROUP_INDEX_NAME} is nonempty, a
+        #    macro was matched. In such case, if:
+        #    * If match group ${ZESHY__MACRO_GROUP_INDEX_ARGS_CHAR_LAST} is
+        #      nonempty, such macro is valid; else, such macro is invalid.
+        #  * Else, a macro was not matched. In such case, a syntactically
+        #    invalid construct was matched if and only if the following:
+        #    (( ${ZPCRE_OP[(w)2]} < ${#ZESHY__CODE_PREPROCESS} ))
+        #
+        #In either case, if an invalidity is matched:
+        #
+        #* The first byte index of the invalid syntactic construct is given by
+        #  $(( ${ZPCRE_OP[(w)2]} + 1 )).
+        #* The last byte index of such construct is, of course,
+        #  ${#ZESHY__CODE_PREPROCESS}.
+        #FIXME: Backtracking on syntactically invalid constructs to the
+        #character immediately preceding such construct may prove somewhat
+        #non-trivial. For example, (*ACCEPT) only returns from subroutine calls
+        #(rather than halting matching) when in such calls, possibly preventing
+        #us from responding in a sane fashion to invalid embedded syntactic
+        #constructs. Hmm; by our PCRE design, this could still work. Possibly.
+        #If we've meticulously matched everything exactly correctly, embedding
+        #(*ACCEPT) in a subroutine call *SHOULD* induce the following behavour:
+        #
+        #* That subroutine call matching that syntactic construct immediately
+        #  returns to the call matching its parent construct. Due to
+        #  backtracking, the current position will be immediately before the
+        #  offending child construct. Assuming proper PCRE construction, the
+        #  call matching the parent construct will fail to match at this point,
+        #  having exhausted all other options, in which case such call reports
+        #  failure to and hence inducing backtracking in its parent and so on
+        #  recursively up the line, iinevitably resulting in backtracking batk
+        #  to the beginning and hence match failure. Hmm; that's bad.
+        #
+        #What we need to do is recursively propagate (*ACCEPT) up the
+        #subroutine call hierarchy. Oh, boy. Perhaps that's simpler than it
+        #sounds? Firstly, how would a parent call detect that a child call has
+        #prematurely returned via (*ACCEPT)? Well...
+        #
+        #O.K.; we believe we may have found the way: "\K". Happily (and
+        #contrarily to all other PCRE behaviour), subroutine calls do *NOT*
+        #isolate the effect of "\K". That is, "\K" operates in a global manner
+        #and hence permits us a subversive means of breaking through the
+        #otherwise rigid barrier PCRE imposes about such calls.
+        #
+        #The idea here is that, on detecting a syntactic invalidity, the PCRE
+        #responsible for matching that construct instead:
+        #
+        #* Backtracks to the first character of such construct. Since
+        #  "(*COMMIT)", "(*SKIP)", and "(*PRUNE)" do nothing meaningful in
+        #  subroutine calls, this implies we'll need to leverage implicit
+        #  backtracking via alternation. Unfortunately, to backtrack all the
+        #  way *BEFORE* the first character of such construct, we'll need to
+        #  also leverage positive lookahead -- which shouldn't be much of an
+        #  imposition: e.g.,
+        #    local pcre_quotes_single="(?=')(?:'(?>[^']++|'')*+'"'|\K.*+)'
+        #  Alternately, if such positive lookahead is *TOO* horrible (...it's
+        #  not, really), we could backtrack to the first character following
+        #  such prefix: e.g.,
+        #    local pcre_quotes_single="'(?:(?>[^']++|'')*+'"'|\K.*+)'
+        #  Unfortunately, that then requires a manual search backwards in
+        #  ={backend} to attempt to find the start of such construct.
+        #  Error-prone and fugly, needless to say the least. Let's just take
+        #  the efficiency hit on this one, yes?
+        #* All recursive subroutine calls (e.g., ${pcre_embeddable}) should be
+        #  suffixed by something resembling
+        #  '(?:'${pcre_string_end_report_success}')?+'.
+        #* In ={backend}, detect the error condition as follows:
+        #  * If a macro name was matched *AND* the first character of such name
+        #    is *NOT* equal to the character at
+        #    ${ZESHY__CODE_PEPROCESS[$(( ${ZPCRE_OP[(w)1]} + 1 ))]},
+        #    then such macro is invalid.
+        #  * Else, a macro was not matched. Assuming that we've recorded the
+        #    last byte index of the prior match (trivial), then if such index
+        #    is *NOT* one less than the first byte index of the current match,
+        #    an invalid construct must have been matched. Oh, yes; this would
+        #    happily work for the prior case as well. Yay! That tidies things.
+        #
+        #In summation:
+        #
+        #* In syntactic construct PCREs, refactor to the form:
+        #    local pcre_quotes_single="(?=')(?:'(?>[^']++|'')*+'"'|\K.*+)'
+        #* All recursive subroutine calls (e.g., ${pcre_embeddable}) should be
+        #  suffixed by ${pcre_string_end_report_success_optional}, defined as:
+        #    local pcre_string_end_report_success_optional='(?:'${pcre_string_end_report_success}')?+'
+        #* In ={backend}, assuming that we've recorded the last byte index of
+        #  the prior match (trivial), then if such index is *NOT* one less than
+        #  the first byte index of the current match, an invalid construct must
+        #  have been matched.
+        #
+        #Surprisingly simple, actually.
 
-        # If a halting condition was *NOT* matched, a macro must have matched.
-        if [[ -z ${match\
-            [${ZESHY_MACRO_MATCH_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS}]-} ]] {
+        # If a macro was matched, handle such macro.
+        if [[ -n ${match[${ZESHY__MACRO_GROUP_INDEX_MACRO_NAME}]-} ]] {
+            #FIXME: Consider everything below. Probably bollocks, at the moment.
+
             # Such macro's name.
-            ZESHY__MACRO_NAME=${match\
-                [${ZESHY_MACRO_MATCH_INDEX_NAME}]}
+            ZESHY__MACRO_NAME=${match[${ZESHY__MACRO_GROUP_INDEX_NAME}]}
 
             # Byte indices recorded for the next preprocessor phase. Note that
             # "man zshmodules" documents ${ZPCRE_OP} to be a " "-delimited integer
@@ -632,15 +753,15 @@ function ::code.preprocess() {
             #a macro was matched or not and, if not, whether the last capture group
             #exists: e.g.,
             #
-            #    if [[ -z ${match[${ZESHY_MACRO_MATCH_INDEX_NAME}]} ]] &&
-            #        (( ${#match} < ZESHY_MACRO_MATCH_INDEX_STRING_IS_VALID )) {
+            #    if [[ -z ${match[${ZESHY__MACRO_GROUP_INDEX_NAME}]} ]] &&
+            #        (( ${#match} < ZESHY__MACRO_GROUP_INDEX_STRING_IS_VALID )) {
             #        :die "Uh oh! Syntactic invalidity found."
             #    }
 
             # If the empty group signifying such macro to be syntactically valid
             # was *NOT* matched, such macro is syntactically invalid. In such case,
             # throw an exception.
-            (( ${#match} >= ZESHY_MACRO_MATCH_INDEX_IS_VALID )) || {
+            (( ${#match} >= ZESHY__MACRO_GROUP_INDEX_IS_VALID )) || {
                 # Line number of the current macro in such code, calculated by
                 # removing all non-newline characters preceding such macro and
                 # counting the number of newline characters that remain.
@@ -758,7 +879,7 @@ function ::code.preprocess() {
     #"libpcre" documentation closer for confirmation, please.
 
     # Compile and optimize such PCRE. See for_string_text_matching_pcre:().
-    pcre_compile -- "${ZESHY_MACRO_ARG_BLOCK_NEXT_PCRE}"
+    pcre_compile -- "${ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE}"
     pcre_study
 
     #FIXME: Localize above.
@@ -1018,6 +1139,10 @@ function ::code.preprocess() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+        # If a halting condition was *NOT* matched, a macro must have matched.
+        # if [[ -z ${match\
+            # [${ZESHY__MACRO_GROUP_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS}]-} ]] {
+
             #FUXME: Report this bug! This is currently affecting *EVERYONE*
             #leveraging zsh module "zsh/pcre", which is probably *EVERYONE*.
 
@@ -1427,7 +1552,7 @@ function ::code.preprocess() {
         # If such macro was passed a here-document or -string on standard
         # input, record such string for the third preprocessor phase.
         # if [[ -n ${ZESHY__CODE_PREPROCESS[
-        #     ${ZESHY_MACRO_MATCH_INDEX_HERE_DOC_OR_STRING}]} ]] {
+        #     ${ZESHY__MACRO_GROUP_INDEX_HERE_DOC_OR_STRING}]} ]] {
         #     macro_byte_here_first=
         #     macro_byte_here_last=
         # }
@@ -1435,7 +1560,7 @@ function ::code.preprocess() {
         # If such macro was passed a here-document or -string on standard
         # input, record such string for the third preprocessor phase.
         # if [[ -n ${ZESHY__CODE_PREPROCESS[
-        #     ${ZESHY_MACRO_MATCH_INDEX_HERE_DOC_OR_STRING}]} ]] {
+        #     ${ZESHY__MACRO_GROUP_INDEX_HERE_DOC_OR_STRING}]} ]] {
         #     ZESHY__MACRO_BYTES_NAME_FIRST_LAST[1]+=( )
         # }
 
