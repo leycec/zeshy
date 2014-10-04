@@ -7,39 +7,6 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Define PCREs specific to macro preprocessing.
 
-#FIXME: Improve exception messages on syntactically invalid code. At the
-#moment, we have no means of printing the line number and/or character range of
-#such code -- which is positively terrible. Fortunately, we believe we *MAY*
-#have a tolerable means of improving this. It will require a bit of additional
-#work, but should substantially improve usability:
-#
-#* For each syntactic construct currently embedding
-#  ${pcre_string_end_report_success} (e.g.,
-#  ${pcre_var_sans_dollar_delimited_prefix}), replace the current use of
-#  ${pcre_string_end_report_success} by a duplication of such syntactic
-#  construct's full PCRE with the following:
-#  * Prepend such PCRE by positive lookahead capturing *ALL* text from the
-#    current position to the end-of-string. Since we know the byte-size of such
-#    full string *AND* of such captured substring, we can subtract the latter
-#    from the former to determine the starting byte of the invalid construct.
-#
-#Of course, this fails for recursively embedded invalid constructs due to group
-#isolation in subroutine calls -- ever the perennial problem. While there may
-#be no meaningful means of correcting that, at least we can improve the general
-#situation for top-level invalid constructs. Hmm; actually, pretty much *ALL*
-#constructs will be recursively embedded at least one level deep within "{"-
-#and "}"-delimited blocks, implying that handling top-level invalid constructs
-#is pretty much useless. Pretty frustrating.
-#FIXME: So... grouping, however clever, clearly won't work. What *WILL* work
-#(more or less, anyway) is to:
-#
-#* Create a temporary file containing exactly such string (e.g., via
-#  "=(...)"-style process substitution).
-#* Pass such file to "zsh --no_exec".
-#
-#The difficulty there, of course, is that zeshy scripts are probably inherently
-#syntactically invalid as zsh scripts. Or not? Only one way to find out, eh?
-
 # ....................{ GLOBALS ~ pcre                     }....................
 #FIXME: Document me.
 typeset -g ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE
@@ -58,6 +25,14 @@ typeset -g ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE
 # following such code block. In either case, Odium and efficiency reigns.
 typeset -g ZESHY__MACRO_PCRE
 
+# PCRE to which ${ZESHY__MACRO_PCRE} is set if no macros exist.
+typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
+
+# PCRE matching unsupported here-documents (i.e., here-documents with
+# non-literal and hence non-PCRE-matchable delimiters).
+typeset -g ZESHY__MACRO_HERE_DOC_UNSUPPORTED_PCRE
+
+# ....................{ GLOBALS ~ pcre : name              }....................
 # Syntactically valid macro name.
 typeset -g ZESHY__MACRO_NAME_VALID_PCRE
 
@@ -68,12 +43,7 @@ typeset -g ZESHY__MACRO_NAME_VALID_PCRE
 # macro-specific PCRE functions (e.g., ::preprocessor_pcres.make()).
 typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
 
-# PCRE to which ${ZESHY__MACRO_PCRE} is set if no macros exist.
-typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
-
 # ....................{ GLOBALS ~ int                      }....................
-# Maximum number of match groups capturable by ${ZESHY__MACRO_PCRE}.
-integer -g ZESHY__MACRO_GROUP_COUNT_MAX
 
 # ....................{ MAIN                               }....................
 #FIXME: Oh, God. Does any of this still apply? Probably, but shifting the chaff
@@ -277,10 +247,6 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # character classes.
     local char_not_embeddable_prefix=${char_embeddable_prefix}'\\'
 
-    # Character class matching both embeddable-reserved *AND* vertical
-    # whitespace characters for negative character classes.
-    local char_not_embeddable_prefix_or_space_vertical=${char_space_vertical}${char_not_embeddable_prefix}
-
     # Character class matching unconditionally invalid characters in unquoted
     # shell words, corresponding one-for-one to the set of all unconditionally
     # shell-reserved operators conflicting with preprocessing parsing (i.e.,
@@ -344,10 +310,6 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
 
     # Invalid character in the first character of unquoted shell words.
     local pcre_char_not_subword_unquoted_char_first='['${char_not_subword_unquoted_char_first}']'
-
-    # One or more characters excluding both embeddable-reserved *AND* vertical
-    # whitespace characters.
-    local pcre_chars_not_embeddable_prefix_or_space_vertical='[^'${char_not_embeddable_prefix_or_space_vertical}']++'
 
     # One or more unquoted shell word characters.
     local pcre_chars_subword_unquoted='[^'${char_not_subword_unquoted}']++'
@@ -464,12 +426,12 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # Zero or more horizontal whitespace characters *OR* line continuations.
     local pcre_spaces_horizontal_continuable_optional='(?:'${pcre_spaces_horizontal}'|'${pcre_line_continuation}')*+'
 
-    # ..................{ SPACE ~ (start|end)                }..................
+    # ..................{ SPACE ~ subject                    }..................
     # Start of the subject string (i.e., the string currently being matched).
-    local pcre_string_start='\A'
+    local pcre_subject_start='\A'
 
     # End of the subject string.
-    local pcre_string_end='\z'
+    local pcre_subject_end='\z'
 
     # End of the subject string, immediately reporting success from the current
     # match attempt. This both avoids spurious match successs *AND* mildly
@@ -477,23 +439,42 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # attempting to match subsequent command termination). While reporting
     # failure would frequently be semantically preferable, doing so unhelpfully
     # prevents zsh from setting canonical list global ${match}.
-    local pcre_string_end_report_success=${pcre_string_end}${pcre_empty_group}${pcre_report_success}
+    local pcre_subject_end_report_success=${pcre_subject_end}${pcre_empty_group}${pcre_report_success}
+    local pcre_subject_end_report_success_optional='(?:'${pcre_subject_end_report_success}')?+'
+
+    #FIXME: Consider excising. We shouldn't require this anymore. Indeed, most
+    #or even all embeddings of this PCRE should be replaced by
+    #${pcre_subject_remainder_cut}.
 
     # End of the subject string, capturing the character immediately preceding
     # such end. Capturing such character facilitates detection of syntactically
     # invalid constructs in subsequent PCREs (e.g., double-quoted strings
     # lacking a prefixing '"'). Note this assumes a non-empty subject string.
-    local pcre_string_end_grouped=${pcre_char_prior_grouped}${pcre_string_end}
+    local pcre_subject_end_grouped=${pcre_char_prior_grouped}${pcre_subject_end}
+
+    #FIXME: Consider excising.
 
     # End of the subject string, capturing the character immediately preceding
     # such end *AND* immediately reporting success from this match attempt.
-    local pcre_string_end_report_success_grouped=${pcre_string_end_grouped}${pcre_report_success}
+    # local pcre_subject_end_report_success_grouped=${pcre_subject_end_grouped}${pcre_report_success}
+
+    # Remainder of the subject string (i.e., all text between the current match
+    # position inclusive and the end of such string), resetting matching to
+    # start at the current match position and hence discarding all previously
+    # matched text.
+    #
+    # This PCRE is intended for use in matching and "returning" syntactically
+    # invalid constructs (e.g., "'"-prefixed strings with no suffixing "'") to
+    # the caller. By definition, such a construct spans from the current match
+    # position to the end of the subject string; resetting matching to such
+    # position ensures the matched substring to consist only of such construct.
+    local pcre_subject_remainder_cut='\K.*+'
 
     # ..................{ SPACE ~ line                       }..................
     # Start of the current line, consuming one or more prefixing vertical
     # whitespace characters if any. "^" is a zero-width assertion consuming no
     # characters and hence inappropriate for use below (excluding lookahead).
-    local pcre_line_start='('${pcre_spaces_vertical}'|'${pcre_string_start}')'
+    local pcre_line_start='('${pcre_spaces_vertical}'|'${pcre_subject_start}')'
 
     # End of the current line *WITHOUT* consuming the suffixing vertical
     # whitespace character if any. Since ${pcre_line_start} already consumes
@@ -513,15 +494,28 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     local pcre_line_end_or_space_continuable=${pcre_line_continuations_optional}'(?:'${pcre_space_horizontal}'|'${pcre_line_end}')'
 
     # ..................{ CHAR ~ escape                      }..................
-    # Character *OR* the end of such string.
-    local pcre_char_optional='(?:.|'${pcre_string_end_report_success}')'
+    #FIXME: Refactor to the new approach leveraging
+    #${pcre_subject_remainder_cut}. If this is embedded external to a recursive
+    #syntactic construct syntax, we'll need to manually match
+    #${pcre_subject_end_report_success_optional}. (That probably shouldn't
+    #happen anywhere, though.)
 
-    # Escaped character (i.e., "\"-prefixed character). To account for
-    # syntactically invalid "\" characters immediately prefixing the end of
-    # such string, shenanigans appear.
-    local pcre_char_escaped_optional='\\'${pcre_char_optional}
+    # "\"-prefixed escaped character *OR* syntactically invalid "\" character
+    # at the end of the subject string.
+    local pcre_char_escaped_prefix='\\'
+    local pcre_char_escaped_optional='(?='${pcre_char_escaped_prefix}')(?:'${pcre_char_escaped_prefix}'.|'${pcre_subject_remainder_cut}')'
 
     # ..................{ CONSTRUCT                          }..................
+    # Subroutine calls matching nestable syntactic constructs *MUST* be
+    # suffixed by ${pcre_subject_end_report_success_optional}. Since all such
+    # constructs may be either syntactically valid or invalid and in the latter
+    # case will have erroneously matched all remaining text in the subject
+    # string (e.g., due to missing or unbalanced delimiters), the current match
+    # point will be at the end of such string on returning from calls matching
+    # syntactically invalid constructs. While reporting failure from such match
+    # attempt would be preferable, doing so prevents identifying and hence
+    # responding to such failure. Rather, success should be reported.
+
     # Recursively embeddable syntactic construct (i.e., embeddable only in
     # arithmetic substitutions, double-quoted strings, or variable expansions).
     # Since recursive syntax is matchable *ONLY* via subroutine calls, this
@@ -530,16 +524,16 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # current character is a prefix of such a construct. Since such subroutine
     # will consume such character if called, we non-consumptively test such
     # character with positive lookahead. See ${pcre_macro_subroutines_body}.
-    local pcre_embeddable='(?=['${char_embeddable_prefix}'])(?&emb)'
+    local pcre_embeddable='(?=['${char_embeddable_prefix}'])(?&emb)'${pcre_subject_end_report_success_optional}
 
     # Recursively interpretable syntactic construct (i.e., replaceable with
     # any arbitrary unquoted shell word, regardless of whether such word is
     # passed to a preprocessor macro or not).
-    local pcre_interpretable='(?=['${char_interpretable_prefix}'])(?&int)'
+    local pcre_interpretable='(?=['${char_interpretable_prefix}'])(?&int)'${pcre_subject_end_report_success_optional}
 
     # Recursively interpretable syntactic construct excluding "`"-delimited
     # process substitutions.
-    local pcre_interpretable_sans_backtick='(?=['${char_interpretable_prefix_sans_backtick}'])(?&int)'
+    local pcre_interpretable_sans_backtick='(?=['${char_interpretable_prefix_sans_backtick}'])(?&int)'${pcre_subject_end_report_success_optional}
 
     # ..................{ STRING                             }..................
     # Single-quoted string *NOT* supporting escaped single quotes (i.e., "''").
@@ -556,10 +550,9 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
 
     # Single-quoted string in zsh format and hence supporting escaped single
     # quotes (i.e., "''").
-    local pcre_quotes_single_prefix="'"
-    local pcre_quotes_single_suffix="(?:'|"${pcre_string_end_report_success}')'
-    local pcre_quotes_single_body="(?>[^']++|'')*+"
-    local pcre_quotes_single_optional=${pcre_quotes_single_prefix}${pcre_quotes_single_body}${pcre_quotes_single_suffix}
+    local pcre_quotes_single_delimiter="'"
+    local pcre_quotes_single_body='(?>[^'${pcre_quotes_single_delimiter}']++|'${pcre_quotes_single_delimiter}${pcre_quotes_single_delimiter}')*+'
+    local pcre_quotes_single_optional='(?='${pcre_quotes_single_delimiter}')(?:'${pcre_quotes_single_delimiter}${pcre_quotes_single_body}${pcre_quotes_single_delimiter}'|'${pcre_subject_remainder_cut}')'
 
     # Double-quoted string in zsh format and hence supporting escaped double
     # quotes (i.e., '\"'). Unlike the prior PCRE, character class [^"] also
@@ -571,10 +564,9 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # a bug or unreliable implementation detail, however, we match
     # substitutables embedded in double quotes in the same manner as that of
     # substitutables embedded in other syntax (e.g., arithmetic substitutions).
-    local pcre_quotes_double_prefix='"'
-    local pcre_quotes_double_suffix='(?:"|'${pcre_string_end_report_success}')'
-    local pcre_quotes_double_body='(?:[^"'${char_not_embeddable_prefix}']++|'${pcre_char_escaped_optional}'|'${pcre_embeddable}')*+'
-    local pcre_quotes_double_optional=${pcre_quotes_double_prefix}${pcre_quotes_double_body}${pcre_quotes_double_suffix}
+    local pcre_quotes_double_delimiter='"'
+    local pcre_quotes_double_body='(?:[^'${pcre_quotes_double_delimiter}${char_not_embeddable_prefix}']++|'${pcre_char_escaped_optional}'|'${pcre_embeddable}')*+'
+    local pcre_quotes_double_optional='(?='${pcre_quotes_double_delimiter}')(?:'${pcre_quotes_double_delimiter}${pcre_quotes_double_body}${pcre_quotes_double_delimiter}'|'${pcre_subject_remainder_cut}')'
 
     # Single- or double-quoted string.
     local pcre_quotes_optional=${pcre_quotes_single_optional}'|'${pcre_quotes_double_optional}
@@ -688,7 +680,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # End of the subject string, capturing the last character of such string to
     # differentiate syntactically invalid from valid subject strings. In the
     # former case, the corresponding capture group will be absent.
-    local pcre_command_end_string_end=${pcre_string_end_report_success_grouped}
+    local pcre_command_end_string_end=${pcre_subject_end_report_success}
 
     # "#"-prefixed comment suffix, comprising either one or more vertical
     # whitespace characters one the end of the subject string. While matching
@@ -707,8 +699,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     #  "WASTELANDS"-formatted comment block, removing such block from such
     #  code: e.g.,
     #
-    #    if (( ${match[
-    #        ${ZESHY__MACRO_MATCH_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS}]-} > 1 )) {
+    #    if (( ${match[${ZESHY__MACRO_GROUP_INDEX_WASTELANDS}]-} > 1 )) {
     #        ZESHY__CODE[-${match[
     #            ${ZESHY__MACRO_MATCH_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS}]},-1]=
     #    }
@@ -720,7 +711,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # of the subject string into the last capture group and reporting success
     # from the current match attempt. This is an optional optimization intended
     # principally for use on the official zeshy codebase.
-    local pcre_command_end_comment_wastelands='-{20}\( WASTELANDS {25}\)-{20}'${pcre_empty_group}'(?|('${pcre_space_vertical}'.*+)|'${pcre_string_end_grouped}')'${pcre_report_success}
+    local pcre_command_end_comment_wastelands='-{20}\( WASTELANDS {25}\)-{20}(?|('${pcre_space_vertical}'.*+)|'${pcre_subject_end_grouped}')'${pcre_report_success}
 
     # "# "-prefixed comment.
     local pcre_command_end_comment_spaced=' (?:'${pcre_command_end_comment_wastelands}'|'${pcre_command_end_comment_unspaced}')'
@@ -832,41 +823,13 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     local pcre_word_literal_grouped='('${pcre_word_literal}')'
 
     # ..................{ REDIRECTION                        }..................
-    #FIXME: Actually handle such error condition with fatal exceptions in
-    #={backend}. Shouldn't be terribly hard, though we may need to generalize
-    #our current exception handling approach in such parcel.
-
-    # Unsupported here-document excluding prefixing "<<" *AND* all subsequent
-    # text in the subject string, captured for subsequent identification of
-    # such here-document's line in such string (e.g., for use in exception
-    # messages). Unfortunately, since subroutine calls isolate captured groups,
-    # Unsupported here-documents embedded in syntactic constructs cannot be
-    # precisely identified in this manner. Happily, the overwhelming majority
-    # of here-documents in zeshy code appear at the top level (e.g., as
-    # operable documentation), somewhat mitigating such concerns.
-    local pcre_here_doc_unsupported_grouped='(.*+)'${pcre_empty_group}${pcre_string_end_report_success}
-
-    #FIXME: Correct documentation. We no longer ignore unsupported
-    #here-document delimiters: we force failure. This pretty much changes
-    #everything, which may (or may not) be a good thing.
-
     # "<"-prefixed here-document or "<<"-prefixed here-string. The latter
     # prefix greedily overlaps the former prefix and must hence be matched
     # first. Since here-strings are shell words, since subsequent parsing
     # already matches such words, and since syntactically invalid here-strings
     # must also be matched, only such prefix is matched here.
-    #
-    # Since syntactically valid here-documents with delimiters containing
-    # escaped characters (e.g., "<<war\ is\ peace") *MUST* be matched but, by
-    # the above discussion, cannot actually be matched in a syntactically valid
-    # manner via PCREs, such here-documents are only matchable in a
-    # syntactically invalid manner via PCREs. To do so, only the "<<" suffixing
-    # such here-documents is matched here by matching the proper subset of
-    # here-documents that is matchable here optionally. All text following such
-    # suffix will be matched by subsequent PCREs as arbitrary code, implying
-    # that here-document text will be preprocessed for macros. While hardly
-    # ideal, this is (arguably) the ideal solution achievable via PCREs.
-    local pcre_here_optional='<(?:<|(?&doc)|'${pcre_here_doc_unsupported_grouped}')'
+    local pcre_here_prefix='<'
+    local pcre_here_optional='(?='${pcre_here_prefix}')(?:'${pcre_here_prefix}'(?:'${pcre_here_prefix}'|(?&doc))|'${pcre_subject_remainder_cut}')'
 
     # Redirections are largely incidental to preprocessor parsing but must
     # nonetheless be partially matched for disambiguation with command
@@ -985,7 +948,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # ignorable for preprocessing purposes, we match arbitrary code in list
     # assignments with previously defined PCREs instead.
     local pcre_list_assignment_prefix=':=\('${pcre_comment_spaced_optional}
-    local pcre_list_assignment_suffix=${pcre_comment_spaced_optional}'(?:\)|'${pcre_string_end_report_success}')'
+    local pcre_list_assignment_suffix=${pcre_comment_spaced_optional}'(?:\)|'${pcre_subject_end_report_success}')'
     local pcre_list_assignment_body=${pcre_word_parenable_nonfirst}'(?:'${pcre_comment_optional_spaced}${pcre_word_parenable_nonfirst}')*+'
     local pcre_list_assignment=${pcre_list_assignment_prefix}${pcre_list_assignment_body}${pcre_list_assignment_suffix}
 
@@ -1025,19 +988,16 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     local pcre_here_doc_prefix='-?'${pcre_continuable_spaces_horizontal_optional} 
 
     # Here-document suffix, matching the previously captured delimiter.
-    local pcre_here_doc_suffix_body=${pcre_space_vertical}'(?-1)'${pcre_line_end}
-    local pcre_here_doc_suffix='(?:'${pcre_here_doc_suffix_body}'|'${pcre_string_end_report_success}')'
+    local pcre_here_doc_suffix=${pcre_space_vertical}'(?-1)'${pcre_line_end}
 
-    # *NOT* a here-document suffix.
-    local pcre_here_doc_not_suffix='(?!'${pcre_here_doc_suffix_body}')'
+    # Vegative lookahead preventing matching of a here-document suffix.
+    local pcre_here_doc_not_suffix='(?!'${pcre_here_doc_suffix}')'
 
     # Quoted here-document and hence *NOT* embedding syntactic constructs.
-    #
-    # Unfortunately, matching all possible here-document delimiters is
-    # infeasible within the purview of a pure PCRE. Matching delimiters
-    # embedding escaped characters (e.g., '<<"mother\"destroyer"') requires
-    # unescaping such characters -- a simple operation that, by definition,
-    # cannot be performed by a pure PCRE.
+    # Sadly, matching all possible here-document delimiters is infeasible
+    # within the purview of a pure PCRE. Matching delimiters embedding escaped
+    # characters (e.g., '<<"mother\"destroyer"') requires unescaping such
+    # characters -- a trivial operation *NOT* implementable under PCRE.
     #
     # Only the proper subset of here-document delimiters containing no escaped
     # characters are matchable. Since no here-documents in the zeshy codebase
@@ -1048,7 +1008,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
 
     # Unquoted here-document and hence *NOT* embedding syntactic constructs.
     local pcre_here_doc_unquoted_delimiter_grouped=${pcre_word_literal_grouped}${pcre_space_vertical}
-    local pcre_here_doc_unquoted_body='(?:'${pcre_chars_not_embeddable_prefix_or_space_vertical}'|'${pcre_char_escaped_optional}'|'${pcre_embeddable}'|'${pcre_here_doc_not_suffix}${pcre_spaces}')'
+    local pcre_here_doc_unquoted_body='(?:[^'${char_space_vertical}${char_not_embeddable_prefix}']++|'${pcre_char_escaped_optional}'|'${pcre_embeddable}'|'${pcre_here_doc_not_suffix}${pcre_spaces}')'
     local pcre_here_doc_unquoted_grouped=${pcre_here_doc_unquoted_delimiter_grouped}${pcre_here_doc_unquoted_body}
 
     # Here-document. Such matching requires capturing and then subsequently
@@ -1057,8 +1017,25 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # a subroutine call. (Similar to function-scoped local variables, such
     # calls isolate capture groups by storing the current set of such groups on
     # entering such call and restoring such set on returning from such call.)
-    local pcre_here_doc_body='(?:'${pcre_here_doc_quoted_grouped}'|'${pcre_here_doc_unquoted_grouped}'|'${pcre_string_end_report_success}')'
-    pcre_macro_subroutines_body+='(?<doc>'${pcre_here_doc_prefix}${pcre_here_doc_body}${pcre_here_doc_unquoted_suffix}')'
+    local pcre_here_doc_content_grouped='(?:'${pcre_here_doc_quoted_grouped}'|'${pcre_here_doc_unquoted_grouped}')'
+    pcre_macro_subroutines_body+='(?<doc>'${pcre_here_doc_prefix}${pcre_here_doc_content_grouped}${pcre_here_doc_suffix}')'
+
+    # ..................{ HERE ~ unsupported                 }..................
+    # The following PCREs are intended for use *ONLY* in
+    # ${ZESHY__MACRO_HERE_DOC_UNSUPPORTED_PCRE} and hence break the rules.
+
+    # Here-document prefix disambiguated from a here-string prefix with
+    # negative lookahead.
+    local pcre_here_doc_unsupported_prefix='<<(?!<)'${pcre_here_doc_prefix}
+
+    # Supported here-document delimiter, matching any delimiter matched above.
+    local pcre_here_doc_supported_delimiter='(?:'${pcre_quotes_single_literal}'|'${pcre_quotes_double_literal}'|'${pcre_word_literal}')'${pcre_space_vertical}
+
+    # Unsupported here-document delimiter, matching any delimiter *NOT* matched
+    # above with negative lookahead. To prevent either the empty string or
+    # vertical whitespace characters from matching, match exactly one non-
+    # vertical whitespace character.
+    local pcre_here_doc_unsupported_delimiter='(?!'${pcre_here_doc_supported_delimiter}')'${pcre_char_sans_space_vertical}
 
     # ..................{ SUBSTITUTION ~ process             }..................
     #FIXME: Actually, we can also match macros in process substitutions
@@ -1155,12 +1132,12 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
 
     # "`"-delimited process substitution.
     local pcre_process_substitution_backtick_prefix='`'
-    local pcre_process_substitution_backtick_suffix='(?:`|'${pcre_string_end_report_success}')'
+    local pcre_process_substitution_backtick_suffix='(?:`|'${pcre_subject_end_report_success}')'
     local pcre_process_substitution_backtick_optional=${pcre_process_substitution_backtick_prefix}${pcre_commands_backtickable_optional}${pcre_process_substitution_backtick_suffix}
 
     # ")"-suffixed process substitution or fork, excluding prefixing substring
     # if any (e.g., "$(", "=(").
-    local pcre_process_sans_paren_left_suffix='(?:\)|'${pcre_string_end_report_success}')'
+    local pcre_process_sans_paren_left_suffix='(?:\)|'${pcre_subject_end_report_success}')'
     local pcre_process_sans_paren_left_optional=${pcre_commands_parenable_optional}${pcre_process_sans_paren_left_suffix}
 
     # "("- and ")"-delimited process fork, excluding such prefix.
@@ -1193,15 +1170,23 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # does *NOT* conflict with "$("- and ")"-delimited process substitutions,
     # the left bit-shift operator "<<" supported by such substitutions still
     # conflicts with here-document and -string prefixes.
+
+    #FIXME: "${pcre_char_escaped_optional}'|'${pcre_embeddable}" appears over
+    #and over and over again. Grep whether or not ${pcre_embeddable} ever
+    #appears in the absence of ${pcre_char_escaped_optional}. (Hint: it
+    #shouldn't.) If ${pcre_embeddable} is indeed always preceded by
+    #${pcre_char_escaped_optional}, the latter should simply be folded into th
+    #former and then excised from all embeddings of ${pcre_embeddable}.
+
     local pcre_math_substitution_braces_sans_dollar_prefix='\['
-    local pcre_math_substitution_braces_sans_dollar_suffix='(?:\]|'${pcre_string_end_report_success}')'
+    local pcre_math_substitution_braces_sans_dollar_suffix='(?:\]|'${pcre_subject_end_report_success}')'
     local pcre_math_substitution_braces_sans_dollar_body='(?:[^\]'${char_not_embeddable_prefix}']++|'${pcre_char_escaped_optional}'|'${pcre_embeddable}')*+'
     local pcre_math_substitution_braces_sans_dollar_optional=${pcre_math_substitution_braces_sans_dollar_prefix}${pcre_math_substitution_braces_sans_dollar_body}${pcre_math_substitution_braces_sans_dollar_suffix}
 
     # "(("- and "))"-delimited arithmetic construct, excluding the first such
     # "(" and prefixing character if any (e.g., "$(").
     local pcre_math_sans_paren_left_prefix='\('
-    local pcre_math_sans_paren_left_suffix='(?:\)\)|'${pcre_string_end_report_success}')'
+    local pcre_math_sans_paren_left_suffix='(?:\)\)|'${pcre_subject_end_report_success}')'
     local pcre_math_sans_paren_left_body='(?:[^)'${char_not_embeddable_prefix}']++|\)(?!\)|'${pcre_char_escaped_optional}'|'${pcre_embeddable}')*+'
     local pcre_math_sans_paren_left_optional=${pcre_math_sans_paren_left_prefix}${pcre_math_sans_paren_left_body}${pcre_math_paren_left_suffix}
 
@@ -1227,11 +1212,11 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # ..................{ VARIABLE                           }..................
     # "$"-prefixed variable expansion, excluding such "$". Since subsequent
     # PCREs already match a lone "$", this PCRE matches at least one character.
-    local pcre_var_sans_dollar_prefixed_optional='(?:(?:'${pcre_chars_subword_unquoted}'|'${pcre_char_escaped_optional}')++|'${pcre_string_end_report_success}')'
+    local pcre_var_sans_dollar_prefixed_optional='(?:(?:'${pcre_chars_subword_unquoted}'|'${pcre_char_escaped_optional}')++|'${pcre_subject_end_report_success}')'
 
     # "${"- and "}"-delimited variable expansion, excluding such "$".
     local pcre_var_sans_dollar_delimited_prefix='\{'
-    local pcre_var_sans_dollar_delimited_suffix='(?:\}|'${pcre_string_end_report_success}')'
+    local pcre_var_sans_dollar_delimited_suffix='(?:\}|'${pcre_subject_end_report_success}')'
     local pcre_var_sans_dollar_delimited_body='(?:[^}'${char_not_embeddable_prefix}']++|'${pcre_char_escaped_optional}'|'${pcre_embeddable}')*+'
     local pcre_var_sans_dollar_delimited_optional=${pcre_var_sans_dollar_delimited_prefix}${pcre_var_sans_dollar_delimited_body}${pcre_var_sans_dollar_delimited_suffix}
 
@@ -1316,91 +1301,13 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # asserted here with positive lookahead, there's no need: the negative
     # lookbehind suffixing such shell words guarantees such "}" to either
     # terminate the prior shell word or be a distinct shell word.
-    #
-    # To detect unbalanced and hence syntactically invalid block arguments, the
-    # last character of the subject string is captured from such arguments.
-
-    #FIXME: Clever. To distinguish unexpected PCRE match errors from expected
-    #end-of-string matches, we *REALLY* want to unconditionally capture the
-    #character immediately preceding the end-of-string at the topmost PCRE
-    #level external to macro matching. That, in turn, implies we do *NOT* need
-    #to group such character. Instead, since we'll be grouping such character
-    #elsewhere, all we need to do to detect a missing "}" is to see whether...
-    #err, O.K.; so, we won't be able to readily discern between scalar and
-    #block arguments in exception messages, but... eh? Who terribly cares.
-    #Given that, implement the following:
-    #
-    #* Replace ${pcre_string_end} by ${pcre_string_end_grouped} in *ALL* PCREs,
-    #  ensuring that the non-emptiness of final capture group "${match[-1]}"
-    #  reliably indicates whether the end-of-string has been reached. By using
-    #  "-1" rather than a positive index, we should be guaranteed of the
-    #  validity of this working regardless of context.
-    #* Add sufficient empty groups to macro matches below to ensure that the
-    #  corresponding group index is *ALWAYS* empty for valid macro matches.
-    #
-    #Pretty darn sweet, no? What's particularly awesome about this is that it
-    #permits us to transparently detect invalidities in *BOTH* scalar and block
-    #macro arguments without any heavy lifting, which is great.
-    #FIXME: Sadly, the above won't quite work due to captured group isolation
-    #in subroutine calls. However, a minor tweak gets us there:
-    #
-    #* In ${pcre_command_end_unspaced}, match
-    #  ${pcre_string_end_report_success_grouped}, ensuring that successful
-    #  preprocessor parsing captures the last character of such code. In such
-    #  case, the last group will be nonempty.
-    #* In syntactic constructs, match ${pcre_string_end_report_success}. Note
-    #  the lack of grouping! Since syntactic constructs are recursively
-    #  embeddable, there's little point in attempting to group. This ensures
-    #  that syntactically invalid constructs will *NOT* capture the last
-    #  character of such code. In such case, the last group will *NOT* exist
-    #  (as we'd have no means of setting such group to the empty string, absent
-    #  overkill-style usage of PCRE directives).
-    #
-    #Testing for syntactic invalidity thus reduces to testing whether a macro
-    #was matched or not and, if not, whether the last capture group exists:
-    #
-    #    if [[ -z ${match[${ZESHY__MACRO_MATCH_INDEX_NAME}]} ]] &&
-    #        (( ${#match} < ZESHY__MACRO_MATCH_INDEX_STRING_IS_VALID )) {
-    #        :die "Uh oh! Syntactic invalidity found."
-    #    }
-
-    #FIXME: Actually, discerning between scalar and block arguments is trivial
-    #with capturing. If:
-    #
-    #* A block argument is matched, capture the prefixing "{" (which is
-    #  guaranteed to be matched, of course) to a new group.
-    #* Else, a scalar argument is matched. In such case, capture the empty
-    #  string to the same group.
-    #
-    #Hence, the non-emptiness of such group indicates the *LAST* argument
-    #passed to the current macro to be a block; else, to be a scalar.
-    #
-    #To provide exception message context, we could even go one farther; by
-    #capturing with positive lookahead instead, we can arbitrarily capture
-    #"(?=(.{1,80}+))" -- that is, anywhere from 1 to 80 characters starting at
-    #the first character of such argument. If such character is a "{", such
-    #argument is a block; else, such argument is a scalar. Note, however, that
-    #we cannot use a positive lookbehind to capture additional context, as
-    #lookbehinds require a fixed number of characters whereas we have no idea
-    #exactly how many characters would be matchable. This could be
-    #circumventable, of course, by prefixing every preprocessed string with an
-    #80 character buffer of ignorable whitespace, guaranteeing the
-    #unconditional validity of lookbehind resembling "(?<(.{80}))"
-    #regardless of context. But, yeah... probably overkill for the moment.
-
     local pcre_block_suffix='\}'
-    local pcre_block_suffix_grouped='(?:'${pcre_block_suffix}'|'${pcre_string_end_report_success_grouped}')'
 
     # "{"- and "}"-delimited block. Blocks are recursively nestable and hence
     # matchable only with subroutine calls. Since such calls isolate groups
     # captured by such calls to such calls, such grouped block suffix is
     # matched outside rather than inside such call.
-    local pcre_block_body=${pcre_block_prefix}'(?&blk)'
-    local pcre_block=${pcre_block_body}${pcre_block_suffix}
-    local pcre_block_grouped=${pcre_block_body}${pcre_block_suffix_grouped}
-
-    # "{"- and "}"-delimited block optionally suffixed by line continuations.
-    local pcre_block_continuable=${pcre_block}${pcre_line_continuations_optional}
+    local pcre_block=${pcre_block_prefix}'(?&blk)'${pcre_subject_end_report_success_optional}${pcre_block_suffix}
 
     # Syntactic component permitting matching of strictly balanced braces.
     local pcre_subword_braceable=${pcre_nanoword}'|'${pcre_block}'|'${pcre_interpretable}
@@ -1508,22 +1415,29 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     local pcre_words_passable_optional_spaced_grouped='('${pcre_words_passable_optional_spaced}')'
 
     # ..................{ MACRO ~ arg                        }..................
-    # Macro argument, comprising both zsh-specific scalar arguments and
-    # zeshy-specific block arguments. While such arguments may be matched in
-    # either order, block arguments are *ALWAYS* prefixed by the same substring
-    # "{" and hence more efficiently matchable.
-    local pcre_macro_arg='(?:'${pcre_block_continuable}'|'${pcre_word_passable}')'
+    # Macro argument optionally suffixed by line continuations, comprising both
+    # standard scalar arguments and zeshy-specific block arguments. While such
+    # arguments may be matched in either order, the latter are *ALWAYS*
+    # prefixed by the same prefix "{" and hence more efficiently matchable.
+    #
+    # Since ${pcre_word_passable} implicitly matches trailing line
+    # continuations, ${pcre_macro_args_optional} matches
+    # ${pcre_spaces_horizontal_continuable} rather than
+    # ${pcre_continuable_spaces_horizontal} for efficiency. Since
+    # ${pcre_block} does *NOT* implicitly match trailing line continuations,
+    # however, such continuations are explicitly matched after such PCRE.
+    local pcre_macro_arg='(?:'${pcre_block}${pcre_line_continuations_optional}'|'${pcre_word_passable}')'
 
     # One or more macro arguments.
-    local pcre_macro_args=${pcre_macro_arg}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_arg}')*+'
-    local pcre_macro_args_optional_grouped='('${pcre_macro_args_optional}')?+'
+    local pcre_macro_args_optional=${pcre_macro_arg}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_arg}')*+'
+    # local pcre_macro_args_optional_grouped='('${pcre_macro_args_optional}')?+'
 
-    # One or more grouped horizontal whitespace characters optionally
-    # interspersed by line continuations followed by zero or more grouped macro
-    # arguments. To identify the last byte indices of macros, all characters
-    # comprising such macro following such macro's name are captured --
-    # including whitespace delimiting such name from subsequent arguments.
-    local pcre_macro_spaced_grouped=${pcre_spaces_horizontal_continuable_grouped}${pcre_macro_args_optional_grouped}
+    # One or more horizontal whitespace characters optionally interspersed by
+    # line continuations followed by zero or more macro arguments. To identify
+    # the last byte indices of macros, all characters comprising such macro
+    # following such macro's name are captured -- including whitespace
+    # delimiting such name from subsequent arguments.
+    local pcre_macro_spaced=${pcre_spaces_horizontal_continuable}${pcre_macro_args_optional}
 
     # End of a macro accepting no arguments *AND* suffixed by no horizontal
     # whitespace characters, thus consisting of a zsh-specific command
@@ -1546,7 +1460,13 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
 
     # Macro body, comprising all arguments passed to such macro as well as
     # line continuations and whitespace cementing the former to the latter.
-    local pcre_macro_body=${pcre_line_continuations_optional}'(?:'${pcre_macro_spaced_grouped}'|'${pcre_macro_unspaced_lookahead}')'
+    #
+    # One or more horizontal whitespace characters optionally interspersed by
+    # line continuations followed by zero or more macro arguments. To identify
+    # the last byte indices of macros, all characters comprising such macro
+    # following such macro's name are captured -- including whitespace
+    # delimiting such name from subsequent arguments.
+    local pcre_macro_body=${pcre_line_continuations_optional}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_args_optional}'|'${pcre_macro_unspaced_lookahead}')'
 
     # ..................{ MACRO                              }..................
     #FIXME: Rename to ${pcre_macro}? What? Help! HE-LLLP!
@@ -1556,7 +1476,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # preprocessor phase iterating over such PCRE that such macro has been
     # fully matched. To distinguish syntactically valid from invalid macros,
     # *ALL* matched substrings must be optional.
-    local pcre_macro_body_report_success_grouped=${pcre_macro_body}${pcre_empty_group}${pcre_empty_group}${pcre_report_success}
+    local pcre_macro_body_report_success_grouped=${pcre_macro_body}${pcre_empty_group}${pcre_report_success}
 
     # Macro name.
     local pcre_macro_name_grouped='('${ZESHY__MACRO_NAME_PLACEHOLDER_PCRE}')'
@@ -1588,7 +1508,6 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # Syntactic construct recursively interpretable in arbitrary code.
     pcre_macro_subroutines_body+='(?<int>'${pcre_dollar_interpretable_optional}'|'${pcre_parens_interpretable_optional}'|'${pcre_process_substitution_redirect_optional}'|'${pcre_process_substitution_backtick_optional}')'
 
-    # ..................{ SUBROUTINE                         }..................
     # PCRE subroutines defined above, concatenated in a manner preventing
     # such definitions from either implicitly matching *OR* capturing.
     #
@@ -1616,6 +1535,10 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     local pcre_macro_subroutines=${pcre_macro_subroutines_prefix}${pcre_macro_subroutines_body}${pcre_macro_subroutines_suffix}
 
     # ..................{ GLOBAL                             }..................
+    # PCRE matching unsupported here-documents (i.e., here-documents with
+    # non-literal and hence non-PCRE-matchable delimiters).
+    ZESHY__MACRO_HERE_DOC_UNSUPPORTED_PCRE=${pcre_here_doc_unsupported_prefix}${pcre_here_doc_unsupported_delimiter}
+
     # PCRE matching syntactically valid macro names.
     ZESHY__MACRO_NAME_VALID_PCRE='['${char_not_macro_name_char_first}']['${char_not_macro_name_char_rest}']*+'
 
@@ -1685,7 +1608,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     #distinguishing syntactically valid from invalid scripts. To do so, we'll
     #need to supplant ${pcre_report_failure} by something resembling:
     #
-    #    ${pcre_spaces_horizontal_continuable_optional}(<=(.))${pcre_string_end}
+    #    ${pcre_spaces_horizontal_continuable_optional}(<=(.))${pcre_subject_end}
     #
     #This ensures that *ONLY* syntactically invalid matches report failure,
     #which is great. Since valid macro matches are easily distinguished by the
@@ -1736,20 +1659,12 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     #FIXME: Document such indices.
 
     # Declare positive absolute indices matched by ${ZESHY__MACRO_PCRE}.
-    ZESHY__MACRO_GROUP_COUNT_MAX=1
     group_index=1
-
-    #FIXME: We're unclear: why do we require *ANY* of the following capture
-    #groups except ${ZESHY__MACRO_GROUP_INDEX_NAME}? In truth, we probably
-    #don't. Contemplate excising both here and above.
 
     for group_name (
         ZESHY__MACRO_GROUP_INDEX_NAME
-        ZESHY__MACRO_GROUP_INDEX_LINE_CONTINUATIONS
-        ZESHY__MACRO_GROUP_INDEX_SPACES_HORIZONTAL
         ZESHY__MACRO_GROUP_INDEX_ARGS
     ) {
-        ZESHY__MACRO_GROUP_COUNT_MAX+=1
         integer -g ${group_name}=$(( group_index++ ))
         # print -r ${group_name}': '${(P)group_name}
     }
@@ -1757,16 +1672,205 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # Declare negative relative indices matched by ${ZESHY__MACRO_PCRE}.
     group_index=-1
     for group_name (
-        ZESHY__MACRO_GROUP_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS
-        ZESHY__MACRO_GROUP_INDEX_HERE_DOC_DELIMITER_INVALID_REMAINDER
+        ZESHY__MACRO_GROUP_INDEX_WASTELANDS
     ) {
-        ZESHY__MACRO_GROUP_COUNT_MAX+=1
         integer -g ${group_name}=$(( group_index-- ))
-        # print -r ${group_name}': '${(P)group_name}
     }
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: We don't quite understand why we suffix by optional line
+    #continuations. There's probably a good reason; sadly, we failed to
+    #document that reason. Hmm.
+    #
+    #Oh, right. It's because we only match
+    #${${pcre_spaces_horizontal_continuable}} for efficiency below, since
+    #${pcre_word_passable} already implicitly matches line continuations.
+    #Document us up, please.
+
+    # local pcre_block_suffix_grouped='(?:'${pcre_block_suffix}'|'${pcre_subject_end_report_success_grouped}')'
+
+    # To detect unbalanced and hence syntactically invalid block arguments, the
+    # last character of the subject string is captured from such arguments.
+
+    #FUXME: Clever. To distinguish unexpected PCRE match errors from expected
+    #end-of-string matches, we *REALLY* want to unconditionally capture the
+    #character immediately preceding the end-of-string at the topmost PCRE
+    #level external to macro matching. That, in turn, implies we do *NOT* need
+    #to group such character. Instead, since we'll be grouping such character
+    #elsewhere, all we need to do to detect a missing "}" is to see whether...
+    #err, O.K.; so, we won't be able to readily discern between scalar and
+    #block arguments in exception messages, but... eh? Who terribly cares.
+    #Given that, implement the following:
+    #
+    #* Replace ${pcre_subject_end} by ${pcre_subject_end_grouped} in *ALL* PCREs,
+    #  ensuring that the non-emptiness of final capture group "${match[-1]}"
+    #  reliably indicates whether the end-of-string has been reached. By using
+    #  "-1" rather than a positive index, we should be guaranteed of the
+    #  validity of this working regardless of context.
+    #* Add sufficient empty groups to macro matches below to ensure that the
+    #  corresponding group index is *ALWAYS* empty for valid macro matches.
+    #
+    #Pretty darn sweet, no? What's particularly awesome about this is that it
+    #permits us to transparently detect invalidities in *BOTH* scalar and block
+    #macro arguments without any heavy lifting, which is great.
+    #FUXME: Sadly, the above won't quite work due to captured group isolation
+    #in subroutine calls. However, a minor tweak gets us there:
+    #
+    #* In ${pcre_command_end_unspaced}, match
+    #  ${pcre_subject_end_report_success_grouped}, ensuring that successful
+    #  preprocessor parsing captures the last character of such code. In such
+    #  case, the last group will be nonempty.
+    #* In syntactic constructs, match ${pcre_subject_end_report_success}. Note
+    #  the lack of grouping! Since syntactic constructs are recursively
+    #  embeddable, there's little point in attempting to group. This ensures
+    #  that syntactically invalid constructs will *NOT* capture the last
+    #  character of such code. In such case, the last group will *NOT* exist
+    #  (as we'd have no means of setting such group to the empty string, absent
+    #  overkill-style usage of PCRE directives).
+    #
+    #Testing for syntactic invalidity thus reduces to testing whether a macro
+    #was matched or not and, if not, whether the last capture group exists:
+    #
+    #    if [[ -z ${match[${ZESHY__MACRO_MATCH_INDEX_NAME}]} ]] &&
+    #        (( ${#match} < ZESHY__MACRO_MATCH_INDEX_STRING_IS_VALID )) {
+    #        :die "Uh oh! Syntactic invalidity found."
+    #    }
+    #FUXME: Actually, discerning between scalar and block arguments is trivial
+    #with capturing. If:
+    #
+    #* A block argument is matched, capture the prefixing "{" (which is
+    #  guaranteed to be matched, of course) to a new group.
+    #* Else, a scalar argument is matched. In such case, capture the empty
+    #  string to the same group.
+    #
+    #Hence, the non-emptiness of such group indicates the *LAST* argument
+    #passed to the current macro to be a block; else, to be a scalar.
+    #
+    #To provide exception message context, we could even go one farther; by
+    #capturing with positive lookahead instead. We could arbitrarily capture
+    #"(?=(.{1,80}+))" -- that is, anywhere from 1 to 80 characters starting at
+    #the first character of such argument. If such character is a "{", such
+    #argument is a block; else, such argument is a scalar. Note, however, that
+    #we cannot use a positive lookbehind to capture additional context, as
+    #lookbehinds require a fixed number of characters whereas we have no idea
+    #exactly how many characters would be matchable. This could be
+    #circumventable, of course, by prefixing every preprocessed string with an
+    #80 character buffer of ignorable whitespace, guaranteeing the
+    #unconditional validity of lookbehind resembling "(?<(.{80}))"
+    #regardless of context. But, yeah... probably overkill for the moment.
+
+    #FUXME: We shouldn't be embedding this PCRE terribly many places at all,
+    #below. Grep and correct, please.
+    #FUXME: Correct documentation. We no longer ignore unsupported
+    #here-document delimiters: we force failure.
+    # Since syntactically valid here-documents with delimiters containing
+    # escaped characters (e.g., "<<war\ is\ peace") *MUST* be matched but, by
+    # the above discussion, cannot actually be matched in a syntactically valid
+    # manner via PCREs, such here-documents are only matchable in a
+    # syntactically invalid manner via PCREs. To do so, only the "<<" suffixing
+    # such here-documents is matched here by matching the proper subset of
+    # here-documents that is matchable here optionally. All text following such
+    # suffix will be matched by subsequent PCREs as arbitrary code, implying
+    # that here-document text will be preprocessed for macros. While hardly
+    # ideal, this is (arguably) the ideal solution achievable via PCREs.
+
+    #FUXME: Actually handle such error condition with fatal exceptions in
+    #={backend}. Shouldn't be terribly hard, though we may need to generalize
+    #our current exception handling approach in such parcel.
+
+    # Unsupported here-document excluding prefixing "<<" *AND* all subsequent
+    # text in the subject string, captured for subsequent identification of
+    # such here-document's line in such string (e.g., for use in exception
+    # messages). Unfortunately, since subroutine calls isolate captured groups,
+    # Unsupported here-documents embedded in syntactic constructs cannot be
+    # precisely identified in this manner. Happily, the overwhelming majority
+    # of here-documents in zeshy code appear at the top level (e.g., as
+    # operable documentation), somewhat mitigating such concerns.
+    # local pcre_here_doc_unsupported_grouped='(.*+)'${pcre_empty_group}${pcre_subject_end_report_success}
+
+# Maximum number of match groups capturable by ${ZESHY__MACRO_PCRE}.
+# integer -g ZESHY__MACRO_GROUP_COUNT_MAX
+    # ZESHY__MACRO_GROUP_COUNT_MAX=1
+        # ZESHY__MACRO_GROUP_COUNT_MAX+=1
+
+    # Declare negative relative indices matched by ${ZESHY__MACRO_PCRE}.
+    # group_index=-1
+    # for group_name (
+    #     ZESHY__MACRO_GROUP_INDEX_CODE_VALID_CHAR_LAST_OR_WASTELANDS
+    #     ZESHY__MACRO_GROUP_INDEX_HERE_DOC_DELIMITER_INVALID_REMAINDER
+    # ) {
+    #     ZESHY__MACRO_GROUP_COUNT_MAX+=1
+    #     integer -g ${group_name}=$(( group_index-- ))
+    #     # print -r ${group_name}': '${(P)group_name}
+    # }
+
+    #FUXME: We're unclear: why do we require *ANY* of the following capture
+    #groups except ${ZESHY__MACRO_GROUP_INDEX_NAME}? In truth, we probably
+    #don't. Contemplate excising both here and above.
+        # ZESHY__MACRO_GROUP_INDEX_LINE_CONTINUATIONS
+        # ZESHY__MACRO_GROUP_INDEX_SPACES_HORIZONTAL
+
+    # local pcre_here_optional='<(?:<|(?&doc)|'${pcre_here_doc_unsupported_grouped}')'
+
+    # # Character *OR* the end of such string.
+    # local pcre_char_optional='(?:.|'${pcre_subject_end_report_success}')'
+    #
+    # # Escaped character (i.e., "\"-prefixed character). To account for
+    # # syntactically invalid "\" characters immediately prefixing the end of
+    # # such string, shenanigans appear.
+    # local pcre_char_escaped_optional='\\'${pcre_char_optional}
+
+#FUXME: Improve exception messages on syntactically invalid code. At the
+#moment, we have no means of printing the line number and/or character range of
+#such code -- which is positively terrible. Fortunately, we believe we *MAY*
+#have a tolerable means of improving this. It will require a bit of additional
+#work, but should substantially improve usability:
+#
+#* For each syntactic construct currently embedding
+#  ${pcre_subject_end_report_success} (e.g.,
+#  ${pcre_var_sans_dollar_delimited_prefix}), replace the current use of
+#  ${pcre_subject_end_report_success} by a duplication of such syntactic
+#  construct's full PCRE with the following:
+#  * Prepend such PCRE by positive lookahead capturing *ALL* text from the
+#    current position to the end-of-string. Since we know the byte-size of such
+#    full string *AND* of such captured substring, we can subtract the latter
+#    from the former to determine the starting byte of the invalid construct.
+#
+#Of course, this fails for recursively embedded invalid constructs due to group
+#isolation in subroutine calls -- ever the perennial problem. While there may
+#be no meaningful means of correcting that, at least we can improve the general
+#situation for top-level invalid constructs. Hmm; actually, pretty much *ALL*
+#constructs will be recursively embedded at least one level deep within "{"-
+#and "}"-delimited blocks, implying that handling top-level invalid constructs
+#is pretty much useless. Pretty frustrating.
+#FUXME: So... grouping, however clever, clearly won't work. What *WILL* work
+#(more or less, anyway) is to:
+#
+#* Create a temporary file containing exactly such string (e.g., via
+#  "=(...)"-style process substitution).
+#* Pass such file to "zsh --no_exec".
+#
+#The difficulty there, of course, is that zeshy scripts are probably inherently
+#syntactically invalid as zsh scripts. Or not? Only one way to find out, eh?
+
+    # One or more characters excluding both embeddable-reserved *AND* vertical
+    # whitespace characters.
+    # local pcre_chars_not_embeddable_prefix_or_space_vertical='[^'${char_space_vertical}${char_not_embeddable_prefix}']++'
+
+    # Character class matching both embeddable-reserved *AND* vertical
+    # whitespace characters for negative character classes.
+    # local char_not_embeddable_prefix_or_space_vertical=${char_space_vertical}${char_not_embeddable_prefix}
+
+    # local pcre_quotes_double_prefix='"'
+    # local pcre_quotes_double_suffix='(?:"|'${pcre_subject_end_report_success}')'
+    # local pcre_quotes_double_body='(?:[^"'${char_not_embeddable_prefix}']++|'${pcre_char_escaped_optional}'|'${pcre_embeddable}')*+'
+    # local pcre_quotes_double_optional=${pcre_quotes_double_prefix}${pcre_quotes_double_body}${pcre_quotes_double_suffix}
+
+    # local pcre_quotes_single_prefix="'"
+    # local pcre_quotes_single_suffix="(?:'|"${pcre_subject_end_report_success}')'
+    # local pcre_quotes_single_body="(?>[^']++|'')*+"
+    # local pcre_quotes_single_optional=${pcre_quotes_single_prefix}${pcre_quotes_single_body}${pcre_quotes_single_suffix}
     #FUXME: Implement ${pcre_here_doc_unquoted_body} in an analogous fashion to
     #"{"- and "}"-delimited variable expansions.
 
@@ -1781,7 +1885,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     #readily induce pathological parser behavior; instead, we need to attempt
     #to match a grouped ${pcre_word_parenable} here (probably in an optional
     #manner also matching the end-of-string: e.g.,
-    #"(${pcre_word_parenable}|${pcre_string_end_grouped})") and then simply
+    #"(${pcre_word_parenable}|${pcre_subject_end_grouped})") and then simply
     #attempt to match the same word as the closing delimiter. Incidentally,
     #this permits us to excise all ${pcre_*_literal_grouped} PCREs, which is
     #mildly nice. More importantly, this ensures that for edge-case here-
@@ -1789,13 +1893,13 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     #"<<$(print ugh)
     #ugh"), an explicit fatal exception will be thrown. Which is a *FANTASTIC*
     #thing. Indeed, such exception message could even be improved by grouping
-    #${pcre_string_end_grouped} in such PCRE into a unique group, permitting
+    #${pcre_subject_end_grouped} in such PCRE into a unique group, permitting
     #the preprocessor to disambiguate ordinary syntactic invalidities from
     #non-preprocessable, ossibly syntactically valid here-documents. Which is
     #fairly important, though hardly required for a first working draft.
     #FUXME: Wait. We can do considerably better than even that. Consider:
     #   local pcre_here_doc_prefix_report_success_grouped=${pcre_char_prior_grouped}${pcre_empty_group}${pcre_report_success}
-    #   local pcre_here_doc_prefix_delimiter_grouped='(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}'|'${pcre_word_literal_grouped}'|'${pcre_string_end_report_success_grouped}'|'${pcre_here_doc_prefix_report_success_grouped}')'
+    #   local pcre_here_doc_prefix_delimiter_grouped='(?|'${pcre_quotes_single_literal_grouped}'|'${pcre_quotes_double_literal_grouped}'|'${pcre_word_literal_grouped}'|'${pcre_subject_end_report_success_grouped}'|'${pcre_here_doc_prefix_report_success_grouped}')'
     #   local pcre_here_doc_prefix_grouped='-?'${pcre_spaces_horizontal_continuable_optional}${pcre_here_doc_prefix_delimiter_grouped}${pcre_space_vertical}
     #
     #This is fairly clever. In the event of no sanely matchable here-document
@@ -1824,7 +1928,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
 #FUXME: Ultimately, we arguably need to post a patch to zsh-workers adding 
     # local pcre_here_optional='<(?:<|(?&doc)?+)'
 
-    # local pcre_here_doc_quoted_suffix='(?:'${pcre_space_vertical}'(?-1)'${pcre_line_end}'|'${pcre_string_end_report_success}')'
+    # local pcre_here_doc_quoted_suffix='(?:'${pcre_space_vertical}'(?-1)'${pcre_line_end}'|'${pcre_subject_end_report_success}')'
 #  This could be amended, of
 #course, by 
     #FUXME: Hmm; since this suffixing ${pcre_line_end} *NEEDS* to be consumed as
@@ -1836,11 +1940,11 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # matching command terminators). While reporting failure would be
     # samentically preferable, doing so inhibits zsh from setting canonical
     # list global ${match} to such groups, which rather defeats the purpose.
-    #Note first that we embed "?+" rather than "'|'${pcre_string_end}", as the
+    #Note first that we embed "?+" rather than "'|'${pcre_subject_end}", as the
     #former matches both end
 
-    #FUXME: Rename ${pcre_string_end_grouped} to
-    #${pcre_string_end_report_success_grouped} and refactor such PCRE to
+    #FUXME: Rename ${pcre_subject_end_grouped} to
+    #${pcre_subject_end_report_success_grouped} and refactor such PCRE to
     #*IMMEDIATELY* halt matching. Failing to do this could induce match
     #failure and, in any case, inefficiency (e.g., as subsequent command
     #terminators will attempt to be matched).
@@ -1897,13 +2001,13 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     #invalidities that we should detect: for example, a "{"-prefixed block
     #argument with no balanced "}" suffix. In such case, the end of the code is
     #matched, which we should probably detect by defining a new PCRE used in
-    #place of ${pcre_string_end} that captures the preceding character in
+    #place of ${pcre_subject_end} that captures the preceding character in
     #positive lookbehind: e.g.,
     #
-    #    local pcre_string_end_grouped='(?<(.))'${pcre_string_end}
+    #    local pcre_subject_end_grouped='(?<(.))'${pcre_subject_end}
     #
     #Pretty sweet. We should probably embed such PCRE rather than
-    #${pcre_string_end} in ${pcre_*_braceable}, in which case such syntactic
+    #${pcre_subject_end} in ${pcre_*_braceable}, in which case such syntactic
     #invalidity may be tested for.
     #FUXME: While there exist similar syntactic invalidities for standard macro
     #arguments (e.g., "'" with no suffixing "'" and hence an unclosed
@@ -1913,9 +2017,9 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     #passable macro arguments is that we'll then need to implement two variants
     #for each syntactic construct:
     #
-    #* A common variant using ${pcre_string_end}, intended for use everywhere
+    #* A common variant using ${pcre_subject_end}, intended for use everywhere
     #  *EXCEPT* in passable macro arguments.
-    #* An uncommon variant using ${pcre_string_end_grouped}, intended for use
+    #* An uncommon variant using ${pcre_subject_end_grouped}, intended for use
     #  only in passable macro arguments.
     #
     #Wait. Actually, this is largely unnecessary. It certainly hardly seems
@@ -1999,7 +2103,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # End of a macro suffixed by one or more horizontal whitespace characters
     # and accepting zero or more arguments, comprising either the end of the
     # current line *OR* a zeshy- or zsh-specific command terminator.
-    # local pcre_macro_args_optional_spaced_lookahead='(?='${pcre_command_ends}'|'${pcre_string_end}')'
+    # local pcre_macro_args_optional_spaced_lookahead='(?='${pcre_command_ends}'|'${pcre_subject_end}')'
 
     # End of a macro suffixed by no horizontal whitespace characters and
     # accepting no arguments, comprising either the end of the current line
@@ -2012,7 +2116,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # match any bytes following such macro -- including the command terminator
     # terminating such macro if any. To ensure this, this PCRE must consume no
     # characters and hence contain *ONLY* zero-width assertions.
-    # local pcre_macro_sans_args_unspaced_lookahead='(?='${pcre_command_end_unspaced}'|'${pcre_string_end}')'
+    # local pcre_macro_sans_args_unspaced_lookahead='(?='${pcre_command_end_unspaced}'|'${pcre_subject_end}')'
 
     #FUXME: ${pcre_redirect} probably already matches "<" and ">" at an
     #*EARLIER* point, preventing this PCRE from ever matching such constructs.
@@ -2172,7 +2276,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # To preprocess macros embedded in such process substitutions, the "$("
     # prefixing such substitutions is matched elsewhere as a command terminator
     # and hence macro prefix.
-    # local pcre_macroable='(?=\$(?:[^(]|\(\()|\(\(|'${pcre_string_end}')(?&mac)'
+    # local pcre_macroable='(?=\$(?:[^(]|\(\()|\(\(|'${pcre_subject_end}')(?&mac)'
 
     #FUXME: As with substitutables above, this subroutine should be inlined
     #directly at its sole point of use and then eliminated. See to it, please.
@@ -2486,7 +2590,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     # local pcre_here_optional=${pcre_here_prefix}'(?:'${pcre_here_string_prefix}'|(?&here)?+)'
 
     #FUXME: Redefine in terms of ${pcre_command_end_unspaced_body}.
-    # local pcre_command_end_unspaced='(?:'${pcre_command_end_char}'|'${pcre_command_end_spaces_vertical}'|'${pcre_command_end_comment}'|'${pcre_command_end_process_substitution_prefix_sans_backtick}'|'${pcre_command_end_pipe}'|'${pcre_command_end_ampersand}'|'${pcre_string_end}')'${pcre_spaces_horizontal_continuable_optional}
+    # local pcre_command_end_unspaced='(?:'${pcre_command_end_char}'|'${pcre_command_end_spaces_vertical}'|'${pcre_command_end_comment}'|'${pcre_command_end_process_substitution_prefix_sans_backtick}'|'${pcre_command_end_pipe}'|'${pcre_command_end_ampersand}'|'${pcre_subject_end}')'${pcre_spaces_horizontal_continuable_optional}
 
     #FUXME: The nomenclature implies such PCRE matches one or more arbitrary
     #command terminators -- which, of course, it doesn't. Which seems silly,
@@ -3609,7 +3713,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
 
     #FUXME: Prefix ${pcre_command_end_spaced_grouped} by
     #${pcre_continuable_spaces_horizontal}, excising the latter below.
-    # local pcre_command_end_spaced='(?:'${pcre_continuable_spaces_horizontal}'|'${pcre_string_start}')(?:'${pcre_command_end_block_prefix}'|'${pcre_command_end_zeshy}')'
+    # local pcre_command_end_spaced='(?:'${pcre_continuable_spaces_horizontal}'|'${pcre_subject_start}')(?:'${pcre_command_end_block_prefix}'|'${pcre_command_end_zeshy}')'
 
     #FUXME: Embed a new ${pcre_command_end_spaced_grouped} below.
     # local pcre_codes_or_chars_not_command_end_optional='(?:'${pcre_code}'|'${pcre_chars_not_subword_unquoted_or_command_end}')*'
@@ -4010,7 +4114,7 @@ integer -g ZESHY__MACRO_GROUP_COUNT_MAX
     #Certainly, both signify the exact same semantics.
 
     # local pcre_macro_sans_args_unspaced_lookahead=${pcre_line_end}'|'${pcre_char_command_end}
-    # local pcre_macro_sans_args_unspaced='(?='${pcre_macro_sans_args_unspaced_lookahead}'|'${pcre_string_end}')'
+    # local pcre_macro_sans_args_unspaced='(?='${pcre_macro_sans_args_unspaced_lookahead}'|'${pcre_subject_end}')'
 
     # Zero or much such constructs.
     # local pcre_subword_sans_parens_optional='(?:'${pcre_subword_sans_parens}')*'
