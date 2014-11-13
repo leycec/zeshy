@@ -7,31 +7,6 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Preprocess zeshy-specific code into zsh-specific code.
 
-#FIXME: Alias expansions containing macro expansions pove a slight issue,
-#though certainly solvable. Consider a macro :macro and alias :alias expanding
-#as follows:
-#
-#    alias ":alias"=":macro"
-#
-#Simple, right? Right. Unfortunately, the current approach expands macros
-#*BEFORE* evaluating the result and hence expands such macro. Thus, such
-#approach fails to preprocess alias-embedded macros. Fortunately, there exists
-#a simple alternative:
-#
-#* Before preprocessing, define a temporary singleton function (e.g.,
-#  ::preprocess.code()) whose body is *EXACTLY* the code to be preprocessed:
-#  e.g.,
-#     functions[::preprocess.code]={preprocessed_code}
-#* After definition, since function's body is such code with all aliases
-#  expanded to their results.
-#* Preprocess such function's body rather than the original code: e.g.,
-#     ::preprocess ${functions[::preprocess.code]}
-#* Undefine such function to avoid unexpected side effects.
-#
-#Inefficient? Yes. But, again, *ALL* digest compilations except the first will
-#be backgrounded. Hence, we generally don't care *TOO* much about compilation
-#times -- so long as they're not apallingly horrific, anyway.
-
 #FIXME: Once we get a working preprocessor up, it becomes trivial to implement
 #support for eliding away debug-specific code under optimized builds. Simply
 #define a new macro :build.if_debug() accepting one and only one block
@@ -85,8 +60,8 @@
 #    plan, such line *SHOULD* be suffixed by a comment indicating the
 #    corresponding line number in the preprocessed original zeshy script,
 #    in which case we're done. If this is *NOT* the case, something went
-#    horribly wrong, implying the current zeshy process should probably throw
-#    a verbose exception.
+#    horribly wrong, implying the current zeshy process should probably throw a
+#    verbose exception.
 #
 #That actually doesn't seem terribly hard, now that we've purportedly uncovered
 #the essential trick of suffixing preprocessed lines by " # line" comments.
@@ -96,31 +71,20 @@
 ::script_zsh.source_or_unwind_call_stack backend.zy pcre.zy
 
 # ....................{ GLOBALS                            }....................
-#FIXME: Document me.
-# From from macro name to the name of the function expanding such macro.
-typeset -gA\
-    ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME\
-    ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME
+# Map from macro name to the name of the function expanding such macro.
+typeset -gA ZESHY__MACRO_TO_FUNC_NAME
+
+# List set of all macro names prefixed by ":", excluding such ":" from each such
+# name for simplicity (e.g., when joining such names into a PCRE).
+typeset -gaU ZESHY__MACRO_NAMES_SEMICOLON_PREFIXED
+
+# List set of all macro names *NOT* prefixed by ":".
+typeset -gaU ZESHY__MACRO_NAMES_SEMICOLON_UNPREFIXED
 
 # ....................{ DECLARERS                          }....................
 #FIXME: Implement macro documentation support. This implies, of course, that
 #we'll need to shift early-time documentation functionality here. *sigh*
 #FIXME: Document me.
-
-#FIXME: *ALL* macro names should be suffixed by ":". Since macros are
-#regrettably subject to constraints that conventional zsh builtins and
-#functions and external commands are not, callers must have some immediate
-#means of differentiating macros from non-macro callables. This is how. Given
-#this convention, we should probably print non-fatal warnings when macros *NOT*
-#suffixed by ":" are declared.
-#FIXME: Actually, we've obviated most such constraints. Assuming we correct the
-#well-documented issue of matching macros in process substitutions embedded in
-#double-quoted strings (which certainly seems feasible), the only remaining
-#discrepancy between zsh and zeshy parsing remains the matching of macros in
-#"`"-delimited process substitutions -- which, honestly, is perfectly ignorable.
-#In other words, for all intents and purposes, macros should indeed be
-#expandable everywhere command aliases are and hence *NOT* require lexical
-#differentiation by the above ":"-suffixed scheme. Contemplate, anyway.
 
 #FIXME: Define a new :macro_in_reverse() declarer, declaring macros which the
 #preprocessor "reverses" until bumping up against a preceding brace. Since such
@@ -200,25 +164,23 @@ function :macro_command() {
 
     # If such function does *NOT exist, throw an exception.
     (( ${+functions[${func_name}]} )) || :die\
-        'Macro '${macro_name}'() function '${func_name}'() not found.'
+        'Macro '${macro_name}'() function '${func_name}'() undefined.'
 
-    # If the first character of such macro is ":", declare such macro
-    # accordingly. Since this is the case for all official zeshy macros and
-    # hence most macros, this is an optimization specific to the common case.
+    # If such macro already exists, throw an exception.
+    (( ${+ZESHY__MACRO_TO_FUNC_NAME[${macro_name}]} == 0 )) || :die\
+        'Macro '${macro_name}'() already defined to be expanded by function '${ZESHY__MACRO_TO_FUNC_NAME[${macro_name}]}'().'
+
+    # Declare such macro.
+    ZESHY__MACRO_TO_FUNC_NAME[${macro_name}]=${func_name}
+
+    # If such macro is prefixed by ":", record such fact. Since this is the case
+    # for all official zeshy macros (and hence most macros), this is an
+    # optimization specific to the common case.
     if [[ ${macro_name[1]} == ':' ]] {
-        # If such macro already exists, throw an exception.
-        (( ${+ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]} == 0 )) || :die\
-            'Macro '${macro_name}'() already defined to be expanded by function '${ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]}'().'
-
-        # Else, declare such macro. For simplicity elsewhere (e.g., when
-        # subsequently joining all such names together), omit the prefixing ":".
-        ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name[2,-1]}]=${func_name}
-    # Else, the first character of such macro is any character *NOT* ":". Again,
-    # declare such macro accordingly.
+        ZESHY__MACRO_NAMES_SEMICOLON_PREFIXED+=${macro_name[2,-1]}
+    # Else, such macro is *NOT* prefixed by ":". Record such fact.
     } else {
-        (( ${+ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]} == 0 )) || :die\
-            'Macro '${macro_name}'() already defined to be expanded by function '${ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]}'().'
-        ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]=${func_name}
+        ZESHY__MACRO_NAMES_SEMICOLON_UNPREFIXED+=${macro_name}
     }
 
     # Clear all previously generated preprocessor PCREs, forcing their
@@ -277,6 +239,44 @@ function :script.source() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # # If the first character of such macro is ":", declare such macro
+    # # accordingly. Since this is the case for all official zeshy macros and
+    # # hence most macros, this is an optimization specific to the common case.
+    # if [[ ${macro_name[1]} == ':' ]] {
+    #     # If such macro already exists, throw an exception.
+    #     (( ${+ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]} == 0 )) || :die\
+    #         'Macro '${macro_name}'() already defined to be expanded by function '${ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]}'().'
+    #
+    #     # Else, declare such macro. For simplicity elsewhere (e.g., when
+    #     # subsequently joining all such names together), omit the prefixing ":".
+    #     ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name[2,-1]}]=${func_name}
+    # # Else, the first character of such macro is any character *NOT* ":". Again,
+    # # declare such macro accordingly.
+    # } else {
+    #     (( ${+ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]} == 0 )) || :die\
+    #         'Macro '${macro_name}'() already defined to be expanded by function '${ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]}'().'
+    #     ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME[${macro_name}]=${func_name}
+    # }
+
+#FUXME: *ALL* macro names should be suffixed by ":". Since macros are
+#regrettably subject to constraints that conventional zsh builtins and
+#functions and external commands are not, callers must have some immediate
+#means of differentiating macros from non-macro callables. This is how. Given
+#this convention, we should probably print non-fatal warnings when macros *NOT*
+#suffixed by ":" are declared.
+#FUXME: Actually, we've obviated most such constraints. Assuming we correct the
+#well-documented issue of matching macros in process substitutions embedded in
+#double-quoted strings (which certainly seems feasible), the only remaining
+#discrepancy between zsh and zeshy parsing remains the matching of macros in
+#"`"-delimited process substitutions -- which, honestly, is perfectly ignorable.
+#In other words, for all intents and purposes, macros should indeed be
+#expandable everywhere command aliases are and hence *NOT* require lexical
+#differentiation by the above ":"-suffixed scheme. Contemplate, anyway.
+# From from macro name to the name of the function expanding such macro.
+# typeset -gA\
+#     ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME\
+#     ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME
+
     #FUXME: For identical reasons, we need to also ensure on alias and function
     #declaration that there exists no macro of the same name. In other words,
     #macros should be considered to share the same namespace as callables, even
