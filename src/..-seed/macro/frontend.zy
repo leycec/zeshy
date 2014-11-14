@@ -7,6 +7,129 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Preprocess zeshy-specific code into zsh-specific code.
 
+#FIXME: Define a new :macro_command_prototyped() function, defining a new class
+#of command macros: prototyped. As the nomenclature implies, the functions
+#expanding such macros take the following signature:
+#
+#    :void :macro_command_prototyped_name(
+#        ^:string expansion_name,
+#        :string prototype_attributes,
+#        :string prototype_return_type_channels,
+#        :string prototype_names,
+#        :string prototype_argument_channels,
+#        ...)
+#
+#This approach generalizes the current conception of a :func() macro to *ANY*
+#desired user-defined macro accepting a prototype as a first argument.
+#
+#However, recall that current PCREs capture *EITHER* a single return type *OR* a
+#set of return channels into separate match groups. While the preprocessor could
+#technically pass both such groups onto such macro functions and let them
+#internally sort it out, this may not necessarily be the optimal approach. Or
+#will it? It's probably the most efficient approach, which is quite critical
+#here. The alternative is to have the preprocessor convert all single return
+#types into "[stdout: "- and "]"-delimited sets of return channels and then pass
+#the latter to macro functions. This simplifies the signature and internal logic
+#of such functions, at the (possibly) substantial efficiency cost of then
+#forcing such "packed" single return types to be unpacked by PCRE iteration back
+#into the original types -- which, frankly, seems silly. Given that, consider
+#the following function signature instead:
+#
+#    :void :macro_command_prototyped_name(
+#        ^:string expansion_name,
+#        :string prototype_attributes,
+#        :string prototype_return_type,
+#        :string prototype_return_type_channels,
+#        :string prototype_name,
+#        :string prototype_names,
+#        :string prototype_arguments,
+#        :string prototype_argument_channels,
+#        ...)
+#
+#Though, that's fairly long-winded as well. While efficiency is paramount here,
+#optimizing for efficiency by expanding the number of arguments in this fashion
+#strikes us as a poor idea. The optimal solution might be to leverage the first
+#macro function prototype above but to compact *BOTH* singular and plural
+#arguments into each...
+#
+#Hmm. *WAIT*. Given the primacy of efficiency and the patent clumsiness of the
+#above solutions, we have to necessarily ask ourselves: *WHY ARE WE EVEN PASSING
+#SUCH ARGUMENTS TO MACRO FUNCTIONS IN THE FIRST PLACE ANYWAY!?* No, really. We
+#shouldn't be passing ${expansion_name} to each and every macro function call;
+#since ${expansion_name} *ALWAYS* unconditionally equals
+#"ZESHY__MACRO_EXPANSION", repassing such string and then forcing macro
+#functions to set such variable in an inefficiently dynamic manner is
+#excessively overkill, a bureaucratic burden on macro function implementations,
+#and absurdly inefficient in the aggregate. Instead:
+#
+#* Rename ${ZESHY__MACRO_EXPANSION} to ${ZESHY_MACRO_EXPANSION}.
+#* Require every macro function to set ${ZESHY_MACRO_EXPANSION} unconditionally.
+#* Declare string globals ${ZESHY_MACRO_PROTOTYPE_ATTRIBUTES},
+#  ${ZESHY_MACRO_PROTOTYPE_RETURN_TYPE},
+#  ${ZESHY_MACRO_PROTOTYPE_RETURN_CHANNELS}, and so on. Alternately, the
+#  +{backend} preprocessor *COULD* preparse apart such string globals into
+#  structured map globals ${ZESHY_MACRO_PROTOTYPE_ATTRIBUTE_NAME_TO_VALUE},
+#  ${ZESHY_MACRO_PROTOTYPE_RETURN_CHANNEL_NAME_TO_TYPE}, and so on. The former
+#  approach is undoubtedly more efficient but less user-friendly. Given that
+#  aliases ignore return types and argument lists in prototypes, however, the
+#  former approach is probably the better. And just contemplate how many
+#  functions we'll eventually be compiling. Efficiency really is paramount here.
+#  Indeed, we could probably perform an efficiency copy from ${match} groups
+#  into such string globals via the empty for loop approach: e.g.,
+#    for\
+#        ZESHY_MACRO_PROTOTYPE_ATTRIBUTES\
+#        ZESHY_MACRO_PROTOTYPE_RETURN_TYPE\
+#        ZESHY_MACRO_PROTOTYPE_RETURN_CHANNELS ...\
+#        ("${match[${ZESHY__MACRO_GROUP_INDEX_PROTOTYPE_ATTRIBUTES},${ZESHY__MACRO_GROUP_INDEX_PROTOTYPE_ARGUMENT_CHANNELS}]}") { }
+#  Classic hackery for the lossless win.
+#* Require every prototyped macro function to access such globals. Done!
+#
+#The implementation of :macro_command_prototyped() should leverage three new
+#globals: ${ZESHY__MACRO_PROTOTYPED_TO_FUNC_NAME},
+#${ZESHY__MACRO_PROTOTYPED_NAMES_SEMICOLON_PREFIXED}, and
+#${ZESHY__MACRO_PROTOTYPED_NAMES_SEMICOLON_UNPREFIXED}. (Naturally, inject
+#"_UNPROTOTYPED" into the names of the corresponding unprototyped globals.)
+#
+#+{pcre/prototype.zy} will need to be defined (e.g., with the current prototype-
+#specific portion of +{*-declare/*-pcre}) and the resulting global
+#${ZESHY__MACRO_PROTOTYPE_PCRE} embedded into ${ZESHY__MACRO_PCRE}. This in turn
+#implies that +{pcre/pcre.zy} should source parcels in the following order:
+#
+#    prototype.zy macro.zy
+#
+#+{pcre/macro.zy} will need to be generalized to match both unprototyped *AND*
+#prototyped command macros, implying the need for unprototyped- and prototyped-
+#specific capture groups and group index globals. Good hacklish fun all around.
+#FIXME: Define :func() as such a prototyped command macro.
+#FIXME: Redefine :alias_command(), :alias_maximal(), and :alias_suffix() as
+#prototyped command macros via :macro_command_prototyped(). Naturally, this will
+#necessitate redefining *ALL* currently defined aliases in the zeshy codebase so
+#as to extract their prototypes into such macro-based approach.
+#
+#For aliases expanding to mostly valid zsh *NOT* inducing syntax highlighting
+#issues in IDEs, define such aliases in a block-oriented approach: e.g.,
+#
+#    # Refactor this...
+#    :alias_command ':void {:arg.prepend, :arg.unshift}(:string arg)'\
+#        '{ :args.set "$(:stdin.get)" "${@}" } <<<' <<'/---'
+#    Prepend the passed argument to the beginning of the current argument list.
+#    /---
+#
+#    # Into this...
+#    :alias_command :void {:arg.prepend, :arg.unshift}(:string arg) {
+#        { :args.set "$(:stdin.get)" "${@}" } <<<
+#    } <<'/---'
+#    Prepend the passed argument to the beginning of the current argument list.
+#    /---
+#
+#For all other aliases (typically expanding to zsh code fragments inducing IDE
+#issues), define such aliases with single-quoted strings: e.g.,
+#
+#    # A purely hypothetical example.
+#    :alias_command :void :bad_alias() '{ thisisbad } <<EOD' <<'/---'
+#    Opus dei.
+#    /---
+
 #FIXME: Once we get a working preprocessor up, it becomes trivial to implement
 #support for eliding away debug-specific code under optimized builds. Simply
 #define a new macro :build.if_debug() accepting one and only one block
