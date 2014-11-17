@@ -14,44 +14,1031 @@
 #Whatever the initial reasoning, such syntax is blatantly wrong. Since newlines
 #are (unfortunately) significant, such extraneous newlines *MUST* be excised.
 
-#FIXME: Alias expansions containing macro expansions pose a slight issue,
-#though certainly solvable. Consider a macro :macro and alias :alias expanding
-#as follows:
+#FIXME: The long-term solution to function prototype optimization, though a bit
+#balls-crazy, is as follows:
 #
-#    alias ":alias"=":macro"
+#* Merge the principal PCRE (i.e., ${ZESHY_CALLABLE_PROTOTYPE_PCRE}) produced
+#  by ={*-soil/*-declare/*-pcre} into the principal PCRE produced by ={pcre}.
+#* Refactor ={*-soil/*-declare/*-func/func} accordingly. (Actually, any
+#  refactoring should be quite minimal, as we already reference match indices
+#  by name rather than hard-coded integer).
 #
-#Simple, right? Right. Unfortunately, the current approach expands macros
-#*BEFORE* evaluating the result and hence expands such macro. Thus, such
-#approach fails to preprocess alias-embedded macros. Fortunately, there exists
-#a simple alternative:
+#What's indolently pleasant about this approach is that it avoids all of the
+#repetitous PCRE compilation we currently perform. Consider it: on each and
+#every function declaration, we currently recompile
+#${ZESHY_CALLABLE_PROTOTYPE_PCRE}! This is absolute insanity. Happily, the
+#above approach does away with that entirely. It also pushes the limits of
+#PCRE-based parsing, but hopefully in a tractable, feasible way.
 #
-#* Before preprocessing, define a temporary singleton function (e.g.,
-#  ::preprocess.code()) whose body is *EXACTLY* the code to be preprocessed:
-#  e.g.,
-#     functions[::preprocess.code]=${preprocessed_code}
-#* After definition, such function's body is such code with all aliases expanded
-#  to their results.
-#* Preprocess such function's body rather than the original code: e.g.,
-#     ::preprocess ${functions[::preprocess.code]}
-#* Undefine such function to avoid unexpected side effects.
-#
-#Inefficient? Yes. But, again, *ALL* digest compilations except the first will
-#be backgrounded. Hence, we generally don't care *TOO* much about compilation
-#times -- so long as they're not apallingly horrific, anyway.
-#FIXME: There's only one (minor) issue with the above approach: shadowing
-#order.  Namely, macros are supposed to shadow aliases, which shadow functions;
-#given the above approach... Actually, the above approach fundamentally falls
-#down. Valid zeshy code is expressly *NOT* valid zsh code, and is frequently
-#blatantly invalid zsh code; attempting to unconditionally interpret the former
-#as the latter is guaranteed to fail (very horribly).
-#
-#Consider instead expanding macros in alias expansions at alias definition
-#time. Such an approach is trivial to implement given current preprocessor
-#design *AND* equitably supports macro expansions in aliases without the
-#syntactic conflicts or extreme inefficiencies of the above approach. There's
-#pretty much no other way to do it, anyway.
+#Only one way to find out whether "libpcre" will actually support a PCRE that
+#monstrously complex *AND* whether we can actually reliably debug that PCRE,
+#right? So, let's do this.
 
-#FIXME: "-n ${ZPCRE_OP[(w)2]}" isn't quite right. We absolutely need to
+# ....................{ GLOBALS ~ public : string          }....................
+# Current macro's expansion to be set by macro functions and hence public.
+typeset -g ZESHY_MACRO_EXPANSION
+
+# ....................{ GLOBALS ~ private : string         }....................
+# Current macro's name.
+typeset -g ZESHY__MACRO_NAME
+
+# Command setting the current macro's expansion, whose:
+#
+# * First shell word is the name of the function expanding such macro.
+# * Subsequent shell words are the same words passed to such macro such that:
+#   * Scalar arguments are unmodified.
+#   * Block arguments are converted to single-quoted scalar arguments.
+typeset -g ZESHY__MACRO_COMMAND
+
+# ....................{ GLOBALS ~ private : int            }....................
+# Byte indices of the first and last non-whitespace bytes of the currently
+# preprocessed code to be preprocessed by the current preprocessor iteration.
+typeset -gi ZESHY__PREPROCESS_CODE_BYTE_FIRST ZESHY__PREPROCESS_CODE_BYTE_LAST
+
+# Currently iterated index of ${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX}.
+typeset -gi ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX
+
+# Byte indices of the first and last non-whitespace bytes of the name of the
+# current macro.
+typeset -gi ZESHY__MACRO_BYTE_NAME_FIRST ZESHY__MACRO_BYTE_NAME_LAST
+
+#FIXME: Still need ${ZESHY__MACRO_BYTE_FIRST}? Excise otherwise.
+
+# Byte indices of the first and last non-whitespace bytes of the current macro.
+typeset -gi ZESHY__MACRO_BYTE_FIRST ZESHY__MACRO_BYTE_LAST
+
+# Byte indices of the first and last characters of the currently matched
+# block argument passed to such macro.
+typeset -gi ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST ZESHY__MACRO_BYTE_ARG_BLOCK_LAST
+
+#FIXME: Still used? Excise otherwise.
+
+# Byte index of the last character of the previously matched block argument
+# passed to such macro if any or the first character following the last
+# character of such macro's name otherwise.
+# typeset -gi ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST
+
+#FIXME: Appears to be obselete now. Excise after due consideration.
+
+# Current 1-based index of list ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST}.
+# typeset -gi ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX
+
+# ....................{ GLOBALS ~ private : list           }....................
+# List of pairs of byte indices into the preprocessed code whose:
+#
+# * First item is the byte index of the first non-whitespace character of such
+#   macro and hence the first character of such macro's name. For all official
+#   macros, such character is guaranteed to be ":".
+# * Second item is the byte index of the last non-whitespace character of such
+#   macro and hence the last character of either:
+#   * Such macro's name if such macro was passed no arguments.
+#   * Such macro's last argument otherwise.
+#
+# The preprocessor iterates and appends to such list as a FIFO queue.
+typeset -ga ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST
+
+# List of triples of byte indices into the preprocessed code whose:
+#
+# * First item is the byte index of the first non-whitespace character of such
+#   macro (e.g., the ":" prefixing :func()).
+# * Second item is the byte index of the last non-whitespace character of such
+#   macro name (e.g., the "c" in :func()).
+# * Third item is the byte index of the last non-whitespace character of such
+#   macro (e.g., the "}" suffixing such macro's last block argument).
+#
+# Such triples are listed in reverse lexical order (i.e., in the reverse order
+# such macros appear in such code). The reason why is fairly subtle, as reasons
+# go. To prevent the expansion of each macro from invalidating byte indices of
+# subsequent macros, the third preprocessor phase must expand and hence iterate
+# macros in reverse order. While there exist various means of ensuring this,
+# persisting such macros in such order by prepending such indices to the head
+# of this list with list operator "+=" is arguably the simplest and most
+# efficient. However, such operator requires a valid 1-based list index and
+# hence cannot be used to prepend directly into the first list index (which
+# would require "+=" to support appending to an imaginary list index 0). We
+# circumvent this oddity by retaining the empty string as a "dummy" first list
+# index to which we append all subsequent triples.
+#
+# Such list circumvents zsh's current inability to nest PCRE-based iteration,
+# permitting matches in the first preprocessor phase to be accessed in the
+# second preprocessor phase. (It's all rather droll.)
+typeset -ga ZESHY__MACRO_BYTES_NAME_FIRST_LAST
+
+# List of ";"-terminated sublists of positive integer pairs, each a byte
+# index into the passed code such that:
+#
+# * The first list item of each such pair is the byte index of the "{"
+#   prefixing the next block argument passed to such macro.
+# * The second list item of each such pair is the byte index of the "}"
+#   suffixing the same block argument.
+#
+# Since zsh does *NOT* currently support type composition, terminate each
+# such sublist by the arbitrary delimiter ";". (This is horrible.)
+#
+# Such list circumvents zsh's current inability to nest PCRE-based
+# iteration, permitting matches in the second preprocessor phase to be
+# accessed in the third preprocessor phase. (Angel of death, take us now.)
+
+#FIXME: Appears to be obselete now. Excise after due consideration.
+
+# typeset -ga ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST
+
+# ....................{ PREPROCESSORS                      }....................
+#FIXME: Optimize by globalizing locals. (You know the code-cadenced drill.)
+#FIXME: Document me. In particular, note that the caller must define
+#${ZESHY__PREPROCESS_CODE} prior to calling such function.
+
+# :void ::code.preprocess()
+function ::code.preprocess() {
+    # Validate sanity.
+    (( # == 0 )) || :die 'Expected no arguments.'
+
+    # If this function call is recursive, throw an exception. For both
+    # efficiency and implementation sanity, this function assumes macro
+    # expansions to *NOT* call this function. See TRAPZERR().
+    (( ${funcstack[(I)::code.preprocess]-1} == 1 )) ||
+    [[ ${funcsourcetrace[${funcstack[(I)::code.preprocess]}]-} == *':0' ]] ||
+        :die 'Non-recursive function ::code.preprocess() called recursively.'
+
+    # If such variable is undefined or not a string, throw an exception. See
+    # :var.die_unless_type_string().
+    [[ ${(t)ZESHY__PREPROCESS_CODE-} == 'scalar'('-'*|) ]] || :die\
+        'String ${ZESHY__PREPROCESS_CODE} undefined or not a string.'
+
+    # If such code is empty, report success immediately. (That was easy.)
+    [[ -n ${ZESHY__PREPROCESS_CODE} ]] || return 0
+
+    # ..................{ DEPENDENCIES                       }..................
+    # If preprocessor PCREs have yet to be generated or require regeneration
+    # (e.g., due to the declaration of new macros), do so.
+    ::preprocessor_pcres.make_if_needed
+
+    # ..................{ OPTIONS                            }..................
+    # Locally disable default zsh option "multibyte", permitting substrings
+    # matched by pcre_match() to be indexed by the " "-delimited byte indices
+    # written to ${ZPCRE_OP}.
+    #
+    # Unfortunately, pcre_match() fails to set integer globals ${MBEGIN} and
+    # ${MEND} to the character indices of the start and end of the matched
+    # substring. Fortunately, it *DOES* set string global ${ZPCRE_OP} to the
+    # " "-delimited byte indices of the start and end of such substring.
+    # Unfortunately, multibyte strings (e.g., UTF8-encoded) are indexed by
+    # character rather than byte indices under default zsh option "multibyte".
+    # Fortunately, locally disabling such option permits all strings (multibyte
+    # or not) and hence such substring to be indexed by such byte indices.
+    setopt local_options no_multibyte
+
+    # ..................{ INITIALIZATION                     }..................
+    # Canonical string global ${ZPCRE_OP}, localized to avoid overwriting
+    # either global or caller-specific versions of such variable.
+    local ZPCRE_OP
+
+    # Initialize the first preprocessor iteration such that all top-level
+    # (i.e., non-nested) macros in such code will be unconditionally expanded.
+    ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST=( 1 ${#ZESHY__PREPROCESS_CODE} )
+
+    #FIXME: Document us.
+    #FIXME: Do we still require this?
+
+    ZESHY__MACRO_BYTES_NAME_FIRST_LAST=( '' )
+
+    # ..................{ PHASE                              }..................
+    # Expand all top-level (i.e., non-nested) macros between the first and last
+    # byte indices into such code corresponding to the current preprocessor
+    # iteration, until *ALL* macros in such code have either been explicitly
+    # expanded or implicitly deleted (e.g., due to being nested in an unused
+    # block argument of an expanded parent macro). Since
+    # ${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST} is a FIFO queue, this
+    # preprocessing strategy is effectively (...and efficiently) recursive.
+    for ((
+        ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX=1;
+        ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX <\
+            ${#ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX};
+        ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX+=2
+    )) {
+        ZESHY__PREPROCESS_CODE_BYTE_FIRST=${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST[${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX}]}
+         ZESHY__PREPROCESS_CODE_BYTE_LAST=${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST[$(( ${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX} + 1 ))]}
+
+        #FIXME: Inject the three existing preprocessor phases here...
+
+        # ................{ PHASE ~ macro                      }................
+        # Due to zsh inadequacies, preprocessing is partitioned into multiple
+        # phases. Since "zsh" permits only one PCRE to be compiled at a time,
+        # PCRE-based iteration cannot be nested. Since the first two phases perform
+        # such iteration, such phases cannot be combined. (Q.E.D., sadly.)
+
+        #FIXME: Recompiling such PCRE on each preprocessor iteration strikes us
+        #as as *HORRIFICALLY* inefficient. There simply *MUST* be a better way.
+        #Anything would be better than this. But there probably isn't any
+        #alternative. How could there be? zsh's overly parsimonious PCRE API
+        #bites us hard on this one, offering yet further stimulus for a
+        #disparate zeshy interpreter. For the moment, however, we have little
+        #choice but to abide by such dictates.
+        #
+        #Hmm. We *REALLY* need to obviate such horribleness in at least the
+        #general case of :func() and :alias_{command,maximal,suffix}()
+        #expansions. Can we? Not really. But we can slightly lessen the blow.
+        #Since we *KNOW* the signature of such macros, we can avoid both the
+        #PCRE compilation *AND* iteration performed by the second phase. We
+        #still have to perform such phase's interior logic, of course. But
+        #every little bit helps. To effect this, we'll need to:
+        #
+        #* Hard-code the matching of :func() and
+        #  :alias_{command,maximal,suffix}() into +{pcre/macro} by *ALWAYS*
+        #  capturing exactly one and only one block argument following such
+        #  macro names into a new group index unique to such argument.
+        #* In phase 2 below:
+        #  * If the current macro name is either :func() or
+        #    :alias_{command,maximal,suffix}(), hard-code logic setting the
+        #    first and last byte indices of such macro's single block argument
+        #    using such captured match substring. (Yay!)
+        #  * Else, perform the current PCRE-based search to get such indices.
+        #FIXME: The above is great. But we can do significantly better. The
+        #perscipacious reader may not necessarily believe this, but we can
+        #engineer the codebase such that "${ZESHY__MACRO_PCRE}" need only be
+        #compiled *ONCE* for the entire codebase. How? Read on, for zeshy
+        #Shangri-la beckons:
+        #
+        #* Declare a new boolean (integer) global ${ZESHY__PCRE_IS_RECOMPILED},
+        #  initialized to ***1***. Such global should be explicitly set to 1
+        #  *EVERYWHERE* else in the codebase that pcre_compiled() is called,
+        #  implying all calls to pcre_compiled() should be wrapped in a zeshy
+        #  helper function also setting ${ZESHY__PCRE_IS_RECOMPILED} to 1.
+        #* Refactor the following code to as follows:
+        #
+        #    # If such PCRE has yet to be compiled *OR* was compiled but has
+        #    # since been replaced in the zsh cache by a more recently compiled
+        #    # PCRE, compile and optimize such PCRE.
+        #    if (( ZESHY__PCRE_IS_RECOMPILED )) {
+        #        pcre_compile -- "${ZESHY__MACRO_PCRE}"
+        #        pcre_study
+        #
+        #        # Avoid unnecessary recompilation on subsequent iterations.
+        #        ZESHY__PCRE_IS_RECOMPILED=0
+        #    }
+        #* We currently employ PCRE-based iteration in two other prominent
+        #  locations at this time: (a) parsing apart prototype lists (e.g.,
+        #  attributes, names, arguments) and (b) capturing block arguments. In
+        #  both cases, an unexpected alternative exists: "=~"-style PCRE-based
+        #  iteration. While requiring PCRE recompilation on each call to "=~"
+        #  and hence mildly inefficient, such approach has the profound benefit
+        #  of *NOT* overwriting the internally cached PCRE resulting from calls
+        #  to pcre_compile(). (Yes, we have manually verified this at the CLI.)
+        #  That means we may iteratively call "=~" as much as we like while
+        #  preserving the compilation of "${ZESHY__MACRO_PCRE}".
+        #
+        #  The question remains, however: is iterating with "=~" feasible? Yes,
+        #  if somewhat cumbersomely. Consider:
+        #
+        #     >>> :string digits='091827' digit_pair
+        #     >>> :string pcre_pair='^(\d\d)'
+        #     >>> :while :is -n ${digits} :and ${digits} =~ ${pcre_pair} :si {
+        #     ...     digit_pair=${match[1]}
+        #     ...     :string.print "${digit_pair}"
+        #     ...     digits=${digits[$(( ${#digit_pair} + 1 )),-1]}
+        #     ... }
+        #     09
+        #     18
+        #     27
+        #
+        #  This works. Of course, it destroys the source string in the process.
+        #  But, hey... Let's see you do better on only twelve hours of sleep.
+        #  It's somewhat clumsy, but it works. And that's all that really
+        #  matters. The mild inefficiencies introduced by such approach are
+        #  dramatically overshadowed by the massive efficiency gain of *NOT*
+        #  recompiling the core PCRE every preprocessor iteration.
+        #
+        #  For safety, PCREs iterated in this way should be anchored to the
+        #  string with "^" or prior match start with "\G".
+        #
+        #Awesome, eh?
+        #FIXME: It may be possible to reuse the compiled "${ZESHY__MACRO_PCRE}"
+        #PCRE to also parse and capture block arguments. This is absurdly
+        #clever, and more than a little crazy -- but we believe it *COULD*
+        #work. *COULD*. We should note that we're getting into wacky-hacky
+        #territory with this one, but... Heck, it's worth a short shot in the
+        #darkling dark. Consider; what if we:
+        #
+        #* Refactor ${ZESHY__MACRO_PCRE} to also capture block arguments.
+        #* Iterate block arguments by calling pcre_match() with the exact byte
+        #  indices of such macro in ${ZESHY__PREPROCESS_CODE}. Since such
+        #  substring *WILL* begin with a macro name, such substring will be
+        #  matched as a macro. If at least one block argument was passed to
+        #  such macro, the last such block argument will be captured. If you
+        #  consider it, however, this is *EXACTLY* what we want: to iterate
+        #  block arguments in reverse order. (Insanity.)
+        #* Convert such argument to a single-quoted string and hence to a
+        #  scalar argument. Since such argument is no longer a block argument,
+        #  iteration is guaranteed to terminate after converting all block
+        #  arguments to single-quoted strings.
+        #* Excise both ${ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE} and
+        #  ${pcre_words_passable_optional_spaced_grouped} from ${+pcre/macro},
+        #  neither of which will be required anymore.
+        #
+        #That's inarguably the single-most clever code hackery I've ever
+        #tunneled into. Man; I love it. It's so fundamentally insane, it simply
+        #*HAS* to work.
+        #FIXME: Indeed, such approach yields several other unexpected
+        #efficiency gains. Since ${ZESHY__MACRO_PCRE} will be refactored to
+        #also capture block arguments:
+        #
+        #* We need *NOT* explicitly match :func() and :alias_*() block
+        #  arguments in ${ZESHY__MACRO_PCRE} -- which is great, as that sounded
+        #  fairly terrible. (Dodged another code bullet on that one.)
+        #* Instead, in a general-purpose manner applicable to *ALL* macros,
+        #  perform phase 2 logic on the last block argument passed to the
+        #  current macro matched by the prior pcre_match() call *BEFORE*
+        #  subsequently iterating all other block arguments with additional
+        #  pcre_match() calls. Since we're capturing one block argument "for
+        #  free" already, we'd might as well efficiently leverage that. Yay!
+
+        # Compile and optimize such PCRE.
+        pcre_compile -- "${ZESHY__MACRO_PCRE}"
+        pcre_study
+
+        # For each macro matched from such code, record matched byte indices for
+        # the next preprocessor phase.
+        ZPCRE_OP='0 0'
+        while {
+            pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__PREPROCESS_CODE}"
+        } {
+            #FIXME: Despite zsh and libpcre constraints, we believe we've uncovered
+            #a means of reliability discerning the starting and ending byte indices
+            #of arbitrarily nested syntactically invalid syntactic cnstructs. How?
+            #For each syntactic construct PCRE:
+            #
+            #* If such PCRE identifies a syntactic invalidity (e.g., by hetting the
+            #  end of the string), such PCRE should report an error by backtracking
+            #  to the character immediately preceding the offending syntactic
+            #  construct and (mildly ironically) reporting success (with no
+            #  additional capture groups). This ensures that ${ZPCRE_OP[(w)2]} will
+            #  provide the byte index of such construct. Yay!
+            #
+            #  *WAIT*. To differentiate invalid from valid macros, we do
+            #  arbitrarily require an additional non-empty capture group -- say,
+            #  capturing the character immediately preceding the invalid syntactic
+            #  construct via positive lookbehind into a trailing capture group.
+            #  Call such global
+            #  ${ZESHY__MACRO_GROUP_INDEX_INVALIDITY_CHAR_LAST}.
+            #
+            #  *WAIT*. If a macro argument is syntactically invalid, that should
+            #  imply that... Ah-ha! O.K.; we should actually instead capture the
+            #  last character (or perhaps all characters) of the set of all
+            #  arguments passed to a macro into a trailing capture group.  Call
+            #  such global ${ZESHY__MACRO_GROUP_INDEX_ARGS_CHAR_LAST}.
+            #
+            #  Since macros are *NEVER* recursive, such group is guaranteed to be
+            #  non-empty if such macro is valid.
+            #* ={backend} may then reliably detect such invalidity by performing
+            #  the following logic:
+            #  * If match group ${ZESHY__MACRO_GROUP_INDEX_NAME} is nonempty, a
+            #    macro was matched. In such case, if:
+            #    * If match group ${ZESHY__MACRO_GROUP_INDEX_ARGS_CHAR_LAST} is
+            #      nonempty, such macro is valid; else, such macro is invalid.
+            #  * Else, a macro was not matched. In such case, a syntactically
+            #    invalid construct was matched if and only if the following:
+            #    (( ${ZPCRE_OP[(w)2]} < ${#ZESHY__PREPROCESS_CODE} ))
+            #
+            #In either case, if an invalidity is matched:
+            #
+            #* The first byte index of the invalid syntactic construct is given by
+            #  $(( ${ZPCRE_OP[(w)2]} + 1 )).
+            #* The last byte index of such construct is, of course,
+            #  ${#ZESHY__PREPROCESS_CODE}.
+            #FIXME: Backtracking on syntactically invalid constructs to the
+            #character immediately preceding such construct may prove somewhat
+            #non-trivial. For example, (*ACCEPT) only returns from subroutine calls
+            #(rather than halting matching) when in such calls, possibly preventing
+            #us from responding in a sane fashion to invalid embedded syntactic
+            #constructs. Hmm; by our PCRE design, this could still work. Possibly.
+            #If we've meticulously matched everything exactly correctly, embedding
+            #(*ACCEPT) in a subroutine call *SHOULD* induce the following behavour:
+            #
+            #* That subroutine call matching that syntactic construct immediately
+            #  returns to the call matching its parent construct. Due to
+            #  backtracking, the current position will be immediately before the
+            #  offending child construct. Assuming proper PCRE construction, the
+            #  call matching the parent construct will fail to match at this point,
+            #  having exhausted all other options, in which case such call reports
+            #  failure to and hence inducing backtracking in its parent and so on
+            #  recursively up the line, iinevitably resulting in backtracking batk
+            #  to the beginning and hence match failure. Hmm; that's bad.
+            #
+            #What we need to do is recursively propagate (*ACCEPT) up the
+            #subroutine call hierarchy. Oh, boy. Perhaps that's simpler than it
+            #sounds? Firstly, how would a parent call detect that a child call has
+            #prematurely returned via (*ACCEPT)? Well...
+            #
+            #O.K.; we believe we may have found the way: "\K". Happily (and
+            #contrarily to all other PCRE behaviour), subroutine calls do *NOT*
+            #isolate the effect of "\K". That is, "\K" operates in a global manner
+            #and hence permits us a subversive means of breaking through the
+            #otherwise rigid barrier PCRE imposes about such calls.
+            #
+            #The idea here is that, on detecting a syntactic invalidity, the PCRE
+            #responsible for matching that construct instead:
+            #
+            #* Backtracks to the first character of such construct. Since
+            #  "(*COMMIT)", "(*SKIP)", and "(*PRUNE)" do nothing meaningful in
+            #  subroutine calls, this implies we'll need to leverage implicit
+            #  backtracking via alternation. Unfortunately, to backtrack all the
+            #  way *BEFORE* the first character of such construct, we'll need to
+            #  also leverage positive lookahead -- which shouldn't be much of an
+            #  imposition: e.g.,
+            #    local pcre_quotes_single="(?=')(?:'(?>[^']++|'')*+'"'|\K.*+)'
+            #  Alternately, if such positive lookahead is *TOO* horrible (...it's
+            #  not, really), we could backtrack to the first character following
+            #  such prefix: e.g.,
+            #    local pcre_quotes_single="'(?:(?>[^']++|'')*+'"'|\K.*+)'
+            #  Unfortunately, that then requires a manual search backwards in
+            #  ={backend} to attempt to find the start of such construct.
+            #  Error-prone and fugly, needless to say the least. Let's just take
+            #  the efficiency hit on this one, yes?
+            #* All recursive subroutine calls (e.g., ${pcre_embeddable}) should be
+            #  suffixed by something resembling
+            #  '(?:'${pcre_string_end_report_success}')?+'.
+            #* In ={backend}, detect the error condition as follows:
+            #  * If a macro name was matched *AND* the first character of such name
+            #    is *NOT* equal to the character at
+            #    ${ZESHY__CODE_PEPROCESS[$(( ${ZPCRE_OP[(w)1]} + 1 ))]},
+            #    then such macro is invalid.
+            #  * Else, a macro was not matched. Assuming that we've recorded the
+            #    last byte index of the prior match (trivial), then if such index
+            #    is *NOT* one less than the first byte index of the current match,
+            #    an invalid construct must have been matched. Oh, yes; this would
+            #    happily work for the prior case as well. Yay! That tidies things.
+            #
+            #In summation:
+            #
+            #* In syntactic construct PCREs, refactor to the form:
+            #    local pcre_quotes_single="(?=')(?:'(?>[^']++|'')*+'"'|\K.*+)'
+            #* All recursive subroutine calls (e.g., ${pcre_embeddable}) should be
+            #  suffixed by ${pcre_string_end_report_success_optional}, defined as:
+            #    local pcre_string_end_report_success_optional='(?:'${pcre_string_end_report_success}')?+'
+            #* In ={backend}, assuming that we've recorded the last byte index of
+            #  the prior match (trivial), then if such index is *NOT* one less than
+            #  the first byte index of the current match, an invalid construct must
+            #  have been matched.
+            #
+            #Surprisingly simple, actually.
+            #FIXME: For disambiguity in exception messages, unsupported
+            #here-documents (i.e., here-documents with non-literal delimiters)
+            #should be differentiated from syntactically invalid here-documents:
+            #the former are *NOT* invalid in general-purpose zsh code, merely
+            #unsupported in zeshy code. Happily, doing so should be more or less
+            #trivial. In fact, we've already done so; see
+            #${ZESHY__MACRO_HERE_DOC_UNSUPPORTED_PCRE}. Yay!
+
+            # If a macro was matched, handle such macro.
+            if [[ -n ${match[${ZESHY__MACRO_GROUP_INDEX_MACRO_NAME}]-} ]] {
+                #FIXME: Consider everything below. Probably bollocks, at the moment.
+
+                # Such macro's name.
+                ZESHY__MACRO_NAME=${match[${ZESHY__MACRO_GROUP_INDEX_NAME}]}
+
+                # Byte indices recorded for the next preprocessor phase. Note that
+                # "man zshmodules" documents ${ZPCRE_OP} to be a " "-delimited integer
+                # pair such that:
+                #
+                # * The first such integer is the byte index of the first character of
+                #   the matched substring.
+                # * The second such integer is the byte index of the first character 
+                #   following such substring.
+                #
+                # Unfortunately, this is *NOT* the case. The documentation is "off by
+                # one" in both cases, a bug in either the current zsh implementation or
+                # documentation. Instead:
+                #
+                # * The first such integer is the byte index of the last character
+                #   preceding such substring.
+                # * The second such integer is the byte index of the last character of
+                #   such substring.
+                #
+                # However, the subtle entanglements don't end there. The byte index of
+                # the first character of such substring is the byte index of the next
+                # character following the first such integer. If such character is
+                # unibyte (i.e., encoded as a single byte), incrementing the latter by
+                # 1 suffices to calculate the former. If such character is multibyte
+                # (i.e., encoded as two or more bytes), however, this overly simplistic
+                # calculation fails.
+                #
+                # By PCRE design, the character preceding a matched macro name is
+                # guaranteed to be whitespace. Technically, UTF-8-encoded multibyte
+                # whitespace characters *DO* exist. Since no official scripts precedes
+                # a macro expansion by such characters *AND* since it appears
+                # vanishingly unlikely that third-party scripts would ever do so,
+                # assume such character to be unibyte for simplicity. In such case,
+                # simplistically incrementing the first such integer by 1 suffices.
+                ZESHY__MACRO_BYTE_NAME_FIRST=$(( ${ZPCRE_OP[(w)1]} + 1 ))
+                ZESHY__MACRO_BYTE_NAME_LAST=$((
+                    ZESHY__MACRO_BYTE_NAME_FIRST + ${#ZESHY__MACRO_NAME} - 1 ))
+                ZESHY__MACRO_BYTE_LAST=${ZPCRE_OP[(w)2]}
+
+                #FIXME: Shift parcel ={*-get} here and explicitly source above.
+                #FIXME: Testing for syntactic invalidity now reduces to testing whether
+                #a macro was matched or not and, if not, whether the last capture group
+                #exists: e.g.,
+                #
+                #    if [[ -z ${match[${ZESHY__MACRO_GROUP_INDEX_NAME}]} ]] &&
+                #        (( ${#match} < ZESHY__MACRO_GROUP_INDEX_STRING_IS_VALID )) {
+                #        :die "Uh oh! Syntactic invalidity found."
+                #    }
+
+                # If the empty group signifying such macro to be syntactically valid
+                # was *NOT* matched, such macro is syntactically invalid. In such case,
+                # throw an exception.
+                (( ${#match} >= ZESHY__MACRO_GROUP_INDEX_IS_VALID )) || {
+                    # Line number of the current macro in such code, calculated by
+                    # removing all non-newline characters preceding such macro and
+                    # counting the number of newline characters that remain.
+                    integer line_number="${#ZESHY__PREPROCESS_CODE[
+                        1,${ZESHY__MACRO_BYTE_NAME_FIRST}]//[^$'\n']}"
+
+                    # Throw such exception.
+                    :die $(::parcel.get_current)'macro '${ZESHY__MACRO_NAME}'() on line '${line_number}' passed syntactically invalid arguments (e.g., due to unmatched braces or quotes).'
+                }
+
+                # Record matched byte indices for the next preprocessor phase.
+                ZESHY__MACRO_BYTES_NAME_FIRST_LAST[1]+=(
+                    ${ZESHY__MACRO_BYTE_NAME_FIRST}
+                    ${ZESHY__MACRO_BYTE_NAME_LAST}
+                    ${ZESHY__MACRO_BYTE_LAST}
+                )
+            # Else, a halting condition was matched.
+            } else {
+                #FIXME: Implement me.
+            }
+        }
+
+        # For simplicity, remove the placeholder empty string prefixing such list.
+        ZESHY__MACRO_BYTES_NAME_FIRST_LAST[1]=()
+
+        # For sanity, ensure such list is of the expected size.
+        (( ZESHY__MACRO_BYTES_NAME_FIRST_LAST % 3 == 0 )) || :die\
+            'List ${ZESHY__MACRO_BYTES_NAME_FIRST_LAST} size '${#ZESHY__MACRO_BYTES_NAME_FIRST_LAST}' not divisible by 3.'
+
+        # ................{ PHASE ~ arg                        }................
+    #FIXME: Great! We believe there may exist a critical optimization, however.
+    #Given the iterative queue-based approach above, is it *REALLY* essential that
+    #we convert block arguments to strings in the same phase that we expand macros?
+    #Intuition suggests, "Nope." Ideally, block arguments should probably be
+    #converted to strings in phase 2. Given that, however, there clearly exists no
+    #demonstrable reason to do much at all in phase 3 except expand macros in place.
+    #That can't be right. Can it? If that *IS* right, we can eliminate
+    #${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST} and associated logic in both
+    #phases 2 and 3. Contemplate further before doing anything courageously wild.
+    #
+    #So. We've been mulling it over and over and... honestly, we can't see the
+    #implicit catch-22 that must be lurking somewhere. So, let's go cautiously
+    #forward, commenting out rather than explicitly eliminating all existing logic
+    #that would appear to be obseleted by such an optimization. Careful here...
+    #FIXME: O.K.; so, phase 2 will need to perform the following:
+    #
+    #* Excise ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST} and associated logic.
+    #* For passed block arguments, replace such arguments by a single-quoted
+    #  string argument containing exactly such block.
+    #* For the prototype passed to prototyped macros, replace such prototype by a
+    #  single-quoted string argument containing exactly such prototype (e.g., via
+    #  "${(qq)...}"). Alternately, such prototype could also be replaced by n
+    #  number of string arguments, each expanding to a specific captured substring
+    #  of such prototype (e.g., attributes, names). However, the latter approach is
+    #  complicated by the disparity between singular and plural lists and the need
+    #  to manually parse apart the latter. However, we may have an equitable
+    #  solution to even that. Consider delimiting each list of elements by "\0";
+    #  since an unquoted "\0" is *NOT* a valid return type, callable name, or
+    #  argument name, such delimiter uniquely identifies a list terminator. An
+    #  example is probably requisite here:
+    #
+    #      # The preprocessor should replace this original macro expansion...
+    #      :some_macro [yum = "2", "yo!"] :void {:ug, ":uh!"}(:int o, :int k) "t i"
+    #
+    #      # ...by this:
+    #      :some_macro \0\0\0 'yum' '2' 'yo!' '1' \0 ':void' ':void' ':void' \0 ':ug' ':uh!' \0 ':int o' ':int k' \0 \0 "t i"
+    #
+    #  Hence:
+    #  * The first argument passed to a prototyped macro function should *ALWAYS*
+    #    be some sufficiently unique constant unlikely to ever be passed otherwise
+    #    (e.g., "\0\0\0").
+    #  * Valueless attributes should be assigned the default value "1" (...assuming
+    #    that's the current logic, anyway), enabling prototyped macro functions to
+    #    copy such attributes directly into a local map (if desired).
+    #  * Return types should *NOT* be prefixed by the name of their channel (e.g.,
+    #    "stdout"). Since there only exist three possible types with no possibility
+    #    of additional types (given the hardwired nature of return channels), all
+    #    three channels should *ALWAYS* be passed. Naturally, single return types:
+    #    * ":void" should be expanded to three arguments ":void :void ;void".
+    #    * ":full" should be expanded to three arguments ":string :string ;int".
+    #  * Argument lists should *NOT* be prefixed by the name of their channel
+    #    (e.g., "stdin"). Again, simply pass (in order):
+    #    * All standard arguments as string arguments, suffixed by "\0".
+    #    * All stdin arguments as string arguments, suffixed by "\0".
+    #
+    #For efficiency, it's absolutely essential that prototype substrings be
+    #captured via the same core PCRE capturing macros. Given that requirement, such
+    #prototypes *MUST* necessarily be replaced by such captured groups in phase 2.
+    #That said, the above approach may not necessarily be ideal. It imposes
+    #inefficiencies and complexities on macro functions, which could be subverted
+    #by the following alternative approach:
+    #
+    #      # The preprocessor should replace this original macro expansion...
+    #      :some_macro [yum = "2", "yo!"] :void {:ug, ":uh!"}(:int o, :int k) "t i"
+    #
+    #      # ...by this:
+    #      :some_macro \0\0\0 'yum = "2", "yo!"' ':void' '' '' ':ug, ":uh!"' ':int o, :int k' '' "t i"
+    #
+    #The empty strings are necessary to differentiate singular from plural capture
+    #groups (e.g., single return types vs. return type channels). Right. So, the
+    #prior example is pretty clearly the way to go. While prefixing such prototype
+    #for validation purposes by "\0\0\0" still strikes us as a sensible idea,
+    #there's no need for other eccentric usage of "\0" or variadic arguments.
+
+        # Compile and optimize such PCRE.
+        pcre_compile -- "${ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE}"
+        pcre_study
+
+        #FIXME: Localize above.
+        local ZESHY__MACRO_ARG_BLOCK
+        local ZESHY__MACRO_ARG_BLOCK_PRIOR_LAST
+
+        # For each previously matched macro, match each block argument passed to
+        # such macro.
+        for ZESHY__MACRO_BYTE_NAME_FIRST\
+            ZESHY__MACRO_BYTE_NAME_LAST ZESHY__MACRO_BYTE_LAST (
+            "${ZESHY__MACRO_BYTES_NAME_FIRST_LAST[@]}") {
+            # Begin searching for block arguments passed to the current macro
+            # immediately after the last character of such macro's name.
+            ZPCRE_OP='0 '${ZESHY__MACRO_BYTE_NAME_LAST}
+
+            # Byte index of the last character of the prior match if any or the
+            # first character following the last character of such macro's name
+            # otherwise.
+            ZESHY__MACRO_BYTE_ARG_BLOCK_LAST=${ZESHY__MACRO_BYTE_NAME_LAST}
+
+            # For each block argument matched from such code, record matched byte
+            # indices for the next preprocessor phase.
+            while {
+                # While such index precedes the last byte index of such macro,
+                # attempt to match the next block argument passed to such macro.
+                #FIXME: We reckon the first test ain't quite right, anymore.
+                (( ZESHY__MACRO_BYTE_ARG_BLOCK_LAST <\
+                   ZESHY__MACRO_BYTE_LAST )) &&
+                    pcre_match -b -n ${ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST} --\
+                    "${ZESHY__PREPROCESS_CODE}"
+            } {
+                #FIXME: Explain me. See below.
+                # First and last byte indices of such block argument.
+                ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST=$((
+                    ${ZPCRE_OP[(w)1]} + ${#match[1]} ))
+                ZESHY__MACRO_BYTE_ARG_BLOCK_LAST=${ZPCRE_OP[(w)2]}
+
+                #FIXME: Explain me. We'll have to explain that:
+                #
+                #* ${ZPCRE_OP[(w)1]} is the byte index of the character *PRECEDING*
+                #  the first character of such matched substring, which in the case
+                #  of the first block argument will be such macro's name.
+                #* Macro names can contain UTF-8-encoded characters, meaning that
+                #  we can't just increment by 1. So, implement this and *ONLY* this
+                #  in a multibyte-aware manner. All other code remains unibyte.
+                #* We don't need to explicitly localize such option, as we already
+                #  did so above.
+                #* Technically, we don't *NEED* to add ${#match[1]} here.
+                #
+                # See ={var/scalar/scalar}.
+                #
+                # Note also that the following isn't right:
+                #
+                #    setopt multibyte
+                #    ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST+=${#ZESHY__PREPROCESS_CODE[
+                #        ${ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST}]}
+                #    setopt no_multibyte
+                #
+                # We need the number of bytes of such character. The above simply
+                # returns "1". Instead, we do the following:
+                #
+                #* In multibyte mode, capture the desired character to a string.
+                #* In unibyte mode, test the length of such string.
+                #
+                #Lame, but there you are. *shrug*
+
+                #FIXME: Wait. This works, but it's inefficient. Instead, fix the
+                #PCRE to ensure that, if there exist *ANY* arguments passed to a
+                #macro, the first substring of such match is a horizontal
+                #whitespace character.
+                #FIXME: O.K.; the solution is, clearly, to revise the PCRE such
+                #that it no longer groups the matched name but instead positive
+                #lookahead capturing such name *PLUS* the following ASCII character
+                #if any (i.e., if not at the end of the string): e.g., 
+                #
+                #    local pcre_macro_name_grouped='(?=(['${ZESHY__MACRO_NAME_CHAR_CLASS}']++.?))'${(kj:|:)ZESHY__MACRO_TO_FUNC_NAME}
+                #
+                #Clever, eh? The use of "++" guarantees that the ".?" matches only
+                #either a non-macro *ASCII* character subject to the constraints of
+                #the following actual match (e.g., horizontal whitespace,
+                #backslash, newline) *OR* the end of the string. Note that while
+                #capturing positive lookahead *SHOULD* work, we'll probably want to
+                #verify this externally at the CLI.
+                #
+                #Since the last character of such match is guaranteed to be ASCII
+                #by PCRE design, the byte index of the last character of such
+                #macro's name is obtainable simply by subtracting one from the byte
+                #length of such captured substring. Yay!
+
+                setopt multibyte
+                ZESHY__MACRO_ARG_BLOCK_PRIOR_LAST=${ZESHY__PREPROCESS_CODE[
+                    ${ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST}]}
+
+                setopt no_multibyte
+                ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST+=${#ZESHY__MACRO_ARG_BLOCK_PRIOR_LAST}
+
+                #FIXME: In accordance with the final optimization discussed above,
+                #let's attempt to convert block arguments to strings in-place here.
+
+                #FIXME: We need to offset such macro by the number of bytes changed
+                #by such quote operation, implying we need to store the result of
+                #such operation in a string local for testing. Make it so!
+
+                # Convert such block argument to a standard argument formatted as a
+                # single-quoted string, implicitly quote-protecting all shell-
+                # reserved characters in such block.
+                ZESHY__MACRO_ARG_BLOCK=${(qq)ZESHY__PREPROCESS_CODE[
+                    ${ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST},
+                    ${ZESHY__MACRO_BYTE_ARG_BLOCK_LAST}]}
+
+                #FIXME: Actually, macro names can contain UTF-8-encoded characters.
+                #We should probably prohibit this, for the moment -- that, or
+                #reimplement this in a multibyte-aware manner. Something like:
+                #    setopt -- local_options multibyte
+
+                # Record matched byte indices for the next preprocessor phase.
+                #
+                # The last character preceding such match is either the last
+                # character of such macro's name *OR* the "}" delimiting the last
+                # block argument passed to such macro. Given that, incrementing the
+                # byte index of such character by 1 gives the byte index of the
+                # first whitespace character of such match; incrementing such index
+                # by the byte length of the possibly empty substring of standard
+                # arguments preceding such block arguments gives the byte index of
+                # the "{" delimiting such block argument.
+                # ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST+=(
+                #     $(( ${ZPCRE_OP[(w)1]} + ${#match[1]} + 1 ))
+                #         ${ZPCRE_OP[(w)2]}
+                # )
+            }
+        }
+
+        #FIXME: Excise after due consideration.
+        # For sanity, ensure such list is of the expected size.
+        # (( ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST % 2 == 0 )) || :die\
+        #     'List ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST} size '${#ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST}' not even.'
+
+        # ................{ PHASE ~ expand                     }................
+        #FIXME: By eval-ing macro arguments, we're effectively guaranteeing that
+        #redirections and process substitutions embedded in double-quoted arguments
+        #*WILL* be evaluated at macro expansion time -- which seems fairly bad. Or
+        #perhaps not? We probably want to simply *STOP* eval-ing macro arguments.
+        #
+        #Hmm; for sane macro expansion, we really need to require that all unquoted
+        #process substitutions and redirections be the *LAST* arguments to a macro
+        #expansion. (Honestly, that's pretty much how it should be for all
+        #conventional commands anyway.) Happily, the current approach should
+        #already ensure this. We'll simply want to document (probably in this
+        #section) that, by design, the current PCRE definition prohibits macro
+        #redirections from being interspersed with standard macro arguments
+        #(unlike standard commands). (Since macro functions never output anything, 
+        #it makes no rational sense to try to redirect such functions anyway.)
+        #
+        #However, that still fails to take into account process substitutions
+        #(either embedded in double-quoted strings or not). And you know what?
+        #Perhaps we don't care terribly much about that. Or perhaps we do. It does
+        #seem silly to expand such substitutions at macro expansion time,
+        #suggesting that we'll need to either:
+        #
+        #* Prohibit such substitutions in macro arguments, which is sensible.
+        #* Quote-protect all standard macro arguments. This would probably need to
+        #  happen in phase 2 of ={backend}. Happily, we've verified that this can
+        #  be accomplished reasonably efficiently: e.g.,
+        #
+        #    >>> :string yaz='"yum oh" test(.) $(yumyum) ''ug uh uk'''
+        #    >>> print -r "${(qq@)${(z)yaz}}"
+        #    '"yum oh"' 'test(.)' '$(yumyum)' '''ug uh uk'''
+        #FIXME: Right. If you consider it, the latter approach is what we need to
+        #be doing *ANYWAY*. Why? Because the eval() approach effectively strips
+        #significant quoting from passed arguments. For example, a macro expansion
+        #call of ":macro '/this is/a dir'" would ensure that the first argument to
+        #such macro function would be "/this is/a dir" without the quotes,
+        #requiring subsequent use of "(qq)" *ANYWAY* when producing an expansion
+        #string. The above approach offloads all such quoting work to the parser,
+        #which is where it should be anyway. So, let's definitely go with the
+        #"${(qq@)${(z)args}}" approach in preprocessor phase 2 (i.e., here). This
+        #ensures that we preserve the original quoting used, which could actually
+        #prove significant. (Well, probably not. But who knows?)
+        #FIXME: O.K.; we need to strip line continuations as well. Yes, literally
+        #*STRIP* all line continuations with a simple global glob-based search and
+        #replace: e.g., "${args//\\$'\n'}". Efficiency for the mild win.
+        #FIXME: Wait. No. We need strip line continuations only when in unquoted
+        #substrings of shell words *OR* between shell words. Line continuations
+        #embedded in syntactic constructs should *NOT* be stripped, for fairly
+        #obvious reasons. What's unclear, however, is just how we go about doing
+        #that. We'll obviously need to do so prior to "(z)"-based word splitting
+        #and "(qq)"-based word quoting. Given that, the only reasonable approach is
+        #PCRE-based substitution and replacement (with the empty string).
+        #
+        #Clearly, this is a non-trivial issue to solve. Semantically, however, it's
+        #largely trivial, implying that a brute-force, simplistic approach could be
+        #preferable. How, though?
+        #FIXME: Oh. Oh. Oh. Sooooo lucky! It turns out that "(z)" is doing quite a
+        #bit more than mere word splitting. At the least, it also appears to
+        #perform syntactically correct line continuation removal: e.g.,
+        #
+        #    >>> :string yum='yum "ok"\'$'\n''hm \'$'\n'' ugh'
+        #    >>> print -r "${(qq@)${(z)yum}}"
+        #    'yum' '"ok"hm' 'ugh'
+        #
+        #So, surprisingly, we're actually good here. "${(qq@)${(z)yum}}" approach
+        #is *CLEARLY* the correct way forward, from a variety of perspectives.
+
+        ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX=1
+
+        # For each previously matched macro, replace such macro by its expansion.
+        for ZESHY__MACRO_BYTE_NAME_FIRST\
+            ZESHY__MACRO_BYTE_NAME_LAST\
+            ZESHY__MACRO_BYTE_LAST (
+            "${ZESHY__MACRO_BYTES_NAME_FIRST_LAST[@]}") {
+            # Such macro's name.
+            ZESHY__MACRO_NAME=${ZESHY__PREPROCESS_CODE[
+                ${ZESHY__MACRO_BYTE_NAME_FIRST},${ZESHY__MACRO_BYTE_NAME_LAST}]}
+
+            #FIXME: O.K.; so, *EVERY* macro unconditionally "returns" a single
+            #string comprising the code replacing such macro. And how do we
+            #"return" values in zsh? Right. Setters. This implies that *ALL* macros
+            #must necessarily be setters. The question is: of what form? Clearly,
+            #macros must accept a string variable name as an argument. (Corollary:
+            #all macros accept at least one argument.) The question is: which
+            #argument? Clearly, either the first or last, right? Given zeshy
+            #nomenclature, we plainly choose the first. This implies that macro
+            #functions should follow a nomenclature resembling:
+            #
+            #    :void :macro_name(^:string expansion_name, ...)
+            #
+            #Given that, implement the following:
+            #
+            #* Define a string global ${ZESHY_MACRO_EXPANSION} above.
+            #* Pass the string "ZESHY_MACRO_EXPANSION" as the first unconditional
+            #  argument following the macro name immediately below. (Yay!)
+            #* After calling such macro function, replace such macro in such code
+            #  by expanding ${ZESHY_MACRO_EXPANSION}.
+            #FIXME: Ah! O.K.; for both efficiency and implementation simplicity, we
+            #now require macro functions to *ALWAYS* set string global
+            #${ZESHY_MACRO_EXPANSION}, implying that "ZESHY_MACRO_EXPANSION" should
+            #*NOT* be explicitly passed as the first argument to macro functions.
+            #Such functions simply know by design contract to set such global. Yay!
+
+            # Command setting a passed string variable to such macro's expansion.
+            ZESHY__MACRO_COMMAND=${ZESHY__MACRO_TO_FUNC_NAME[${ZESHY__MACRO_NAME}]}
+
+            # If such name does *NOT* correspond to an existing function, throw an
+            # exception. (Macros are implemented as functions of the same name.)
+            (( ${+functions[${ZESHY__MACRO_COMMAND}]} )) || :die\
+                'Macro '${ZESHY__MACRO_NAME}'() function '${ZESHY__MACRO_COMMAND}'() undefined.'
+
+            # Set the byte index of the last character of the prior block argument
+            # to the byte index of the last character of such macro's name,
+            # ensuring standard arguments following such name and preceding the
+            # first block argument are passed to such call in the customary way.
+            ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST=${ZESHY__MACRO_BYTE_NAME_LAST}
+
+            # For each previously matched block argument passed to such macro,
+            # convert such argument into a standard single-quoted argument.
+            # Since a variadic number of block arguments are supported, the prior
+            # phase terminates the last block argument passed to such macro with a
+            # character constant.
+            while {
+                # While there exists at least one more block argument...
+                ((     ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX <\
+                    ${#ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST} )) && {
+                    # Byte index of the first character of the next block argument.
+                    ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST=${
+                        ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST[
+                      ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX}]}
+
+                    # ...and while such index precedes the last byte index of such
+                    # macro, such block argument was passed to such macro. In such
+                    # case, convert such block argument.
+                    (( ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST <\
+                       ZESHY__MACRO_BYTE_LAST ))
+                }
+            } {
+                # Byte index of the last character of such block argument.
+                # Concurrently increment to the next block argument in preparation
+                # for the next iteration.
+                ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX+=1
+                ZESHY__MACRO_BYTE_ARG_BLOCK_LAST=${
+                    ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST[
+                  ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX}]}
+                ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX+=1
+
+                # Pass such call all standard arguments (i.e., non-block arguments)
+                # following the prior block argument and preceding the current
+                # block argument if any. (If no such arguments exist, this simply
+                # appends the empty string and hence reduces to a noop.)
+                #
+                # By PCRE design, such arguments are guaranteed to be both preceded
+                # and followed by non-empty whitespace.
+                ZESHY__MACRO_COMMAND+=${ZESHY__PREPROCESS_CODE[
+                    $(( ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST + 1 )),
+                    $(( ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST - 1 ))]}
+
+                # Preserve the byte index of the last character of such block
+                # argument for subsequent examination *AFTER* expanding the prior
+                # such index above.
+                ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST=${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST[
+                    $(( ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX + 1 ))]}
+
+                #FIXME: We need to offset such macro by the number of bytes changed
+                #by such quote operation, implying we need to store the result of
+                #such operation in a string local for testing. Make it so!
+
+                # Pass such call such block argument converted to a standard
+                # argument (i.e., as a single-quoted string, thus implicitly
+                # quote-protecting all shell-reserved characters in such block).
+                ZESHY__MACRO_COMMAND+=${(qq)ZESHY__PREPROCESS_CODE[
+                    ${ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST},
+                    ${ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST}]}
+            }
+
+            #FIXME: Append all remaining standard arguments preceding the optional
+            #suffixing here-document or -string.
+            if [[ ]] {
+                ZESHY__MACRO_COMMAND+=
+            }
+
+            #FIXME: Define ${ZESHY_MACRO_EXPANSION_UNSET} above.
+
+            # Initialize such global to a placeholder, permitting detection of such
+            # command reporting success but failing to set such global to such
+            # macro's expansion. In such case, such global will remain set to such 
+            # uniquely identifiable placeholder.
+            ZESHY_MACRO_EXPANSION=${ZESHY_MACRO_EXPANSION_UNSET}
+
+            #FIXME: Consider wrapping exceptions thrown by and/or failure exit
+            #status reported by such command with human-readable exception messages
+            #listing the macro that failed, the line number on which it failed, and
+            #so on. We'll definitely want some common error handling routines for
+            #similar functionality elsewhere in this parcel.
+
+            # Set such string to such macro's expansion. Specifically:
+            #
+            # * "${(z)...}", splitting such command into shell words as well as
+            #   removing all unquoted line continuations between such words.
+            # * "${(qq@)...}", quote-protecting each such word as a single-quoted
+            #   string. This ensures that executable code embedded in such words
+            #   (e.g., process substitutions) will be preserved as is rather than
+            #   insecurely executed in-place.
+
+            #FIXME: Correct, but inefficient. Since macro names need *NOT* be
+            #quote-protected (by design) *AND* since all prototype and block
+            #arguments are already necessarily quote-protected above, the only
+            #arguments that remain to be quote-protected are scalar. If one
+            #considers it, however, we could simply:
+            #
+            #* Explicitly quote-protect scalar arguments above in phase 2.
+            #* Refactor the following command to read merely:
+            #
+            #    ${(z)ZESHY__MACRO_COMMAND}
+
+            ${(qq@)${(z)ZESHY__MACRO_COMMAND}}
+
+            # If such command reported success but failed to set such global to
+            # such macro's expansion, throw an exception.
+            [[ ${ZESHY_MACRO_EXPANSION} != ${ZESHY_MACRO_EXPANSION_UNSET} ]] ||
+                :die 'Macro '${ZESHY__MACRO_NAME}'() function '${ZESHY__MACRO_COMMAND}'() undefined.'
+
+            # Replace such macro in such code by such expansion.
+            ZESHY__PREPROCESS_CODE[${ZESHY__MACRO_BYTE_NAME_FIRST},${ZESHY__MACRO_BYTE_LAST}]=${ZESHY_MACRO_EXPANSION}
+
+            # If such expansion is nonempty, append its first and last byte
+            # indices to the FIFO queue of such indices, ensuring all top-level
+            # (i.e., non-nested) macros in such expansion will be expanded by
+            # subsequent preprocessor iteration. Since this phase iterates
+            # macros in reverse lexical order, appending onto such list
+            # implicitly preserves such order, ensuring the first pair of list
+            # items will remain the indices of the last expansion in such code.
+            if (( -n ${ZESHY_MACRO_EXPANSION} )) {
+                ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST+=(
+                    ${ZESHY__MACRO_BYTE_NAME_FIRST}
+                    (( ZESHY__MACRO_BYTE_NAME_FIRST + ${#ZESHY_MACRO_EXPANSION} ))
+                )
+            }
+        }
+    }
+}
+
+# --------------------( WASTELANDS                         )--------------------
+        #* +{compile} should set explicitly set ${ZESHY__PCRE_IS_RECOMPILED} to
+        #  0 for safety before the first call to :script.source():. Err,
+        #  actually, a 
+
+#FUXME: "-n ${ZPCRE_OP[(w)2]}" isn't quite right. We absolutely need to
 #record byte indices for macros expanded within block arguments passed to
 #top-level macros: e.g.,
 #
@@ -67,7 +1054,7 @@
 #match at any byte index inclusively between the first and last characters
 #of such line. For efficiency, we'd might as well choose the byte index of
 #the last character of such macro's name, which we have access to below.
-#FIXME: O.K.! The above change is both simple and correct. Unfortunately,
+#FUXME: O.K.! The above change is both simple and correct. Unfortunately,
 #we need to do more. Alot more. The reason why, of course, is that
 #expanding an inner macro invalidates the last (but not first) byte indices
 #of all outer macros containing such inner macro. Consider the following
@@ -342,7 +1329,7 @@
 #
 #This can thus be tested as follows:
 #
-#    #FIXME: Define new function :int.set_system_bit_width() in the main
+#    #FUXME: Define new function :int.set_system_bit_width() in the main
 #    #codebase implementing such logic. (Yay!)
 #    integer int_is_64_bit=$(( (1 << 31) > 0 ))
 #
@@ -393,7 +1380,7 @@
 #
 #That's it. Hurrah, hurrah! The above algorithm appears to smoothly scale to
 #*ALL* nesting depths, which is certainly a relief.
-#FIXME: O.K.; so, the above solution is actually fairly shoddy for a number of
+#FUXME: O.K.; so, the above solution is actually fairly shoddy for a number of
 #reasons. For one, we don't actually need or even want to unconditionally
 #expand all nested macros. We only want to expand nested macros that survive
 #the expansion process. If one considers the typical macro accepting two or
@@ -406,14 +1393,14 @@
 #
 #* Wrap all *THREE* preprocessor phases in stack-based iteration (a while loop,
 #  perhaps?). This should be the *ONLY* stack-based iteration in the entire
-#  algorithm. Such iteration behaves as follows:
+#  algorithm, behaving as follows:
 #  * Declare a new list local ${ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST} (or
 #    some such). As with existing list locals, such list consists *ONLY* of
 #    consecutive pairs of first and last byte indices for substrings of the
 #    passed code to be preprocessed in reverse lexical order. (That last
 #    constraint is particularly critical; as elsewhere, iterating in reverse
 #    lexical order ensures we don't have to laboriously maintain byte offsets).
-#    Note, however, since that we should already be iterating in such order,
+#    Note, however, that since we should already be iterating in such order,
 #    merely appending to the end of such list suffices to guarantee such order.
 #  * Initialize ${ZESHY__MACRO_BYTES_PREPROCESS_FIRST_LAST} before iteration to
 #    the byte length of such code: e.g.,
@@ -442,793 +1429,46 @@
 #    preserves reverse order, ensuring the first list item will remain the
 #    indices of the last expansion in such code. Yay!
 #
-# And... that's it. Extraordinarily simpler, isn't it? A shame we didn't
-# stumble onto this technique sooner, but later is better than never.
-#FIXME: Great! We believe there may exist a critical optimization, however.
-#Given the iterative queue-based approach above, is it *REALLY* essential that
-#we convert block arguments to strings in the same phase that we expand macros?
-#Intuition suggests, "Nope." Ideally, block arguments should probably be
-#converted to strings in phase 2. Given that, however, there clearly exists no
-#demonstrable reason to do much at all in phase 3 except expand macros in place.
-#That can't be right. Can it? If that *IS* right, we can eliminate
-#${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST} and associated logic in both
-#phases 2 and 3. Contemplate further before doing anything courageously wild.
-#
-#So. We've been mulling it over and over and... honestly, we can't see the
-#implicit catch-22 that must be lurking somewhere. So, let's go cautiously
-#forward, commenting out rather than explicitly eliminating all existing logic
-#that would appear to be obseleted by such an optimization. Careful here...
+#And... that's it. Extraordinarily simpler, isn't it? A shame we didn't
+#stumble onto this technique sooner, but later is better than never.
 
-#FIXME: The long-term solution to function prototype optimization, though a bit
-#balls-crazy, is as follows:
-#
-#* Merge the principal PCRE (i.e., ${ZESHY_CALLABLE_PROTOTYPE_PCRE}) produced
-#  by ={*-soil/*-declare/*-pcre} into the principal PCRE produced by ={pcre}.
-#* Refactor ={*-soil/*-declare/*-func/func} accordingly. (Actually, any
-#  refactoring should be quite minimal, as we already reference match indices
-#  by name rather than hard-coded integer).
-#
-#What's indolently pleasant about this approach is that it avoids all of the
-#repetitous PCRE compilation we currently perform. Consider it: on each and
-#every function declaration, we currently recompile
-#${ZESHY_CALLABLE_PROTOTYPE_PCRE}! This is absolute insanity. Happily, the
-#above approach does away with that entirely. It also pushes the limits of
-#PCRE-based parsing, but hopefully in a tractable, feasible way.
-#
-#Only one way to find out whether "libpcre" will actually support a PCRE that
-#monstrously complex *AND* whether we can actually reliably debug that PCRE,
-#right? So, let's do this.
+            #FUXME: Append the first and last byte indices of the resulting
+            #expansion in such code to the end of
+            #${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST}. Since the third phase
+            #iterates in reverse order, appending onto such list implicitly
+            #preserves reverse order, ensuring the first pair of list items
+            #will remain the indices of the last expansion in such code. Yay!
 
-#FIXME: The current preprocessing approach replaces string slices in-place. We
+        #FUXME: Refactor to iterate list indices rather than popping items.
+    # while (( ${#ZESHY__MACROS_BYTES_FIRST_LAST} )) {
+        # Pop the top pair of byte indices off such stack.
+        # ZESHY__MACRO_BYTE_FIRST=${ZESHY__MACROS_BYTES_FIRST_LAST[${ZESHY__MACROS_BYTES_FIRST_LAST_INDEX}]}
+        #  ZESHY__MACRO_BYTE_LAST=${ZESHY__MACROS_BYTES_FIRST_LAST[$(( ${ZESHY__MACROS_BYTES_FIRST_LAST_INDEX} + 1 ))]}
+ 
+#FUXME: The current preprocessing approach replaces string slices in-place. We
 #should note, however, that ={var/scalar/scalar} takes the alternative approach
 #of iteratively constructing the output string from an input string without
 #modifying the original. Both approaches have merit. Which is more efficient?
 #Since we perform so much slicing split over numerous phases, implementing the
 #latter would be quite difficult (if not infeasible). Nonetheless, consider.
 
-# ....................{ GLOBALS ~ public : string          }....................
-# Current macro's expansion.
-typeset -g ZESHY_MACRO_EXPANSION
-
-# ....................{ GLOBALS ~ private : string         }....................
-# Current macro's name.
-typeset -g ZESHY__MACRO_NAME
-
-# Command setting the current macro's expansion, whose:
-#
-# * First shell word is the name of the function expanding such macro.
-# * Subsequent shell words are the same words passed to such macro such that:
-#   * Scalar arguments are unmodified.
-#   * Block arguments are converted to single-quoted scalar arguments.
-typeset -g ZESHY__MACRO_COMMAND
-
-# ....................{ GLOBALS ~ private : int            }....................
-# Byte indices of the first and last characters of such macro's name.
-typeset -gi ZESHY__MACRO_BYTE_NAME_FIRST ZESHY__MACRO_BYTE_NAME_LAST
-
-# Byte index of the last non-whitespace character of the current macro.
-typeset -gi ZESHY__MACRO_BYTE_LAST
-
-# Byte indices of the first and last characters of the currently matched
-# block argument passed to such macro.
-typeset -gi ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST ZESHY__MACRO_BYTE_ARG_BLOCK_LAST
-
-#FIXME: Still used? Excise otherwise.
-
-# Byte index of the last character of the previously matched block argument
-# passed to such macro if any or the first character following the last
-# character of such macro's name otherwise.
-# typeset -gi ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST
-
-#FIXME: Appears to be obselete now. Excise after due consideration.
-
-# Current 1-based index of list ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST}.
-# typeset -gi ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX
-
-# ....................{ GLOBALS ~ private : list           }....................
-# List of positive integer triples, each a byte index into the passed code such
-# that:
-#
-# * The first list item of each such triple is the byte index of the first
-#   non-whitespace character of such macro (e.g., the ":" prefixing such
-#   macro's name).
-# * The second list item of each such triple is the byte index of the last
-#   non-whitespace character of such macro name (e.g., the "c" in ":func").
-# * The third list item of each such triple is the byte index of the last
-#   non-whitespace character of such macro (e.g., the "}" suffixing such
-#   macro's last block argument).
-#
-# Such triples are listed in reverse lexical order (i.e., in the reverse order
-# such macros appear in such code). The reason why is fairly subtle, as reasons
-# go. To prevent the expansion of each macro from invalidating byte indices of
-# subsequent macros, the third preprocessor phase must expand and hence iterate
-# macros in reverse order. While there exist various means of ensuring this,
-# persisting such macros in such order by prepending such indices to the head
-# of this list with list operator "+=" is arguably the simplest and most
-# efficient. However, such operator requires a valid 1-based list index and
-# hence cannot be used to prepend directly into the first list index (which
-# would require "+=" to support appending to an imaginary list index 0). We
-# circumvent this oddity by retaining the empty string as a "dummy" first list
-# index to which we append all subsequent triples.
-#
-# Such list circumvents zsh's current inability to nest PCRE-based iteration,
-# permitting matches in the first preprocessor phase to be accessed in the
-# second preprocessor phase. (It's all rather droll.)
-typeset -ga ZESHY__MACRO_BYTES_NAME_FIRST_LAST
-
-# List of ";"-terminated sublists of positive integer pairs, each a byte
-# index into the passed code such that:
-#
-# * The first list item of each such pair is the byte index of the "{"
-#   prefixing the next block argument passed to such macro.
-# * The second list item of each such pair is the byte index of the "}"
-#   suffixing the same block argument.
-#
-# Since zsh does *NOT* currently support type composition, terminate each
-# such sublist by the arbitrary delimiter ";". (This is horrible.)
-#
-# Such list circumvents zsh's current inability to nest PCRE-based
-# iteration, permitting matches in the second preprocessor phase to be
-# accessed in the third preprocessor phase. (Angel of death, take us now.)
-
-#FIXME: Appears to be obselete now. Excise after due consideration.
-
-# typeset -ga ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST
-
-# ....................{ PREPROCESSORS                      }....................
-#FIXME: Optimize by globalizing locals. (You know the code-cadenced drill.)
-#FIXME: Document me. In particular, note that the caller must define
-#${ZESHY__PREPROCESS_CODE} prior to calling such function.
-
-# :void ::code.preprocess()
-function ::code.preprocess() {
-    # Validate sanity.
-    (( # == 0 )) || :die 'Expected no arguments.'
-
-    # If this function call is recursive, throw an exception. For both
-    # efficiency and implementation sanity, this function assumes macro
-    # expansions to *NOT* call this function. See TRAPZERR().
-    (( ${funcstack[(I)::code.preprocess]-1} == 1 )) ||
-    [[ ${funcsourcetrace[${funcstack[(I)::code.preprocess]}]-} == *':0' ]] ||
-        :die 'Non-recursive function ::code.preprocess() called recursively.'
-
-    # If such variable is undefined or not a string, throw an exception. See
-    # :var.die_unless_type_string().
-    [[ ${(t)ZESHY__PREPROCESS_CODE-} == 'scalar'('-'*|) ]] || :die\
-        'String ${ZESHY__PREPROCESS_CODE} undefined or not a string.'
-
-    # ..................{ DEPENDENCIES                       }..................
-    # If preprocessor PCREs have yet to be generated or require regeneration
-    # (e.g., due to the declaration of new macros), do so.
-    ::preprocessor_pcres.make_if_needed
-
-    # ..................{ OPTIONS                            }..................
-    # Locally disable default zsh option "multibyte", permitting substrings
-    # matched by pcre_match() to be indexed by the " "-delimited byte indices
-    # written to ${ZPCRE_OP}.
-    #
-    # Unfortunately, pcre_match() fails to set integer globals ${MBEGIN} and
-    # ${MEND} to the character indices of the start and end of the matched
-    # substring. Fortunately, it *DOES* set string global ${ZPCRE_OP} to the
-    # " "-delimited byte indices of the start and end of such substring.
-    # Unfortunately, multibyte strings (e.g., UTF8-encoded) are indexed by
-    # character rather than byte indices under default zsh option "multibyte".
-    # Fortunately, locally disabling such option permits all strings (multibyte
-    # or not) and hence such substring to be indexed by such byte indices.
-    setopt local_options no_multibyte
-
-    # ..................{ VARIABLES                          }..................
-    # Canonical string global ${ZPCRE_OP}, localized to avoid overwriting
-    # either global or caller-specific versions of such variable.
-    local ZPCRE_OP
-
-    #FIXME: Document us.
-    ZESHY__MACRO_BYTES_NAME_FIRST_LAST=( '' )
-
-    # ..................{ PHASE ~ macro                      }..................
-    # Due to zsh inadequacies, preprocessing is partitioned into multiple
-    # phases. Since "zsh" permits only one PCRE to be compiled at a time,
-    # PCRE-based iteration cannot be nested. Since the first two phases perform
-    # such iteration, such phases cannot be combined. (Q.E.D., sadly.)
-
-    # Compile and optimize such PCRE.
-    pcre_compile -- "${ZESHY__MACRO_PCRE}"
-    pcre_study
-
-    # For each macro matched from such code, record matched byte indices for
-    # the next preprocessor phase.
-    ZPCRE_OP='0 0'
-    while {
-        pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__PREPROCESS_CODE}"
-    } {
-        #FIXME: Despite zsh and libpcre constraints, we believe we've uncovered
-        #a means of reliability discerning the starting and ending byte indices
-        #of arbitrarily nested syntactically invalid syntactic cnstructs. How?
-        #For each syntactic construct PCRE:
-        #
-        #* If such PCRE identifies a syntactic invalidity (e.g., by hetting the
-        #  end of the string), such PCRE should report an error by backtracking
-        #  to the character immediately preceding the offending syntactic
-        #  construct and (mildly ironically) reporting success (with no
-        #  additional capture groups). This ensures that ${ZPCRE_OP[(w)2]} will
-        #  provide the byte index of such construct. Yay!
-        #
-        #  *WAIT*. To differentiate invalid from valid macros, we do
-        #  arbitrarily require an additional non-empty capture group -- say,
-        #  capturing the character immediately preceding the invalid syntactic
-        #  construct via positive lookbehind into a trailing capture group.
-        #  Call such global
-        #  ${ZESHY__MACRO_GROUP_INDEX_INVALIDITY_CHAR_LAST}.
-        #
-        #  *WAIT*. If a macro argument is syntactically invalid, that should
-        #  imply that... Ah-ha! O.K.; we should actually instead capture the
-        #  last character (or perhaps all characters) of the set of all
-        #  arguments passed to a macro into a trailing capture group.  Call
-        #  such global ${ZESHY__MACRO_GROUP_INDEX_ARGS_CHAR_LAST}.
-        #
-        #  Since macros are *NEVER* recursive, such group is guaranteed to be
-        #  non-empty if such macro is valid.
-        #* ={backend} may then reliably detect such invalidity by performing
-        #  the following logic:
-        #  * If match group ${ZESHY__MACRO_GROUP_INDEX_NAME} is nonempty, a
-        #    macro was matched. In such case, if:
-        #    * If match group ${ZESHY__MACRO_GROUP_INDEX_ARGS_CHAR_LAST} is
-        #      nonempty, such macro is valid; else, such macro is invalid.
-        #  * Else, a macro was not matched. In such case, a syntactically
-        #    invalid construct was matched if and only if the following:
-        #    (( ${ZPCRE_OP[(w)2]} < ${#ZESHY__PREPROCESS_CODE} ))
-        #
-        #In either case, if an invalidity is matched:
-        #
-        #* The first byte index of the invalid syntactic construct is given by
-        #  $(( ${ZPCRE_OP[(w)2]} + 1 )).
-        #* The last byte index of such construct is, of course,
-        #  ${#ZESHY__PREPROCESS_CODE}.
-        #FIXME: Backtracking on syntactically invalid constructs to the
-        #character immediately preceding such construct may prove somewhat
-        #non-trivial. For example, (*ACCEPT) only returns from subroutine calls
-        #(rather than halting matching) when in such calls, possibly preventing
-        #us from responding in a sane fashion to invalid embedded syntactic
-        #constructs. Hmm; by our PCRE design, this could still work. Possibly.
-        #If we've meticulously matched everything exactly correctly, embedding
-        #(*ACCEPT) in a subroutine call *SHOULD* induce the following behavour:
-        #
-        #* That subroutine call matching that syntactic construct immediately
-        #  returns to the call matching its parent construct. Due to
-        #  backtracking, the current position will be immediately before the
-        #  offending child construct. Assuming proper PCRE construction, the
-        #  call matching the parent construct will fail to match at this point,
-        #  having exhausted all other options, in which case such call reports
-        #  failure to and hence inducing backtracking in its parent and so on
-        #  recursively up the line, iinevitably resulting in backtracking batk
-        #  to the beginning and hence match failure. Hmm; that's bad.
-        #
-        #What we need to do is recursively propagate (*ACCEPT) up the
-        #subroutine call hierarchy. Oh, boy. Perhaps that's simpler than it
-        #sounds? Firstly, how would a parent call detect that a child call has
-        #prematurely returned via (*ACCEPT)? Well...
-        #
-        #O.K.; we believe we may have found the way: "\K". Happily (and
-        #contrarily to all other PCRE behaviour), subroutine calls do *NOT*
-        #isolate the effect of "\K". That is, "\K" operates in a global manner
-        #and hence permits us a subversive means of breaking through the
-        #otherwise rigid barrier PCRE imposes about such calls.
-        #
-        #The idea here is that, on detecting a syntactic invalidity, the PCRE
-        #responsible for matching that construct instead:
-        #
-        #* Backtracks to the first character of such construct. Since
-        #  "(*COMMIT)", "(*SKIP)", and "(*PRUNE)" do nothing meaningful in
-        #  subroutine calls, this implies we'll need to leverage implicit
-        #  backtracking via alternation. Unfortunately, to backtrack all the
-        #  way *BEFORE* the first character of such construct, we'll need to
-        #  also leverage positive lookahead -- which shouldn't be much of an
-        #  imposition: e.g.,
-        #    local pcre_quotes_single="(?=')(?:'(?>[^']++|'')*+'"'|\K.*+)'
-        #  Alternately, if such positive lookahead is *TOO* horrible (...it's
-        #  not, really), we could backtrack to the first character following
-        #  such prefix: e.g.,
-        #    local pcre_quotes_single="'(?:(?>[^']++|'')*+'"'|\K.*+)'
-        #  Unfortunately, that then requires a manual search backwards in
-        #  ={backend} to attempt to find the start of such construct.
-        #  Error-prone and fugly, needless to say the least. Let's just take
-        #  the efficiency hit on this one, yes?
-        #* All recursive subroutine calls (e.g., ${pcre_embeddable}) should be
-        #  suffixed by something resembling
-        #  '(?:'${pcre_string_end_report_success}')?+'.
-        #* In ={backend}, detect the error condition as follows:
-        #  * If a macro name was matched *AND* the first character of such name
-        #    is *NOT* equal to the character at
-        #    ${ZESHY__CODE_PEPROCESS[$(( ${ZPCRE_OP[(w)1]} + 1 ))]},
-        #    then such macro is invalid.
-        #  * Else, a macro was not matched. Assuming that we've recorded the
-        #    last byte index of the prior match (trivial), then if such index
-        #    is *NOT* one less than the first byte index of the current match,
-        #    an invalid construct must have been matched. Oh, yes; this would
-        #    happily work for the prior case as well. Yay! That tidies things.
-        #
-        #In summation:
-        #
-        #* In syntactic construct PCREs, refactor to the form:
-        #    local pcre_quotes_single="(?=')(?:'(?>[^']++|'')*+'"'|\K.*+)'
-        #* All recursive subroutine calls (e.g., ${pcre_embeddable}) should be
-        #  suffixed by ${pcre_string_end_report_success_optional}, defined as:
-        #    local pcre_string_end_report_success_optional='(?:'${pcre_string_end_report_success}')?+'
-        #* In ={backend}, assuming that we've recorded the last byte index of
-        #  the prior match (trivial), then if such index is *NOT* one less than
-        #  the first byte index of the current match, an invalid construct must
-        #  have been matched.
-        #
-        #Surprisingly simple, actually.
-        #FIXME: For disambiguity in exception messages, unsupported
-        #here-documents (i.e., here-documents with non-literal delimiters)
-        #should be differentiated from syntactically invalid here-documents:
-        #the former are *NOT* invalid in general-purpose zsh code, merely
-        #unsupported in zeshy code. Happily, doing so should be more or less
-        #trivial. In fact, we've already done so; see
-        #${ZESHY__MACRO_HERE_DOC_UNSUPPORTED_PCRE}. Yay!
-
-        # If a macro was matched, handle such macro.
-        if [[ -n ${match[${ZESHY__MACRO_GROUP_INDEX_MACRO_NAME}]-} ]] {
-            #FIXME: Consider everything below. Probably bollocks, at the moment.
-
-            # Such macro's name.
-            ZESHY__MACRO_NAME=${match[${ZESHY__MACRO_GROUP_INDEX_NAME}]}
-
-            # Byte indices recorded for the next preprocessor phase. Note that
-            # "man zshmodules" documents ${ZPCRE_OP} to be a " "-delimited integer
-            # pair such that:
-            #
-            # * The first such integer is the byte index of the first character of
-            #   the matched substring.
-            # * The second such integer is the byte index of the first character 
-            #   following such substring.
-            #
-            # Unfortunately, this is *NOT* the case. The documentation is "off by
-            # one" in both cases, a bug in either the current zsh implementation or
-            # documentation. Instead:
-            #
-            # * The first such integer is the byte index of the last character
-            #   preceding such substring.
-            # * The second such integer is the byte index of the last character of
-            #   such substring.
-            #
-            # However, the subtle entanglements don't end there. The byte index of
-            # the first character of such substring is the byte index of the next
-            # character following the first such integer. If such character is
-            # unibyte (i.e., encoded as a single byte), incrementing the latter by
-            # 1 suffices to calculate the former. If such character is multibyte
-            # (i.e., encoded as two or more bytes), however, this overly simplistic
-            # calculation fails.
-            #
-            # By PCRE design, the character preceding a matched macro name is
-            # guaranteed to be whitespace. Technically, UTF-8-encoded multibyte
-            # whitespace characters *DO* exist. Since no official scripts precedes
-            # a macro expansion by such characters *AND* since it appears
-            # vanishingly unlikely that third-party scripts would ever do so,
-            # assume such character to be unibyte for simplicity. In such case,
-            # simplistically incrementing the first such integer by 1 suffices.
-            ZESHY__MACRO_BYTE_NAME_FIRST=$(( ${ZPCRE_OP[(w)1]} + 1 ))
-            ZESHY__MACRO_BYTE_NAME_LAST=$((
-                ZESHY__MACRO_BYTE_NAME_FIRST + ${#ZESHY__MACRO_NAME} - 1 ))
-            ZESHY__MACRO_BYTE_LAST=${ZPCRE_OP[(w)2]}
-
-            #FIXME: Shift parcel ={*-get} here and explicitly source above.
-            #FIXME: Testing for syntactic invalidity now reduces to testing whether
-            #a macro was matched or not and, if not, whether the last capture group
-            #exists: e.g.,
-            #
-            #    if [[ -z ${match[${ZESHY__MACRO_GROUP_INDEX_NAME}]} ]] &&
-            #        (( ${#match} < ZESHY__MACRO_GROUP_INDEX_STRING_IS_VALID )) {
-            #        :die "Uh oh! Syntactic invalidity found."
-            #    }
-
-            # If the empty group signifying such macro to be syntactically valid
-            # was *NOT* matched, such macro is syntactically invalid. In such case,
-            # throw an exception.
-            (( ${#match} >= ZESHY__MACRO_GROUP_INDEX_IS_VALID )) || {
-                # Line number of the current macro in such code, calculated by
-                # removing all non-newline characters preceding such macro and
-                # counting the number of newline characters that remain.
-                integer line_number="${#ZESHY__PREPROCESS_CODE[
-                    1,${ZESHY__MACRO_BYTE_NAME_FIRST}]//[^$'\n']}"
-
-                # Throw such exception.
-                :die $(::parcel.get_current)'macro '${ZESHY__MACRO_NAME}'() on line '${line_number}' passed syntactically invalid arguments (e.g., due to unmatched braces or quotes).'
-            }
-
-            # Record matched byte indices for the next preprocessor phase.
-            ZESHY__MACRO_BYTES_NAME_FIRST_LAST[1]+=(
-                ${ZESHY__MACRO_BYTE_NAME_FIRST}
-                ${ZESHY__MACRO_BYTE_NAME_LAST}
-                ${ZESHY__MACRO_BYTE_LAST}
-            )
-        # Else, a halting condition was matched.
-        } else {
-            #FIXME: Implement me.
-        }
-    }
-
-    # For simplicity, remove the placeholder empty string prefixing such list.
-    ZESHY__MACRO_BYTES_NAME_FIRST_LAST[1]=()
-
-    # For sanity, ensure such list is of the expected size.
-    (( ZESHY__MACRO_BYTES_NAME_FIRST_LAST % 3 == 0 )) || :die\
-        'List ${ZESHY__MACRO_BYTES_NAME_FIRST_LAST} size '${#ZESHY__MACRO_BYTES_NAME_FIRST_LAST}' not divisible by 3.'
-
-    # ..................{ PHASE ~ arg                        }..................
-    # Compile and optimize such PCRE.
-    pcre_compile -- "${ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE}"
-    pcre_study
-
-    #FIXME: Localize above.
-    local ZESHY__MACRO_ARG_BLOCK
-    local ZESHY__MACRO_ARG_BLOCK_PRIOR_LAST
-
-    # For each previously matched macro, match each block argument passed to
-    # such macro.
-    for ZESHY__MACRO_BYTE_NAME_FIRST\
-        ZESHY__MACRO_BYTE_NAME_LAST ZESHY__MACRO_BYTE_LAST (
-        "${ZESHY__MACRO_BYTES_NAME_FIRST_LAST[@]}") {
-        # Begin searching for block arguments passed to the current macro
-        # immediately after the last character of such macro's name.
-        ZPCRE_OP='0 '${ZESHY__MACRO_BYTE_NAME_LAST}
-
-        # Byte index of the last character of the prior match if any or the
-        # first character following the last character of such macro's name
-        # otherwise.
-        ZESHY__MACRO_BYTE_ARG_BLOCK_LAST=${ZESHY__MACRO_BYTE_NAME_LAST}
-
-        # For each block argument matched from such code, record matched byte
-        # indices for the next preprocessor phase.
-        while {
-            # While such index precedes the last byte index of such macro,
-            # attempt to match the next block argument passed to such macro.
-            #FIXME: We reckon the first test ain't quite right, anymore.
-            (( ZESHY__MACRO_BYTE_ARG_BLOCK_LAST <\
-               ZESHY__MACRO_BYTE_LAST )) &&
-                pcre_match -b -n ${ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST} --\
-                "${ZESHY__PREPROCESS_CODE}"
-        } {
-            #FIXME: Explain me. See below.
-            # First and last byte indices of such block argument.
-            ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST=$((
-                ${ZPCRE_OP[(w)1]} + ${#match[1]} ))
-            ZESHY__MACRO_BYTE_ARG_BLOCK_LAST=${ZPCRE_OP[(w)2]}
-
-            #FIXME: Explain me. We'll have to explain that:
-            #
-            #* ${ZPCRE_OP[(w)1]} is the byte index of the character *PRECEDING*
-            #  the first character of such matched substring, which in the case
-            #  of the first block argument will be such macro's name.
-            #* Macro names can contain UTF-8-encoded characters, meaning that
-            #  we can't just increment by 1. So, implement this and *ONLY* this
-            #  in a multibyte-aware manner. All other code remains unibyte.
-            #* We don't need to explicitly localize such option, as we already
-            #  did so above.
-            #* Technically, we don't *NEED* to add ${#match[1]} here.
-            #
-            # See ={var/scalar/scalar}.
-            #
-            # Note also that the following isn't right:
-            #
-            #    setopt multibyte
-            #    ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST+=${#ZESHY__PREPROCESS_CODE[
-            #        ${ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST}]}
-            #    setopt no_multibyte
-            #
-            # We need the number of bytes of such character. The above simply
-            # returns "1". Instead, we do the following:
-            #
-            #* In multibyte mode, capture the desired character to a string.
-            #* In unibyte mode, test the length of such string.
-            #
-            #Lame, but there you are. *shrug*
-
-            #FIXME: Wait. This works, but it's inefficient. Instead, fix the
-            #PCRE to ensure that, if there exist *ANY* arguments passed to a
-            #macro, the first substring of such match is a horizontal
-            #whitespace character.
-            #FIXME: O.K.; the solution is, clearly, to revise the PCRE such
-            #that it no longer groups the matched name but instead positive
-            #lookahead capturing such name *PLUS* the following ASCII character
-            #if any (i.e., if not at the end of the string): e.g., 
-            #
-            #    local pcre_macro_name_grouped='(?=(['${ZESHY__MACRO_NAME_CHAR_CLASS}']++.?))'${(kj:|:)ZESHY__MACRO_TO_FUNC_NAME}
-            #
-            #Clever, eh? The use of "++" guarantees that the ".?" matches only
-            #either a non-macro *ASCII* character subject to the constraints of
-            #the following actual match (e.g., horizontal whitespace,
-            #backslash, newline) *OR* the end of the string. Note that while
-            #capturing positive lookahead *SHOULD* work, we'll probably want to
-            #verify this externally at the CLI.
-            #
-            #Since the last character of such match is guaranteed to be ASCII
-            #by PCRE design, the byte index of the last character of such
-            #macro's name is obtainable simply by subtracting one from the byte
-            #length of such captured substring. Yay!
-
-            setopt multibyte
-            ZESHY__MACRO_ARG_BLOCK_PRIOR_LAST=${ZESHY__PREPROCESS_CODE[
-                ${ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST}]}
-
-            setopt no_multibyte
-            ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST+=${#ZESHY__MACRO_ARG_BLOCK_PRIOR_LAST}
-
-            #FIXME: In accordance with the final optimization discussed above,
-            #let's attempt to convert block arguments to strings in-place here.
-
-            #FIXME: We need to offset such macro by the number of bytes changed
-            #by such quote operation, implying we need to store the result of
-            #such operation in a string local for testing. Make it so!
-
-            # Convert such block argument to a standard argument formatted as a
-            # single-quoted string, implicitly quote-protecting all shell-
-            # reserved characters in such block.
-            ZESHY__MACRO_ARG_BLOCK=${(qq)ZESHY__PREPROCESS_CODE[
-                ${ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST},
-                ${ZESHY__MACRO_BYTE_ARG_BLOCK_LAST}]}
-
-            #FIXME: Actually, macro names can contain UTF-8-encoded characters.
-            #We should probably prohibit this, for the moment -- that, or
-            #reimplement this in a multibyte-aware manner. Something like:
-            #    setopt -- local_options multibyte
-
-            # Record matched byte indices for the next preprocessor phase.
-            #
-            # The last character preceding such match is either the last
-            # character of such macro's name *OR* the "}" delimiting the last
-            # block argument passed to such macro. Given that, incrementing the
-            # byte index of such character by 1 gives the byte index of the
-            # first whitespace character of such match; incrementing such index
-            # by the byte length of the possibly empty substring of standard
-            # arguments preceding such block arguments gives the byte index of
-            # the "{" delimiting such block argument.
-            # ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST+=(
-            #     $(( ${ZPCRE_OP[(w)1]} + ${#match[1]} + 1 ))
-            #         ${ZPCRE_OP[(w)2]}
-            # )
-        }
-    }
-
-    #FIXME: Excise after due consideration.
-    # For sanity, ensure such list is of the expected size.
-    # (( ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST % 2 == 0 )) || :die\
-    #     'List ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST} size '${#ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST}' not even.'
-
-    # ..................{ PHASE ~ expand                     }..................
-    #FIXME: By eval-ing macro arguments, we're effectively guaranteeing that
-    #redirections and process substitutions embedded in double-quoted arguments
-    #*WILL* be evaluated at macro expansion time -- which seems fairly bad. Or
-    #perhaps not? We probably want to simply *STOP* eval-ing macro arguments.
-    #
-    #Hmm; for sane macro expansion, we really need to require that all unquoted
-    #process substitutions and redirections be the *LAST* arguments to a macro
-    #expansion. (Honestly, that's pretty much how it should be for all
-    #conventional commands anyway.) Happily, the current approach should
-    #already ensure this. We'll simply want to document (probably in this
-    #section) that, by design, the current PCRE definition prohibits macro
-    #redirections from being interspersed with standard macro arguments
-    #(unlike standard commands). (Since macro functions never output anything, 
-    #it makes no rational sense to try to redirect such functions anyway.)
-    #
-    #However, that still fails to take into account process substitutions
-    #(either embedded in double-quoted strings or not). And you know what?
-    #Perhaps we don't care terribly much about that. Or perhaps we do. It does
-    #seem silly to expand such substitutions at macro expansion time,
-    #suggesting that we'll need to either:
-    #
-    #* Prohibit such substitutions in macro arguments, which is sensible.
-    #* Quote-protect all standard macro arguments. This would probably need to
-    #  happen in phase 2 of ={backend}. Happily, we've verified that this can
-    #  be accomplished reasonably efficiently: e.g.,
-    #
-    #    >>> :string yaz='"yum oh" test(.) $(yumyum) ''ug uh uk'''
-    #    >>> print -r "${(qq@)${(z)yaz}}"
-    #    '"yum oh"' 'test(.)' '$(yumyum)' '''ug uh uk'''
-    #FIXME: Right. If you consider it, the latter approach is what we need to
-    #be doing *ANYWAY*. Why? Because the eval() approach effectively strips
-    #significant quoting from passed arguments. For example, a macro expansion
-    #call of ":macro '/this is/a dir'" would ensure that the first argument to
-    #such macro function would be "/this is/a dir" without the quotes,
-    #requiring subsequent use of "(qq)" *ANYWAY* when producing an expansion
-    #string. The above approach offloads all such quoting work to the parser,
-    #which is where it should be anyway. So, let's definitely go with the
-    #"${(qq@)${(z)args}}" approach in preprocessor phase 2 (i.e., here). This
-    #ensures that we preserve the original quoting used, which could actually
-    #prove significant. (Well, probably not. But who knows?)
-    #FIXME: O.K.; we need to strip line continuations as well. Yes, literally
-    #*STRIP* all line continuations with a simple global glob-based search and
-    #replace: e.g., "${args//\\$'\n'}". Efficiency for the mild win.
-    #FIXME: Wait. No. We need strip line continuations only when in unquoted
-    #substrings of shell words *OR* between shell words. Line continuations
-    #embedded in syntactic constructs should *NOT* be stripped, for fairly
-    #obvious reasons. What's unclear, however, is just how we go about doing
-    #that. We'll obviously need to do so prior to "(z)"-based word splitting
-    #and "(qq)"-based word quoting. Given that, the only reasonable approach is
-    #PCRE-based substitution and replacement (with the empty string).
-    #
-    #Clearly, this is a non-trivial issue to solve. Semantically, however, it's
-    #largely trivial, implying that a brute-force, simplistic approach could be
-    #preferable. How, though?
-    #FIXME: Oh. Oh. Oh. Sooooo lucky! It turns out that "(z)" is doing quite a
-    #bit more than mere word splitting. At the least, it also appears to
-    #perform syntactically correct line continuation removal: e.g.,
-    #
-    #    >>> :string yum='yum "ok"\'$'\n''hm \'$'\n'' ugh'
-    #    >>> print -r "${(qq@)${(z)yum}}"
-    #    'yum' '"ok"hm' 'ugh'
-    #
-    #So, surprisingly, we're actually good here. "${(qq@)${(z)yum}}" approach
-    #is *CLEARLY* the correct way forward, from a variety of perspectives.
-
-    ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX=1
-
-    # For each previously matched macro, replace such macro by its expansion.
-    for ZESHY__MACRO_BYTE_NAME_FIRST\
-        ZESHY__MACRO_BYTE_NAME_LAST\
-        ZESHY__MACRO_BYTE_LAST (
-        "${ZESHY__MACRO_BYTES_NAME_FIRST_LAST[@]}") {
-        # Such macro's name.
-        ZESHY__MACRO_NAME=${ZESHY__PREPROCESS_CODE[
-            ${ZESHY__MACRO_BYTE_NAME_FIRST},${ZESHY__MACRO_BYTE_NAME_LAST}]}
-
-        #FIXME: O.K.; so, *EVERY* macro unconditionally "returns" a single
-        #string comprising the code replacing such macro. And how do we
-        #"return" values in zsh? Right. Setters. This implies that *ALL* macros
-        #must necessarily be setters. The question is: of what form? Clearly,
-        #macros must accept a string variable name as an argument. (Corollary:
-        #all macros accept at least one argument.) The question is: which
-        #argument? Clearly, either the first or last, right? Given zeshy
-        #nomenclature, we plainly choose the first. This implies that macro
-        #functions should follow a nomenclature resembling:
-        #
-        #    :void :macro_name(^:string expansion_name, ...)
-        #
-        #Given that, implement the following:
-        #
-        #* Define a string global ${ZESHY_MACRO_EXPANSION} above.
-        #* Pass the string "ZESHY_MACRO_EXPANSION" as the first unconditional
-        #  argument following the macro name immediately below. (Yay!)
-        #* After calling such macro function, replace such macro in such code
-        #  by expanding ${ZESHY_MACRO_EXPANSION}.
-        #FIXME: Ah! O.K.; for both efficiency and implementation simplicity, we
-        #now require macro functions to *ALWAYS* set string global
-        #${ZESHY_MACRO_EXPANSION}, implying that "ZESHY_MACRO_EXPANSION" should
-        #*NOT* be explicitly passed as the first argument to macro functions.
-        #Such functions simply know by design contract to set such global. Yay!
-
-        # Command setting a passed string variable to such macro's expansion.
-        ZESHY__MACRO_COMMAND=${ZESHY__MACRO_TO_FUNC_NAME[${ZESHY__MACRO_NAME}]}
-
-        # If such name does *NOT* correspond to an existing function, throw an
-        # exception. (Macros are implemented as functions of the same name.)
-        (( ${+functions[${ZESHY__MACRO_COMMAND}]} )) || :die\
-            'Macro '${ZESHY__MACRO_NAME}'() function '${ZESHY__MACRO_COMMAND}'() undefined.'
-
-        # Set the byte index of the last character of the prior block argument
-        # to the byte index of the last character of such macro's name,
-        # ensuring standard arguments following such name and preceding the
-        # first block argument are passed to such call in the customary way.
-        ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST=${ZESHY__MACRO_BYTE_NAME_LAST}
-
-        # For each previously matched block argument passed to such macro,
-        # convert such argument into a standard single-quoted argument.
-        # Since a variadic number of block arguments are supported, the prior
-        # phase terminates the last block argument passed to such macro with a
-        # character constant.
-        while {
-            # While there exists at least one more block argument...
-            ((     ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX <\
-                ${#ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST} )) && {
-                # Byte index of the first character of the next block argument.
-                ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST=${
-                    ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST[
-                  ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX}]}
-
-                # ...and while such index precedes the last byte index of such
-                # macro, such block argument was passed to such macro. In such
-                # case, convert such block argument.
-                (( ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST <\
-                   ZESHY__MACRO_BYTE_LAST ))
-            }
-        } {
-            # Byte index of the last character of such block argument.
-            # Concurrently increment to the next block argument in preparation
-            # for the next iteration.
-            ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX+=1
-            ZESHY__MACRO_BYTE_ARG_BLOCK_LAST=${
-                ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST[
-              ${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX}]}
-            ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX+=1
-
-            # Pass such call all standard arguments (i.e., non-block arguments)
-            # following the prior block argument and preceding the current
-            # block argument if any. (If no such arguments exist, this simply
-            # appends the empty string and hence reduces to a noop.)
-            #
-            # By PCRE design, such arguments are guaranteed to be both preceded
-            # and followed by non-empty whitespace.
-            ZESHY__MACRO_COMMAND+=${ZESHY__PREPROCESS_CODE[
-                $(( ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST + 1 )),
-                $(( ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST - 1 ))]}
-
-            # Preserve the byte index of the last character of such block
-            # argument for subsequent examination *AFTER* expanding the prior
-            # such index above.
-            ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST=${ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST[
-                $(( ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST_INDEX + 1 ))]}
-
-            #FIXME: We need to offset such macro by the number of bytes changed
-            #by such quote operation, implying we need to store the result of
-            #such operation in a string local for testing. Make it so!
-
-            # Pass such call such block argument converted to a standard
-            # argument (i.e., as a single-quoted string, thus implicitly
-            # quote-protecting all shell-reserved characters in such block).
-            ZESHY__MACRO_COMMAND+=${(qq)ZESHY__PREPROCESS_CODE[
-                ${ZESHY__MACRO_BYTE_ARG_BLOCK_FIRST},
-                ${ZESHY__MACRO_BYTE_ARG_BLOCK_PRIOR_LAST}]}
-        }
-
-        #FIXME: Append all remaining standard arguments preceding the optional
-        #suffixing here-document or -string.
-        if [[ ]] {
-            ZESHY__MACRO_COMMAND+=
-        }
-
-        #FIXME: Define ${ZESHY_MACRO_EXPANSION_UNSET} above.
-
-        # Initialize such global to a placeholder, permitting detection of such
-        # command reporting success but failing to set such global to such
-        # macro's expansion. In such case, such global will remain set to such 
-        # uniquely identifiable placeholder.
-        ZESHY_MACRO_EXPANSION=${ZESHY_MACRO_EXPANSION_UNSET}
-
-        #FIXME: Consider wrapping exceptions thrown by and/or failure exit
-        #status reported by such command with human-readable exception messages
-        #listing the macro that failed, the line number on which it failed, and
-        #so on. We'll definitely want some common error handling routines for
-        #similar functionality elsewhere in this parcel.
-
-        # Set such string to such macro's expansion. Specifically:
-        #
-        # * "${(z)...}", splitting such command into shell words as well as
-        #   removing all unquoted line continuations between such words.
-        # * "${(qq@)...}", quote-protecting each such word as a single-quoted
-        #   string. This ensures that executable code embedded in such words
-        #   (e.g., process substitutions) will be preserved as is rather than
-        #   insecurely executed in-place.
-        ${(qq@)${(z)ZESHY__MACRO_COMMAND}}
-
-        # If such command reported success but failed to set such global to
-        # such macro's expansion, throw an exception.
-        [[ ${ZESHY_MACRO_EXPANSION} != ${ZESHY_MACRO_EXPANSION_UNSET} ]] ||
-            :die 'Macro '${ZESHY__MACRO_NAME}'() function '${ZESHY__MACRO_COMMAND}'() undefined.'
-
-        # Replace such macro in such code by such expansion.
-        ZESHY__PREPROCESS_CODE[${ZESHY__MACRO_BYTE_NAME_FIRST},${ZESHY__MACRO_BYTE_LAST}]=${ZESHY_MACRO_EXPANSION}
-    }
-}
-
-# --------------------( WASTELANDS                         )--------------------
         # passed the arguments passed to such macro.
 
         #FUXME: This could use a bit of massaging. We currently map macro to
         #function names in two maps:
-        #${ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME} and
-        #${ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME}. Clearly, this
+        #${ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFUX_TO_FUNC_NAME} and
+        #${ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFUX_TO_FUNC_NAME}. Clearly, this
         #approach is suboptimal here. For all internal uses, we only want a
         #single centralized map ${ZESHY__MACRO_TO_FUNC_NAME}. Since the current
         #distinction between semicolon-prefixed and non-semicolon-prefixed
         #macro names only requires a list, do the following:
         #
-        #* Replace ${ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFIX_TO_FUNC_NAME} and
-        #  ${ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFIX_TO_FUNC_NAME} with a
+        #* Replace ${ZESHY__MACRO_NAME_SANS_SEMICOLON_PREFUX_TO_FUNC_NAME} and
+        #  ${ZESHY__MACRO_NAME_WITH_SEMICOLON_PREFUX_TO_FUNC_NAME} with a
         #  single map ${ZESHY__MACRO_TO_FUNC_NAME}.
         #* Create two new list globals
-        #  ${ZESHY__MACRO_NAMES_SANS_SEMICOLON_PREFIX} and
-        #  ${ZESHY__MACRO_NAMES_WITH_SEMICOLON_PREFIX}, used in lieu of the
+        #  ${ZESHY__MACRO_NAMES_SANS_SEMICOLON_PREFUX} and
+        #  ${ZESHY__MACRO_NAMES_WITH_SEMICOLON_PREFUX}, used in lieu of the
         #  prior two maps. Alternately, such lists are probably constructable
         #  on the fly by dynamically grepping ${ZESHY__MACRO_TO_FUNC_NAME}
         #  (e.g., "${ZESHY__MACRO_TO_FUNC_NAME:#:*}" or some such), which may
@@ -1238,8 +1478,8 @@ function ::code.preprocess() {
         #  (consider stripping the prefixing ":" from all such macro names) as
         #  well as reducing the efficiency thereof. Since the latter is much
         #  more of a concern than the former, adopt the 
-        #  ${ZESHY__MACRO_NAMES_SANS_SEMICOLON_PREFIX} and
-        #  ${ZESHY__MACRO_NAMES_WITH_SEMICOLON_PREFIX} approach.
+        #  ${ZESHY__MACRO_NAMES_SANS_SEMICOLON_PREFUX} and
+        #  ${ZESHY__MACRO_NAMES_WITH_SEMICOLON_PREFUX} approach.
 
     #FUXME: Don't forget to strip suffixing line continuations (i.e.,
     #"\"-prefixed newlines) from macro arguments before calling such macros.
