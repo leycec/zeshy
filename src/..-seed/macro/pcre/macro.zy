@@ -7,6 +7,28 @@
 # --------------------( SYNOPSIS                           )--------------------
 # Define PCREs specific to macro preprocessing.
 
+#FIXME: We need to match macros immediately following each ")"-suffixed glob
+#expression of a case() statement. While this is certainly feasible for the
+#first such expression, it's unclear how (if at all) macros following any
+#subsequent ")"-suffixed glob expressions could be matched. If they can't,
+#then, for orthogonality, the first shouldn't be matched either. Contemplate.
+#
+#After contemplation, macros are technically matchable following ")"-suffixed
+#glob expressions in *NON-NESTED* case statements (i.e., case statements *NOT*
+#nested in other case statements, which require subroutine calls precluding
+#capturing of macro substrings). That said, we're hard-pressed to recall the
+#last time we required nested case statements, implying such matching to be
+#feasible in practice. However, it's a bit non-trivial.
+#
+#No existing PCRE substructure needs to be modified to accomodate such
+#matching. Instead, if the command name is "case", a new parallel top-level
+#PCRE structure matching case statement syntax suffices. Such structure should
+#mirror the current PCRE structure with one simple addition: ")"-suffixed
+#glob expressions in command position should be matched as terminators. That's
+#it. That said, while relatively simple, that could impose quite a bit of PCRE
+#duplication significantly increasing the length and hence debuggability of
+#such PCRE. Hold off on such improvement until stabilizing such PCRE.
+
 #FIXME: For debuggability, we probably want to prepand global PCREs with option
 #"(?x)" enabling "extended PCRE" mode. Following that, append suitable
 #subsections of such PCREs by newlines for improved readability.
@@ -17,13 +39,6 @@ typeset -g ZESHY__MACRO_PCRE_IF_EMPTY
 
 # PCRE to which ${ZESHY__MACRO_PCRE} will be set if at least one macro exists.
 typeset -g ZESHY__MACRO_PCRE_IF_NONEMPTY
-
-# PCRE matching the next block argument in a macro-specific argument list,
-# explicitly designed such that:
-#
-# * ${ZPCRE_OP[(w)1]} expands to the byte index of the block's first character.
-# * ${ZPCRE_OP[(w)2]} expands to the byte index of the block's last character.
-typeset -g ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE
 
 # PCRE matching unsupported here-documents (i.e., here-documents with
 # non-literal and hence non-PCRE-matchable delimiters).
@@ -1414,25 +1429,26 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
     local pcre_commands_backtickable_optional='(?:'${pcre_words_backtickable_optional}${pcre_terminators}')*+'
 
     # ..................{ WORD ~ passable                    }..................
-    # "("- and ")"-delimited glob qualifier in a macro argument.
+    # "("- and ")"-delimited glob qualifier in a scalar macro argument.
     local pcre_qualifier_passable=${pcre_qualifier_head}${pcre_nanoword_passable_rest}${pcre_qualifier_foot}
 
-    # Macro argument. Since macro arguments are *NOT* in command position, list
-    # assignments are irrelevant to such matching and hence omitted. To halt
-    # argument matching at the first "}" block suffix, this PCRE avoids
+    # Scalar macro argument. Since arguments are never in command position,
+    # list assignments are irrelevant to such matching and hence omitted. To
+    # halt argument matching at the first "}" block suffix, this PCRE avoids
     # matching such suffix via negative lookbehind.
-    local pcre_nanoword_passable_start='(?:'${pcre_nanoword_passable_start}'|'${pcre_qualifier_passable}')'
-    local pcre_nanowords_passable_rest_optional='(?:'${pcre_nanoword_passable_rest}'|'${pcre_qualifier_passable}')*+'
-    local pcre_word_passable=${pcre_nanoword_passable_start}${pcre_nanowords_passable_rest_optional}${pcre_word_braceable_lookbehind}
+    local pcre_word_passable='(?:'${pcre_nanoword_passable_start}'|'${pcre_qualifier_passable}')(?:'${pcre_nanoword_passable_rest}'|'${pcre_qualifier_passable}')*+'${pcre_word_braceable_lookbehind}
     local pcre_word_passable_optional='(?:'${pcre_word_passable_rest}')?+'
 
-    # One or more horizontal whitespace characters optionally interspersed by
-    # line continuations followed by zero or more macro arguments, each
-    # suffixed by such whitespace. Since block arguments are necessarily
-    # prefixed by such whitespace, the latter constraint ensures proper
-    # matching of the following such argument if any.
-    local pcre_words_passable_optional_spaced=${pcre_continuable_spaces_horizontal}'(?:'${pcre_word_passable}${pcre_spaces_horizontal_continuable}')*+'
-    local pcre_words_passable_optional_spaced_grouped='('${pcre_words_passable_optional_spaced}')'
+    # Zero or more scalar macro arguments, preceded by one or more horizontal
+    # whitespace characters optionally interspersed by line continuations.
+    # ${pcre_word_passable} matches escaped characters and hence line
+    # continuations, implying the whitespace preceding such PCRE to be more
+    # efficiently matchable with ${pcre_spaces_horizontal_continuable} than
+    # ${pcre_continuable_spaces_horizontal}. However, embedding the former
+    # prevents one or more initial line continuations from matching, requiring
+    # explicit matching of such continuations. (Phew!)
+    local pcre_words_passable_spaced_optional=${pcre_line_continuations_optional}'(?:'${pcre_spaces_horizontal_continuable}${pcre_word_passable}')*+'
+    local pcre_words_passable_spaced_optional_grouped='('${pcre_words_passable_optional_spaced}')'
 
     # ..................{ HERE                               }..................
     # Note that here-document syntactic invalidities (e.g., unmatched suffixing
@@ -1509,22 +1525,29 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
     #embedded in double quotes, that's actually what we do. Specifically:
     #
     #* Create a new PCRE
-    #  ${pcre_quotes_double_sans_process_substitution_prefix_grouped}, retaining
-    #  the existing ${pcre_quotes_double} for use in all other syntactic
-    #  contexts.  *
-    #  ${pcre_quotes_double_sans_process_substitution_prefix_grouped} should be
+    #  ${pcre_quotes_double_sans_process_substitution_prefix_grouped},
+    #  retaining the existing ${pcre_quotes_double} for use in all other
+    #  syntactic contexts.
+    #* ${pcre_quotes_double_sans_process_substitution_prefix_grouped} should be
     #  identical to ${pcre_quotes_double} except that the former should
     #  explicitly avoid matching any syntactic prefix of a process substitution
     #  (e.g., "=(") embedded in such quotes, probably via negative lookahead.
+    #  (Uhm; no. Just avoid matching such prefix with a positive construction
+    #  resembling the PCRE "([^$]++|\$[^(]*+)*+". That will efficiently do it.)
     #  Such prefix will then be subsequently matched as a command terminator by
-    #  ${pcre_macro} as desired.
+    #  ${pcre_macro} as desired. (Hmm; are "=("-prefixed substitutions even
+    #  parsed in double-quoted strings? We strongly doubt it; but test. Right.
+    #  So, no: the only process substitutions parsed in double-quoted strings
+    #  are "$("-prefixed process substitutions, simplifying matters somewhat.)
     #* As the variable name implies,
     #  ${pcre_quotes_double_sans_process_substitution_prefix_grouped} *MUST*
     #  capture a nonempty substring of such double quotes -- say, the prefixing
     #  '"'. Such group permits the preprocessor to reliably detect when a
     #  macro-interrupted double quotes has been matched. Note that, to do so,
     #  ${pcre_quotes_double_sans_process_substitution_prefix_grouped} *CANNOT*
-    #  be matched within a subroutine call.
+    #  by definition be matched within a subroutine call, confining such
+    #  matching to only non-recursive (i.e., top-level) macro usage -- which,
+    #  again, simplifies matters.
     #* Rename the existing PCRE globals ${ZESHY__MACRO_PCRE_PREFIX},
     #  ${ZESHY__MACRO_PCRE_SUFFIX}, and ${ZESHY__MACRO_PCRE} to
     #  ${ZESHY__MACRO_UNQUOTED_PCRE_PREFIX},
@@ -1564,6 +1587,21 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
     #ignoring parens balancing. Which works perfectly serviceably. Given that,
     #we *SHOULD* match macros nested in all single character-prefixed
     #constructs (e.g., double-quoted strings, "`"-delimited substitutions).
+    #FIXME: Actually, we strongly suspect that the above method is technically
+    #infeasible even for matching macros in "$("-prefixed process substitutions
+    #in double-quoted strings at the top-level. Why? Because capturing. The
+    #match group to which the the previous PCRE "iteration" captured the '"'
+    #character will be reset to the empty string on the current PCRE iteration
+    #matching such macro, implying such condition to be undetectable.
+    #
+    #In other words, macros *MUST* be prohibited from all "$("-prefixed process
+    #substitutions in double-quoted strings. This constraint is
+    #incontrovertible and should be documented above along with:
+    #
+    #* The inability to match macros in "`"-delimited process substitutions in
+    #  double-quoted strings.
+    #* The current inability to match macros immediately following the "`"
+    #  prefixing such process substitutions.
 
     # Process substitutions accept arbitrary zsh code and hence *SHOULD*
     # technically also accept arbitrary zeshy code -- including embedded
@@ -1847,11 +1885,18 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
     # characters optionally interspersed by line continuations.
     local pcre_words_macroable_rest_optional='(?>'${pcre_spaces_horizontal_continuable}${pcre_word_macroable_rest_optional}')*+'
 
-    # ..................{ MACRO ~ braceable                  }..................
-    # "{"- and "}"-delimited block. Blocks are recursively nestable and hence
-    # matchable only with subroutine calls.
+    # ..................{ MACRO ~ block                      }..................
+    # "{"- and "}"-delimited block, recursively nestable and hence matchable
+    # only with a subroutine call.
     local pcre_block='(?='${pcre_block_prefix}')(?:.(?&blk)'${pcre_block_suffix}'|'${pcre_reset_remainder_report_success}')'
+    local pcre_block_grouped='('${pcre_block}')'
 
+    # "{"- and "}"-delimited block optionally suffixed by zero or more scalar
+    # macro arguments, each captured to a new group for subsequent PCRE-
+    # based iteration of such arguments.
+    local pcre_block_grouped_and_words_passable_optional_grouped=${pcre_block_grouped}${pcre_words_passable_spaced_optional_grouped}
+
+    # ..................{ MACRO ~ braceable                  }..................
     # Smaller syntactic component at the start of the first shell word of a
     # command in a block.
     local pcre_nanoword_braceable_start_word_first=${pcre_nanoword_macroable_start_word_first}'|'${pcre_block}
@@ -1885,25 +1930,32 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
 
     # ..................{ MACRO ~ arg                        }..................
     # Macro argument optionally suffixed by line continuations, comprising both
-    # standard scalar arguments and zeshy-specific block arguments. While such
+    # zsh-style scalar arguments and zeshy-specific block arguments. While such
     # arguments may be matched in either order, the latter are *ALWAYS*
     # prefixed by the same prefix "{" and hence more efficiently matchable.
     #
-    # Since ${pcre_word_passable} implicitly matches trailing line
-    # continuations, ${pcre_macro_args_optional} matches
-    # ${pcre_spaces_horizontal_continuable} rather than
-    # ${pcre_continuable_spaces_horizontal} for efficiency. Since
-    # ${pcre_block} does *NOT* implicitly match trailing line continuations,
-    # however, such continuations are explicitly matched after such PCRE.
-    local pcre_macro_arg='(?:'${pcre_block}${pcre_line_continuations_optional}'|'${pcre_word_passable}')'
-    local pcre_macro_arg_optional=${pcre_macro_arg}'?+'
+    # For efficiency, block arguments are captured and optionally followed by
+    # zero or more scalar arguments, also captured. Such grouping generalizes
+    # ${ZESHY__MACRO_PCRE} for iterative matching of both macros *AND* macro
+    # block arguments, permitting a single compilation of such PCRE to be
+    # efficiently reused for *ALL* macro preprocessing. While all scalar and
+    # block arguments will be matched, the '*+' quantifier suffixing the
+    # ${pcre_macro_args_grouped} PCRE embedding this PCRE implies that only the
+    # last block argument passed to a macro will be captured. Since such
+    # argument may be optionally followed by zero or more scalar arguments,
+    # determining the first and last byte indices of such last block argument
+    # and following scalar arguments requires capturing both. Such capturing is
+    # requisite for iterative matching of macro block arguments but otherwise
+    # ignorable for iterative matching of macros.
+    local pcre_macro_arg_grouped='(?>'${pcre_block_grouped_and_words_passable_optional_grouped}'|'${pcre_word_passable}')'
+    local pcre_macro_arg_optional_grouped=${pcre_macro_arg_grouped}'?+'
 
     # One or more macro arguments.
-    local pcre_macro_args=${pcre_macro_arg}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_arg_optional}')*+'
+    local pcre_macro_args_grouped=${pcre_macro_arg_grouped}'(?>'${pcre_spaces_horizontal_continuable}${pcre_macro_arg_optional_grouped}')*+'
 
     # One or more horizontal whitespace characters optionally interspersed by
     # line continuations, followed by zero or more macro arguments.
-    local pcre_macro_args_optional_spaced=${pcre_spaces_horizontal_continuable}'(?:'${pcre_macro_args}')?+'
+    local pcre_macro_args_optional_spaced_grouped=${pcre_spaces_horizontal_continuable}'(?:'${pcre_macro_args_grouped}')?+'
 
     # Positive lookahead matching the end of a macro both accepting no
     # arguments *AND* suffixed by no horizontal whitespace characters.
@@ -1916,6 +1968,16 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
     # positive lookahead rather than consumed here.
     local pcre_macro_unspaced_lookahead='(?='${pcre_terminator_unspaced_body}')'
 
+    # ..................{ COMPLEX COMMAND                    }..................
+    # Name of a complex command (e.g., "if", "for", "while") requiring no "{"- 
+    # and "}"-delimited block arguments and hence _not_ conflicting with macro
+    # syntax. As of this writing, there exists only one such command.
+    local pcre_command_complex_blockless_name='time'
+
+    # Blockless complex command suffixed by one or more horizontal whitespace
+    # characters optionally interspersed by line continuations.
+    local pcre_command_complex_blockless_optional='(?>'${pcre_command_complex_blockless_name}${pcre_continuable_spaces_horizontal}')?+'
+
     # ..................{ MACRO                              }..................
     # Macro name, grouped for disambiguating non-erroneous macros from
     # erroneous syntactic invalidities. (See below.)
@@ -1927,7 +1989,7 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
     # To permit macros to be suffixed by whitespace-prefixed zeshy-specific
     # command terminators (e.g., ":and"), optional whitespace suffixing such
     # body is matched by ${pcre_words_macroable_rest_optional} and *NOT* here.
-    local pcre_macro_body=${pcre_line_continuations_optional}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_args_optional_spaced}'|'${pcre_macro_unspaced_lookahead}')'
+    local pcre_macro_body=${pcre_line_continuations_optional}'(?:'${pcre_spaces_horizontal_continuable}${pcre_macro_args_optional_spaced_grouped}'|'${pcre_macro_unspaced_lookahead}')'
 
     # Macro. To notify the preprocessor iterating on such PCRE of such macro's:
     #
@@ -1952,7 +2014,7 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
     local pcre_macro_grouped_or_command_optional='(?:'${pcre_macro_grouped_or_word_macroable_first}${pcre_words_macroable_rest_optional}')?+'
 
     # Zero or more macros or commands permitting matching of macros.
-    local pcre_commands_macroable_optional_grouped='(?:'${pcre_macro_grouped_or_command_optional}${pcre_terminators_macroable}')*+'
+    local pcre_commands_macroable_optional_grouped='(?:'${pcre_command_complex_blockless_optional}${pcre_macro_grouped_or_command_optional}${pcre_terminators_macroable}')*+'
 
     # ..................{ SUBROUTINE                         }..................
     # PCRE subroutines defined above, concatenated in a manner preventing
@@ -1994,18 +2056,6 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
     # PCRE to which ${ZESHY__MACRO_PCRE} will be set if no macros exist.
     ZESHY__MACRO_PCRE_IF_EMPTY=${pcre_report_success}
 
-    # PCRE matching the next block argument in a macro-specific argument list.
-    # To support identification of such block's first byte index, the mandatory
-    # horizontal whitespace and optional scalar arguments preceding such block
-    # are captured to a group. Adding the string length of such group to the
-    # current match position's byte index yields such block's first byte index.
-    #
-    # While embedding ${pcre_reset} before ${pcre_block} would yield the same
-    # result, doing so would complicate edge-case detection of syntactic
-    # invalidities also ebedding ${pcre_reset}. For disambiguity, the current
-    # approach is strongly preferable.
-    ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE=${pcre_options_anchored}${pcre_words_passable_optional_spaced_grouped}${pcre_block}${pcre_subroutines}
-
     # ..................{ INDICES                            }..................
     #FIXME: All such integers should be declared to be constants.
     #Unfortunately, attempting to do so currently fails, as digest compilation
@@ -2025,6 +2075,8 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
 
     for group_name (
         ZESHY__MACRO_GROUP_INDEX_NAME
+        ZESHY__MACRO_GROUP_INDEX_ARG_BLOCK_LAST
+        ZESHY__MACRO_GROUP_INDEX_ARGS_SCALAR_LAST
         ZESHY__MACRO_GROUP_INDEX_WASTELANDS
     ) {
         integer -g ${group_name}=$(( group_index++ ))
@@ -2033,6 +2085,62 @@ typeset -g ZESHY__MACRO_NAME_PLACEHOLDER_PCRE='ZESHY__MACRO_NAME'
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Blockless complex command name (i.e., the 
+#FUXME: There technically exist a few other locations at which macros should be
+#matchable and expandable: namely, as the shell word immediately following a
+#builtin conditional (e.g., "if", "elif") or iterator (e.g., "while", "until")
+#or the "time" builtin. zsh documentation refers to such contexts in its "info"
+#documentation as "Complex Commands." See such documentation.
+#
+#Since zeshy style *ALWAYS* employs "{"- and "}"-delimited conditional style in
+#such contexts, the current PCRE structure already suffices for all official
+#zeshy uses. While matching macros immediately following the command names
+#"if", "time", "until", and "while" is trivial, doing so following "elif"
+#intuitively seems non-trivial. Contemplate.
+
+# PCRE matching the next block argument in a macro-specific argument list,
+# explicitly designed such that:
+#
+# * ${ZPCRE_OP[(w)1]} expands to the byte index of the block's first character.
+# * ${ZPCRE_OP[(w)2]} expands to the byte index of the block's last character.
+# typeset -g ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE
+
+    # PCRE matching the next block argument in a macro-specific argument list.
+    # To support identification of such block's first byte index, the mandatory
+    # horizontal whitespace and optional scalar arguments preceding such block
+    # are captured to a group. Adding the string length of such group to the
+    # current match position's byte index yields such block's first byte index.
+    #
+    # While embedding ${pcre_reset} before ${pcre_block} would yield the same
+    # result, doing so would complicate edge-case detection of syntactic
+    # invalidities also ebedding ${pcre_reset}. For disambiguity, the current
+    # approach is strongly preferable.
+    # ZESHY__MACRO_ARG_BLOCK_NEXT_PCRE=${pcre_options_anchored}${pcre_words_passable_optional_spaced_grouped}${pcre_block}${pcre_subroutines}
+
+    #FUXME: Not quite. We need to match optional line continuations suffixing
+    #blocks, even if such blocks are *NOT* suffixed by scalar arguments. Hence,
+    # permit reuse of a single precompiled ${ZESHY__MACRO_PCRE} for  
+
+    # Block macro argument optionally suffixed by line continuations. Since
+    # ${pcre_word_passable} implicitly matches such continuations,
+    # ${pcre_macro_args_optional} matches ${pcre_spaces_horizontal_continuable}
+    # rather than ${pcre_continuable_spaces_horizontal} for efficiency. Since
+    # ${pcre_block} does *NOT* implicitly match trailing line continuations,
+    # however, such continuations are explicitly matched here.
+    # local pcre_word_blockable_grouped='('${pcre_block}${pcre_line_continuations_optional}')'
+
+    # Zero or more syntactic components *AFTER* the start of a scalar macro
+    # argument.
+    # local pcre_nanowords_passable_rest_optional='(?:'${pcre_nanoword_passable_rest}'|'${pcre_qualifier_passable}')*+'
+
+    # One or more horizontal whitespace characters optionally interspersed by
+    # line continuations followed by zero or more macro arguments, each
+    # suffixed by such whitespace. Since block arguments are necessarily
+    # prefixed by such whitespace, the latter constraint ensures proper
+    # matching of the following such argument if any.
+    # local pcre_words_passable_optional_spaced=${pcre_continuable_spaces_horizontal}'(?:'${pcre_word_passable}${pcre_spaces_horizontal_continuable}')*+'
+    # local pcre_words_passable_optional_spaced_grouped='('${pcre_words_passable_optional_spaced}')'
+
 #FUXME: Ugh; we just uncovered a minor flaw: "{"- and "}"-delimited brace
 #expansion requires we explicitly parse such expansions to avoid matching
 #either such delimiter as a block delimiter. Grep "brace_ccl" in +{src/.main}
