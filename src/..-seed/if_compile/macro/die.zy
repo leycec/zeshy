@@ -1,0 +1,340 @@
+#!/usr/bin/env zeshy
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "LICENSE" for additional details.
+
+#FIXME: Uncomment after shifting +{parcel} here.
+
+# :parcel <<'/---'
+# Handle *macro preprocessor exception handlers* (i.e., functions throwing
+# exceptions resulting from macro preprocessing).
+# /---
+
+# ....................{ EXCEPTIONS                         }....................
+# :void ::code.preprocess.die_at_byte(
+#     :string exception_message,
+#     :int error_byte_first)
+#
+# Throw an exception with the passed message detailing a fatal error beginning
+# at the passed byte index of the code to be preprocessed by the most recent
+# call to ::code.preprocess(). This private exception handler is intended to be
+# called _only_ by such function.
+#
+# == Message Format ==
+#
+# The passed message should be formatted as a lowercase sentence fragment (e.g.,
+# `prototype invalid`), which this function then:
+#
+# * Prefixes by `Parcel +{${parcel_name}} line ${line_number} `, where:
+# ** `${parcel_name}` is the name of the preprocessed parcel.
+# ** `${line_number}` is the line number in such parcel at which such error
+#    began or was otherwise first identified.
+# * Suffixes by such line.
+function ::code.preprocess.die_at_byte() {
+    # Validate sanity.
+    (( # == 2 )) || :die 'Expected one exception message and one byte index.'
+    local\
+        exception_message=${1}\
+        error_byte_first=${2}\
+        error_arrow\
+        error_line\
+        error_line_error_prefix\
+        exception_prefix\
+        exception_suffix
+    integer\
+        error_line_number\
+        error_line_byte_first\
+        error_line_error_byte_first\
+        error_line_error_char_first
+
+    # List of all lines in the substring of such code up to and including the
+    # first byte of such error.
+    local -a code_lines
+
+    # If such index is *NOT* a valid integer, throw an exception.
+    [[ ${error_byte_first} == <0-9>## ]] || :die\
+        'Byte index '${error_byte_first}' not a non-negative integer.'
+
+    # If such index is *NOT* a valid index into such code, throw an exception.
+    ((
+        error_byte_first > 0 &&
+        error_byte_first <= ${#ZESHY__PREPROCESS_CODE}
+    )) || :die 'Byte index '${error_byte_first}' not in [1,'${#ZESHY__PREPROCESS_CODE}'].'
+
+    # Index of the first byte of the line containing such error. Dismantled,
+    # this is:
+    #
+    # * "%", removing the smallest matching string and hence the last line of
+    #   the substring of such code preceding such error including prefixing
+    #   newline. If such line is the first line and hence *NOT* prefixed by
+    #   newline, no string will be matched or removed, implying such index will
+    #   erroneously be reported as ${error_byte_first}. This is corrected below.
+    error_line_byte_first=${#ZESHY__PREPROCESS_CODE[1,${error_byte_first}]%$'\n'*}
+
+    # If such line is the first line, such index will erroneously be reported as
+    # ${error_byte_first}. Correct this by coercing such index to 1.
+    (( error_line_byte_first != error_byte_first )) ||
+       error_line_byte_first=1
+
+    # Line containing the first byte of such error. Dismantled, this is:
+    #
+    # * "%%", removing the longest matching string and hence all lines of the
+    #   substring of such code following such line including prefixing newlines.
+    error_line=${ZESHY__PREPROCESS_CODE[${error_line_byte_first},-1]%%$'\n'*}
+
+    # List of all lines in the substring of such code up to and including the
+    # first byte of such error. The prior approach provides the index of the
+    # first byte of the line containing such error but *NOT* such line number,
+    # requiring the current approach. See set_list_to_string_lines().
+    code_lines=( "${(@f)ZESHY__PREPROCESS_CODE[1,${error_byte_first}]}" )
+
+    # Line number of the line containing such error.
+    error_line_number=${#code_lines}
+
+    # Index of the first byte of such error relative to the first byte of such
+    # line.
+    error_line_error_byte_first=$((
+        error_byte_first - error_line_byte_first + 1 ))
+
+    # Substring up to and including the first byte of such error on such line.
+    error_line_error_prefix=${error_line[1,${error_line_error_byte_first}}
+
+    # Human-readable multibyte length of such substring. Since prior code
+    # operates under shell option "no_multiybyte" due to ${+backend}
+    # requirements and hence in a unibyte manner, locally disable such option.
+    setopt local_options multibyte
+    error_line_error_char_first=${#error_line_error_prefix}
+
+    # Number of ASCII characters preceding the multiline ASCII arrowhead below.
+    error_arrow_padding_length=$(( error_line_error_char_first - 1 ))
+
+    #FIXME: Colorize such output at some future point.
+
+    # Multiline ASCII arrow indicating the first character of such error in such
+    # line. See :set_string_to_string_ansiless_repeated_to_length().
+    error_arrow=${(r:${error_arrow_padding_length}::-:):-}','$'\n'${(r:${error_arrow_padding_length}:: :):-}'v'
+
+    # String prefixing such exception message.
+    exception_prefix=$(::parcel.get)'line '${error_line_number}' character '${error_line_error_char_first}' '
+
+    # String suffixing such exception message.
+    exception_suffix=':'$'\n\n'${error_arrow}${error_line}
+
+    # Throw such exception.
+    :die ${exception_prefix}${exception_message}${exception_suffix}
+}
+
+# ....................{ EXCEPTIONS ~ invalidity            }....................
+# :void ::code.preprocess.die_of_invalidity()
+#
+# Throw an exception detailing an *invalidity* at the current match position
+# (i.e., a syntax error in the most recently matched syntactic construct). This
+# function implicitly detects such invalidity's type and hence requires no
+# explicit message to be passed. This private exception handler is intended to
+# be called _only_ by ::code.preprocess().
+function ::code.preprocess.die_of_invalidity() {
+    # Validate sanity.
+    (( ! # )) || :die 'Expected no arguments.'
+
+    # Human-readable name of the type of such construct.
+    local construct_type
+
+    # Byte length of the prefix prefixing such construct (e.g., 2 for
+    # "<<"-prefixed here-documents).
+    integer construct_prefix_byte_length
+
+    # Index of the byte at which to begin iterative globbing of such prefix.
+    # Since syntactic prefixes are guaranteed to be between one to three
+    # characters, compare only the three characters preceding the first byte of
+    # the matched substring against an iterative series of simple globs. For
+    # safety, clamp such index to 1.
+    integer code_test_byte_first=$((
+        ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST - 3 ))
+
+    # Index of the byte at which to end iterative globbing of such prefix.
+    integer code_test_byte_last=$((
+        ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST - 1 ))
+
+    # Clamp such 1-based indices to 1.
+    (( code_test_byte_first > 0 )) || code_test_byte_first=1
+    (( code_test_byte_last  > 0 )) || code_test_byte_last=1
+
+    # Identify such construct.
+    case ${ZESHY__PREPROCESS_CODE[${code_test_byte_first},${code_test_byte_last}]} {
+    # The "=(" prefixing list assignments overlaps the "=(" prefixing such
+    # process substitutions and hence is matched first.
+    (${~ZESHY__VAR_NAME_CLASS_REST}'=(')
+        construct_type='list assignment'
+        construct_prefix_byte_length=2;;
+    (*"'")
+        construct_type='single-quoted string'
+        construct_prefix_byte_length=1;;
+    (*'"')
+        construct_type='double-quoted string'
+        construct_prefix_byte_length=1;;
+    (*'\')
+        construct_type='escaped character'
+        construct_prefix_byte_length=1;;
+    (*'(')
+        construct_type='process fork'
+        construct_prefix_byte_length=1;;
+    (*'`')
+        construct_type='"`"-delimited process substitution'
+        construct_prefix_byte_length=1;;
+    # The "${" prefixing variable expansions overlaps the "{" prefixing blocks
+    # and hence is matched first.
+    (*'${')
+        construct_type='variable expansion'
+        construct_prefix_byte_length=2;;
+    (*'{')
+        construct_type='block'
+        construct_prefix_byte_length=1;;
+    (*(#b)(['$=<>'])'(')
+        construct_type='"'${match[1]}'"-prefixed process substitution'
+        construct_prefix_byte_length=2;;
+    # The "$((" prefixing arithmetic substitutions overlaps the "((" prefixing
+    # arithmetic tests and hence is matched first.
+    (*'$((')
+        construct_type='"$(("-prefixed arithmetic substitution'
+        construct_prefix_byte_length=3;;
+    (*'((')
+        construct_type='arithmetic test'
+        construct_prefix_byte_length=2;;
+    (*'$[')
+        construct_type='"$["-prefixed arithmetic substitution'
+        construct_prefix_byte_length=2;;
+
+    #FIXME: For disambiguity in exception messages, unsupported here-documents
+    #(i.e., here-documents with non-literal delimiters) should be differentiated
+    #from syntactically invalid here-documents: the former are *NOT* invalid in
+    #general-purpose zsh code, merely unsupported in zeshy code.  Happily, doing
+    #so should be more or less trivial. In fact, we've already done so; see
+    #${ZESHY__MACRO_HERE_DOC_UNSUPPORTED_PCRE}. Yay!
+    (*'<<')
+        construct_type='here-document'
+        construct_prefix_byte_length=2;;
+
+    # Else, such construct was *NOT* identifiable. Throw a generic exception at
+    # the index of the first byte of the current match in such code.
+    (*)
+        ::code.preprocess.die_at_byte\
+            'syntax (of unknown type) invalid'\
+            ${ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST}
+    }
+
+    # Suffix such type by an adjective describing such failure (albeit weakly).
+    construct_type+=' invalid'
+
+    # If such construct's prefix is non-positive, throw an exception.
+    (( construct_prefix_byte_length > 0 )) ||
+        ::code.preprocess.die_at_byte\
+            ${construct_type}' with '\
+            ${ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST}
+
+    # Throw such exception detailing a fatal error beginning at the byte index
+    # of the current match offset negatively offset by the byte length of the
+    # prefix prefixing the erroneous syntactic construct.
+    ::code.preprocess.die_at_byte ${construct_type} $((
+        ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST -
+        construct_prefix_byte_length
+    ))
+}
+
+# --------------------( WASTELANDS                         )--------------------
+    # case ${ZESHY__PREPROCESS_CODE[$((
+    #     ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST - 3 )),$((
+    #     ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST - 1 ))]} {
+    #FUXME: Detect all remaining syntactic construct types.
+    #FUXME: For legibility, we should actually grep backward for the first non-
+    #variable character preceding "=(". Not terribly difficult.
+
+    #FUXME: Suffix ${exception_prefix} by such line number programmatically
+    #derived by grepping the substring of
+    #${ZESHY__PREPROCESS_CODE[1,${error_byte_first}]} for the number of newlines
+    #in such code. Since we implement such functionality elsewhere
+    #(+{func/die}, possibly?), deposit such logic here.
+    #FUXME: Once such line number is determined, subtract ${error_byte_first}
+    #from the byte index of such line to determine the relative byte index of
+    #the character within such line responsible for such error. (Trivial.)
+    #Having calculated that, we should print a higher-level language-style arrow
+    #above the printed line containing such error visually showing the erroneous
+    #character: e.g.,
+    #
+    #    ---------------,
+    #                   v
+    #    :string.output "undelimited string: uh oh!
+    #
+    #...or its alternate:
+    #
+    #    :string.output "undelimited string: uh oh!
+    #                   ^
+    #    ---------------|
+    #FUXME: Initialize ${exception_suffix} to the contents of such line. (While
+    #preceding and subsequent context should at some point also be printed, that
+    #exceeds our mandate at the moment.)
+
+#6-1=5+1=6
+#
+#123456
+#<-a->z
+
+#byte '${error_byte_first}',
+    # Index of the first byte of such construct relative to the first byte of
+    # such line.
+    # error_line_error_byte_first=
+
+    # Technically, such line is more efficiently and conveniently obtained via
+    # the following approach:
+    #
+    #     local -a code_lines
+    #     code_lines=( "${(@f)ZESHY__PREPROCESS_CODE[1,${error_byte_first}]}" )
+    #     error_line=${code_lines[-1]}
+    #
+    # Unfortunately, such approach provides no means of obtaining the index of
+    # the first byte of such line in such code. In such case, the passed index
+    # of the first byte of such error would *NOT* be correlatable to such line,
+    # rendering such passed index functionally useless. While considerably more
+    # verbose, the current approach has the benefit of obtaining both such line
+    # *AND* the index of its first byte.
+
+    # Line containing such error. Dismantled, this is:
+    #
+    # * "%%", removing the longest matching string and hence all lines of the
+    #   substring of such code following such line including prefixing newlines.
+    # error_line=${ZESHY__PREPROCESS_CODE[${error_line_byte_first},-1]%%$'\n'*}
+
+    # Line containing the first byte of such construct. See
+    # set_list_to_string_lines().
+    # code_lines=( "${(@f)ZESHY__PREPROCESS_CODE[1,${error_byte_first}]}" )
+    # error_line=${code_lines[-1]}
+
+        # error_line_byte_last\
+    # Index of the last byte of the line containing such error. Dismantled, this
+    # is:
+    #
+    # * "%%", removing the longest matching string and hence all lines of the
+    #   substring of such code following the line containing such error
+    #   including prefixing newlines. Since the 
+    # error_line_byte_last=$((
+    #     error_line_byte_first +
+    #     ${#ZESHY__PREPROCESS_CODE[${error_line_byte_first},-1]%%$'\n'*}
+    # ))
+
+    # error_line_byte_first=${ZESHY__PREPROCESS_CODE[1,${error_byte_first}]##*($'\n'|)}
+    # Human-readable name of the type of such construct, defaulting
+    # to a non-fatal warning message in the event that we
+    # (erroneously) fail to detect such type below.
+    # local construct_type='syntax of unknown type'
+
+# byte index
+    # of the current match offset negatively offset by the byte length of the
+    # prefix prefixing the erroneous syntactic construct.
+
+    # Number of bytes the first byte of such construct is offset
+    # from the first byte matched by such match attempt, defaulting
+    # to 0 but typically redefined to either -1 or -2 below.
+
+                #FUXME: For readibility, externalize such logic to a separate
+                #exception handler.
+#first first responsible for
+#    such error (i.e., the line number at which such error ).

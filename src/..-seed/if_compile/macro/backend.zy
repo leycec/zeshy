@@ -58,8 +58,20 @@ typeset -gi ZESHY__PREPROCESS_CODE_BYTE_FIRST ZESHY__PREPROCESS_CODE_BYTE_LAST
 # Currently iterated index of ${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX}.
 typeset -gi ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX
 
-# Index of the last byte matched in the code to be preprocessed.
-typeset -gi ZESHY__PREPROCESS_MATCH_BYTE_LAST
+# Indices of the first and last bytes of the current match in the current code.
+typeset -gi\
+    ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST\
+    ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_LAST
+
+# Indices of the first and last bytes of the current match in the current
+# subcode (i.e., current substring to be preprocessed in the current code) and
+# hence relative to such substring rather than such code.
+typeset -gi\
+    ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST\
+    ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_LAST
+
+# Index of the last byte of the previous match in the current subcode.
+typeset -gi ZESHY__PREPROCESS_SUBCODE_MATCH_PRIOR_BYTE_LAST
 
 # Indices of the first and last non-whitespace bytes of the name of the current
 # macro.
@@ -372,15 +384,43 @@ function ::code.preprocess() {
         # internal PCRE cache by a more recently compiled PCRE.
         :pcre.compile "${ZESHY__MACRO_PCRE}"
 
+        #FIXME: Pretty much everywhere that we reference
+        #${ZESHY__MACRO_BYTE_FIRST} and ${ZESHY__MACRO_BYTE_LAST} in relation
+        #to ${ZESHY__PREPROCESS_CODE} is *WRONG*; the former bytes are relative
+        #to the first byte of the current substring of
+        #${ZESHY__PREPROCESS_CODE} being preprocessed, implying that 
+        #${ZESHY__MACRO_BYTE_FIRST} and ${ZESHY__MACRO_BYTE_LAST} are relative
+        #rather than absolute byte indices. To convert such indices to absolute
+        #byte indices (e.g., for appending onto
+        #${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST}), simply add
+        #${ZESHY__PREPROCESS_CODE_BYTE_FIRST} to both.
+
         # For each macro matched in such code, record matched byte indices
         # for the next preprocessor phase.
         ZPCRE_OP='0 0'
         while {
+            #FIXME: Incorrect. We only iterate until the end of the string,
+            #which reports *SUCCESS* and not *FAILURE*. If such match fails
+            #with failure, we need to explicitly detect that and throw an
+            #exception, as that indicates a PCRE design failure.
+            #FIXME: Inefficient. Avoid reslicing such string each iteration by
+            #defining a new string global ${ZESHY__PREPROCESS_SUBCODE} above
+            #initialized just above as follows:
+            #
+            #ZESHY__PREPROCESS_SUBCODE=${ZESHY__PREPROCESS_CODE[${ZESHY__PREPROCESS_CODE_BYTE_FIRST},${ZESHY__PREPROCESS_CODE_BYTE_LAST}]}
+
             pcre_match -b -n ${ZPCRE_OP[(w)2]} --\
                 "${ZESHY__PREPROCESS_CODE[${ZESHY__PREPROCESS_CODE_BYTE_FIRST},${ZESHY__PREPROCESS_CODE_BYTE_LAST}]}"
         } {
-            # Index of the last byte matched in such code.
-            ZESHY__PREPROCESS_MATCH_BYTE_LAST=${ZPCRE_OP[(w)2]}
+            # Indices of the first and last bytes of the current match relative
+            # to the current subcode being preprocessed.
+            ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST=$((
+                ${ZPCRE_OP[(w)1]} + 1 ))
+            ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_LAST=${ZPCRE_OP[(w)2]}
+
+            #FIXME: Define.
+            ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST
+            ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_LAST
 
             # If the first byte matched by such match attempt does *NOT*
             # immediately follow the last byte matched by the prior attempt, an
@@ -426,75 +466,13 @@ function ::code.preprocess() {
             # For example, a simplified PCRE matching single-quoted strings:
             #
             #     local pcre_quotes_single="'(?:(?>[^']++|'')*+'"'|\K.*+)'
-            if ((
-                ZESHY__PREPROCESS_MATCH_BYTE_LAST <
-                ZESHY__PREPROCESS_CODE_BYTE_LAST
-            )) {
-                #FIXME: For readibility, externalize such logic to a separate
-                #exception handler.
 
-                # Number of bytes the first byte of such construct is offset
-                # from the first byte matched by such match attempt, defaulting
-                # to 0 but typically redefined to either -1 or -2 below.
-                integer construct_byte_first_offset=0
-
-                # Human-readable name of the type of such construct, defaulting
-                # to a non-fatal warning message in the event that we
-                # (erroneously) fail to detect such type below.
-                local construct_type='syntax of unknown type'
-
-                #FIXME: Detect all remaining syntactic construct types.
-                #FIXME: For disambiguity in exception messages, unsupported
-                #here-documents (i.e., here-documents with non-literal
-                #delimiters) should be differentiated from syntactically
-                #invalid here-documents: the former are *NOT* invalid in
-                #general-purpose zsh code, merely unsupported in zeshy code.
-                #Happily, doing so should be more or less trivial. In fact,
-                #we've already done so; see
-                #${ZESHY__MACRO_HERE_DOC_UNSUPPORTED_PCRE}. Yay!
-
-                # Identify such name. Since syntactic prefixes are guaranteed
-                # to be between one to three characters, compare only the three
-                # characters preceding the first byte of the matched substring
-                # against an iterative series of simple globs.
-                case ${ZESHY__PREPROCESS_CODE[$((
-                    ZESHY__MATCH_BYTE_FIRST_INDEX - 3 )),$((
-                    ZESHY__MATCH_BYTE_FIRST_INDEX - 1 ))]} {
-                #FIXME: We should actually grep backward for the first non-
-                #variable character preceding "=(". Not terribly difficult.
-
-                # The "=(" prefixing list assignments overlaps the "=("
-                # prefixing such process substitutions and hence *MUST* be
-                # preferentially matched first.
-                (${~ZESHY__VAR_NAME_CLASS_REST}'=(')
-                    construct_type='list assignment'
-                    construct_byte_first_offset=-2;;
-                (*"'")
-                    construct_type='single-quoted string'
-                    construct_byte_first_offset=-1;;
-                (*'"')
-                    construct_type='double-quoted string'
-                    construct_byte_first_offset=-1;;
-                (*'\')
-                    construct_type='escaped character'
-                    construct_byte_first_offset=-1;;
-                (*'(')
-                    construct_type='process fork'
-                    construct_byte_first_offset=-1;;
-                (*'`')
-                    construct_type='"`"-delimited process substitution'
-                    construct_byte_first_offset=-1;;
-                (*(#b)(['$=<>'])'(')
-                    construct_type='"'${match[1]}'"-prefixed process substitution'
-                    construct_byte_first_offset=-2;;
-                (*'${')
-                    construct_type='variable expansion'
-                    construct_byte_first_offset=-2;;
-                (*'<<')
-                    construct_type='here-document'
-                    construct_byte_first_offset=-2;;
-                }
-            }
+            #FIXME: Set ${ZESHY__PREPROCESS_SUBCODE_MATCH_PRIOR_BYTE_LAST}
+            #below (and presumably initiazie above to something sane like 0).
+            ((
+                ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST ==
+                ZESHY__PREPROCESS_SUBCODE_MATCH_PRIOR_BYTE_LAST + 1
+            )) || ::code.preprocess.die_of_invalidity
 
             # If a zeshy-specific "WASTELANDS" comment matched, avoid
             # preprocessing and/or interpreting the remainder of such code.
@@ -581,7 +559,7 @@ function ::code.preprocess() {
                         1,${ZESHY__MACRO_BYTE_FIRST}]//[^$'\n']}"
 
                     # Throw such exception.
-                    :die $(::parcel.get_current)'macro '${ZESHY__MACRO_NAME}'() on line '${line_number}' passed syntactically invalid arguments (e.g., due to unmatched braces or quotes).'
+                    :die $(::parcel.get)'macro '${ZESHY__MACRO_NAME}'() on line '${line_number}' passed syntactically invalid arguments (e.g., due to unmatched braces or quotes).'
                 }
 
                 # Record matched byte indices for the next preprocessor phase.
@@ -1059,6 +1037,13 @@ function ::code.preprocess() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+            # ((
+            #     ZESHY__PREPROCESS_SUBCODE_MATCH_BYTE_LAST <
+            #     ZESHY__PREPROCESS_CODE_BYTE_LAST
+            # )) 
+            # ZESHY__PREPROCESS_SUBCODE_MATCH_BYTE_FIRST=$((
+            #     ${ZPCRE_OP[(w)1]} + 1 ))
+
             #FUXME: Despite zsh and libpcre constraints, we believe we've
             #uncovered a means of reliability discerning the starting and
             #ending byte indices of arbitrarily nested syntactically invalid
@@ -1205,7 +1190,7 @@ function ::code.preprocess() {
             # If the last byte matched by such match attempt precedes the last
             # byte of the code matched against, such   
             # if ((
-            #     ZESHY__PREPROCESS_MATCH_BYTE_LAST <
+            #     ZESHY__PREPROCESS_SUBCODE_MATCH_BYTE_LAST <
             #     ZESHY__PREPROCESS_CODE_BYTE_LAST
                 # ${#ZESHY__PREPROCESS_CODE}
         #FUXME: It's quite likely that ${ZESHY__PREPROCESS_CODE_BYTE_FIRST}
