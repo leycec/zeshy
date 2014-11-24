@@ -39,6 +39,9 @@
 typeset -g ZESHY_MACRO_EXPANSION
 
 # ....................{ GLOBALS ~ private : string         }....................
+# Current substring of the current code to be preprocessed.
+typeset -g ZESHY__PREPROCESS_SUBCODE
+
 # Current macro's name.
 typeset -g ZESHY__MACRO_NAME
 
@@ -51,8 +54,11 @@ typeset -g ZESHY__MACRO_NAME
 typeset -g ZESHY__MACRO_COMMAND
 
 # ....................{ GLOBALS ~ private : int            }....................
-# Indices of the first and last bytes of the code to be preprocessed by the
-# current preprocessor iteration.
+# Byte length of the current code to be preprocessed.
+typeset -gi ZESHY__PREPROCESS_CODE_BYTE_LENGTH
+
+# Indices of the first and last bytes of the current substring of the current
+# code to be preprocessed.
 typeset -gi ZESHY__PREPROCESS_CODE_BYTE_FIRST ZESHY__PREPROCESS_CODE_BYTE_LAST
 
 # Currently iterated index of ${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX}.
@@ -63,15 +69,21 @@ typeset -gi\
     ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST\
     ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_LAST
 
-# Indices of the first and last bytes of the current match in the current
-# subcode (i.e., current substring to be preprocessed in the current code) and
-# hence relative to such substring rather than such code.
+# Index of the last byte of the current substring of such code to be
+# preprocessed relative to such substring (and *NOT* such code). Since the
+# index of the first such byte is always 1, there exists no corresponding
+# integer global ${ZESHY__PREPROCESS_SUBCODE_BYTE_FIRST}.
+typeset -gi ZESHY__PREPROCESS_SUBCODE_BYTE_LAST
+
+# Indices of the first and last bytes of the current match relative to the
+# current substring of the current code to be preprocessed.
 typeset -gi\
     ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST\
     ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_LAST
 
-# Index of the last byte of the previous match in the current subcode.
-typeset -gi ZESHY__PREPROCESS_SUBCODE_MATCH_PRIOR_BYTE_LAST
+# Expected index of the first byte of the next match relative to the current
+# substring of the current code to be preprocessed.
+typeset -gi ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST_EXPECTED
 
 # Indices of the first and last non-whitespace bytes of the name of the current
 # macro.
@@ -159,7 +171,6 @@ typeset -ga ZESHY__MACRO_BYTES_NAME_FIRST_LAST
 # typeset -ga ZESHY__MACRO_BYTES_ARG_BLOCK_FIRST_LAST
 
 # ....................{ PREPROCESSORS                      }....................
-#FIXME: Optimize by globalizing locals. (You know the code-cadenced drill.)
 #FIXME: Document me. In particular, note that the caller must define
 #${ZESHY__PREPROCESS_CODE} prior to calling such function.
 
@@ -179,9 +190,6 @@ function ::code.preprocess() {
     # :var.die_unless_type_string().
     [[ ${(t)ZESHY__PREPROCESS_CODE-} == 'scalar'('-'*|) ]] || :die\
         'String ${ZESHY__PREPROCESS_CODE} undefined or not a string.'
-
-    # If such code is empty, report success immediately. (That was easy.)
-    [[ -n ${ZESHY__PREPROCESS_CODE} ]] || return 0
 
     # ..................{ DEPENDENCIES                       }..................
     # If preprocessor PCREs have yet to be generated or require regeneration
@@ -208,9 +216,16 @@ function ::code.preprocess() {
     # either global or caller-specific versions of such variable.
     local ZPCRE_OP
 
+    # Byte length of the code to be preprocessed.
+    ZESHY__PREPROCESS_CODE_BYTE_LENGTH=${#ZESHY__PREPROCESS_CODE}
+
+    # If such code is empty, report success. (That was easy.)
+    (( ZESHY__PREPROCESS_CODE_BYTE_LENGTH )) || return 0
+
     # Initialize the first preprocessor iteration such that all top-level
     # (i.e., non-nested) macros in such code will be unconditionally expanded.
-    ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST=( 1 ${#ZESHY__PREPROCESS_CODE} )
+    ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST=(
+        1 ${ZESHY__PREPROCESS_CODE_BYTE_LENGTH} )
 
     #FIXME: Document us.
     #FIXME: Do we still require this?
@@ -236,6 +251,15 @@ function ::code.preprocess() {
         ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX+=1
          ZESHY__PREPROCESS_CODE_BYTE_LAST=${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST[${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX}]}
         ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX+=1
+
+        #FIXME: Isolate such sanity test to debug builds.
+        # Validate such indices.
+        ((
+            ZESHY__PREPROCESS_CODE_BYTE_FIRST > 0 &&
+            ZESHY__PREPROCESS_CODE_BYTE_LAST <=
+            ZESHY__PREPROCESS_CODE_BYTE_LENGTH
+        )) || ::code.preprocess.die\
+            'with invalid substring byte range ['${ZESHY__PREPROCESS_CODE_BYTE_FIRST}','${ZESHY__PREPROCESS_CODE_BYTE_LAST}'] not in code byte range [1,'${ZESHY__PREPROCESS_CODE_BYTE_LENGTH}']'
 
         # ................{ PHASE ~ macro                      }................
         # Due to zsh inadequacies, preprocessing is partitioned into multiple
@@ -271,7 +295,7 @@ function ::code.preprocess() {
         #  * Else, perform the current PCRE-based search to get such indices.
         #FIXME: The above is great. But we can do significantly better. The
         #perscipacious reader may not necessarily believe this, but we can
-        #engineer the codebase such that "${ZESHY__MACRO_PCRE}" need only be
+        #engineer the codebase such that "${ZESHY__PREPROCESS_PCRE}" need only be
         #compiled *ONCE* for the entire codebase. How? Read on, for zeshy
         #Shangri-la beckons:
         #
@@ -280,12 +304,12 @@ function ::code.preprocess() {
         #    # If such PCRE has yet to be compiled *OR* was compiled but has
         #    # since been replaced in the zsh cache by a more recently compiled
         #    # PCRE, compile and optimize such PCRE.
-        #    if [[ ${ZESHY__PCRE_COMPILED_LAST} == ${ZESHY__MACRO_PCRE} ]] {
-        #        pcre_compile -- "${ZESHY__MACRO_PCRE}"
+        #    if [[ ${ZESHY__PCRE_COMPILED_LAST} == ${ZESHY__PREPROCESS_PCRE} ]] {
+        #        pcre_compile -- "${ZESHY__PREPROCESS_PCRE}"
         #        pcre_study
         #
         #        # Avoid unnecessary recompilation on subsequent iterations.
-        #        ZESHY__PCRE_COMPILED_LAST=${ZESHY__MACRO_PCRE}
+        #        ZESHY__PCRE_COMPILED_LAST=${ZESHY__PREPROCESS_PCRE}
         #    }
         #* We currently employ PCRE-based iteration in two other prominent
         #  locations at this time: (a) parsing apart prototype lists (e.g.,
@@ -296,7 +320,7 @@ function ::code.preprocess() {
         #  of *NOT* overwriting the internally cached PCRE resulting from calls
         #  to pcre_compile(). (Yes, we have manually verified this at the CLI.)
         #  That means we may iteratively call "=~" as much as we like while
-        #  preserving the compilation of "${ZESHY__MACRO_PCRE}".
+        #  preserving the compilation of "${ZESHY__PREPROCESS_PCRE}".
         #
         #  The question remains, however: is iterating with "=~" feasible? Yes,
         #  if somewhat cumbersomely. Consider:
@@ -323,14 +347,14 @@ function ::code.preprocess() {
         #  string with "^" or prior match start with "\G".
         #
         #Awesome, eh?
-        #FIXME: It may be possible to reuse the compiled "${ZESHY__MACRO_PCRE}"
+        #FIXME: It may be possible to reuse the compiled "${ZESHY__PREPROCESS_PCRE}"
         #PCRE to also parse and capture block arguments. This is absurdly
         #clever, and more than a little crazy -- but we believe it *COULD*
         #work. *COULD*. We should note that we're getting into wacky-hacky
         #territory with this one, but... Heck, it's worth a short shot in the
         #darkling dark. Consider; what if we:
         #
-        #* Refactor ${ZESHY__MACRO_PCRE} to also capture block arguments.
+        #* Refactor ${ZESHY__PREPROCESS_PCRE} to also capture block arguments.
         #* Iterate block arguments by calling pcre_match() initially with the
         #  exact byte indices of such macro in ${ZESHY__PREPROCESS_CODE}. Since
         #  such substring *WILL* begin with a macro name, such substring will
@@ -366,11 +390,11 @@ function ::code.preprocess() {
         #tunneled into. Man; I love it. It's so fundamentally insane, it simply
         #*HAS* to work.
         #FIXME: Indeed, such approach yields several other unexpected
-        #efficiency gains. Since ${ZESHY__MACRO_PCRE} will be refactored to
+        #efficiency gains. Since ${ZESHY__PREPROCESS_PCRE} will be refactored to
         #also capture block arguments:
         #
         #* We need *NOT* explicitly match :func() and :alias_*() block
-        #  arguments in ${ZESHY__MACRO_PCRE} -- which is great, as that sounded
+        #  arguments in ${ZESHY__PREPROCESS_PCRE} -- which is great, as that sounded
         #  fairly terrible. (Dodged another code bullet on that one.)
         #* Instead, in a general-purpose manner applicable to *ALL* macros,
         #  perform phase 2 logic on the last block argument passed to the
@@ -382,7 +406,7 @@ function ::code.preprocess() {
         # (Re)compile such PCRE in an optimized manner if such PCRE has yet to 
         # be compiled *OR* was compiled but has since been replaced in zsh's
         # internal PCRE cache by a more recently compiled PCRE.
-        :pcre.compile "${ZESHY__MACRO_PCRE}"
+        :pcre.compile "${ZESHY__PREPROCESS_PCRE}"
 
         #FIXME: Pretty much everywhere that we reference
         #${ZESHY__MACRO_BYTE_FIRST} and ${ZESHY__MACRO_BYTE_LAST} in relation
@@ -395,32 +419,63 @@ function ::code.preprocess() {
         #${ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST}), simply add
         #${ZESHY__PREPROCESS_CODE_BYTE_FIRST} to both.
 
+        # Current substring of the current code to be preprocessed.
+        ZESHY__PREPROCESS_SUBCODE=${ZESHY__PREPROCESS_CODE[${ZESHY__PREPROCESS_CODE_BYTE_FIRST},${ZESHY__PREPROCESS_CODE_BYTE_LAST}]}
+
+        #FIXME: Excise here and above if unrequired below.
+
+        # Index of the last byte of the current substring of such code to be
+        # preprocessed relative to such substring (and *NOT* such code).
+        # ZESHY__PREPROCESS_SUBCODE_BYTE_LAST=$((
+        #     ZESHY__PREPROCESS_CODE_BYTE_LAST -
+        #     ZESHY__PREPROCESS_CODE_BYTE_FIRST + 1 ))
+
+        # Expected index of the first byte of the next match relative to the
+        # current substring of the current code to be preprocessed.
+        # ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST_EXPECTED=1
+
         # For each macro matched in such code, record matched byte indices
         # for the next preprocessor phase.
         ZPCRE_OP='0 0'
-        while {
-            #FIXME: Incorrect. We only iterate until the end of the string,
-            #which reports *SUCCESS* and not *FAILURE*. If such match fails
-            #with failure, we need to explicitly detect that and throw an
-            #exception, as that indicates a PCRE design failure.
-            #FIXME: Inefficient. Avoid reslicing such string each iteration by
-            #defining a new string global ${ZESHY__PREPROCESS_SUBCODE} above
-            #initialized just above as follows:
-            #
-            #ZESHY__PREPROCESS_SUBCODE=${ZESHY__PREPROCESS_CODE[${ZESHY__PREPROCESS_CODE_BYTE_FIRST},${ZESHY__PREPROCESS_CODE_BYTE_LAST}]}
+        while { true } {
+            # Match either the next macro in such code or the end of such
+            # code. If such match fails, such PCRE failed to match at the
+            # prior match position; since this implies a critical design
+            # flaw in such PCRE, throw an exception.
+            pcre_match\
+                -b -n ${ZPCRE_OP[(w)2]}\
+                -- "${ZESHY__PREPROCESS_SUBCODE}" ||
+                ::code.preprocess.die_at_byte\
+                    'unmatchable by preprocessor PCRE'\
+                    ${ZESHY__PREPROCESS_SUBCODE_MATCH_PRIOR_BYTE_LAST}
 
-            pcre_match -b -n ${ZPCRE_OP[(w)2]} --\
-                "${ZESHY__PREPROCESS_CODE[${ZESHY__PREPROCESS_CODE_BYTE_FIRST},${ZESHY__PREPROCESS_CODE_BYTE_LAST}]}"
-        } {
+            #FIXME: We can't simply "+ 1", as the last byte matched by the
+            #prior iteration could be only the first byte of a multibyte
+            #string. Happily, we've already solved this. Shift the solution
+            #below here. That said, we may have to special-case the first
+            #iteration (i.e., the case that
+            #(( ${ZPCRE_OP[(w)1]} == 0 ))), since in that case there exists no
+            #character to take the byte length of. *shrug*
+
+            # Expected index of the first byte of the next match relative to
+            # such substring.
+            ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST_EXPECTED=$((
+                ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_LAST + 1 ))
+
             # Indices of the first and last bytes of the current match relative
-            # to the current subcode being preprocessed.
+            # to the current substring of such code.
             ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST=$((
                 ${ZPCRE_OP[(w)1]} + 1 ))
             ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_LAST=${ZPCRE_OP[(w)2]}
 
-            #FIXME: Define.
-            ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST
-            ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_LAST
+            # Indices of the first and last bytes of the current match absolute
+            # in such code.
+            ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_FIRST=$((
+                ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST +
+                ZESHY__PREPROCESS_CODE_BYTE_FIRST ))
+            ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_LAST=$((
+                ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_LAST +
+                ZESHY__PREPROCESS_CODE_BYTE_FIRST ))
 
             # If the first byte matched by such match attempt does *NOT*
             # immediately follow the last byte matched by the prior attempt, an
@@ -469,36 +524,20 @@ function ::code.preprocess() {
 
             #FIXME: Set ${ZESHY__PREPROCESS_SUBCODE_MATCH_PRIOR_BYTE_LAST}
             #below (and presumably initiazie above to something sane like 0).
+
             ((
                 ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST ==
-                ZESHY__PREPROCESS_SUBCODE_MATCH_PRIOR_BYTE_LAST + 1
+                ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST_EXPECTED
             )) || ::code.preprocess.die_of_invalidity
 
-            # If a zeshy-specific "WASTELANDS" comment matched, avoid
-            # preprocessing and/or interpreting the remainder of such code.
-            # This is an optimization principally intended for use on the
-            # official zeshy codebase.
-            #
-            # Specifically, remove the substring of such code starting at such 
-            # comment to the end of such code, inclusive. Since this suffices
-            # to prematurely halt preprocessing *AND* since the remainder of
-            # the current preprocessor iteration should proceed per usual,
-            # avoid brute-force return statements here (e.g., "return 0").
-            [[ -z ${match[${ZESHY__MACRO_GROUP_INDEX_WASTELANDS}]-} ]] || {
-                ZESHY__PREPROCESS_CODE[$((
-                    ${ZPCRE_OP[(w)2]} -
-                    ${#match[${ZESHY__MACRO_GROUP_INDEX_WASTELANDS}]} + 1
-                )),-1]=
-                print 'WASTELANDS matched at: '${ZPCRE_OP[(w)2]}
-            }
+            #FIXME: Consider everything below. Probably bollocks at the moment.
 
-            # If a macro matched, handle such macro.
-            if [[ -n ${match[${ZESHY__MACRO_GROUP_INDEX_MACRO_NAME}]-} ]] {
-                #FIXME: Consider everything below. Probably bollocks, at the moment.
+            # Currently matched macro's name if a macro matched or the empty
+            # string otherwise.
+            ZESHY__MACRO_NAME=${match[${ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_UNPROTOTYPED_NAME}]-}
 
-                # Such macro's name.
-                ZESHY__MACRO_NAME=${match[${ZESHY__MACRO_GROUP_INDEX_NAME}]}
-
+            # If a macro matched, preprocess such macro.
+            if [[ -n ${ZESHY__MACRO_NAME} ]] {
                 # Byte indices recorded for the next preprocessor phase. Note
                 # that "man zshmodules" documents ${ZPCRE_OP} to be a "
                 # "-delimited integer pair such that:
@@ -562,16 +601,43 @@ function ::code.preprocess() {
                     :die $(::parcel.get)'macro '${ZESHY__MACRO_NAME}'() on line '${line_number}' passed syntactically invalid arguments (e.g., due to unmatched braces or quotes).'
                 }
 
+                #FIXME: Relative to such substring and hence erroneous. Convert
+                #to global byte indices.
+
                 # Record matched byte indices for the next preprocessor phase.
                 ZESHY__MACRO_BYTES_NAME_FIRST_LAST[1]+=(
                     ${ZESHY__MACRO_BYTE_FIRST}
                     ${ZESHY__MACRO_BYTE_NAME_LAST}
                     ${ZESHY__MACRO_BYTE_LAST}
                 )
-            # Else, a halting condition was matched.
-            } else {
-                #FIXME: Implement me.
             }
+
+            # If a zeshy-specific "WASTELANDS" comment matched, such comment
+            # implies the functional end of such code and hence such substring.
+            # For efficiency, avoid preprocessing and/or interpreting the
+            # remainder of such code by destructively removing the substring of
+            # such code starting at such comment to the end of such code.
+            #
+            # While intended principally for use on the official zeshy
+            # codebase, such optimization *COULD* have general-purpose utility.
+            if [[ -n ${match[${ZESHY__MACRO_GROUP_INDEX_WASTELANDS}]-} ]] {
+                ZESHY__PREPROCESS_CODE[$((
+                    ZESHY__PREPROCESS_CODE_MATCH_CURRENT_BYTE_LAST -
+                    ${#match[${ZESHY__MACRO_GROUP_INDEX_WASTELANDS}]} + 1
+                )),-1]=
+                print 'WASTELANDS matched at: '${ZPCRE_OP[(w)2]}
+
+                # Halt preprocessing of such substring.
+                break
+            # If no macro *OR* zeshy-specific "WASTELANDS" comment was matched,
+            # such substring contains neither. PCRE design implies that the end
+            # of such substring was matched. Halt preprocessing of such
+            # substring.
+            } elif [[ -n ${ZESHY__MACRO_NAME} ]] {
+                break
+            }
+
+            # Else, ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST_EXPECTED
         }
 
         # For simplicity, remove the placeholder empty string prefixing such list.
@@ -1037,6 +1103,80 @@ function ::code.preprocess() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+            #FUXME: Shift to the end of the following "while" loop body after
+            #correcting the same multibyte issues.
+
+            # Else, the end of such substring was matched. Instruct subsequent
+            # logic to halt preprocessing of the current substring *AFTER*
+            # possibly resolving a zeshy-specific "WASTELANDS" comment.
+            # } else {
+            #     ZESHY__MACRO_NAME=
+
+                ## Halt preprocessing of the current substring.
+                #break
+
+        #FUXME: Globally declare above.
+        # To simplify logic, pretend the first match attempt below to have been
+        # preceded by a match attempt ending immediately before the first byte
+        # of the current substring of such code to be preprocessed. (Yeah.)
+        # Index of the byte following the last byte of the previous match
+        # relative to the current substring of the current code to be
+        # preprocessed. For simplicity, 
+
+# Index of the first byte following the last byte of the previous match relative to
+# the current substring of the current code to be preprocessed.
+# For efficiency and simplicity, such index will be incremented by 1.
+#FUXME: Optimize by globalizing locals. (You know the code-cadenced drill.)
+            #FUXME: The first such test should probably simply be a sanity test
+            #throwing an exception if *NOT* the case.
+
+            # If the prior match failed to consume all remaining bytes of such
+            # code, continue matching.
+            # ((
+            #     ZESHY__PREPROCESS_SUBCODE_MATCH_PRIOR_BYTE_LAST <
+            #     ZESHY__PREPROCESS_SUBCODE_BYTE_LAST
+            # )) &&
+
+            #FUXME: Inefficient. Avoid reslicing such string each iteration by
+            #defining a new string global ${ZESHY__PREPROCESS_SUBCODE} above
+            #initialized just above as follows:
+            #
+            ## Current substring of the current code to be preprocessed.
+            #ZESHY__PREPROCESS_SUBCODE=${ZESHY__PREPROCESS_CODE[${ZESHY__PREPROCESS_CODE_BYTE_FIRST},${ZESHY__PREPROCESS_CODE_BYTE_LAST}]}
+
+            #FUXME: Not quite right. We do absolutely need to trigger a "break"
+            #of some sort on a "WASTELANDS" match.
+
+            # prevent zsh from attempting to interpret the
+            # remaining characters by destructively removing the substring of
+            # such code starting at such comment to the end of such code.
+            # avoid preprocessing and/or interpreting the remainder of such code.
+            #
+            # Specifically, remove the substring of such code starting at such 
+            # comment to the end of such code, inclusive. Since this suffices
+            # to prematurely halt preprocessing *AND* since the remainder of
+            # the current preprocessor iteration should proceed per usual,
+            # avoid brute-force return statements here (e.g., "return 0").
+
+                # ZESHY__MACRO_NAME=
+            # If no macro was matched, then by PCRE design and the above logic
+            # the end of such substring was matched. Cease preprocessing.
+            # [[ -n ${ZESHY__MACRO_NAME} ]] || break
+            # if [[ -n ${match[${ZESHY__MACRO_GROUP_INDEX_MACRO_NAME}]-} ]] {
+
+            #FUXME: Incorrect. We only iterate until the end of the string,
+            #which reports *SUCCESS* and not *FAILURE*. If such match fails
+            #with failure, we need to explicitly detect that and throw an
+            #exception, as that indicates a PCRE design failure.
+
+            # ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST=$((
+            #     ${ZPCRE_OP%% *} + 1 ))
+            # ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_LAST=${ZPCRE_OP##* }
+
+            # ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_FIRST=$((
+            #     ${ZPCRE_OP[(w)1]} + 1 ))
+            # ZESHY__PREPROCESS_SUBCODE_MATCH_CURRENT_BYTE_LAST=${ZPCRE_OP[(w)2]}
+
             # ((
             #     ZESHY__PREPROCESS_SUBCODE_MATCH_BYTE_LAST <
             #     ZESHY__PREPROCESS_CODE_BYTE_LAST
@@ -1212,16 +1352,16 @@ function ::code.preprocess() {
                 # ZESHY__PREPROCESS_CODE[-${#match[
                 #     ${ZESHY__MACRO_GROUP_INDEX_WASTELANDS}]},-1]=
 
-        # if [[ ${ZESHY__PCRE_COMPILED_LAST} != ${ZESHY__MACRO_PCRE} ]] {
-        #     pcre_compile -- "${ZESHY__MACRO_PCRE}"
+        # if [[ ${ZESHY__PCRE_COMPILED_LAST} != ${ZESHY__PREPROCESS_PCRE} ]] {
+        #     pcre_compile -- "${ZESHY__PREPROCESS_PCRE}"
         #     pcre_study
         #
         #     # Avoid unnecessary recompilation on subsequent iterations.
-        #     ZESHY__PCRE_COMPILED_LAST=${ZESHY__MACRO_PCRE}
+        #     ZESHY__PCRE_COMPILED_LAST=${ZESHY__PREPROCESS_PCRE}
         # }
 
         # Compile and optimize such PCRE.
-        # pcre_compile -- "${ZESHY__MACRO_PCRE}"
+        # pcre_compile -- "${ZESHY__PREPROCESS_PCRE}"
         # pcre_study
 
         #* Declare a new boolean (integer) global ${ZESHY__PCRE_IS_RECOMPILED},
@@ -1235,7 +1375,7 @@ function ::code.preprocess() {
         #    # since been replaced in the zsh cache by a more recently compiled
         #    # PCRE, compile and optimize such PCRE.
         #    if (( ZESHY__PCRE_IS_RECOMPILED )) {
-        #        pcre_compile -- "${ZESHY__MACRO_PCRE}"
+        #        pcre_compile -- "${ZESHY__PREPROCESS_PCRE}"
         #        pcre_study
         #
         #        # Avoid unnecessary recompilation on subsequent iterations.
