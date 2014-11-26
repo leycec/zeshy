@@ -562,7 +562,7 @@ zmodload -F zsh/stat b:zstat
 zmodload zsh/parameter
 
 # ....................{ EXCEPTIONS ~ throw                 }....................
-# void :unwind_call_stack(void)
+# void :call_stack.unwind(void)
 #
 # Unwind the current call stack by intentionally triggering a fatal internal
 # error. Specifically, silently attempt to redefine a local string constant --
@@ -575,7 +575,7 @@ zmodload zsh/parameter
 # and hence are *NOT* reliably callable by low-level exception handlers,
 # aliases are expanded at function and script definition time and hence
 # guaranteed to be expanded in such handlers below.
-alias :unwind_call_stack='{
+alias :call_stack.unwind='{
     readonly THROW=
     THROW= 2>/dev/null
 }'
@@ -746,7 +746,7 @@ function :die() {
         } 1>&2
 
         # Unwind the current call stack.
-        :unwind_call_stack
+        :call_stack.unwind
     }
 
     # If such function is defined, globalize such exception.
@@ -770,7 +770,7 @@ function :die() {
     }
 
     # Unwind the current call stack.
-    :unwind_call_stack
+    :call_stack.unwind
 }
 
 # string ::store_exception_status(string error_message, int exit_status)
@@ -1362,15 +1362,19 @@ typeset -g ZESHY_USER_NAMES_FILE="${ZESHY_USER_CACHE_DIR}/names.zsh"
 #FIXME: Call such function wherever we currently call source().
 #FIXME: Document me.
 
-# :full ::script_zeshy.source_or_unwind_call_stack(
-#     :string... filenames)
+# :full ::script.source(:string... filenames)
 #
-# Source all passed zeshy scripts if found or unwind the current call stack
-# otherwise. The source() builtin currently appears to fail to signal TRAPZERR
-# and hence induce exceptions on script failures, possibly due to such builtin
-# reporting exit status of 126 on such failures. Until the underlying issue is
-# resolved, this function implements a suitable short-term solution.
-function ::script_zeshy.source_or_unwind_call_stack() {
+# Source all passed `zeshy` scripts, reporting failure on the first such script
+# to either _not_ exist or report failure _or_ reporting success otherwise
+# (i.e., if all such scripts both exist and report success).
+#
+# == Motivation ==
+#
+# The source() builtin currently appears to fail to signal `TRAPZERR` and hence
+# induce exceptions on script failures, possibly due to such builtin reporting
+# exit status of 126 on such failures. Until the underlying issue is resolved,
+# this function implements a suitable short-term solution.
+function ::script.source() {
     # Validate sanity.
     (( # )) || :die 'Expected one or more script filenames.'
     local filename
@@ -1390,10 +1394,8 @@ function ::script_zeshy.source_or_unwind_call_stack() {
             # If such script is still not found, attempt to append such
             # filename by ".zy" if not already suffixed by a filetype.
             [[ -e ${filename} ]] || {
-                # If such filename's basename (i.e., filename excluding
-                # prefixing path) contains no "." and hence no filetype, append
-                # such filename by ".zy".
-                [[ ${filename:t} == *'.'* ]] || filename+='.zy'
+                # If such filename is *NOT* already suffixed by ".zy", do so.
+                [[ ${filename[-3,-1]} == '.zy' ]] || filename+='.zy'
 
                 # If such script is still not found, throw an exception.
                 [[ -e ${filename} ]] ||
@@ -1401,28 +1403,44 @@ function ::script_zeshy.source_or_unwind_call_stack() {
             }
         }
 
-        # If such script is *NOT* a file, throw an exception. While source() does
-        # report failure if such script does not exist, such builtin does *NOT*
-        # report failure if such script is a directory rather a file.  Since this
-        # function accepts only files, test whether such file is actually a file
-        # *BEFORE* calling such builtin.
+        # If such script is *NOT* a file, throw an exception. While source()
+        # does report failure if such script does not exist, such builtin does
+        # *NOT* report failure if such script is a directory rather a file.
+        # Since this function accepts only files, test whether such file is
+        # actually a file *BEFORE* calling such builtin.
         [[ -f ${filename} ]] || :die 'Script "'${filename}'" not a file.'
 
-        # If such path is relative rather than absolute, print a non-fatal warning.
+        # If such path is relative rather than absolute, print a non-fatal
+        # warning. This should *NEVER* be the case, but hardly constitutes a
+        # fatal error.
         [[ ${filename[1]} == '/' ]] || :warning.output\
             'Script "'${filename}'" not an absolute path.'
 
         # Set such global to such path.
         ZESHY_SCRIPT_FILENAME=${filename}
 
-        # Source such script. If such script fails, silently unwind the current
-        # call stack rather than verbosely throwing an exception. Why? If such
-        # script fails, a stack trace describing the fatal error or exception
-        # responsible for such failure will have already been printed; in such
-        # case, throwing an exception here would result in another such trace,
-        # obscuring the prior trace describing the real issue. (Less is more.)
-        builtin source -- "${filename}" || :unwind_call_stack
+        # Source such script.
+        builtin source -- "${filename}" || return ${?}
     }
+}
+
+# :full ::script.source_or_unwind_call_stack(
+#     :string... filenames)
+#
+# Source all passed `zeshy` scripts, silently unwinding the current call stack
+# on the first such script to either _not_ exist or report failure. See
+# ::script.source().
+#
+# == Motivation ==
+#
+# If any such script fails, the current call stack is silently unwound rather
+# than a descriptive exception being thrown. Why? If such script fails, a stack
+# trace describing the fatal error or exception responsible for such failure
+# will have already been printed; in such case, throwing an exception here
+# would result in another such trace, obscuring the prior trace describing the
+# real issue. (Less is more.)
+function ::script.source_or_unwind_call_stack() {
+    ::script.source "${@}" || :call_stack.unwind
 }
 
 # ....................{ LOAD                               }....................
@@ -1499,7 +1517,7 @@ if (( ZESHY_PID_LAST_LOADED_BY == $$ )) {
 } else {
     # If the current shell is a login shell, set login-specific behavior.
     if [[ -o login ]] {
-        ::script_zeshy.source_or_unwind_call_stack\
+        ::script.source_or_unwind_call_stack\
             ${ZESHY_SEED_DIRNAME}'/if_login/login'
     }
 
@@ -1511,7 +1529,7 @@ if (( ZESHY_PID_LAST_LOADED_BY == $$ )) {
     #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     #
     # Autoload zeshy's user digest file, recompiling such file if needed.
-    ::script_zeshy.source_or_unwind_call_stack ${ZESHY_SEED_DIRNAME}'/digest'
+    ::script.source_or_unwind_call_stack ${ZESHY_SEED_DIRNAME}'/digest'
 
     #FIXME: Sadly, the following appears to no longer work as advertised, as
     #this file is now sourced from a function context by ".zshrc". Since such
@@ -1662,7 +1680,7 @@ if [[ -n ${*} ]] {
     # /home/leycec/zsh/zeshy/src/main() failed with exit status 1
     #  "~/tmp/tmp.zeshy" { /home/leycec/zsh/zeshy/src/main: 1398 }
     #   "/home/leycec/zsh/zeshy/src/main" { /usr/local/bin/zeshy: 206 }
-    ::script_zeshy.source_or_unwind_call_stack "${@}" ||
+    ::script.source_or_unwind_call_stack "${@}" ||
         :die 'Script "'${*}'" failed with exit status '${status}'.'
 }
 
@@ -1673,6 +1691,26 @@ if [[ -n ${*} ]] {
 return 0
 
 # --------------------( WASTELANDS                         )--------------------
+        # [[ ${filename[1]} == '/' ]] || :warning.output\
+        # Source such script. If such script fails, silently unwind the current
+        # call stack rather than verbosely throwing an exception. Why? If such
+        # script fails, a stack trace describing the fatal error or exception
+        # responsible for such failure will have already been printed; in such
+        # case, throwing an exception here would result in another such trace,
+        # obscuring the prior trace describing the real issue. (Less is more.)
+        # builtin source -- "${filename}" || :call_stack.unwind
+
+# Source all passed zeshy scripts if found or unwind the current call stack
+# otherwise. The source() builtin currently appears to fail to signal TRAPZERR
+# and hence induce exceptions on script failures, possibly due to such builtin
+# reporting exit status of 126 on such failures. Until the underlying issue is
+# resolved, this function implements a suitable short-term solution.
+
+                # If such filename's basename (i.e., filename excluding
+                # prefixing path) contains no "." and hence no filetype, append
+                # such filename by ".zy".
+                # [[ ${filename:t} == *'.'* ]] || filename+='.zy'
+
 # setopt no_glob_assign    # do not glob variable assignments (use lists instead)
 # setopt no_ignore_braces  # enable "{...}"-style brace expansion
 # setopt no_ignore_close_braces  # render ";" optional for single-line functions
