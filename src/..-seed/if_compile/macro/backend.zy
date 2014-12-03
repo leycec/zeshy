@@ -82,6 +82,21 @@
 #for validation purposes by "\0\0\0" still strikes us as a sensible idea,
 #there's no need for other eccentric usage of "\0" or variadic arguments.
 
+#FIXME: Implement support for explicit quote-protection of test arguments
+#(i.e., both "(("- and "))"-delimited arithmetic tests *AND* "[["- and "]]"-
+#delimited standard tests): e.g.,
+#
+#     # The preprocessor should quote-protect this...
+#     :test_macro "yum" { :print ok } [[ "yil" == "yaz" ]]
+#
+#     # ...into this.
+#     :test_macro '"yum"' '{ :print ok }' '[[ "yil" == "yaz" ]]'
+#
+#This shouldn't be terribly difficult to implement. Do *NOT* implement a new
+#type of macro to do so. Instead, all macros should gain support for test
+#arguments by revising ${ZESHY__PREPROCESS_PCRE}, currently only capturing
+#scalar and block arguments, to also capture test arguments. Yay!
+
 # ....................{ GLOBALS ~ public : string          }....................
 # Current macro's expansion to be set by macro functions and hence public.
 typeset -g ZESHY_MACRO_EXPANSION
@@ -107,6 +122,9 @@ typeset -gi ZESHY__PREPROCESS_CODE_BYTES_FIRST_LAST_INDEX
 
 # Byte length of the current code to be preprocessed.
 typeset -gi ZESHY__PREPROCESS_CODE_BYTE_LENGTH
+
+# Byte length of the current macro matched from such code.
+typeset -gi ZESHY__PREPROCESS_MACRO_BYTE_LENGTH
 
 # Index of the first byte of the last character of the prior match of the
 # current substring of the current code to be preprocessed, equivalent to
@@ -327,9 +345,7 @@ function ::code.preprocess() {
                 -b\
                 -n ${ZESHY__PREPROCESS_CODE_MATCH_LAST_CHAR_LAST_BYTE_FIRST}\
                 -- "${ZESHY__PREPROCESS_SUBCODE}" ||
-                ::code.preprocess.die_at_byte\
-                    'unmatchable by preprocessor PCRE'\
-                    ${ZESHY__PREPROCESS_CODE_MATCH_LAST_CHAR_LAST_BYTE_FIRST}
+                ::code.preprocess.die_of_pcre_bug
 
             # Index of the first byte of the last character of the prior match.
             ZESHY__PREPROCESS_CODE_MATCH_LAST_CHAR_LAST_BYTE_FIRST=${ZPCRE_OP[(w)2]}
@@ -398,33 +414,39 @@ function ::code.preprocess() {
 
             # If a macro matched, preprocess such macro.
             if [[ -n ${match[${ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_IS_VALID}]-} ]] {
-                # Index of the last byte of the current match relative to the
-                # current substring of such code. While ${ZPCRE_OP[(w)2]} has
-                # the index of the first byte of the last character of such
-                # match, obtaining the last byte of such character from such
-                # variable is nontrivial. Since such character could be a non-
-                # ASCII UTF-8-encoded multibyte character, incrementing
+                # Byte length of such macro.
+                ZESHY__PREPROCESS_MACRO_BYTE_LENGTH=${#MATCH}
+
+                # Index of the last byte of such macro relative to the current
+                # substring of such code. While ${ZPCRE_OP[(w)2]} has the index
+                # of the first byte of the last character of such match,
+                # obtaining the last byte of such character from such variable
+                # is nontrivial. Since such character could be a non- ASCII
+                # UTF-8-encoded multibyte character, incrementing
                 # ${ZPCRE_OP[(w)2]} by 1 does *NOT* suffice to obtain such last
                 # byte. The current approach is simpler and more efficient.
                 ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST=$((
-                    ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST + ${#MATCH} ))
+                    ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST +
+                    ZESHY__PREPROCESS_MACRO_BYTE_LENGTH ))
 
-                #FIXME: Inline if only expanded once.
-
-                # Indices of the first and last bytes of the current match
-                # absolute in such code.
-                ZESHY__PREPROCESS_CODE_MACRO_BYTE_FIRST=$((
-                    ZESHY__PREPROCESS_CODE_SUBCODE_BYTE_FIRST +
-                    ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST ))
+                # Index of the last byte of such macro relative to such code.
                 ZESHY__PREPROCESS_CODE_MACRO_BYTE_LAST=$((
                     ZESHY__PREPROCESS_CODE_SUBCODE_BYTE_FIRST +
                     ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST ))
 
+                #FIXME: Declare ${ZESHY__PREPROCESS_MACRO} above.
+
+                # Such macro.
+                ZESHY__PREPROCESS_MACRO=${ZESHY__PREPROCESS_SUBCODE[${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST},${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST}]}
+
                 # Such macro's name.
                 ZESHY__PREPROCESS_MACRO_NAME=${match[${ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_UNPROTOTYPED_NAME}]-}
 
-                # Sanitize each argument passed to such macro in such code.
-                # Specifically:
+                # Begin matching arguments passed to such macro at the first
+                # character of the name of such macro. (See below.)
+                ZPCRE_OP='0 0'
+
+                # Sanitize such arguments. Specifically:
                 #
                 # * Convert "{"- and "}"-delimited block arguments to single-
                 #   quoted strings whose first and last characters remain such
@@ -446,22 +468,97 @@ function ::code.preprocess() {
                     ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST=${match[${ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_ARG_BLOCK_LAST}]-}
                     ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST=${match[${ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_ARGS_SCALAR_LAST}]-}
 
+                    #FIXME: Declare above.
+                    ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_LENGTH=${#ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST}
+                    ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_LENGTH=${#ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST}
+
+                    #FIXME: Declare above.
+                    ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_FIRST=$((
+                        ZESHY__PREPROCESS_MACRO_BYTE_LENGTH -
+                        ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_LENGTH +
+                        1 ))
+
+                    #FIXME: We probably have a slight issue: the whitespace
+                    #delimiting block from scalar arguments will almost
+                    #certainly be obliterated by the "${(qq@)${(z)...}}"-style
+                    #quote protection performed below. Naturally, that's bad.
+                    #Since we perform similar protection to block arguments,
+                    #such whitespace is guaranteed to be erroneously excised in
+                    #either case; we'll need to either:
+                    #
+                    #* Explicitly preserve such whitespace via PCRE redesign.
+                    #* Explicitly prefix (or is it suffix, here?) the result of
+                    #  protecting such argument by a single space.
+                    #
+                    #Right. So, clearly the latter, we should think.
+
+                    #FIXME: Ugh. It would appear that we do *NOT* need to
+                    #explicitly quote-protect scalar arguments, as zsh already
+                    #does *NOT* unquote shell words expanded by either the "="
+                    #and "(z)" split operators -- which, in hindsight, makes
+                    #perfect sense: e.g.,
+                    #
+                    #    >>> :string zzz='print -r "ok ''yum'' oeu" what$(print ok)'
+                    #    >>> ${=zzz}
+                    #    "ok 'yum' oeu" what$(print ok)
+                    #    >>> ${(z)zzz}
+                    #    "ok 'yum' oeu" what$(print ok)
+                    #
+                    #Woops. Given that, we can *CONSIDERABLY* simplify the
+                    #logic below. Note that while we probably still need to
+                    #capture suffixing scalar arguments to assist in
+                    #determining the byte indices of a suffixing block
+                    #argument, we should revise such PCRE to do so *ONLY* when
+                    #a block argument is captured as well.
+                    #
+                    #It's all rather unfortunate, but... hey, here we are.
+
+                    # If one or more suffixing scalar arguments matched,
+                    # protect such argument(s) *BEFORE* protecting a suffixing
+                    # block argument. The latter conditional could terminate
+                    # matching, requiring the former be performed first.
+                    if ((
+                        ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_LENGTH
+                    )) {
+                        # Protect such arguments. By PCRE design, such
+                        # arguments suffix the current match, implying the last
+                        # byte of such arguments to be the last byte of such
+                        # match. Specifically:
+                        #
+                        # * "${(z)...}", splitting such argument substring into
+                        #   a temporary argument list as well as removing all
+                        #   whitespace and insignificant line continuations
+                        #   separating such arguments.
+                        # * "${(qq@)...}", quote-protecting each such argument
+                        #   as a single-quoted string, preserving all
+                        #   interpretable code embedded in such arguments
+                        #   (e.g., process substitutions) as is rather than
+                        #   insecurely interpreting such code in-place.
+                        ZESHY__PREPROCESS_MACRO[${ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_FIRST},${ZESHY__PREPROCESS_MACRO_BYTE_LENGTH}]=${(qq@)${(z)ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST}}
+                    }
+
                     # If a suffixing block argument matched, protect such
                     # argument.
-                    if [[ -n ${ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST} ]] {
-                        .
-                        # If one or more suffixing scalar arguments also
-                        # matched, protect such argument(s).
-                        if [[ -n ${ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST} ]] {
-                        }
-                    # If one or more suffixing scalar arguments matched,
-                    # protect such argument(s).
-                    } elif [[ -n ${ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST} ]] {
-                        .
-                    # If neither matched, all such arguments have been matched.
+                    if ((
+                        ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_LENGTH
+                    )) {
+                        #FIXME: Declare above.
+                        ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_FIRST=$((
+                            ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_FIRST -
+                            ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_LENGTH
+                        ))
+
+                        # Protect such argument.
+                        ZESHY__PREPROCESS_MACRO[${ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_FIRST},$((
+                            ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_FIRST +
+                            ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_LENGTH
+                        ))]=${(qq)ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST}
+                    # Else, no such argument matched, in which case all 
+                    # arguments passed to such macro have been protected.
+                    # Terminate matching.
                     } else {
                         break
-                    {
+                    }
 
                     # Match the next-to-last block argument and/or scalar
                     # argument(s) if any. For efficiency, reuse the same PCRE
@@ -497,17 +594,23 @@ function ::code.preprocess() {
                     # If such match fails, such PCRE failed to rematch the same
                     # macro that it just successfully matched, implying a
                     # gnostic rupture in the zsh-time continuum. Which is bad.
+                    pcre_match -b --\
+                        "${ZESHY__PREPROCESS_MACRO[1,${ZPCRE_OP[(w)2]}]}" ||
+                        ::code.preprocess.die_of_pcre_bug
+                l}
 
-                    #FIXME: Correct.
+                #FIXME: Replace such macro name by such function name.
 
-                    pcre_match\
-                        -b\
-                        -n ${ZESHY__PREPROCESS_CODE_MATCH_LAST_CHAR_LAST_BYTE_FIRST}\
-                        -- "${ZESHY__PREPROCESS_SUBCODE}" ||
-                        ::code.preprocess.die_at_byte\
-                            'unmatchable by preprocessor PCRE'\
-                            ${ZESHY__PREPROCESS_CODE_MATCH_LAST_CHAR_LAST_BYTE_FIRST}
-                }
+                # Call the function expanding such macro. Unlike most older
+                # shells, zsh does *NOT* implicitly split expanded variables
+                # into shell words. This is a good thing, but does require we
+                # do so explicitly. There exist two principle expansion flags
+                # for doing so: "=" and "(z)". The former depends on the value
+                # of canonical string global ${SH_WORD_SPLIT} for its
+                # operation and hence is inherently unreliable, while the
+                # latter does *NOT* depend on such value and hence is
+                # inherently reliable. (Naturally, we prefer the latter.)
+                ${(z)ZESHY__PREPROCESS_MACRO}
             # Else if the remainder of such substring was successfully
             # consumed, cease preprocessing such substring.
             } elif [[ -z ${match[${ZESHY__PREPROCESS_GROUP_INDEX_NONMACRO_CODE_IS_VALID}]-} ]] {
@@ -929,6 +1032,78 @@ function ::code.preprocess() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+                #FUXME: This is quite optimizable. Rather than resplitting the
+                #entire function call, we should instead:
+                #
+                #* Declare a new *LIST* global
+                #  ${ZESHY__PREPROCESS_MACRO_FUNC_WORDS}.
+                #* Initialize such global each iteration as follows:
+                #  ZESHY__PREPROCESS_MACRO_FUNC_WORDS=(
+                #      ZESHY__PREPROCESS_MACRO_NAME )
+                #* Append each argument protected above to such list (rather
+                #  than resplicing such arguments back into
+                #  ${ZESHY__PREPROCESS_MACRO}).
+
+                        # ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_FIRST=$((
+                        #     ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_FIRST -
+                        #     ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_LENGTH
+                        # ))
+                        # ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_LAST=$((
+                        #     ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_FIRST +
+                        #     ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_LENGTH
+                        # ))
+
+                        #FUXME: If both block and scalar arguments match, the
+                        #following munging prevents subsequent munging of block
+                        #arguments given current logic. Amend us up, please.
+
+                    # 123456789
+                    # m { } 'o'
+                    #ZESHY__PREPROCESS_MACRO_BYTE_LENGTH=9
+                    #ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_LENGTH=3
+                    #ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_LENGTH=4
+
+                    #FUXME: Declare above. Do we still require this?
+                    # ZESHY__PREPROCESS_MACRO_MATCH_LAST_BYTE_FIRST=$((
+                    #     ZESHY__PREPROCESS_MACRO_BYTE_LENGTH -
+                    #     ZESHY__PREPROCESS_MACRO_ARG_BLOCK_LAST_BYTE_LENGTH -
+                    #     ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_LENGTH ))
+
+                    # the scalar arguments just matched constitute *ALL*
+                    # arguments passed to such macro. Terminate matching.
+
+                        # If one or more suffixing scalar arguments also
+                        # matched, protect such argument(s).
+                        # if ((
+                        #     ZESHY__PREPROCESS_MACRO_ARGS_SCALAR_LAST_BYTE_LENGTH
+                        # )) {
+                        #     .
+                        # }
+
+# "${ZESHY__PREPROCESS_MACRO[1,${ZESHY__PREPROCESS_MACRO_MATCH_LAST_CHAR_LAST_BYTE_FIRST}]}" ||
+                #FUXME: Declare above.
+                # Begin matching arguments at the first character of such macro.
+                # ZESHY__PREPROCESS_MACRO_MATCH_LAST_CHAR_LAST_BYTE_FIRST=0
+
+# ${ZESHY__PREPROCESS_MACRO_MATCH_LAST_CHAR_LAST_BYTE_FIRST}
+                # ZPCRE_OP='0 0'
+                        # -n ${ZPCRE_OP[(w)2]}\
+
+                #FUXME: Inline if only expanded once.
+                # Indices of the first and last bytes of the current match
+                # absolute in such code.
+                # ZESHY__PREPROCESS_CODE_MACRO_BYTE_FIRST=$((
+                #     ZESHY__PREPROCESS_CODE_SUBCODE_BYTE_FIRST +
+                #     ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST ))
+                # ZESHY__PREPROCESS_CODE_MACRO_BYTE_LAST=$((
+                #     ZESHY__PREPROCESS_CODE_SUBCODE_BYTE_FIRST +
+                #     ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST ))
+
+                # ZESHY__PREPROCESS_MACRO_MATCH_LAST_CHAR_LAST_BYTE_FIRST=0
+                # ::code.preprocess.die_at_byte\
+                #     'unmatchable by preprocessor PCRE'\
+                #     ${ZESHY__PREPROCESS_CODE_MATCH_LAST_CHAR_LAST_BYTE_FIRST}
+
 # it is absolutely required for proper functioning.
     #FUXME: Great! We believe there may exist a critical optimization, however.
     #Given the iterative queue-based approach above, is it *REALLY* essential that
