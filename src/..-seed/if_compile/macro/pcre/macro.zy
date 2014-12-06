@@ -470,13 +470,17 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # Character class matching invalid characters at the start of an unquoted
     # shell word in a scalar macro argument, also including:
     #
+    # * Digits, preventing such word from consuming digit-prefixed
+    #   redirections (e.g., "1>&2"). For simplicity, scalar macro arguments are
+    #   prohibited from matching any redirection. See
+    #   ${pcre_literal_passable_start} below.
     # * "(", preventing such word from consuming arithmetic test prefixes.
-    #   While valid macro arguments, such prefixes are matched elsewhere in a
-    #   syntax-aware manner.
+    #   While valid scalar macro arguments, such prefixes are matched elsewhere
+    #   in a syntax-aware manner.
     # * "[", preventing such word from consuming non-arithmetic test
-    #   delimiters. While valid macro arguments, such delimiters are matched
-    #   elsewhere in a syntax-aware manner.
-    local char_not_literal_passable_start=${char_not_literal_sourceable_start_word_rest}'(['${char_not_literal_passable_core}
+    #   delimiters. While valid scalar macro arguments, such delimiters are
+    #   matched elsewhere in a syntax-aware manner.
+    local char_not_literal_passable_start=${char_not_literal_sourceable_start_word_rest}'0-9(['${char_not_literal_passable_core}
 
     # Character class matching unconditionally invalid characters *AFTER* the
     # start of an unquoted shell word in a scalar macro argument.
@@ -1356,16 +1360,33 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     local pcre_literals_passable_rest='['${char_not_literal_passable_rest}']++|'${pcre_literal_passable_core}
 
     # ..................{ REDIRECTION                        }..................
-    # Unquoted literal shell word, comprising only unconditionally unreserved
-    # characters and hence excluding conditionally unreserved parens.
-    local pcre_word_literal=${pcre_literal_parenable_start}${pcre_literals_parenable_rest_optional}
-    local pcre_word_literal_grouped='('${pcre_word_literal}')'
-
-    # Redirections are largely incidental to preprocessor parsing but must
-    # nonetheless be partially matched for disambiguation with command
-    # terminators and unquoted shell words. For example, since "&!" is a
-    # command terminator while "&>" is not, matching merely an unquoted "&"
-    # character is insufficient to identify a "&"-prefixed command terminator.
+    # Since redirections are freely interspersable amongst arguments (e.g.,
+    # ":the church {of}>the subgenius", where "{of}>the" is a redirection
+    # sandwiched between two arguments "church" and "subgenius"), redirections
+    # do *NOT* terminate commands and hence are *NOT* command terminators.
+    # Since redirection and command terminator syntax frequently overlaps
+    # (e.g., the "&"-prefixed redirection "&>" and the three "&"-prefixed
+    # command terminators "&", "&!", and "&&"), disambiguating the two requires
+    # redirection syntax conflicting with command terminator syntax to be
+    # matched. Unfortunately, this includes most redirection syntax:
+    #
+    # * Standard redirections:
+    #   "<",  "<>",  ">",   ">|",  ">!",  ">>",  ">>|", ">>!",  "<&",   ">&",
+    #   "&>", ">&|", ">&!", "&>|", "&>!", ">>&", "&>>", ">>&|", ">>&!", "&>>|",
+    #   and "&>>!".
+    # * Variable name-prefixed redirections (e.g., "{jhvh_1}<'rebel god'").
+    # * "<<"-prefixed here-documents and -strings.
+    #
+    # Digit-prefixed redirections (e.g., "1>&2") do *NOT* require explicit
+    # matched. Since such digits are already matched as unquoted shell words
+    # and the remainder of such redirections as standard redirections, no
+    # further matching is required to disambiguate such redirections from
+    # command terminators,
+    #
+    # Both "<("- and ">("-prefixed process substitution redirections are
+    # explicitly prevented from matching here by negative lookahead. See below.
+    #
+    # See section "REDIRECTION" of "man zshmisc".
 
     # "<"-prefixed here-document or "<<"-prefixed here-string. The latter
     # prefix greedily overlaps the former prefix and must hence be matched
@@ -1375,27 +1396,49 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     local pcre_here_prefix='<'
     local pcre_here=${pcre_here_prefix}'(?>'${pcre_here_prefix}'|(?&doc))|'${pcre_reset_remainder_succeed}')'
 
-    # Redirection. Since command arguments may be freely interspersed with
-    # redirections, redirections must be disambiguated from command terminators
-    # with overlapping syntax -- particularly, "&"-prefixed command terminators
-    # "&", "&!", and "&&". In addition to "<<"-prefixed here-documents and
-    # -strings, the following redirections are matched:
-    #
-    # "<", "<>", ">", ">|", ">!", ">>", ">>|", ">>!", "<&", ">&", "&>", ">&|",
-    # ">&!", "&>|", "&>!", ">>&", "&>>", ">>&|", ">>&!", "&>>|", and "&>>!".
-    #
-    # Since matching "<("- and ">("-prefixed process substitution redirections
-    # requires recursion and hence subroutine calls exceeding the scope of this
-    # PCRE, a "(" *MUST* be prevented from matching after a "<" or ">" is
-    # matched with negative lookahead.
-    #
-    # See section "REDIRECTION" of "man zshmisc".
-    local pcre_redirect_not_process_substitution_lookahead='(?!\()'
-    local pcre_redirect_less_than='<(?:'${pcre_here}'|[&>]|'${pcre_redirect_not_process_substitution_lookahead}')'
-    local pcre_redirect_greater_than_char='>'${pcre_redirect_not_process_substitution_lookahead}
-    local pcre_redirect_greater_than=${pcre_redirect_greater_than_char}'>?+&?+[!|]?+'
-    local pcre_redirect_ampersand='&'${pcre_redirect_greater_than_char}'>?+[!|]?+'
-    local pcre_redirect=${pcre_redirect_less_than}'|'${pcre_redirect_greater_than}'|'${pcre_redirect_ampersand}
+    # Negative lookahead preventing a "(" character and hence a "<("- or ">("-
+    # prefixed process substitution redirection from matching. Since such
+    # redirections are recursively nestable and hence matchable only by
+    # subroutine calls exceeding the scope of the comparatively simpler PCREs
+    # below, such redirections are matched elsewhere as process substitutions
+    # rather than here as redirections.
+    local pcre_redirect_not_process_substitution='(?!'${pcre_paren_left}')'
+
+    # ">" character *NOT* followed by a "(" character and hence *NOT*
+    # signifying a ">("-prefixed process substitution.
+    local pcre_redirect_greater_than_char_optional='>?+'${pcre_redirect_not_process_substitution}
+
+    # One ">" character optionally followed by another, neither signifying a
+    # ">("-prefixed process substitution.
+    local pcre_redirect_greater_than_char_pair='>'${pcre_redirect_greater_than_char_optional}
+
+    # ">"-prefixed redirection.
+    local pcre_redirect_greater_than=${pcre_redirect_greater_than_char_pair}'&?+[!|]?+'
+
+    # "<"-prefixed redirection.
+    local pcre_redirect_less_than='<(?>'${pcre_here}'|&|'${pcre_redirect_greater_than_char_optional}')'
+
+    # "&"-prefixed redirection.
+    local pcre_redirect_ampersand='&'${pcre_redirect_greater_than_char_pair}'[!|]?+'
+
+    # "{"- and "}"-delimited variable name, whose leading "{" conflicts with
+    # the "{" prefixing command-terminating blocks and hence requires
+    # disambiguation. By "man zshmisc" commentary, "No whitespace is allowed
+    # between the closing brace and the redirection character."
+    local pcre_redirect_var_name='\{'${ZESHY_VAR_NAME_PCRE}'\}'
+    local pcre_redirect_var_name_optional='(?>'${pcre_redirect_var_name}')?+'
+
+    # ">"- or "<"-prefixed redirection optionally preceded by a "{"- and
+    # "}"-delimited variable name. Due to zeshy's usage of "<"-prefixed here-
+    # documents for official documentation, the former appears considerably
+    # more frequently than the latter and hence is matched first.
+    local pcre_redirect_less_than_or_greater_than=${pcre_redirect_var_name_optional}'(?>'${pcre_redirect_less_than}'|'${pcre_redirect_greater_than}')'
+
+    # Redirection *AFTER* the start of a shell word of a command.
+    local pcre_redirect_rest=${pcre_redirect_less_than_or_greater_than}'|'${pcre_redirect_ampersand}
+
+    # Redirection at the start of a shell word of a command.
+    local pcre_redirect_start=${pcre_redirect_rest}'|'${pcre_redirect_file_descriptor}
 
     # ..................{ BRACE EXPANSION                    }..................
     # Smallest syntactic component in a brace expansion and hence matching
@@ -1439,15 +1482,15 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # ..................{ PICOWORD ~ sourceable              }..................
     # Smallest syntactic component at the start of the first shell word of a
     # command.
-    local pcre_picoword_sourceable_start_word_first=${pcre_picoword_passable_sans_brace_left}'|'${pcre_redirect}
+    local pcre_picoword_sourceable_start_word_first=${pcre_picoword_passable_sans_brace_left}'|'${pcre_redirect_start}
 
     # Smallest syntactic component at the start of any shell word *AFTER* the
     # first of a command.
-    local pcre_picoword_sourceable_start_word_rest=${pcre_picoword_passable_start}'|'${pcre_redirect}
+    local pcre_picoword_sourceable_start_word_rest=${pcre_picoword_passable_start}'|'${pcre_redirect_start}
 
     # Smallest syntactic component *AFTER* the start of any shell word of a
     # command.
-    local pcre_picoword_sourceable_rest=${pcre_picoword_passable_rest}'|'${pcre_redirect}
+    local pcre_picoword_sourceable_rest=${pcre_picoword_passable_rest}'|'${pcre_redirect_rest}
 
     # ..................{ NANOWORD ~ backtickable            }..................
     # Syntactic component at the start of the first shell word of a command
@@ -1629,6 +1672,14 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # Note that here-document syntactic invalidities (e.g., unmatched suffixing
     # delimiters) need *NOT* be matched here, as the PCRE embedding such PCREs
     # already accounts for such invalidities in a generalized manner.
+
+    #FIXME: Unconvinced that ${pcre_literal_parenable_*} comprises only
+    #unconditionally unreserved characters. Verify, please.
+
+    # Unquoted literal shell word, comprising only unconditionally unreserved
+    # characters and hence excluding conditionally unreserved parens.
+    local pcre_word_literal=${pcre_literal_parenable_start}${pcre_literals_parenable_rest_optional}
+    local pcre_word_literal_grouped='('${pcre_word_literal}')'
 
     # Here-document delimiter prefix, comprising an ignorable optional hyphen
     # (signifying leading tabs to be insignificant) followed by zero or more
@@ -2270,6 +2321,8 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # Declare positive absolute indices matched by ${ZESHY__PREPROCESS_PCRE}.
     group_index=1
 
+    #FIXME: Not entirely convinced of the validity of these indices. Verify.
+
     for group_name (
         ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_UNPROTOTYPED_NAME
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPED_NAME
@@ -2279,14 +2332,13 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPE_NAMES
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPE_ARG_LIST
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPE_ARG_CHANNELS
-        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_ARG_BLOCK_LAST
-        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_ARGS_SCALAR_LAST
-        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_IS_VALID
+        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_ARG_ZESHY_LAST
+        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_END
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_BRACE_RIGHT_NAME
-        # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_BRACE_RIGHT_ARG_BLOCK_LAST
-        # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_BRACE_RIGHT_ARGS_SCALAR_LAST
-        ZESHY__PREPROCESS_GROUP_INDEX_NONMACRO_CODE_IS_VALID_WASTELANDS
-        ZESHY__PREPROCESS_GROUP_INDEX_NONMACRO_CODE_IS_VALID
+        # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_BRACE_RIGHT_ARG_ZESHY_LAST
+        # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_BRACE_RIGHT_END
+        ZESHY__PREPROCESS_GROUP_INDEX_CODE_END_WASTELANDS
+        ZESHY__PREPROCESS_GROUP_INDEX_CODE_END
     ) {
         integer -g ${group_name}=$(( group_index++ ))
         # print -r ${group_name}': '${(P)group_name}
@@ -2294,6 +2346,46 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: Yet another minor issue: the "{" prefixing "{var_name}[<>]"-style
+#redirections conflicts with the command terminator "{" prefixing blocks and
+#hence commands. While the former is considerably rarer than the latter in the
+#zeshy codebase, we should still correct this.
+    #FUXME: Replace all usage of ${pcre_redirect} by such PCREs as appropriate.
+
+    # "{"- and "}"-delimited variable name-prefixed redirection, whose leading
+    # "{" conflicts with the "{" prefixing command-terminating blocks and hence
+    # requires disambiguation. By "man zshmisc" commentary, "No whitespace is
+    # allowed between the closing brace and the redirection character."
+    # local pcre_redirect_file_descriptor='\{'${ZESHY_VAR_NAME_PCRE}'\}[<>]'${pcre_redirect_not_process_substitution}
+
+    # ">" character *NOT* followed by a "(" character and hence *NOT*
+    # signifying a ">("-prefixed process substitution.
+    # local pcre_redirect_greater_than_char='>'${pcre_redirect_not_process_substitution}
+    # local pcre_redirect_greater_than_char_pair='(?>'${pcre_redirect_greater_than_char}'){1,2}'
+
+    # ${pcre_redirect_greater_than_char}${pcre_redirect_greater_than_char_optional}
+    # local pcre_redirect_greater_than_char_optional='(?>'${pcre_redirect_greater_than_char}')?+'
+        # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_ARGS_SCALAR_LAST
+        # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_IS_VALID
+    # Note that, according to section "PROCESS SUBSTITUTIONS" of "man zshexpn",
+    # "Process substitutions may be used following redirection operators; in
+    # this case, the substitution must appear with no trailing string." Hence,
+    # this PCRE need *NOT* be embedded after redirection operators guaranteed
+
+    # Redirections are largely incidental to preprocessor parsing but must
+    # nonetheless be partially matched for disambiguation with command
+    # terminators and unquoted shell words. For example, since "&!" is a
+    # command terminator while "&>" is not, matching merely an unquoted "&"
+    # character is insufficient to identify a "&"-prefixed command terminator.
+    
+    # To guarantee this, "(" characters are prevented from matching after "<"
+    # or ">" characters are matched here.
+
+    # Since matching "<("- and ">("-prefixed process substitution redirections
+    # requires recursion and hence subroutine calls exceeding the scope of this
+    # PCRE, a "(" *MUST* be prevented from matching after a "<" or ">" is
+    # matched with negative lookahead.
+
     # # "`"-delimited process substitution.
     # local pcre_passable_nanoword_process_substitution_backtick='(?=`)'${pcre_embeddable_body}
     #
