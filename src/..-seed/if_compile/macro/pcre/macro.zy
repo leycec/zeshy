@@ -1174,24 +1174,6 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # Command terminator(s) optimizing matching of preprocessor macros.
     local pcre_terminators_macroable_grouped=${pcre_terminators_head}${pcre_terminator_unspaced_macroable_grouped}${pcre_terminators_foot}
 
-    # ..................{ REDIRECTION ~ lookahead            }..................
-    # Digit-prefixed redirection prefix, matching only sufficiently many
-    # characters to identify such redirection.
-    local pcre_redirect_numbered_prefix='[0-9]++&?[<>]'
-
-    # "{"- and "}"-delimited variable name-prefixed redirection prefix,
-    # matching only sufficiently many characters to identify such redirection.
-    # By "man zshmisc" commentary, "No whitespace is allowed between the
-    # closing brace and the redirection character."
-    local pcre_redirect_file_descriptor_prefix='\{'${ZESHY_VAR_NAME_PCRE}'\}[<>]'
-
-    # Digit- or file descriptor redirection prefix, principally intended for
-    # use in negative lookahead preventing matching of such redirections. All
-    # other redirections are prefixed by characters already prevented from
-    # matching in unquoted shell words (e.g., "<", ">") and hence need *NOT* be
-    # matched explicitly.
-    local pcre_redirect_unique_prefix=${pcre_redirect_numbered_prefix}'|'${pcre_redirect_file_descriptor_prefix}
-
     # ..................{ LITERAL ~ sourceable               }..................
     # Negative lookahead preventing substrings that would otherwise be matched
     # as unquoted shell words from being matched as such. By PCRE design, most
@@ -1342,6 +1324,10 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     #* In ${pcre_nanoword_passable_start}, add alternatives matching something
     #  resembling:
     #    '|[0-9](?!'${pcre_redirect_numbered_prefix_sans_digit}')|'${pcre_brace_left}'(?!'${pcre_redirect_file_descriptor_prefix_sans_brace_left}')'
+    #FIXME: Actually, given the effort involved in even the current approach,
+    #we'd might as well go ahead and just capture here and then "fix up"
+    #redirections properly in +{backend} (e.g., by shifting each captured macro
+    #redirection to the end of such macro). No more lookahead nonsense, please.
 
     # Negative lookahead preventing matching of syntactic construct prefixes
     # conflicting with the start of unquoted shell words in scalar macro
@@ -1359,7 +1345,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # macro argument.
     local pcre_literals_passable_rest='['${char_not_literal_passable_rest}']++|'${pcre_literal_passable_core}
 
-    # ..................{ REDIRECTION                        }..................
+    # ..................{ REDIRECTION ~ sourceable           }..................
     # Since redirections are freely interspersable amongst arguments (e.g.,
     # ":the church {of}>the subgenius", where "{of}>the" is a redirection
     # sandwiched between two arguments "church" and "subgenius"), redirections
@@ -1421,6 +1407,10 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # "&"-prefixed redirection.
     local pcre_redirect_ampersand='&'${pcre_redirect_greater_than_char_pair}'[!|]?+'
 
+    # Redirection *AFTER* the start of a shell word of a command in a general-
+    # purpose context.
+    local pcre_redirect_sourceable_rest=${pcre_redirect_less_than}'|'${pcre_redirect_greater_than}'|'${pcre_redirect_ampersand}
+
     # "{"- and "}"-delimited variable name, whose leading "{" conflicts with
     # the "{" prefixing command-terminating blocks and hence requires
     # disambiguation. By "man zshmisc" commentary, "No whitespace is allowed
@@ -1428,22 +1418,69 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     local pcre_redirect_var_name='\{'${ZESHY_VAR_NAME_PCRE}'\}'
     local pcre_redirect_var_name_optional='(?>'${pcre_redirect_var_name}')?+'
 
+    # ">"- or "<"-prefixed redirection. Due to zeshy's usage of "<"-prefixed
+    # here- documents for official documentation, the former appears
+    # considerably more frequently than the latter and hence is matched first.
+    local pcre_redirect_less_or_greater_than='(?>'${pcre_redirect_less_than}'|'${pcre_redirect_greater_than}')'
+
     # ">"- or "<"-prefixed redirection optionally preceded by a "{"- and
-    # "}"-delimited variable name. Due to zeshy's usage of "<"-prefixed here-
-    # documents for official documentation, the former appears considerably
-    # more frequently than the latter and hence is matched first.
-    local pcre_redirect_less_than_or_greater_than=${pcre_redirect_var_name_optional}'(?>'${pcre_redirect_less_than}'|'${pcre_redirect_greater_than}')'
+    # "}"-delimited variable name at the start of a shell word. Since
+    # "&"-prefixed redirections are shorthand signifying both standard output
+    # and input and hence accept no prefixing variable name, such redirections
+    # are matched separately.
+    local pcre_redirect_sourceable_start_less_or_greater=${pcre_redirect_var_name_optional}${pcre_redirect_less_or_greater_than}
 
-    # Redirection *AFTER* the start of a shell word of a command.
-    local pcre_redirect_rest=${pcre_redirect_less_than_or_greater_than}'|'${pcre_redirect_ampersand}
+    # Redirection at the start of the first shell word of a command in a
+    # general-purpose context.
+    local pcre_redirect_sourceable_start_word_first=${pcre_redirect_sourceable_start_less_or_greater}'|'${pcre_redirect_ampersand}
 
-    # Redirection at the start of a shell word of a command.
-    local pcre_redirect_start=${pcre_redirect_rest}'|'${pcre_redirect_file_descriptor}
+    # Redirection at the start of a shell word *AFTER* the first of a command
+    # in a general-purpose context.
+    local pcre_redirect_sourceable_start_word_rest=${pcre_redirect_sourceable_start_word_first}
+
+    # ..................{ REDIRECTION ~ passable             }..................
+    #FIXME: Insufficient, sadly. Since the prior PCREs do *NOT* match most
+    #redirection components following the "<" or ">", we'll have to do so
+    #below. This is complicated by the fact that most redirections take a
+    #single shell word as their arguments -- a shell word *NOT* containing
+    #redirections, of course. In other words, this is considerably less trivial
+    #than we thought. While subsequently implementing this properly remains
+    #feasible, doing so really exceeds the scope of a first draft. Hence, let's
+    #refactor this into a negative lookahead approach prohibiting scalar
+    #arguments from containing redirections. What say you? Yay!
+    #FIXME: We'll need to add "&" to ${pcre_char_not_literal_passable_*}.
+    #FIXME: Correct documentation, including why we've adopted a negative
+    #lookahead approach.
+
+    # Negative lookahead preventing either a "<"- or ">"-prefixed redirection
+    # from matching.
+    local pcre_not_redirect_less_or_greater_than='(?!'${pcre_redirect_less_or_greater_than}')'
+
+    # One or more digits prefixing a redirection. While incidental to general-
+    # purpose redirection matching, such digits are essential to disambiguating
+    # redirections from scalar macro arguments.
+    local pcre_picoword_passable_start_digit_not_redirect='[0-9]'
+
+    # "{"- and "}"-delimited variable name *OR* one or more digits.
+    local pcre_redirect_var_name_or_digits_optional='(?>'${pcre_redirect_digits}'|'${pcre_redirect_var_name}')?+'
+
+    # ">"- or "<"-prefixed redirection optionally preceded by either a "{"- and
+    # "}"-delimited variable name *OR* one or more digits at the start of a
+    # shell word.
+    local pcre_redirect_passable_start_less_or_greater=${pcre_redirect_var_name_or_digits_optional}${pcre_redirect_less_or_greater_than}
+
+    # Redirection at the start of scalar macro argument.
+    local pcre_redirect_passable_start=${pcre_redirect_passable_start_less_or_greater}'|'${pcre_redirect_ampersand}
+    local pcre_redirect_passable_start_grouped='('${pcre_redirect_passable_start}')'
+
+    # Redirection *AFTER* the start of a scalar macro argument.
+    local pcre_redirect_passable_rest=${pcre_redirect_sourceable_rest}
+    local pcre_redirect_passable_rest_grouped='('${pcre_redirect_passable_rest}')'
 
     # ..................{ BRACE EXPANSION                    }..................
-    # Smallest syntactic component in a brace expansion and hence matching
-    # neither redirections nor quoted strings. (Such expansions prohibit both.)
-    local pcre_picoword_braceable=${pcre_char_escaped}
+    # Smallest syntactic component in a brace expansion and hence *NOT*
+    # matching redirections, which such expansions prohibit.
+    local pcre_picoword_braceable=${pcre_char_escaped}'|'${pcre_quotes}
 
     # Syntactic component in a brace expansion.
     local pcre_nanoword_braceable=${pcre_literals_braceable_optional}'|'${pcre_picoword_braceable}'|'${pcre_sourceable_nanoword_rest}
@@ -1461,36 +1498,35 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # prevent such expansion from erroneously matching shell words consisting
     # only of "{" and hence block prefixes, such prefix is suffixed by one
     # (rather than zero) or more characters.
-    local pcre_brace_expansion_or_brace_left_start_word_rest=${pcre_brace_left}'(?>'${pcre_nanowords_braceable}${pcre_brace_right_optional}'|'${pcre_brace_right}')'
+    local pcre_braceable_start_word_rest=${pcre_brace_left}'(?>'${pcre_nanowords_braceable}${pcre_brace_right_optional}'|'${pcre_brace_right}')'
 
     # Brace expansion *OR* "{" character balanced by no subsequent "}"
     # character *AFTER* the start of any shell word of a command. 
-    local pcre_brace_expansion_or_brace_left_rest=${pcre_brace_left}${pcre_nanowords_braceable_optional}${pcre_brace_right_optional}
-
-    # ..................{ PICOWORD ~ passable                }..................
-    # Smallest syntactic component in a scalar macro argument and hence *NOT*
-    # matching redirections.
-    local pcre_picoword_passable_sans_brace_left=${pcre_picoword_braceable}'|'${pcre_quotes}
-
-    # Smallest syntactic component at the start of a scalar macro argument.
-    local pcre_picoword_passable_start=${pcre_picoword_passable_sans_brace_left}'|'${pcre_brace_expansion_or_brace_left_start_word_rest}
-
-    # Smallest syntactic component *AFTER* the start of a scalar macro
-    # argument.
-    local pcre_picoword_passable_rest=${pcre_picoword_passable_sans_brace_left}'|'${pcre_brace_expansion_or_brace_left_rest}
+    local pcre_braceable_rest=${pcre_brace_left}${pcre_nanowords_braceable_optional}${pcre_brace_right_optional}
 
     # ..................{ PICOWORD ~ sourceable              }..................
     # Smallest syntactic component at the start of the first shell word of a
-    # command.
-    local pcre_picoword_sourceable_start_word_first=${pcre_picoword_passable_sans_brace_left}'|'${pcre_redirect_start}
+    # command in a general-purpose context. "{"- and "}"-delimited glob
+    # qualifiers are prohibited at such position and hence omitted here.
+    local pcre_picoword_sourceable_start_word_first=${pcre_picoword_braceable}'|'${pcre_redirect_sourceable_start_word_first}
 
     # Smallest syntactic component at the start of any shell word *AFTER* the
-    # first of a command.
-    local pcre_picoword_sourceable_start_word_rest=${pcre_picoword_passable_start}'|'${pcre_redirect_start}
+    # first of a command in a general-purpose context. Since "{"-prefixed
+    # redirections take precedence over "{"-prefixed brace expansions,
+    # redirections are matched before the latter.
+    local pcre_picoword_sourceable_start_word_rest=${pcre_picoword_braceable}'|'${pcre_redirect_sourceable_start_word_rest}'|'${pcre_braceable_start_word_rest}
 
     # Smallest syntactic component *AFTER* the start of any shell word of a
-    # command.
-    local pcre_picoword_sourceable_rest=${pcre_picoword_passable_rest}'|'${pcre_redirect_rest}
+    # command in a general-purpose context.
+    local pcre_picoword_sourceable_rest=${pcre_picoword_braceable}'|'${pcre_redirect_sourceable_rest}'|'${pcre_braceable_rest}
+
+    # ..................{ PICOWORD ~ passable                }..................
+    # Smallest syntactic component at the start of a scalar macro argument.
+    local pcre_picoword_passable_start_grouped=${pcre_picoword_braceable}'|'${pcre_redirect_passable_start_grouped}'|'${pcre_braceable_start_word_rest}
+
+    # Smallest syntactic component *AFTER* the start of a scalar macro
+    # argument.
+    local pcre_picoword_passable_rest_grouped=${pcre_picoword_braceable}'|'${pcre_redirect_passable_start_grouped}'|'${pcre_braceable_rest}
 
     # ..................{ NANOWORD ~ backtickable            }..................
     # Syntactic component at the start of the first shell word of a command
@@ -1520,10 +1556,10 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
 
     # ..................{ NANOWORD ~ passable                }..................
     # Syntactic component at the start of a scalar macro argument.
-    local pcre_nanoword_passable_start=${pcre_literal_passable_start}'|'${pcre_picoword_passable_start}'|'${pcre_passable_nanoword_start}
+    local pcre_nanoword_passable_start_grouped=${pcre_literal_passable_start}'|'${pcre_picoword_passable_start_grouped}'|'${pcre_passable_nanoword_start}
 
     # Syntactic component *AFTER* the start of a scalar macro argument.
-    local pcre_nanoword_passable_rest=${pcre_literals_passable_rest}'|'${pcre_picoword_passable_rest}'|'${pcre_passable_nanoword_rest}
+    local pcre_nanoword_passable_rest_grouped=${pcre_literals_passable_rest}'|'${pcre_picoword_passable_rest_grouped}'|'${pcre_passable_nanoword_rest}
 
     # ..................{ GLOB QUALIFIER                     }..................
     # Parenable-specific word PCREs are split into two subsections, reflecting
@@ -1538,9 +1574,15 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # negative lookbehind. PCREs below *NOT* embedding such lookbehind thus
     # match unbalanced "}" block suffixes.
 
+    # "("- and ")"-delimited glob qualifier prefix.
+    local pcre_qualifier_prefix=${pcre_paren_left}
+
+    # "("- and ")"-delimited glob qualifier suffix.
+    local pcre_qualifier_suffix=${pcre_paren_right_optional}
+
     # "("- and ")"-delimited glob qualifier permitting matching of strictly
     # balanced parens.
-    local pcre_qualifier_parenable=${pcre_paren_left}'(?>'${pcre_nanoword_parenable_rest}')'${pcre_paren_right_optional}
+    local pcre_qualifier_parenable=${pcre_qualifier_prefix}'(?>'${pcre_nanoword_parenable_rest}')'${pcre_qualifier_suffix}
 
     # Zero or more syntactic components *AFTER* the start of a shell word,
     # permitting matching of strictly balanced parens.
@@ -1647,16 +1689,15 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     local pcre_commands_backtickable_optional='(?>'${pcre_words_backtickable_optional}${pcre_terminators}')*+'
 
     # ..................{ WORD ~ passable                    }..................
-    # "("- and ")"-delimited glob qualifier in a scalar macro argument. To
-    # avoid erroneous consumption of unbalanced non-qualifying ")" characters
-    # suffixing syntactic constructs (e.g., the ")" suffixing process forks),
-    # match such character non-optionally.
-    local pcre_qualifier_passable=${pcre_paren_left}'(?>'${pcre_nanoword_passable_rest}')'${pcre_paren_right}
+    #FIXME: Erroneous. Qualifiers clearly *CANNOT* contain redirections.
+
+    # "("- and ")"-delimited glob qualifier in a scalar macro argument.
+    local pcre_qualifier_passable=${pcre_qualifier_prefix}'(?>'${pcre_nanoword_passable_rest_grouped}')'${pcre_qualifier_suffix}
 
     # Scalar macro argument. Since arguments are never in command position,
     # list assignments are irrelevant to such matching and hence omitted.
-    local pcre_word_passable='(?>'${pcre_nanoword_passable_start}'|'${pcre_qualifier_passable}')(?>'${pcre_nanoword_passable_rest}'|'${pcre_qualifier_passable}')*+'
-    local pcre_word_passable_optional='(?>'${pcre_word_passable_rest}')?+'
+    local pcre_word_passable_grouped='(?>'${pcre_nanoword_passable_start_grouped}'|'${pcre_qualifier_passable}')(?>'${pcre_nanoword_passable_rest_grouped}'|'${pcre_qualifier_passable}')*+'
+    local pcre_word_passable_optional_grouped='(?>'${pcre_word_passable_grouped}')?+'
 
     # One or more scalar macro arguments, preceded by one or more horizontal
     # whitespace characters optionally interspersed by line continuations.
@@ -1666,7 +1707,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # ${pcre_continuable_spaces_horizontal}. However, embedding the former
     # prevents one or more initial line continuations from matching, requiring
     # explicit matching of such continuations. (Phew!)
-    local pcre_words_passable_spaced=${pcre_continuations_optional}'(?>'${pcre_spaces_horizontal_continuable}${pcre_word_passable}')++'
+    local pcre_words_passable_spaced_grouped=${pcre_continuations_optional}'(?>'${pcre_spaces_horizontal_continuable}${pcre_word_passable_grouped}')++'
 
     # ..................{ HERE                               }..................
     # Note that here-document syntactic invalidities (e.g., unmatched suffixing
@@ -2147,25 +2188,6 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     pcre_subroutines_body+='(?<blk>'${pcre_commands_blockable_optional}')'
 
     # ..................{ MACRO ~ arg                        }..................
-    #FIXME: Implement support for explicit quote-protection of test arguments
-    #(i.e., both "(("- and "))"-delimited arithmetic tests *AND* "[["- and
-    #"]]"- delimited standard tests): e.g.,
-    #
-    #     # The preprocessor should quote-protect this...
-    #     :test_macro "yum" { :print ok } [[ "yil" == "yaz" ]]
-    #
-    #     # ...into this.
-    #     :test_macro '"yum"' '{ :print ok }' '[[ "yil" == "yaz" ]]'
-    #
-    #This shouldn't be terribly difficult to implement. Do *NOT* implement a
-    #new type of macro to do so. Instead, all macros should gain support for
-    #test arguments by revising ${ZESHY__PREPROCESS_PCRE}, currently only
-    #capturing scalar and block arguments, to also capture test arguments. Yay!
-    #
-    #The only subtle occurs with scalar arguments; since test arguments are
-    #also valid scalar arguments, the latter *MUST* be explicitly prevented
-    #from matching the former.
-
     # To permit efficient reuse of a single compilation of
     # ${ZESHY__PREPROCESS_PCRE} for *ALL* macro preprocessing, such PCRE is
     # generalized to support PCRE-based iteration of both macros *AND* macro
@@ -2182,11 +2204,22 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # first and last byte indices of such last block argument and following
     # scalar arguments requires capturing both.
 
-    # Macro block argument optionally followed by zero or more scalar macro
-    # arguments *OR* one or more macro scalar arguments. While such arguments
-    # may be matched in either order, the former are *ALWAYS* prefixed by "{"
-    # and hence more efficiently matchable than the latter.
-    local pcre_macro_arg_grouped='(?|'${pcre_block_grouped}'|'${pcre_math_test_grouped}'|'${pcre_test_grouped}'|'${pcre_words_passable_spaced}')'
+    # zeshy-specific macro argument, captured to the same match group
+    # irrespective of such macro's type.
+    local pcre_macro_arg_zeshy_grouped='(?|'${pcre_block_grouped}'|'${pcre_math_test_grouped}'|'${pcre_test_grouped}')'
+
+    # One or more scalar macro arguments, captured to a new match group.
+    local pcre_macro_args_scalar_grouped='('${pcre_words_passable_spaced_grouped}')'
+
+    # Macro argument.
+    #
+    # Since the "[[" substrings prefixing non-arithmetic test arguments are
+    # also valid unquoted shell words and hence scalar macro arguments, the
+    # former are matched before the latter. Happily, this is also justifiable
+    # on efficiency grounds: while scalar macro arguments are prefixable by any
+    # of several characters, zeshy-specific macro arguments are prefixed by
+    # constants (e.g., "{", "[[") and hence more efficiently matchable.
+    local pcre_macro_arg_grouped='(?>'${pcre_macro_arg_zeshy_grouped}'|'${pcre_macro_args_scalar_grouped}')'
 
     # One or more macro arguments preceded by one or more horizontal whitespace
     # characters optionally interspersed by line continuations,
@@ -2324,8 +2357,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     #FIXME: Not entirely convinced of the validity of these indices. Verify.
 
     for group_name (
-        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_UNPROTOTYPED_NAME
-        # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPED_NAME
+        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_NAME
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPE_ATTRS
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPE_RETURN_TYPE
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPE_RETURN_CHANNELS
@@ -2333,6 +2365,10 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPE_ARG_LIST
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_PROTOTYPE_ARG_CHANNELS
         ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_ARG_ZESHY_LAST
+        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_ARGS_SCALAR_LAST
+        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_REDIRECT_LAST_LAST
+        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_REDIRECT_LAST_LAST_
+        ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_REDIRECT_LAST
         ZESHY__PREPROCESS_GROUP_INDEX_MACRO_COMMAND_END
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_BRACE_RIGHT_NAME
         # ZESHY__PREPROCESS_GROUP_INDEX_MACRO_BRACE_RIGHT_ARG_ZESHY_LAST
@@ -2346,6 +2382,111 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # # One or more digits prefixing a redirection. While incidental to general-
+    # # purpose redirection matching, such digits are essential to disambiguating
+    # # redirections from scalar macro arguments.
+    # local pcre_redirect_digits='[0-9]++'
+    #
+    # # "{"- and "}"-delimited variable name *OR* one or more digits.
+    # local pcre_redirect_var_name_or_digits_optional='(?>'${pcre_redirect_digits}'|'${pcre_redirect_var_name}')?+'
+    #
+    # # ">"- or "<"-prefixed redirection optionally preceded by either a "{"- and
+    # # "}"-delimited variable name *OR* one or more digits at the start of a
+    # # shell word.
+    # local pcre_redirect_passable_start_less_or_greater=${pcre_redirect_var_name_or_digits_optional}${pcre_redirect_less_or_greater_than}
+    #
+    # # Redirection at the start of scalar macro argument.
+    # local pcre_redirect_passable_start=${pcre_redirect_passable_start_less_or_greater}'|'${pcre_redirect_ampersand}
+    # local pcre_redirect_passable_start_grouped='('${pcre_redirect_passable_start}')'
+    #
+    # # Redirection *AFTER* the start of a scalar macro argument.
+    # local pcre_redirect_passable_rest=${pcre_redirect_sourceable_rest}
+    # local pcre_redirect_passable_rest_grouped='('${pcre_redirect_passable_rest}')'
+
+    #FUXME: Implement support for explicit quote-protection of test arguments
+    #(i.e., both "(("- and "))"-delimited arithmetic tests *AND* "[["- and
+    #"]]"- delimited standard tests): e.g.,
+    #
+    #     # The preprocessor should quote-protect this...
+    #     :test_macro "yum" { :print ok } [[ "yil" == "yaz" ]]
+    #
+    #     # ...into this.
+    #     :test_macro '"yum"' '{ :print ok }' '[[ "yil" == "yaz" ]]'
+    #
+    #This shouldn't be terribly difficult to implement. Do *NOT* implement a
+    #new type of macro to do so. Instead, all macros should gain support for
+    #test arguments by revising ${ZESHY__PREPROCESS_PCRE}, currently only
+    #capturing scalar and block arguments, to also capture test arguments. Yay!
+    #FUXME: The only subtlety occurs with scalar arguments; since test
+    #arguments are also valid scalar arguments, the latter *MUST* be explicitly
+    #prevented from matching the former.
+    # zeshy-specific macro argument optionally followed by zero or more scalar
+    # macro arguments *OR* one or more macro scalar arguments. While such
+    # arguments may be matched in either order, the former are *ALWAYS*
+    # prefixed by "{" and hence more efficiently matchable than the latter.
+
+    # ..................{ PICOWORD ~ core                    }..................
+    # Smallest syntactic component at the start of the first shell word of an
+    # abstract command.
+    # local pcre_picoword_braceable=${pcre_picoword_braceable}
+
+    # Smallest syntactic component at the start of any shell word *AFTER* the
+    # first of an abstract command.
+    # local pcre_picoword_core_start_word_rest=${pcre_picoword_braceable}'|'${pcre_braceable_start_word_rest}
+
+    # Smallest syntactic component *AFTER* the start of a shell word of an
+    # abstract command.
+    # local pcre_picoword_core_rest=${pcre_picoword_braceable}'|'${pcre_braceable_rest}
+
+    # Since "{"-prefixed redirections take precedence over "{"-prefixed brace
+    # expansions, the former are matched before the latter.
+    #FUXME: Woops. We're fairly certain that we need to match "{"- and "}"-
+    #delimited glob qualifiers here to avoid conflicts with "{"-specific block
+    #prefix command terminators.
+    #FUXME: Match ${pcre_redirect_passable_start_grouped} *BEFORE*
+    #${pcre_braceable_start_word_rest}; while both match
+    #"{"-prefixed substrings, the former *ALWAYS* takes precedence.
+    #FUXME: Slightly incorrect. Since quotes are valid in brace expansions,
+    #append ${pcre_picoword_braceable} by "'|'${pcre_quotes}" and refactor
+    #accordingly below.
+
+    # Smallest syntactic component in a brace expansion and hence matching
+    # neither redirections nor quoted strings. (Such expansions prohibit both.)
+    # Smallest syntactic component in a scalar macro argument and hence *NOT*
+    # matching redirections.
+    # local pcre_picoword_passable_sans_brace_left=${pcre_picoword_braceable}'|'${pcre_quotes}
+
+# Matching such digits is irrelevant to general-purpose redirection matching but
+
+    # ..................{ REDIRECTION ~ lookahead            }..................
+    #FUXME: Excise such PCREs below.
+
+    # Digit-prefixed redirection prefix, matching only sufficiently many
+    # characters to identify such redirection.
+    # local pcre_redirect_numbered_prefix='[0-9]++&?[<>]'
+
+    # "{"- and "}"-delimited variable name-prefixed redirection prefix,
+    # matching only sufficiently many characters to identify such redirection.
+    # By "man zshmisc" commentary, "No whitespace is allowed between the
+    # closing brace and the redirection character."
+    # local pcre_redirect_file_descriptor_prefix='\{'${ZESHY_VAR_NAME_PCRE}'\}[<>]'
+
+    # Digit- or file descriptor redirection prefix, principally intended for
+    # use in negative lookahead preventing matching of such redirections. All
+    # other redirections are prefixed by characters already prevented from
+    # matching in unquoted shell words (e.g., "<", ">") and hence need *NOT* be
+    # matched explicitly.
+    # local pcre_redirect_unique_prefix=${pcre_redirect_numbered_prefix}'|'${pcre_redirect_file_descriptor_prefix}
+
+    #FUXME: Revert to the prior ${pcre_qualifier_prefix} and
+    #${pcre_qualifier_suffix} PCREs.
+
+    # "("- and ")"-delimited glob qualifier in a scalar macro argument. To
+    # avoid erroneous consumption of unbalanced non-qualifying ")" characters
+    # suffixing syntactic constructs (e.g., the ")" suffixing process forks),
+    # match such character non-optionally.
+    # local pcre_qualifier_passable=${pcre_paren_left}'(?>'${pcre_nanoword_passable_rest}')'${pcre_paren_right}
+
 #FUXME: Yet another minor issue: the "{" prefixing "{var_name}[<>]"-style
 #redirections conflicts with the command terminator "{" prefixing blocks and
 #hence commands. While the former is considerably rarer than the latter in the
@@ -2613,7 +2754,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # local pcre_brace_expansion_suffix='\}'
     # local pcre_brace_expansion_suffix_optional=${pcre_brace_expansion_suffix}'?+'
 
-    #FUXME: Ehrm; ${pcre_brace_expansion_or_brace_left_start_word_rest} has yet
+    #FUXME: Ehrm; ${pcre_braceable_start_word_rest} has yet
     #to be defined here. Amend us, please.
 
 #*NOT* signifying a brace expansion suffix.
