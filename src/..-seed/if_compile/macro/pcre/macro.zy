@@ -39,47 +39,12 @@
 #Phew! While each of the above steps is largely trivial, there certainly exist
 #more than a few of them. *wet choleric sigh*
 
-#FIXME: We need to match macros immediately following each ")"-suffixed glob
-#expression of a case() statement. While this is certainly feasible for the
-#first such expression, it's unclear how (if at all) macros following any
-#subsequent ")"-suffixed glob expressions could be matched. If they can't,
-#then, for orthogonality, the first shouldn't be matched either. Contemplate.
-#
-#After contemplation, macros are technically matchable following ")"-suffixed
-#glob expressions in *NON-NESTED* case statements (i.e., case statements *NOT*
-#nested in other case statements, which require subroutine calls precluding
-#capturing of macro substrings). That said, we're hard-pressed to recall the
-#last time we required nested case statements, implying such matching to be
-#feasible in practice. However, it's a bit non-trivial.
-#
-#No existing PCRE substructure needs to be modified to accomodate such
-#matching. Instead, if the command name is "case", a new parallel top-level
-#PCRE structure matching case statement syntax suffices. Such structure should
-#mirror the current PCRE structure with one simple addition: ")"-suffixed
-#glob expressions in command position should be matched as terminators. That's
-#it. That said, while relatively simple, that could impose quite a bit of PCRE
-#duplication significantly increasing the length and hence debuggability of
-#such PCRE. Hold off on such improvement until stabilizing such PCRE.
-#FIXME: The prior comment appears blatantly wrong. After all, after matching a
-#macro in the first conditional of a case statement and resuming matching, all
-#memory of having even been in a case statement has been lost. That said, there
-#is a *FAR* simpler means of matching macros after case statement conditionals:
-#
-#* If either a "{" command terminator or two or more ";" command terminators
-#  match, then optionally match (in order):
-#  * One or more whitespace characters (either horizontal or vertical).
-#  * An optional "(".
-#  * A shell word.
-#  * A non-optional ")".
-#  * One or more whitespace characters (either horizontal or vertical).
-#
-#That's it. Extraordinarily trivial, at least on paper.
-#FIXME: After successfully implementing the prior improvement, excise the
-#"Case Statement Patterns" caveat from +{frontend} documentation.
-
 #FIXME: For debuggability, we probably want to prepand global PCREs with option
-#"(?x)" enabling "extended PCRE" mode. Following that, append suitable
-#subsections of such PCREs by newlines for improved readability.
+#"(?x)" enabling "extended PCRE" mode. Before doing so, however, we'll need to
+#investigate which formerly ignored characters such mode renders reserved;
+#this is probably at least "#". all instances of which may now need to be
+#explicitly escaped by "\". Following that, append suitable subsections of such
+#PCREs by newlines for improved readability.
 
 # ....................{ GLOBALS ~ pcre                     }....................
 # PCRE to which ${ZESHY__PREPROCESS_PCRE} will be set if no macros exist.
@@ -265,13 +230,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # Character class bodies intended to be embedded *ONLY* in positive
     # character classes (i.e., *NOT* prefixed by "^").
 
-    # Character class matching embeddable-reserved characters, including:
-    #
-    # * "$", prefixing variable expansions *AND* arithmetic and standard
-    #   process substitutions.
-    # * "`", prefixing non-recursive process substitutions.
-    local char_embeddable_prefix='$`'
-
+    # ..................{ CLASS ~ space                      }..................
     # Character class matching horizontal ASCII whitespace characters.
     local char_space_horizontal=' \t'
 
@@ -280,6 +239,14 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
 
     # Character class matching ASCII whitespace characters.
     local char_space=${char_space_horizontal}${char_space_vertical}
+
+    # ..................{ CLASS ~ embeddable                 }..................
+    # Character class matching embeddable-reserved characters, including:
+    #
+    # * "$", prefixing variable expansions *AND* arithmetic and standard
+    #   process substitutions.
+    # * "`", prefixing non-recursive process substitutions.
+    local char_embeddable_prefix='$`'
 
     # ..................{ CLASS ~ sourceable                 }..................
     # Character class matching sourceable-reserved characters at any character
@@ -334,6 +301,40 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # matching characters at the start of such arguments.
     local char_passable_nanoword_start=${char_passable_nanoword_rest}'=`'
 
+    # ..................{ CLASS ~ terminator                 }..................
+    # Character class matching single-character command terminators in a
+    # generic context.
+    #
+    # Technically, characters this class matches should be prefixed by either
+    # horizontal or vertical whitespace when preceded by characters that are
+    # *NOT* unspaced command terminators (e.g., "if { true } {"). Since shell
+    # word-specific negative lookahead prevents such words from matching "{",
+    # however, such technicalities are ignorable.
+    #
+    # Technically, "{" only conditionally constitutes a command terminator in
+    # specific syntactic contexts (namely, after if, elif, for, unless, and
+    # while conditionals): e.g.,
+    #
+    #    # A syntactic context in which "{" is *NOT* a command terminator,
+    #    # requiring that :macro() *NOT* be expanded in this syntactic context.
+    #    >>> :print { :macro
+    #    { :macro
+    #
+    # Unfortunately, matching such contexts is infeasible in the general case.
+    # Macros embedded in the conditional blocks of complex commands require
+    # matching, preventing PCRE-based retention of the observation that the
+    # current match position is in a complex command and hence preventing
+    # matching of "{" block prefixes in a contextual manner: e.g.,
+    #
+    #    # Matching "{" block prefixes in a contextual manner would erroneously
+    #    # prevent # :macro2() from being matched.
+    #    >>> !if { :macro1 } { :macro2 }
+    #
+    # Fortunately, issues only arise in the uncommon (and frankly syntactically
+    # unsupported) edge case of literal "{" shell words appearing *AFTER* the
+    # first shell words of commands. Hence, such issues are largely ignorable.
+    local char_terminator_sourceable=${char_space_vertical}'{'
+
     # ..................{ NOT ~ embeddable                   }..................
     # Character class bodies intended to be embedded *ONLY* in negative
     # character classes (i.e., prefixed by "^"). Since escaped characters must
@@ -351,9 +352,11 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # Character class matching invalid characters *AFTER* the start of an
     # unquoted shell word in a command at the top level, comprising most
     # zsh-reserved operators conflicting with macro preprocessing. This
-    # compriss all unconditionally meaningful ASCII punctuation, including:
+    # includes all unconditionally meaningful ASCII punctuation as well as:
     #
-    # * "{", prefixing:
+    # * "&", unconditionally signifying "&"-prefixed command terminators
+    #   (e.g., "&", "&&", "&!").
+    # * "{", unconditionally signifying either:
     #   * Blocks when the first character of the first shell word of a command.
     #   * Brace expansions when any other character of such words of a command.
     #
@@ -444,11 +447,11 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # prior classes, this class is invariant with respect to word order; that
     # is, this class unconditionally applies to both the first unquoted shell
     # word and all following such words of a command.
-    local char_not_literal_parenable_start='#{'${char_not_literal_parenable_rest}
+    local char_not_literal_parenable_start='#'${char_not_literal_parenable_rest}
 
     # ..................{ NOT ~ literal : passable           }..................
-    # Character class matching additionally invalid characters at any position
-    # of an unquoted shell word in a scalar macro argument, including:
+    # Character class matching invalid characters at any position of an
+    # unquoted shell word in a scalar macro argument, including:
     #
     # * "}", preventing such word from erroneously consuming block suffixes.
     # * ")", preventing such word from consuming arithmetic test, process fork,
@@ -1534,10 +1537,10 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # former case, the corresponding capture group will be absent.
     local pcre_terminator_string_end=${pcre_subject_end_succeed}
 
-    # "&"-prefixed command terminator, comprising a:
+    # "&"-prefixed command terminator, including:
     #
-    # * "&" or "&!" backgrounding.
-    # * "&&" boolean AND operator.
+    # * "&" and "&!", backgrounding the current process.
+    # * "&&", a boolean AND command operator.
     #
     # Since redirections do *NOT* terminate commands, this PCRE excludes both 
     # "&<"- and "&>"-formatted redirections.
@@ -1568,80 +1571,30 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     local pcre_terminator_process_prefix_sans_backtick='[$=<>]?+'${pcre_paren_left}
 
     # ..................{ TERMINATOR ~ unspaced : case       }..................
-    #FIXME: Uhm; what sort of shell word do we want here? Whatever it is should
-    #probably be maximally restrictive as well as explicitly match balanced 
-    #glob qualifiers. Yeah. While ${pcre_word_passable} does appear restrictive
-    #enough, we should probably verify this.
-
     # Case statement pattern, permitting macros situated on the same line as
     # such patterns to be matched as such. Such pattern *MUST* be
     # suffixed by one or more whitespace characters; to avoid interfering with
     # subsequent matching (e.g., of spaced terminators), such characters are
-    # asserted rather than consumed here.
+    # asserted rather than consumed here. Such pattern is prevented from
+    # matching overly permissively by use of a syntactically restrictive PCRE
+    # matching shell words (namely, that matching scalar macro arguments).
+
+    #FIXME: Actually, ${pcre_word_passable} prohibits prefixing "(" characters
+    #and hence is certainly *MUCH* too restrictive. We'll need to concoct a
+    #new case-specific suite of PCREs: ${pcre_char_not_literal_caseable_*},
+    #${pcre_word_caseable}, and so on.
+
     local pcre_terminator_case_pattern=${pcre_continuable_spaces}${pcre_paren_left_optional}${pcre_word_passable}${pcre_paren_right}${pcre_is_continuable_space}
     local pcre_terminator_case_pattern_optional='(?>'${pcre_terminator_case_pattern}')?+'
-
-    #FIXME: O.K.; we can't fix the first technicality, but we can (and should)
-    #fix the second as follows:
-    #
-    #* Define a new PCRE matching case statement prefixes. This is actually
-    #  quite trivial (ignoring the issue of whether or not
-    #  ${pcre_word_passable} is appropriate here, which it probably is): e.g.,
-    #    ':?+case'${pcre_continuable_spaces_horizontal}${pcre_word_passable}${pcre_continuable_spaces_horizontal}${pcre_brace_left}${pcre_terminator_case_pattern}
-    #* Prepend ${ZESHY__PREPROCESS_PCRE} by such PCRE in such a manner that
-    #  the start of each command matches either (in order):
-    #  * A case statement prefix.
-    #  * The current macro/command hybrid approach.
-    #* Excise the ${pcre_terminator_case_pattern_optional} here.
-    #
-    #All told, such refactoring should be trivial. *NO* complex PCRE constructs
-    #should be required, including PCRE conditionals. The above should suffice.
-    #If it doesn't, just bail and retain the current caveat commentary below.
-
-    # "{" block prefix optionally followed by a case statement pattern.
-    #
-    # Technically, "{" only conditionally constitutes a command terminator in
-    # specific syntactic contexts (namely, after if, elif, for, unless, and
-    # while conditionals): e.g.,
-    #
-    #    # A syntactic context in which "{" is *NOT* a command terminator,
-    #    # requiring that :macro() *NOT* be expanded in this syntactic context.
-    #    >>> :print { :macro
-    #    { :macro
-    #
-    # Unfortunately, matching such contexts is infeasible in the general case.
-    # Macros embedded in the conditional blocks of complex commands require
-    # matching, preventing PCRE-based retention of the observation that the
-    # current match position is in a complex command and hence preventing
-    # matching of "{" block prefixes in a contextual manner: e.g.,
-    #
-    #    # Matching "{" block prefixes in a contextual manner would erroneously
-    #    # prevent # :macro2() from being matched.
-    #    >>> !if { :macro1 } { :macro2 }
-    #
-    # Fortunately, issues only arise in the uncommon (and frankly syntactically
-    # unsupported) edge case of literal "{" shell words appearing *AFTER* the
-    # first shell words of commands. Hence, such issues are largely ignorable.
-    #
-    # Technically, another largely ignorable issue exists as well. Command
-    # macro-like shell words will be erroneously expanded as if they were
-    # macros when following a ")"-suffixed shell word following a "{" block
-    # prefix: e.g.,
-    #
-    #    # Command macro expansion will be applied to :or().
-    #    { ((LIVE_FREE)) :or :die trying }
-    #
-    # Specifically, "((LIVE_FREE))" will be mismatched as a case statement
-    # pattern-style command terminator rather than as an arithmetic test, which
-    # is largely ignorable. Likewise, ":or" will be mismatched as if in command
-    # position and hence subject to command macro matching. Since command
-    # macros are otherwise invalid when not in command position and hence
-    # should never appear in such positions, this is also largely ignorable.
-    local pcre_terminator_block_prefix=${pcre_brace_left}${pcre_terminator_case_pattern_optional}
 
     # ";"-prefixed command terminator. If such terminator also terminates case
     # statements (e.g., ";;"), optionally match a case statement pattern after
     # matching such terminator.
+    #
+    # This PCRE matches all patterns *AFTER* the first of a case statement
+    # (i.e., excluding the pattern following the "{" delimiting such
+    # statement). For disambiguity, the first pattern of a case statement is
+    # matched below in a context-aware manner.
     local pcre_terminator_semicolon=';(?>[;&|]'${pcre_terminator_case_pattern_optional}')?+'
 
     # ..................{ TERMINATOR ~ unspaced : comment    }..................
@@ -1673,15 +1626,35 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     local pcre_terminator_comment_macroable_grouped=${pcre_comment_prefix}'(?>'${pcre_terminator_comment_macroable_spaced_grouped}'|'${pcre_terminator_comment_body}')'
     local pcre_terminator_comment_macroable_optional_grouped='(?>'${pcre_terminator_comment_macroable_grouped}')?+'
 
-    # ..................{ TERMINATOR ~ unspaced : vertical   }..................
-    # One or more vertical whitespace command terminators in a generic context.
-    local pcre_terminator_spaces_vertical_sourceable=${pcre_spaces_vertical}
-
     # One or more vertical whitespace command terminators optionally followed
     # by a comment or commented "WASTELANDS" code terminator at the top level.
     # The latter is *ALWAYS* preceded by vertical whitespace, dictating this
     # PCRE's rather curious structure.
     local pcre_terminator_spaces_vertical_macroable_grouped=${pcre_spaces_vertical}${pcre_terminator_comment_macroable_optional_grouped}
+
+    # ..................{ TERMINATOR ~ unspaced : vertical   }..................
+    # One or more single-character command terminators in a generic context.
+    local pcre_terminator_chars_sourceable='['${char_terminator_sourceable}']++'
+
+    # Single-character command terminator at the top level and hence excluding:
+    #
+    # * Vertical whitespace, prefixing commented "WASTELANDS" code terminators
+    #   and hence requiring more complex matching than afforded by a simple
+    #   character class.
+    #
+    # The only remaining such character is the "{" block prefix. Since such
+    # character is rarely (if ever) repeated, match only one rather than one
+    # or more such characters.
+    local pcre_terminator_char_macroable=${pcre_brace_left}
+
+    # One or more single-character command terminators in a block and hence
+    # excluding:
+    #
+    # " "{", prefixing blocks. Matching such prefix as a terminator here
+    #   prevents recursive subroutine calls elsewhere from matching such prefix
+    #   as a balanced block delimiter. Note that "}" never terminates commands
+    #   and hence need *NOT* be explicitly excluded here.
+    local pcre_terminator_chars_blockable=${pcre_spaces_vertical}
 
     # ..................{ TERMINATOR ~ unspaced : core       }..................
     # Command terminator *NOT* requiring prefixing or suffixing whitespace in a
@@ -1698,16 +1671,12 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # *NOT* horizontal whitespace, due to commented "WASTELANDS" command
     # terminators only being preceded by the former), such PCRE requires the
     # generalized comment matching performed here.
-    local pcre_terminator_unspacing_core_blockable=${pcre_terminator_comment_sourceable}'|'${pcre_terminator_semicolon}'|'${pcre_terminator_pipe}'|'${pcre_terminator_ampersand}'|'${pcre_terminator_string_end}
-
-    # Command terminator *NOT* requiring prefixing or suffixing whitespace in a
-    # generic context, generalizable to all syntactic contexts.
-    local pcre_terminator_unspacing_core_sourceable=${pcre_terminator_block_prefix}'|'${pcre_terminator_unspacing_core_blockable}
+    local pcre_terminator_unspacing_core=${pcre_terminator_comment_sourceable}'|'${pcre_terminator_semicolon}'|'${pcre_terminator_pipe}'|'${pcre_terminator_ampersand}'|'${pcre_terminator_string_end}
 
     # ..................{ TERMINATOR ~ unspaced              }..................
     # Command terminator *NOT* requiring prefixing or suffixing whitespace in a
     # generic context, grouped for simplicity.
-    local pcre_terminator_unspacing_sourceable='(?>'${pcre_terminator_spaces_vertical_sourceable}'|'${pcre_terminator_unspacing_core_sourceable}')'
+    local pcre_terminator_unspacing_sourceable='(?>'${pcre_terminator_chars_sourceable}'|'${pcre_terminator_unspacing_core}')'
 
     # Command terminator *NOT* requiring prefixing or suffixing whitespace in a
     # block, grouped for simplicity. For efficiency, process-specific syntactic
@@ -1716,13 +1685,13 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # in such contexts; since matching such constructs requires recursion and
     # hence subroutine calls, such matching is best avoided when feasible
     # (namely, here).
-    local pcre_terminator_unspacing_blockable='(?>'${pcre_terminator_spaces_vertical_sourceable}'|'${pcre_terminator_unspacing_core_blockable}'|'${pcre_terminator_process_prefix_sans_backtick}')'
+    local pcre_terminator_unspacing_blockable='(?>'${pcre_terminator_chars_blockable}'|'${pcre_terminator_unspacing_core}'|'${pcre_terminator_process_prefix_sans_backtick}')'
 
     # Command terminator *NOT* requiring prefixing or suffixing whitespace at
     # the top level. To permit matching of macros embedded in process
     # substitutions, process-specific syntactic prefixes are also
     # matched as such terminators.
-    local pcre_terminator_unspacing_macroable_grouped='(?>'${pcre_terminator_spaces_vertical_macroable_grouped}'|'${pcre_terminator_unspacing_core_sourceable}'|'${pcre_terminator_process_prefix_sans_backtick}')'
+    local pcre_terminator_unspacing_macroable_grouped='(?>'${pcre_terminator_char_macroable}'|'${pcre_terminator_spaces_vertical_macroable_grouped}'|'${pcre_terminator_unspacing_core}'|'${pcre_terminator_process_prefix_sans_backtick}')'
 
     # ..................{ TERMINATOR                         }..................
     # Header and footer for PCREs matching terminators implicity prefixed and
@@ -1760,13 +1729,58 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # Command terminator(s) at the top level.
     local pcre_terminator_macroable_grouped=${pcre_terminator_head}${pcre_terminator_unspacing_macroable_grouped}${pcre_terminator_foot}
 
-    # ..................{ COMMANDS                           }..................
-    # Zero or more commands permitting matching of "`"-delimited processs
-    # substitutions.
-    local pcre_commands_backtickable_optional='(?>'${pcre_words_backtickable_optional}${pcre_terminator_sourceable}')*+'
+    # ..................{ COMMANDS ~ blockless               }..................
+    # Name of a complex command (e.g., "if", "for", "while") requiring no "{"- 
+    # and "}"-delimited block arguments and hence _not_ conflicting with macro
+    # syntax. As of this writing, there exists only one such command.
+    local pcre_command_complex_blockless_name=':?+time'
 
-    # Zero or more commands permitting matching of strictly balanced parens.
-    local pcre_commands_parenable_optional='(?>'${pcre_words_parenable_optional}${pcre_terminator_sourceable}')*+'
+    # Blockless complex command suffixed by one or more horizontal whitespace
+    # characters optionally interspersed by line continuations.
+    local pcre_command_complex_blockless_optional='(?>'${pcre_command_complex_blockless_name}${pcre_continuable_spaces_horizontal}')?+'
+
+    # ..................{ COMMANDS ~ case                    }..................
+    # Command name of a case statement.
+    local pcre_command_complex_case_name=':?+case'
+
+    # Case statement prefix comprising such statement's command name, string
+    # argument, and leading pattern. Empty case statements (i.e., case
+    # statements containing no patterns and hence no commands) will be
+    # subsequently matched as conventional commands.
+    #
+    # In theory, a simpler alternative would be to match such prefix by
+    # optionally matching a case statement pattern after matching a "{"
+    # terminator. In practice, such approach fails on common edge cases by
+    # erroneously matching and hence expanding command macro-like shell words
+    # following a ")"-suffixed shell word following a "{" block prefix: e.g.,
+    #
+    #    # Command macro expansion will be erroneously applied to :or().
+    #    { ((LIVE_FREE)) :or :die trying }
+    #
+    # Specifically, "((LIVE_FREE))" would be mismatched as a case statement
+    # pattern-style command terminator rather than as an arithmetic test,
+    # ensuring that ":or" would be mismatched as if in command position and
+    # hence subject to command macro matching.
+
+    #FIXME: Actually, ${pcre_word_passable} prohibits prefixing "(" characters
+    #and hence is certainly *MUCH* too restrictive. We'll need to concoct a
+    #new case-specific suite of PCREs: ${pcre_char_not_literal_caseable_*},
+    #${pcre_word_caseable}, and so on.
+
+    local pcre_command_complex_case_prefix=${pcre_command_complex_case_name}${pcre_continuable_spaces_horizontal}${pcre_word_passable}${pcre_continuable_spaces_horizontal}${pcre_brace_left}${pcre_terminator_case_pattern_optional}
+
+    # ..................{ COMMANDS                           }..................
+    # PCRE prefixing all PCREs matching zero or more commands.
+    local pcre_commands_head='(?>'${pcre_command_complex_blockless_optional}'(?>'${pcre_command_complex_case_prefix}'|'
+
+    # PCRE suffixing all PCREs matching zero or more commands.
+    local pcre_commands_foot='))*+'
+
+    # Zero or more commands in "`"-delimited processs substitutions.
+    local pcre_commands_backtickable_optional=${pcre_commands_head}${pcre_words_backtickable_optional}${pcre_terminator_sourceable}${pcre_commands_foot}
+
+    # Zero or more commands in parens-delimited syntactic constructs.
+    local pcre_commands_parenable_optional=${pcre_commands_head}${pcre_words_parenable_optional}${pcre_terminator_sourceable}${pcre_commands_foot}
 
     # ..................{ HERE                               }..................
     # Note that here-document syntactic invalidities (e.g., unmatched suffixing
@@ -1776,6 +1790,10 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     #FIXME: Unconvinced that ${pcre_literal_parenable_*} comprises only
     #unconditionally unreserved characters. Verify, please. (We might want
     #${pcre_literal_passable_*} PCREs instead, which tend to be stricter.)
+    #FIXME: Indeed, our suspiciouns were correct: ${pcre_literal_parenable_*}
+    #omits '}[]?*`', which are shell-reserved and hence impermissible here.
+    #That said, ${pcre_literal_passable_*} may very well be *TOO* restrictive.
+    #We'll have to examine this further.
 
     # Unquoted literal shell word, comprising only unconditionally unreserved
     # characters and hence excluding conditionally unreserved parens.
@@ -2241,7 +2259,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     local pcre_words_blockable=${pcre_word_blockable_first}'(?>'${pcre_spaces_horizontal_continuable}${pcre_word_blockable_rest_optional}')*+'
 
     # Zero or more commands in a block.
-    local pcre_commands_blockable_optional='(?>'${pcre_words_blockable}${pcre_terminator_blockable}')*+'
+    local pcre_commands_blockable_optional=${pcre_commands_head}${pcre_words_blockable}${pcre_terminator_blockable}${pcre_commands_foot}
 
     # "{"- and "}"-delimited block excluding such delimiters, defined as a
     # recursively callable subroutine.
@@ -2305,16 +2323,6 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # such whitespace.
     local pcre_macro_sans_args_lookahead='(?='${pcre_continuable_space_horizontal}'|'${pcre_terminator_unspacing_body}')'
 
-    # ..................{ COMPLEX COMMAND                    }..................
-    # Name of a complex command (e.g., "if", "for", "while") requiring no "{"- 
-    # and "}"-delimited block arguments and hence _not_ conflicting with macro
-    # syntax. As of this writing, there exists only one such command.
-    local pcre_command_complex_blockless_name='time'
-
-    # Blockless complex command suffixed by one or more horizontal whitespace
-    # characters optionally interspersed by line continuations.
-    local pcre_command_complex_blockless_optional='(?>'${pcre_command_complex_blockless_name}${pcre_continuable_spaces_horizontal}')?+'
-
     # ..................{ MACRO                              }..................
     # Macro name, grouped for disambiguating non-erroneous macros from
     # erroneous syntactic invalidities. (See below.)
@@ -2349,12 +2357,11 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # command name.
     local pcre_macro_grouped_or_command_optional='(?:'${pcre_macro_grouped_or_word_macroable_first}${pcre_words_macroable_rest_optional}')?+'
 
-    # Zero or more macros or commands permitting matching of macros.
-    #
-    # To notify the preprocessor of the syntactic validity of code containing
-    # no macros after the last such macro, the last character of such code is
-    # captured *AFTER* such code is successfully matched.
-    local pcre_commands_macroable_optional_grouped_body='(?:'${pcre_command_complex_blockless_optional}${pcre_macro_grouped_or_command_optional}${pcre_terminator_macroable_grouped}')*+'
+    # Zero or more macros or commands permitting matching of macros. To notify
+    # the preprocessor of the syntactic validity of code containing no macros
+    # after the last such macro, the last character of such code is captured
+    # *AFTER* such code is successfully matched.
+    local pcre_commands_macroable_optional_grouped_body=${pcre_commands_head}${pcre_macro_grouped_or_command_optional}${pcre_terminator_macroable_grouped}${pcre_commands_foot}
     local pcre_commands_macroable_optional_grouped=${pcre_commands_macroable_optional_grouped_body}${pcre_char_last_grouped}
 
     # ..................{ SUBROUTINE                         }..................
@@ -2439,6 +2446,127 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    #FUXME: We need to match single "&" characters *NOT* followed by subsequent
+    #"&" characters as literal -- probably in ${pcre_literal_sourceable} below.
+    #To do so, see the current definition of ${pcre_terminator_ampersand}.
+
+#FUXME: We need to match macros immediately following each ")"-suffixed glob
+#expression of a case() statement. While this is certainly feasible for the
+#first such expression, it's unclear how (if at all) macros following any
+#subsequent ")"-suffixed glob expressions could be matched. If they can't,
+#then, for orthogonality, the first shouldn't be matched either. Contemplate.
+#
+#After contemplation, macros are technically matchable following ")"-suffixed
+#glob expressions in *NON-NESTED* case statements (i.e., case statements *NOT*
+#nested in other case statements, which require subroutine calls precluding
+#capturing of macro substrings). That said, we're hard-pressed to recall the
+#last time we required nested case statements, implying such matching to be
+#feasible in practice. However, it's a bit non-trivial.
+#
+#No existing PCRE substructure needs to be modified to accomodate such
+#matching. Instead, if the command name is "case", a new parallel top-level
+#PCRE structure matching case statement syntax suffices. Such structure should
+#mirror the current PCRE structure with one simple addition: ")"-suffixed
+#glob expressions in command position should be matched as terminators. That's
+#it. That said, while relatively simple, that could impose quite a bit of PCRE
+#duplication significantly increasing the length and hence debuggability of
+#such PCRE. Hold off on such improvement until stabilizing such PCRE.
+#FUXME: The prior comment appears blatantly wrong. After all, after matching a
+#macro in the first conditional of a case statement and resuming matching, all
+#memory of having even been in a case statement has been lost. That said, there
+#is a *FAR* simpler means of matching macros after case statement conditionals:
+#
+#* If either a "{" command terminator or two or more ";" command terminators
+#  match, then optionally match (in order):
+#  * One or more whitespace characters (either horizontal or vertical).
+#  * An optional "(".
+#  * A shell word.
+#  * A non-optional ")".
+#  * One or more whitespace characters (either horizontal or vertical).
+#
+#That's it. Extraordinarily trivial, at least on paper.
+#FUXME: After successfully implementing the prior improvement, excise the
+#"Case Statement Patterns" caveat from +{frontend} documentation.
+
+    # Command terminator *NOT* requiring prefixing or suffixing whitespace in a
+    # generic context, generalizable to all syntactic contexts.
+    # local pcre_terminator_unspacing_core_sourceable=${pcre_terminator_block_prefix}'|'${pcre_terminator_unspacing_core_blockable}
+
+    #FUXME: Right. So, in non-macroable contexts, let's revert to matching
+    #vertical whitespace and block prefixes in a character class-based manner.
+
+    # "{" block prefix.
+    # local pcre_terminator_block_prefix=${pcre_brace_left}
+
+    # Character class matching single-character command terminators at the
+    # top level and hence excluding:
+    #
+    # * Vertical whitespace, prefixing commented "WASTELANDS" code terminators
+    #   and hence requiring more complex matching than afforded by a simple
+    #   character class.
+    # local char_terminator_macroable='{'
+
+    # Character class matching single-character command terminators in a block
+    # and hence excluding:
+    #
+    # " "{", prefixing blocks. Matching such prefix as a terminator here
+    #   prevents recursive subroutine calls elsewhere from matching such prefix
+    #   as a balanced block delimiter. Note that "}" never terminates commands
+    #   and hence need *NOT* be explicitly excluded here.
+    # local char_terminator_blockable=${char_space_vertical}
+
+    # ..................{ TERMINATOR ~ unspaced : vertical   }..................
+    # One or more vertical whitespace command terminators in a generic context.
+    # local pcre_terminator_spaces_vertical_sourceable=${pcre_spaces_vertical}
+
+    #FUXME: O.K.; we can't fix the first technicality, but we can (and should)
+    #fix the second as follows:
+    #
+    #* Define a new PCRE matching case statement prefixes. This is actually
+    #  quite trivial (ignoring the issue of whether or not
+    #  ${pcre_word_passable} is appropriate here, which it probably is): e.g.,
+    #    ':?+case'${pcre_continuable_spaces_horizontal}${pcre_word_passable}${pcre_continuable_spaces_horizontal}${pcre_brace_left}${pcre_terminator_case_pattern}
+    #* Prepend ${ZESHY__PREPROCESS_PCRE} by such PCRE in such a manner that
+    #  the start of each command matches either (in order):
+    #  * A case statement prefix.
+    #  * The current macro/command hybrid approach.
+    #* Excise the ${pcre_terminator_case_pattern_optional} here.
+    #
+    #All told, such refactoring should be trivial. *NO* complex PCRE constructs
+    #should be required, including PCRE conditionals. The above should suffice.
+    #If it doesn't, just bail and retain the current caveat commentary below.
+    #FUXME: That's great. However, we'll also want to:
+    #
+    #* Match ignorable and hence optional "time" shell words in command
+    #  position.
+    #* Match case statements at the head of *ALL* ${pcre_commands_*} PCREs.
+    #
+    #To best implement both, we probably want to define new
+    #${pcre_commands_head} and ${pcre_commands_foot} PCREs and then wrap all
+    #existing ${pcre_commands_*} PCREs in such wrappers.
+
+    #FUHhHoeUhm; what sort of shell word do we want here? Whatever it is should
+    #probably be maximally restrictive as well as explicitly match balanced 
+    #glob qualifiers. Yeah. While ${pcre_word_passable} does appear restrictive
+    #enough, we should probably verify this.
+
+    # "{" block prefix optionally followed by a case statement pattern.
+    # Technically, another largely ignorable issue exists as well. Command
+    # macro-like shell words will be erroneously expanded as if they were
+    # macros when following a ")"-suffixed shell word following a "{" block
+    # prefix: e.g.,
+    #
+    #    # Command macro expansion will be applied to :or().
+    #    { ((LIVE_FREE)) :or :die trying }
+    #
+    # Specifically, "((LIVE_FREE))" will be mismatched as a case statement
+    # pattern-style command terminator rather than as an arithmetic test, which
+    # is largely ignorable. Likewise, ":or" will be mismatched as if in command
+    # position and hence subject to command macro matching. Since command
+    # macros are otherwise invalid when not in command position and hence
+    # should never appear in such positions, this is also largely ignorable.
+    # local pcre_terminator_block_prefix=${pcre_brace_left}${pcre_terminator_case_pattern_optional}
+
     #FUXME: O.K.; edge cases slightly conflict with such PCRE design: e.g.,
     #
     #    { ((LIVE_FREE)) :or :die trying }
