@@ -3,51 +3,6 @@
 # Copyright 2007-2014 by Cecil Curry.
 # See "LICENSE" for additional details.
 
-#FIXME: The current algorithmic approach, while fantastic, suffers one
-#reasonably significant inefficiency: it reparses each macro name *AND*
-#prototype (for prototyped macros) n+1 times, where n is the number of
-#arguments passed to such macro. *THIS IS INEXPRESSIBLY TERRIBLE*. Does there
-#exist an elegant solution? Fortunately, there does. By temporarily replacing 
-#the macro name and function prototype prefixing
-#${ZESHY__PREPROCESS_MACRO_FUNC_COMMAND} with a significantly shorter
-#"sentinel" macro name for the duration of argument parsing, one can
-#effectively eliminate such costs.
-#
-#The name of such sentinel must be chosen with care. Fortunately, we have it:
-#":\0". The ":" guarantees such sentinel to be matched early along with all
-#other ":"-prefixed macro names; the "\0", which is invalid in both filenames
-#(and hence external command names) *AND* macro names, guarantees such sentinel
-#to *NOT* conflict with existing callables. Two characters only. Awesome.
-#
-#Given that:
-#
-#* Declare the following new globals in +{frontend}:
-#    typeset -g ZESHY__PREPROCESS_MACRO_SENTINEL_NAME=':'$'\0'
-#    typeset -gi ZESHY__PREPROCESS_MACRO_SENTINEL_NAME_BYTE_LENGTH=${#ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}
-#* Initialize ${ZESHY__MACRO_TO_FUNC_NAME} (which should incidentally be
-#  renamed to ${ZESHY__PREPROCESS_MACRO_TO_FUNC_NAME}) as follows:
-#    ZESHY__MACRO_TO_FUNC_NAME=(
-#        ${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}
-#        'no-sentinel-macro-function-exists' )
-#* Excise ${ZESHY__PREPROCESS_MACRO_NAME_BYTE_LENGTH} below.
-#* Initialize ${ZESHY__PREPROCESS_MACRO_FUNC_COMMAND} as follows each iteration:
-#    ZESHY__PREPROCESS_MACRO_FUNC_COMMAND=${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}${ZESHY__PREPROCESS_SUBCODE[$((
-#        ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST +
-#        ${#ZESHY__PREPROCESS_MACRO_NAME}
-#    )),${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST}]}
-#* Naturally, we should probably jigger (and possibly rename)
-#  ${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST} accordingly as well.
-#* After argument parsing, set ${ZESHY__PREPROCESS_MACRO_FUNC_COMMAND} as
-#  follows:
-#    ZESHY__PREPROCESS_MACRO_FUNC_COMMAND[1,${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME_BYTE_LENGTH}]=${(qq)ZESHY__PREPROCESS_MACRO_FUNC_NAME}
-#* When checking for the emptiness of ${ZESHY__MACRO_TO_FUNC_NAME} in
-#  +{pcre/macro}, be sure to account for the existence of the sentinel.
-#* At the very start of :code.preprocess(), we *REALLY* need to assert that:
-#   (( ${+ZESHY__MACRO_TO_FUNC_NAME[${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}]} )) ||
-#       :die 'Sentinel not found in ${ZESHY__MACRO_TO_FUNC_NAME}.'
-#
-#Extraordinarily simple, given the above delineation. It is good.
-
 #FIXME: The long-term solution to function prototype optimization, though a bit
 #balls-crazy, is as follows:
 #
@@ -169,6 +124,61 @@ typeset -g ZESHY__PREPROCESS_MACRO_ARG_LAST
 # intentionally as an expansion.
 typeset -g ZESHY__PREPROCESS_MACRO_EXPANSION_UNSET='$}<<|>>{$'
 
+# ....................{ GLOBALS ~ sentinel                 }....................
+# Name of the sentinel macro, an optimization-specific placeholder dramatically
+# improving macro argument parsing efficiency. Without such sentinel, the
+# preprocessor rematches the prefix of each macro call comprising at least each
+# macro name *AND* prototype (for prototyped macros) n + 1 times, where n is the
+# number of arguments passed to such macro. While the cost of reparsing macro
+# names is negligible, the cost of reparsing macro prototypes is *NOT*.
+#
+# To obviate such costs, such macro name and prototype are replaced for the
+# duration of argument parsing by a significantly shorter "sentinel" macro name.
+# While such sentinel will still be rematched n + 1 times, the costs associated
+# with doing so are markedly lower. This is a good thing.
+#
+# To permit reuse of string global ${ZESHY__PREPROCESS_PCRE} for matching both
+# macros and macro arguments, such sentinel must be "baked" into such PCRE at
+# PCRE compile time. Unfortunately, this implies non-macros to be erroneously
+# matchable as such sentinel. To avoid conflicts with existing callables, such
+# name thus contains:
+#
+# * A literal ASCII alarm bell, which is unprintable and hence strongly
+#   unlikely to appear in unquoted shell words. For PCRE efficiency, such
+#   character prefixes such name.
+# * "$", which is invalid in macro names, preventing standard macro names from
+#   being erroneously matched as such sentinel.
+# * "}", which is invalid when following a "$", preventing valid zsh code from
+#   being erroneously matched as such sentinel.
+# * "/", which is invalid in filenames (and hence external command names),
+#   preventing external commands from being erroneously matched as such
+#   sentinel. While this does *NOT* prevent external directories named "/&"
+#   from being erroneously matched as such sentinel, such directories would
+#   need to be in command position of a command to be matched as such. Since
+#   directories are *NOT* executable in the conventional sense, this is
+#   vanishingly unlikely.
+#
+# Despite the unlikelihood, any use of such sentinel as an unquoted shell word
+# in zeshy code (e.g., as a directory in command position) will induce an
+# exception reporting such sentinel to not exist. In other words, "Nothing to
+# see here, folks."
+#
+# Ideally, such sentinel would embed the null character $'\0' rather than "/".
+# While libpcre explicitly supports subject strings containing such characters
+# (i.e., "Unlike the pattern string, the subject may contain binary zeroes.")
+# *AND* while zsh explicitly supports strings containing such character when
+# shell option "posix_strings" is disabled (as is the default under zeshy), zsh
+# currently suffers a bug terminating subject strings on the first null
+# character in such strings when passed to libpcre. This should probably be
+# reported and corrected. (Until it is, the current approach stands.)
+typeset -g ZESHY__PREPROCESS_MACRO_SENTINEL_NAME=$'\a''$}/'
+
+# PCRE matching the name of the sentinel macro.
+typeset -g ZESHY__PREPROCESS_MACRO_SENTINEL_PCRE='\a\$\}/'
+
+# Byte length of the name of the sentinel macro.
+typeset -gi ZESHY__PREPROCESS_MACRO_SENTINEL_NAME_BYTE_LENGTH=${#ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}
+
 # ....................{ GLOBALS ~ private : int            }....................
 #FIXME: All of the following still requisite?
 
@@ -180,9 +190,6 @@ typeset -gi ZESHY__PREPROCESS_CODE_BYTE_LENGTH
 
 # Byte length of the current macro matched from such code.
 typeset -gi ZESHY__PREPROCESS_MACRO_BYTE_LENGTH
-
-# Byte length of the current macro's name.
-typeset -gi ZESHY__PREPROCESS_MACRO_NAME_BYTE_LENGTH
 
 # Index of the first byte of the last character of the prior match of the
 # current substring of the current code to be preprocessed, equivalent to
@@ -459,9 +466,6 @@ function ::code.preprocess() {
                 # Byte length of such macro.
                 ZESHY__PREPROCESS_MACRO_BYTE_LENGTH=${#MATCH}
 
-                # Byte length of such macro's name.
-                ZESHY__PREPROCESS_MACRO_NAME_BYTE_LENGTH=${#ZESHY__PREPROCESS_MACRO_NAME}
-
                 # Index of the last byte of such macro relative to the current
                 # substring of such code. While ${ZPCRE_OP[(w)2]} has the index
                 # of the first byte of the last character of such match,
@@ -480,8 +484,14 @@ function ::code.preprocess() {
                     ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST ))
 
                 # Such macro, localized for subsequent transformation into a
-                # command calling the function expanding such macro.
-                ZESHY__PREPROCESS_MACRO_FUNC_COMMAND=${ZESHY__PREPROCESS_SUBCODE[${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST},${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST}]}
+                # command calling the function expanding such macro. For
+                # efficiency, replace both the mandatory name *AND* optional
+                # prototype prefixing such macro by the name of the sentinel
+                # macro. See ${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME} above.
+                ZESHY__PREPROCESS_MACRO_FUNC_COMMAND=${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}${ZESHY__PREPROCESS_SUBCODE[$((
+                    ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST +
+                    ${#ZESHY__PREPROCESS_MACRO_NAME}
+                )),${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST}]}
 
                 # Appease the first iteration of argument matching performed
                 # below, which expects the second shell word of ${ZPCRE_OP} to
@@ -623,12 +633,10 @@ function ::code.preprocess() {
                         ${ZESHY__PREPROCESS_MACRO_ARG_LAST_BYTE_LAST}
                 }
 
-                # Replace such macro's name by such function's name in such
-                # command *AFTER* matching all arguments above. Due to PCRE
-                # reuse, such matching expects the first shell word of such
-                # command to be such macro's name. For safety, protect such
-                # function's name as well.
-                ZESHY__PREPROCESS_MACRO_FUNC_COMMAND[1,${ZESHY__PREPROCESS_MACRO_NAME_BYTE_LENGTH}]=${(qq)ZESHY__PREPROCESS_MACRO_FUNC_NAME}
+                # Replace such sentinel's name by such function's name in such
+                # command *AFTER* matching all macro arguments. For safety,
+                # protect such function's name as above.
+                ZESHY__PREPROCESS_MACRO_FUNC_COMMAND[1,${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME_BYTE_LENGTH}]=${(qq)ZESHY__PREPROCESS_MACRO_FUNC_NAME}
 
                 # Prepare to detect such function reporting success but failing
                 # to overwrite such global with such macro's expansion. In such
@@ -714,6 +722,72 @@ function ::code.preprocess() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: The current algorithmic approach, while fantastic, suffers one
+#reasonably significant inefficiency: it reparses each macro name *AND*
+#prototype (for prototyped macros) n+1 times, where n is the number of
+#arguments passed to such macro. *THIS IS INEXPRESSIBLY TERRIBLE*. Does there
+#exist an elegant solution? Fortunately, there does. By temporarily replacing 
+#the macro name and function prototype prefixing
+#${ZESHY__PREPROCESS_MACRO_FUNC_COMMAND} with a significantly shorter
+#"sentinel" macro name for the duration of argument parsing, one can
+#effectively eliminate such costs.
+#
+#The name of such sentinel must be chosen with care. Fortunately, we have it:
+#":\0". The ":" guarantees such sentinel to be matched early along with all
+#other ":"-prefixed macro names; the "\0", which is invalid in both filenames
+#(and hence external command names) *AND* macro names, guarantees such sentinel
+#to *NOT* conflict with existing callables. Two characters only. Awesome.
+#
+#Given that:
+#
+#* Ensure that macro name matching prohibits "\0" characters. (It probably
+#  doesn't, at the moment.)
+#* Declare the following new globals in +{frontend}:
+#    typeset -g ZESHY__PREPROCESS_MACRO_SENTINEL_NAME=':'$'\0'
+#    typeset -gi ZESHY__PREPROCESS_MACRO_SENTINEL_NAME_BYTE_LENGTH=${#ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}
+#* Initialize ${ZESHY__MACRO_TO_FUNC_NAME} (which should incidentally be
+#  renamed to ${ZESHY__PREPROCESS_MACRO_TO_FUNC_NAME}) as follows:
+#    ZESHY__MACRO_TO_FUNC_NAME=(
+#        ${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}
+#        'no-sentinel-macro-function-exists' )
+#  *WAIT*. Actually, just inject such sentinel into such PCRE manually. We'd
+#  rather such sentinel *NOT* be advertised as a genuine macro.
+#* Excise ${ZESHY__PREPROCESS_MACRO_NAME_BYTE_LENGTH} below.
+#* Initialize ${ZESHY__PREPROCESS_MACRO_FUNC_COMMAND} as follows each iteration:
+#    ZESHY__PREPROCESS_MACRO_FUNC_COMMAND=${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}${ZESHY__PREPROCESS_SUBCODE[$((
+#        ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST +
+#        ${#ZESHY__PREPROCESS_MACRO_NAME}
+#    )),${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST}]}
+#* Naturally, we should probably jigger (and possibly rename)
+#  ${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST} accordingly as well.
+#* After argument parsing, set ${ZESHY__PREPROCESS_MACRO_FUNC_COMMAND} as
+#  follows:
+#    ZESHY__PREPROCESS_MACRO_FUNC_COMMAND[1,${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME_BYTE_LENGTH}]=${(qq)ZESHY__PREPROCESS_MACRO_FUNC_NAME}
+#* When checking for the emptiness of ${ZESHY__MACRO_TO_FUNC_NAME} in
+#  +{pcre/macro}, be sure to account for the existence of the sentinel.
+#* At the very start of :code.preprocess(), we *REALLY* need to assert that:
+#   (( ${+ZESHY__MACRO_TO_FUNC_NAME[${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}]} )) ||
+#       :die 'Sentinel not found in ${ZESHY__MACRO_TO_FUNC_NAME}.'
+#
+#Extraordinarily simple, given the above delineation. It is good.
+
+                #FUXME: Consider renaming
+                #${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST}
+                #to ${ZESHY__PREPROCESS_SUBCODE_MACRO_ARG_FIRST_BYTE_FIRST} and
+                #recalculate accordingly (e.g., as below).
+
+                # ZESHY__PREPROCESS_MACRO_FUNC_COMMAND[1,${ZESHY__PREPROCESS_MACRO_NAME_BYTE_LENGTH}]=${(qq)ZESHY__PREPROCESS_MACRO_FUNC_NAME}
+
+# Due to PCRE
+                # reuse, such matching expects the first shell word of such
+                # command to be such macro's name. 
+                # ZESHY__PREPROCESS_MACRO_FUNC_COMMAND=${ZESHY__PREPROCESS_SUBCODE[${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_FIRST},${ZESHY__PREPROCESS_SUBCODE_MACRO_BYTE_LAST}]}
+
+# Byte length of the current macro's name.
+# typeset -gi ZESHY__PREPROCESS_MACRO_NAME_BYTE_LENGTH
+                # Byte length of such macro's name.
+                # ZESHY__PREPROCESS_MACRO_NAME_BYTE_LENGTH=${#ZESHY__PREPROCESS_MACRO_NAME}
+
 #  Note the definition of ${ZESHY__PREPROCESS_MACRO_SENTINEL_NAME}.
 #  In this case, however, ${ZPCRE_OP} is guaranteed to *NOT* have been
 #  overwritten with spurious data.
