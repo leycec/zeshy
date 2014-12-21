@@ -1630,7 +1630,24 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # variable assignment. (See above for commentary.)
     local pcre_nanoword_nonscalarable_rest=${pcre_literals_nonscalarable_rest}'|'${pcre_picoword_assignable_rest}'|'${pcre_passable_nanoword_rest}
 
-    # ..................{ GLOB QUALIFIER                     }..................
+    # ..................{ GLOB                               }..................
+    #FIXME: *UGH*. Guess what? While "("- and ")"-delimited glob qualifiers are
+    #*NOT* recursively nestable, the more general-purpose "("- and
+    #")"-delimited glob expressions *ARE*. Which means that we'll need to
+    #substantially generalize away from the former to the latter. Specifically,
+    #we'll need to:
+    #
+    #* Define one new subroutines for each type of word embeddable in such
+    #  expression.
+    #* Call the subroutine for the current type of word after matching the
+    #  first "(" in such word.
+    #* Since an unbalanced "(" in a word effectively constitutes invalid syntax
+    #  (regardless of whether zsh strictly interprets unbalanced "(" characters
+    #  as such), ${pcre_reset_remainder_succeed} should be leveraged as well.
+    #
+    #Since there are only two or three places where we're required to match
+    #globs, this shouldn't be *TOO* terrible -- merely unctuous.
+
     # Glob qualifier prefix.
     local pcre_qualifier_prefix=${pcre_paren_left}
 
@@ -1683,7 +1700,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # line continuations.
     local pcre_words_scalarable_optional='(?>'${pcre_word_scalarable}'(?>'${pcre_continuable_spaces_horizontal}${pcre_word_scalarable}')*+)?+'
 
-    # ..................{ ASSIGNMENT                         }..................
+    # ..................{ ASSIGNMENT ~ value                 }..................
     # Variable assignment operator, comprising either:
     #
     # * "=", signifying an assignment operation.
@@ -1697,75 +1714,21 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # assignments, the former is matched before the latter.
     local pcre_assignment_value_grouped='('${pcre_assignment_value_nonscalarable_grouped}'|'${pcre_words_scalarable_optional}')'
 
-    # "="-prefixed variable assignment.  While zsh prohibits such assignment
-    # operator to be delimited by whitespace, zeshy supports zero or more
-    # horizontal whitespace characters optionally interspersed by line
-    # continuations both preceding and following such operator. For simplicity,
-    # such substrings are captured into distinct match groups.
-    #
-    # For efficiency, optional whitespace prefixing such operator is matched
-    # below, avoiding backtracking in the common case of commands whose names
-    # match variable name syntax but are *NOT* variable assignments.
-    local pcre_assignment_operator_value_grouped=${pcre_assignment_operator_grouped}${pcre_spaces_horizontal_continuable_optional_grouped}${pcre_assignment_value_grouped}
-    local pcre_assignment_operator_value_optional_grouped='(?>'${pcre_assignment_operator_value_grouped}')?+'
+    # "="-prefixed variable assignment with zero or more horizontal whitespace
+    # characters optionally interspersed by line continuations both preceding
+    # and following such "=". For preprocessor efficiency *AND* simplicity,
+    # such substrings are captured into distinct match groups. To avoid
+    # backtracking in the common case of commands whose names match variable
+    # name syntax but are *NOT* variable assignments, prefixing whitespace is
+    # matched elsewhere.
+    local pcre_assignment_operator_value_spaceable_grouped=${pcre_assignment_operator_grouped}${pcre_spaces_horizontal_continuable_optional_grouped}${pcre_assignment_value_grouped}
+    local pcre_assignment_operator_value_spaceable_optional_grouped='(?>'${pcre_assignment_operator_value_grouped}')?+'
 
-    #FIXME: Shift below ${pcre_words_macroable_optional}, please.
     #FIXME: Embed below.
-    #FIXME: Subtle issue: we really *ONLY* want to match assignments in which
-    #such operator is either prefixed or suffixed by at least one horizontal
-    #whitespace character. There's pretty much no reason to match standard zsh
-    #assignments, as those (obviously) already comply with zsh syntax.
-    #Interestingly, we do *NOT* need to ...
-    #
-    #Wait. zsh has rather peculiar behaviour not found anywhere else (that we
-    #know of) in the core language. Scalar variable assignments appear to be
-    #terminated by the first horizontal (!) whitespace character, which is a
-    #bit wild: e.g.,
-    #
-    #    >>> :string zio; zio= world;
-    #    Command "world" not found.
-    #    >>> :string zio; zio=hello world;
-    #    Command "world" not found.
-    #
-    #Honestly, that's so overwhelmingly non-orthogonal with the remainder of
-    #the zsh language that we're increasingly inclined to want to "fix" such
-    #misstep. Doing so is trivial -- since, of course, we already do so! No
-    #edits are required below. Simply document why we take the current
-    #approach, please.
-    #FIXME: Oh, right. We'll need to "fix up" non-compliant variable
-    #assignments [read: assignments of two or more shell words] in the
-    #preprocessor. Hmm; what's the most efficacious means of doing so? Ideally,
-    #we simply want to replace all unquoted horizontal characters with quoted
-    #horizontal characters. Right; but that's clearly somewhat non-trivial to
-    #achieve. Oh! Wait. No, it's clearly trivial. Simply:
-    #
-    #* Split the entire assignment value substring into words with "(z)".
-    #* In the same variable expansion, join such words together with ' ' (i.e.,
-    #  a single-quoted string containing a single literal space character). The
-    #  definition of join_list_on_string() suggests the following should work:
-    #
-    #    # Trivially simple. Now test us, please!
-    #    ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORD_FIRST=${match[${ZESHY__PREPROCESS_MATCH_GROUP_INDEX_ASSIGNMENT_VALUE_WORD_FIRST}]-}
-    #    ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORDS_REST=${match[${ZESHY__PREPROCESS_MATCH_GROUP_INDEX_ASSIGNMENT_VALUE_WORDS_REST}]-}
-    #
-    #    if [[ -n ${ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORDS_REST} ]] {
-    #        ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORD_FIRST+=' '${(@j:' ':)${(z)ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORDS_REST}}
-    #    }
-    #
-    #Of course, we should only perform such splitting and rejoining when we
-    #really need to -- which is to say, when two or more shell words are being
-    #assigned. Happily, this is easy to ascertain. Given the current PCRE
-    #structure, implementing the following incurs no inefficiencies:
-    #
-    #* Capture the first shell word being assigned to a distinct match group.
-    #* Capture all remaining shell words being assigned to a distinct match
-    #  group.
-    #
-    #Then simply apply such split and rejoining if the latter such match group
-    #is empty. Simple; efficient. Yay!
 
-    # "="-delimited variable assignment.
-    local pcre_assignment_optional_grouped=${pcre_var_name_grouped}${pcre_spaces_horizontal_continuable_grouped}'(?>'${pcre_assignment_operator_value_grouped}'|'${pcre_words_macroable_optional}')'
+    # zsh-specific "=("-prefixed list assignment, prohibiting whitespace
+    # between such "=" and "(" characters.
+    local pcre_assignment_operator_value_nonscalarable=${pcre_assignment_operator}${pcre_assignment_value_nonscalarable}
 
     # ..................{ WORD ~ backtickable                }..................
     # First shell word of a command, permitting matching of "`"-delimited
@@ -1798,24 +1761,10 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     local pcre_word_parenable_rest_optional='(?>'${pcre_word_parenable_rest}')?+'
 
     # First shell word of a command in a parens-delimited syntactic construct.
-    # Since the ")" suffixing list assignments conflicts with the ")" suffixing
-    # such construct, list assignments are explicitly matched.  Since list
-    # assignments are prefixed by variable names indistinguishable from and
-    # hence conflicting with unquoted shell words, the former are matched
-    # first. Naturally, only the first shell word is in command position and
-    # hence requires matching for list assignments.
+    # While the ")" suffixing list assignments conflicts with the ")" suffixing
+    # such construct, list assignments are matched elsewhere in a generic
+    # manner applicable to *ALL* syntactic contexts.
     local pcre_word_parenable_first_body='(?>'${pcre_nanoword_parenable_start_word_first}')'${pcre_nanowords_parenable_rest_optional}
-
-    #FIXME: Incorrect structure both here and below. If an assignment matches,
-    #then that terminates the current command, implying no subsequent words
-    #should be matched for such command. Amend, please.
-    #FIXME: Actually, assignments should *ONLY* be matched at the top level.
-    #Hence, revert this (and anywhere else we embedded ${pcre_assignment_*}
-    #PCREs as well) by excising such embeddings.
-    #FIXME: Actually, no. We *DO* need to match list assignments here, but
-    #*ONLY* list assignments -- ideally in a non-capturing manner.
-
-    local pcre_word_parenable_first='(?>'${pcre_var_name}'(?>'${pcre_assignment_operator}${pcre_assignment_value_nonscalar}'|'${pcre_nanowords_parenable_rest_optional}')|'${pcre_word_parenable_first_body}')'
 
     # Zero or more shell words permitting matching of strictly balanced parens,
     # each delimited by one or more horizontal whitespace characters optionally
@@ -2035,22 +1984,22 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # Command terminator(s) at the top level.
     local pcre_terminator_macroable_grouped=${pcre_terminator_head}${pcre_terminator_unspacing_macroable_grouped}${pcre_terminator_foot}
 
-    # ..................{ COMMANDS ~ blockless               }..................
+    # ..................{ COMPLEX ~ blockless                }..................
     # Name of a complex command (e.g., "if", "for", "while") requiring no "{"- 
     # and "}"-delimited block arguments and hence _not_ conflicting with macro
     # syntax. As of this writing, there exists only one such command.
-    local pcre_command_complex_blockless_name=':?+time'
+    local pcre_complex_blockless_name=':?+time'
 
     # Blockless complex command suffixed by one or more horizontal whitespace
     # characters optionally interspersed by line continuations.
-    local pcre_command_complex_blockless_optional='(?>'${pcre_command_complex_blockless_name}${pcre_continuable_spaces_horizontal}')?+'
+    local pcre_complex_blockless_optional='(?>'${pcre_complex_blockless_name}${pcre_continuable_spaces_horizontal}')?+'
 
-    # ..................{ COMMANDS ~ case                    }..................
+    # ..................{ COMPLEX ~ case                     }..................
     # Command name of a case statement.
-    local pcre_command_complex_case_name=':?+case'
+    local pcre_complex_case_name=':?+case'
 
     # String argument of a case statement.
-    local pcre_command_complex_case_arg=${pcre_continuable_spaces_horizontal}${pcre_word_backtickable}${pcre_spaces_continuable_horizontal}${pcre_brace_left}${pcre_continuable_spaces}
+    local pcre_complex_case_arg=${pcre_continuable_spaces_horizontal}${pcre_word_backtickable}${pcre_spaces_continuable_horizontal}${pcre_brace_left}${pcre_continuable_spaces}
 
     # Case statement prefix comprising such statement's command name, string
     # argument, and leading pattern. Empty case statements (i.e., case
@@ -2070,12 +2019,26 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # pattern-style command terminator rather than as an arithmetic test,
     # ensuring that ":or" would be mismatched as if in command position and
     # hence subject to command macro matching.
-    local pcre_command_complex_case_prefix=${pcre_command_complex_case_name}${pcre_command_complex_case_arg}${pcre_terminator_case_pattern}${pcre_continuable_spaces_horizontal_optional}
+    local pcre_complex_case_prefix=${pcre_complex_case_name}${pcre_complex_case_arg}${pcre_terminator_case_pattern}${pcre_continuable_spaces_horizontal_optional}
 
     # ..................{ COMMANDS                           }..................
+    #FIXME: Unfortunately, merely matching "time" and "case" statements does
+    #*NOT* suffice. We'll also need to match:
+    #
+    #* List assignments *EXCEPT* at the top level, where we already match such
+    #  assignments in a specific manner. Lists have peculiar syntax requiring
+    #  special handling to avoid erroneous matching elsewhere.
+    #* "for ((...))"-style "for" statements in *ALL* syntactic contexts. Such
+    #  arithmetic tests conflict with here-documents and hence require explicit
+    #  disambiguation everywhere.
+    #* "for ... (...)"-style "for" statements in *ALL* syntactic contexts. Such
+    #  lists require special handling, again.
+    #
+    #Nothing infeasible, of course. Merely more syntactic tedium. *sigh*
+
     # PCRE prefixing all PCREs matching zero or more commands. Prefixing
     # horizontal but *NOT* vertical whitespace is optionally matched.
-    local pcre_commands_head='(?>'${pcre_continuable_spaces_horizontal_optional}${pcre_command_complex_blockless_optional}'(?>'${pcre_command_complex_case_prefix}'|'
+    local pcre_commands_head='(?>'${pcre_continuable_spaces_horizontal_optional}${pcre_complex_blockless_optional}'(?>'${pcre_complex_case_prefix}'|'
 
     # PCRE suffixing all PCREs matching zero or more commands.
     local pcre_commands_foot='))*+'
@@ -2478,7 +2441,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # word of a command.
     local pcre_picoword_unforkable_rest=${pcre_picoword_sourceable_rest}'|'${pcre_unforkable_subword_rest}
 
-    # ..................{ MACRO ~ macroable                  }..................
+    # ..................{ WORD ~ macroable                   }..................
     # Since strict balancing of delimiters (e.g., braces, parens) is irrelevant
     # to macro name matching, such delimiters are matched in arbitrary order.
 
@@ -2503,12 +2466,7 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # but no commands and hence macros, list assignments *MUST* be explicitly
     # matched to prevent macros from being erroneously matched after such
     # whitespace in such assignments.
-    local pcre_word_macroable_first_body='(?>'${pcre_nanoword_macroable_start_word_first}')'${pcre_nanowords_macroable_rest_optional}
-
-    #FIXME: Excise such list assignment PCREs here and ensure we aren't still
-    #embedding them elsewhere as well.
-
-    local pcre_word_macroable_first=${pcre_var_name_with_list_assignment_or_head}${pcre_nanowords_macroable_rest_optional}${pcre_var_name_with_list_assignment_or_foot}'|'${pcre_word_macroable_first_body}
+    local pcre_word_macroable_first='(?>'${pcre_nanoword_macroable_start_word_first}')'${pcre_nanowords_macroable_rest_optional}
 
     # Any shell word *AFTER* the first of a nan-macro command at the top level
     local pcre_word_macroable_rest='(?>'${pcre_nanoword_macroable_start_word_rest}')'${pcre_nanowords_macroable_rest_optional}
@@ -2518,6 +2476,76 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # top level, each delimited by one or more horizontal whitespace characters
     # optionally interspersed by line continuations.
     local pcre_words_macroable_rest_optional='(?>'${pcre_spaces_horizontal_continuable}${pcre_word_macroable_rest_optional}')*+'
+
+    # ..................{ ASSIGNMENT                         }..................
+    #FIXME: Subtle issue: we really *ONLY* want to match assignments in which
+    #such operator is either prefixed or suffixed by at least one horizontal
+    #whitespace character. There's pretty much no reason to match standard zsh
+    #assignments, as those (obviously) already comply with zsh syntax.
+    #Interestingly, we do *NOT* need to ...
+    #
+    #Wait. zsh has rather peculiar behaviour not found anywhere else (that we
+    #know of) in the core language. Scalar variable assignments appear to be
+    #terminated by the first horizontal (!) whitespace character, which is a
+    #bit off-the-linguistic-hook: e.g.,
+    #
+    #    >>> :string zio; zio= world;
+    #    Command "world" not found.
+    #    >>> :string zio; zio=hello world;
+    #    Command "world" not found.
+    #
+    #Honestly, that's so overwhelmingly non-orthogonal with the remainder of
+    #the zsh language that we're increasingly inclined to want to "fix" such
+    #arguable misstep. Doing so is trivial -- since, of course, we already do
+    #so! No edits are required below. Simply document why we take the current
+    #approach, please.
+    #FIXME: Oh, right. We'll need to "fix up" non-compliant variable
+    #assignments [read: assignments of two or more shell words] in the
+    #preprocessor. Hmm; what's the most efficacious means of doing so? Ideally,
+    #we simply want to replace all unquoted horizontal characters with quoted
+    #horizontal characters. Right; but that's clearly somewhat non-trivial to
+    #achieve. Oh! Wait. No, it's clearly trivial. Simply:
+    #
+    #* Split the entire assignment value substring into words with "(z)".
+    #* In the same variable expansion, join such words together with ' ' (i.e.,
+    #  a single-quoted string containing a single literal space character). The
+    #  definition of join_list_on_string() suggests the following should work:
+    #
+    #    # Trivially simple. Now test us, please!
+    #    ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORD_FIRST=${match[${ZESHY__PREPROCESS_MATCH_GROUP_INDEX_ASSIGNMENT_VALUE_WORD_FIRST}]-}
+    #    ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORDS_REST=${match[${ZESHY__PREPROCESS_MATCH_GROUP_INDEX_ASSIGNMENT_VALUE_WORDS_REST}]-}
+    #
+    #    if [[ -n ${ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORDS_REST} ]] {
+    #        ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORD_FIRST+=' '${(@j:' ':)${(z)ZESHY__PREPROCESS_ASSIGNMENT_VALUE_WORDS_REST}}
+    #    }
+    #
+    #Of course, we should only perform such splitting and rejoining when we
+    #really need to -- which is to say, when two or more shell words are being
+    #assigned. Happily, this is easy to ascertain. Given the current PCRE
+    #structure, implementing the following incurs no inefficiencies:
+    #
+    #* Capture the first shell word being assigned to a distinct match group.
+    #* Capture all remaining shell words being assigned to a distinct match
+    #  group.
+    #
+    #Then simply apply such split and rejoining if the latter such match group
+    #is empty. Simple; efficient. Yay!
+
+    # "="-delimited variable assignment comprising a variable name, assignment
+    # operator, and assignment value, immediately reporting success if such
+    # assignment matches. To reduce backtracking in the common case of command
+    # names matching variable name syntax *NOT* followed by assignment
+    # operators, all components of such assignment are matched optionally.
+    #
+    # While resetting the current match position to the start of such name
+    # would be preferable, there exists no means of doing so that would *NOT*
+    # also erroneously apply to such common case (without introducing
+    # backtracking, of course). Since all components of such assignment are
+    # captured *AND* since matching is halted after doing so, resetting such
+    # position is *NOT* required to calculate the byte indices of such
+    # components. This differs from matched macros, for which resetting such
+    # position is both feasible and simpler than capturing substrings. *shrug*
+    local pcre_assignment_macroable_optional_grouped_succeed=${pcre_var_name_grouped}'(?|'${pcre_spaces_horizontal_continuable_grouped}'(?|'${pcre_assignment_operator_value_grouped}${pcre_succeed}'|'${pcre_words_macroable_rest_optional}')|'${pcre_nanowords_macroable_rest_optional}${pcre_words_macroable_rest_optional}')'
 
     # ..................{ MACRO ~ blockable                  }..................
     # "{"- and "}"-delimited block, recursively nestable and hence matchable
@@ -2656,6 +2684,10 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
     # erroneous syntactic invalidities. (See below.)
     local pcre_macro_name_grouped='('${ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER}')'
 
+    #FIXME: Actually, we've excised ${pcre_words_macroable_rest_optional}
+    #elsewhere and hence need to ensure that suffixing optional whitespace is
+    #matched. This is critical, folks!
+
     # Macro body, comprising all arguments passed to such macro as well as
     # line continuations and whitespace cementing the former to the latter. To
     # permit macros to be suffixed by whitespace-prefixed zeshy-specific
@@ -2665,36 +2697,54 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
 
     # Macro. To notify the preprocessor of such macro's:
     #
-    # * First byte index, the match position is reset *BEFORE* such match.
+    # * First byte index, the current match position is reset immediately
+    #   before performing such match.
     # * Syntactic validity, the last character of such macro is captured
-    #   *AFTER* such match.
-    # * Last byte index, success is reported *AFTER* such match.
+    #   after performing such match.
+    # * Last byte index, success is reported after capturing such character.
     #
     # Since invalid syntax also leverages such resetting and reporting but
     # fails to capture such character, the two are readily disambiguatable.
+    #
+    # Note that macros are suffixable by shell words *NOT* matched as such
+    # macros (e.g., redirections). Such words will be matched as commands
+    # on the next preprocessor iteration and hence need *NOT* be matched here.
+    # (Indeed, attempting to do so would be complicated by the need to report
+    # success immediately after matching such macro.) While erroneously
+    # matching shell words *NOT* in command position as if in command position
+    # would typically incite issues, such words are guaranteed to be
+    # redirections and hence inapplicable for matching as anything else.
     local pcre_macro_grouped_succeed=${pcre_reset}${pcre_macro_name_grouped}${pcre_macro_body}${pcre_char_last_grouped}${pcre_succeed}
 
-    #FIXME: A number of issues here:
+    #FIXME: Document why macro calls take precedence over variable assignments
+    #(namely, because zeshy-specific macros are expanded in a phase preceding
+    #zsh-standard assignments). This implies that variables should *NEVER*
+    #share the same name as macros, as in such case the latter will take
+    #precedence over the former in the specific case of variable assignments --
+    #which is a bit odd, of course, but unavoidable due to lack of signifying
+    #parens for callables as in conventional languages. In practice, since
+    #*ALL* official zeshy macros are prefixed by colons prohibited in variable
+    #names, there exists no conflict.
     #
-    #* Document why macro calls take precedence over variable assignments
-    #  (namely, because zeshy-specific macros are expanded in a phase
-    #  preceding zsh-standard assignments). This implies that variables should
-    #  *NEVER* share the same name as macros, as in such case the latter will
-    #  take precedence over the former in the specific case of variable
-    #  assignments. Note that attempting to reverse
-    #  such order introduces numerous issues: namely, 
+    #Note that ettempting to implement the reverse ordering quickly bogs down
+    #in a morrass of impoderabilities. Specifically, variable names either have
+    #to be prevented from matching macro names via negative lookahead *OR*
+    #backtracking has to be permitted if a subsequent "=" is *NOT* matched.
+    #Clearly, neither is happening. Hence, the current approach.
 
-    # Macro or first shell word of a command permitting matching of macros. To
+    #FIXME: Define ${pcre_words_macroable}.
+
+    # Macro, variable assignment, or command at the top level. To
     # preferentially match the first unquoted such word as a macro rather than
     # command name, the former is matched before the latter.
-    local pcre_macro_grouped_or_word_first='(?>'${pcre_macro_grouped_succeed}'|'${pcre_assignment_optional_grouped}'|'${pcre_word_macroable_first}')'
+    local pcre_macro_or_assignment_grouped_or_command='(?>'${pcre_macro_grouped_succeed}'|'${pcre_assignment_macroable_optional_grouped_succeed}'|'${pcre_words_macroable}')'
 
     # Macro or command at the top level. Since macros may be suffixed by shell
     # words external to such macros (e.g., redirections), zero or more such
     # words are matched after matching either a macro *OR* command name.
-    local pcre_macro_or_command_grouped_optional='(?>'${pcre_macro_grouped_or_word_first}${pcre_words_macroable_rest_optional}')?+'
+    local pcre_macro_or_command_grouped_optional='(?>'${pcre_assignment_macroable_optional_grouped_succeed}'|'${pcre_macro_grouped_or_word_first}${pcre_words_macroable_rest_optional}')?+'
 
-    #FIXME: Embed ${pcre_assignment_optional_grouped}.
+    #FIXME: Embed ${pcre_assignment_optional_grouped}? Ugh. What's goin' on!?
 
     # Macro, variable assignment, or command at the top level. Unlike macros,
     # such assignments consume all remaining shell words for the current
@@ -2793,6 +2843,105 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
 }
 
 # --------------------( WASTELANDS                         )--------------------
+        # ZESHY__PREPROCESS_GROUP_INDEX_ASSIGNMENT
+    # "="-delimited variable assignment comprising a variable name, assignment
+    # operator, and assignment value, resetting the current match position to
+    # the start of such name and reporting success if such assignment matches.
+    # To reduce backtracking in the common case of command names matching
+    # variable name syntax *NOT* followed by assignment operators, all
+    # components of such assignment are matched optionally.
+    # local pcre_assignment_macroable_optional_grouped_succeed=${pcre_reset}${pcre_var_name_grouped}'(?|'${pcre_spaces_horizontal_continuable_grouped}'(?|'${pcre_assignment_operator_value_grouped}${pcre_succeed}'|'${pcre_words_macroable_rest_optional}')|'${pcre_nanowords_macroable_rest_optional}${pcre_words_macroable_rest_optional}')'
+
+    # local pcre_assignment_macroable_optional_grouped=${pcre_var_name_grouped}${pcre_spaces_horizontal_continuable_optional_grouped}'(?>'${pcre_assignment_operator_value_grouped}'|'${pcre_words_macroable_rest_optional}')'
+
+    #FUXME: Document why we group the entire assignment: namely, to both
+    #simplify and optimize byte index calculation in the preprocessor.
+    #FUXME: ${pcre_assignment_optional_grouped} matches horizontal whitespace
+    #suffixing the first shell word. In the event of the second shell word
+    #*NOT* being either "+=" or "=", this will prevent such word and all
+    #following words from being matched below. Why? Because
+    #${pcre_words_macroable_rest_optional} requires at least one such
+    #whitespace character to be matched. To correct this, we'll need to
+    #extricate ${pcre_assignment_optional_grouped} from its current embedding
+    #below. Preprocessor changes may also be (but hopefully *NOT*) required to
+    #accommodate such refactoring.
+    #FUXME: Ugh! So *MANY* new match groups, all requiring indices. We've done
+    #our utmost to limit the number of such groups, but still... *sigh*
+
+    #FUXME: Do we still require this anywhere?
+# zero or more such words are matched after matching
+    # either a macro *OR* command name.
+    # Macro or first shell word of a command permitting matching of macros. To
+    # preferentially match the first unquoted such word as a macro rather than
+    # command name, the former is matched before the latter.
+    # local pcre_macro_grouped_or_word_first='(?>'${pcre_macro_grouped_succeed}'|'${pcre_word_macroable_first}')'
+
+    # Macro or command at the top level. Since macros may be suffixed by shell
+    # words external to such macros (e.g., redirections), zero or more such
+    # words are matched after matching either a macro *OR* command name.
+    # local pcre_macro_or_command_grouped_optional='(?>'${pcre_assignment_macroable_optional_grouped_succeed}'|'${pcre_macro_grouped_or_word_first}${pcre_words_macroable_rest_optional}')?+'
+
+    #FUXME: Define ${pcre_words_macroable_rest_optional_grouped} and
+    #${pcre_nanowords_macroable_rest_optional_grouped}.
+
+    # Three consecutive empty groups.
+    # local pcre_empty_group_three=${pcre_empty_group}${pcre_empty_group}${pcre_empty_group}
+
+    # Four consecutive empty groups.
+    # local pcre_empty_group_four=${pcre_empty_group_three}${pcre_empty_group}
+
+    # local pcre_assignment_macroable_optional_grouped_succeed=${pcre_reset}'('${pcre_var_name_grouped}'(?|'${pcre_spaces_horizontal_continuable_grouped}'(?|'${pcre_assignment_operator_value_grouped}${pcre_succeed}'|'${pcre_empty_group_three}${pcre_words_macroable_rest_optional_grouped}')|'${pcre_empty_group_four}${pcre_nanowords_macroable_rest_optional_grouped}'))'
+
+    #FUXME: Actually, we ended up implementing the opposite ordering, which
+    #ends up making substantially more semantic sense as well as being somewhat
+    #simpler to implement. (A win on both marks.) That said, since the inherent
+    #conflict between variable and macro names still exists, such conflict
+    #should be voluminously documented.
+
+        # ZESHY__PREPROCESS_GROUP_INDEX_NONASSIGNMENT_WORDS
+    #FUXME: Incorrect structure both here and below. If an assignment matches,
+    #then that terminates the current command, implying no subsequent words
+    #should be matched for such command. Amend, please.
+    #FUXME: Actually, assignments should *ONLY* be matched at the top level.
+    #Hence, revert this (and anywhere else we embedded ${pcre_assignment_*}
+    #PCREs as well) by excising such embeddings.
+    #FUXME: Actually, no. We *DO* need to match list assignments here, but
+    #*ONLY* list assignments -- ideally in a non-capturing manner.
+    #FUXME: O.K.; so, we've astutely ascertained that we need to match list
+    #assignments in *ALL* contexts, which means that the PCREs embedded below
+    #to do so should be shifted below to ${pcre_commands_head}. Yay!
+
+    # Since list
+    # assignments are prefixed by variable names indistinguishable from and
+    # hence conflicting with unquoted shell words, the former are matched
+    # first. Naturally, only the first shell word is in command position and
+    # hence requires matching for list assignments.
+    # local pcre_word_parenable_first='(?>'${pcre_var_name}'(?>'${pcre_assignment_operator}${pcre_assignment_value_nonscalar}'|'${pcre_nanowords_parenable_rest_optional}')|'${pcre_word_parenable_first_body}')'
+
+    # For efficiency, optional whitespace prefixing such operator is matched
+    # below, avoiding backtracking in the common case of commands whose names
+    # match variable name syntax but are *NOT* variable assignments.
+
+    # and following such "=". While zsh prohibits such assignment
+    # operator to be delimited by whitespace, zeshy supports zero or more
+    # horizontal whitespace characters optionally interspersed by line
+    # continuations both preceding and following such operator. For simplicity,
+
+    #FUXME: We also need to embed both ${pcre_reset} and ${pcre_succeed} here.
+    # local pcre_macro_grouped_or_word_first='(?>'${pcre_macro_grouped_succeed}'|'${pcre_assignment_macroable_optional_grouped}'|'${pcre_word_macroable_first}')'
+
+    #FUXME: O.K.; on the latter point, we should *NOT* need to extricate
+    #${pcre_assignment_optional_grouped} from its current embedding below.
+    #Rather, such PCRE should be internally refactored. Note, however, that
+    #preprocessor changes will be required to accommodate such refactoring.
+    #FUXME: Excise such list assignment PCREs here and ensure we aren't still
+    #embedding them elsewhere as well.
+
+    # local pcre_word_macroable_first=${pcre_var_name_with_list_assignment_or_head}${pcre_nanowords_macroable_rest_optional}${pcre_var_name_with_list_assignment_or_foot}'|'${pcre_word_macroable_first_body}
+
+    #FUXME: Shift below ${pcre_words_macroable_optional}, please.
+    #FUXME: Embed below.
+
     # "="-delimited variable assignment.
     # local pcre_assignment_optional_grouped=${pcre_var_name_grouped}${pcre_spaces_horizontal_continuable_grouped}'(?>'${pcre_assignment_operator_value_grouped}'|'${pcre_words_macroable_optional}')'
 
