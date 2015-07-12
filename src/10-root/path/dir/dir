@@ -1,0 +1,378 @@
+#!/usr/bin/env zsh
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2014 by Cecil Curry.
+# See "LICENSE" for additional details.
+
+:parcel <<'/---'
+Handle core directory functionality.
+/---
+
+#FIXME: Add support for directory diffing: e.g.,
+#    # Under Linux, this displays all changes between the two passed
+#    # directories.
+#    >>> command diff --brief --recursive dir1/ dir2/
+#
+#    # Alternately, if "git" is installed, the following command should be
+#    # preferred to the above. Why? Because it supports color, and that is
+#    # simply awesome.
+#    >>> command git diff dir1/ dir2/
+#
+#    # Actually, the ideal approach is probably to use "colordiff", a Perl
+#    # script wrapping "diff" in the obvious way.
+#    >>> command colordiff --brief --recursive dir1/ dir2/
+#FIXME: "colordiff" is sufficiently useful that we should *DEFINITELY* make an
+#interactive alias shadowing "diff" with "colordiff" under strictly interactive
+#terminals.
+
+# ....................{ EXCEPTIONS                         }....................
+declare_function_with_stdin <<'/---'
+void die_unless_dir(
+    string dirname,
+    string error_message = "\"${dirname}\" not a directory.")
+
+Throw an exception with the passed message unless the passed directory exists.
+/---
+function die_unless_dir() {
+    die_unless_args_1_to_2 'Expected one dirname and optional error message.'
+    string dirname="${1}"
+    is_dir "${dirname}" or :die "${2-\"${dirname}\" not a directory.}"
+}
+
+declare_function_with_stdin <<'/---'
+void die_unless_dir_writable(
+    string dirname,
+    string error_message = "\"${dirname}\" not a writable directory.")
+
+Throw an exception with the passed message unless the passed directory exists
+and is writable by the current user.
+/---
+function die_unless_dir_writable() {
+    die_unless_args_1_to_2 'Expected one dirname and optional error message.'
+    string dirname="${1}"
+    is_dir_writable "${dirname}" or
+        :die "${2-\"${dirname}\" not a writable directory.}"
+}
+
+# ....................{ EXCEPTIONS ~ if                    }....................
+declare_function_with_stdin <<'/---'
+void die_if_dir(
+    string dirname,
+    string error_message = "\"${dirname}\" already a directory.")
+
+Throw an exception with the passed message if the passed directory exists. See
+die_if_files() for potential pitfalls (e.g., race conditions).
+/---
+function die_if_dir() {
+    die_unless_args_1_to_2 'Expected one dirname and optional error message.'
+    string dirname="${1}"
+    is_dir "${dirname}" and :die "${2-\"${dirname}\" already a directory.}"
+}
+
+declare_function_with_stdin <<'/---'
+void die_if_dir_nonempty(
+    string dirname,
+    string error_message = "\"${dirname}\" already a non-empty directory.")
+
+Throw an exception with the passed message if the passed directory exists and is
+non-empty (i.e., unless the passed directory does _not_ exist or exists but is
+empty). See is_dir_nonempty() for further details and die_if_files() for
+potential pitfalls (e.g., race conditions).
+/---
+function die_if_dir_nonempty() {
+    die_unless_args_1_to_2 'Expected one dirname and optional error message.'
+    string dirname="${1}"
+    is_dir_nonempty "${dirname}" and
+        :die "${2-\"${dirname}\" already a non-empty directory.}"
+}
+
+# ....................{ TESTERS                            }....................
+declare_function_with_stdin <<'/---'
+[status: bool] is_dir(string pathname)
+
+Report success if the passed path is an existing directory.
+/---
+function is_dir() {
+    die_unless_arg 'Expected one pathname.'
+    is -d "${1}" si
+}
+
+declare_function_with_stdin <<'/---'
+[status: bool] is_dir_writable(string dirname)
+
+Report success if the passed directory is writable by the current user.
+/---
+function is_dir_writable() {
+    # Validate sanity.
+    die_unless_arg 'Expected one dirname.'
+    string dirname="${1}"
+    die_unless_dir "${dirname}"
+
+    # Test such directory.
+    is -w "${1}" si
+}
+
+# ....................{ TESTERS ~ emptiness                }....................
+declare_function_with_stdin <<'/---'
+[status: bool] is_dir_empty(string dirname)
+
+Report success if the passed directory is empty (i.e., contains no nested files
+or subdirectories).
+/---
+function is_dir_empty() {
+    # Validate sanity.
+    die_unless_arg 'Expected one dirname.'
+    string dirname="${1}"
+    die_unless_dir "${dirname}"
+
+    # Dismantled, this is:
+    #
+    # * "/^F", matching existing directories ("/") containing no files ("^F").
+    #
+    # Directory emptiness is also efficiently checkable by testing the number of
+    # directory links for equality with two, since only empty directories have
+    # two such links (i.e., "." and ".."): e.g.,
+    #
+    #   string dirname="${1}"
+    #   is_dir "${dirname}" and (( $(get_dir_subdir_count "${dirname}") == 0 ))
+    #
+    # While it remains unclear which method is the more efficient, the current
+    # method is certainly more straightforward.
+    :is_glob_qualified_path "${dirname}" '/^F'
+}
+
+declare_function_with_stdin <<'/---'
+[status: bool] is_dir_nonempty(string dirname)
+
+Report success if the passed directory is non-empty (i.e., contains at least one
+file or subdirectory).
+/---
+function is_dir_nonempty() {
+    # See is_dir_empty() for further discussion.
+    die_unless_arg 'Expected one dirname.'
+    string dirname="${1}"
+    die_unless_dir "${dirname}"
+    :is_glob_qualified_path "${dirname}" '/F'
+}
+
+# ....................{ GETTERS                            }....................
+declare_function_with_stdin <<'/---'
+string get_dir()
+
+Get the absolute path of the current working directory.
+/---
+function get_dir() {
+    die_if_args
+    :string.output "${PWD}"
+}
+
+declare_function_with_stdin <<'/---'
+integer get_dir_subdir_count(string dirname)
+
+Get the number of subdirectories directly under the passed directory, excluding
+canonical hard links `.` and `..`.
+/---
+function get_dir_subdir_count() {
+    # Validate passed arguments.
+    die_unless_arg 'Expected one dirname.'
+    string dirname="${1}"
+    die_unless_dir "${dirname}"
+
+    #FIXME: Avoid highly inefficient command substitutions! We have a new
+    #set_list_to_path_stats() function encapsulating such functionality
+    #*WITHOUT* such substitutions. (Refactor to call such function.)
+
+    # For non-directories, "nlink" counts the number of hard links to such file;
+    # for directories, "nlink" counts the number of subdirectories of such
+    # directory including omnipresent "." and ".." hard links. Hence,
+    # subtracting two from "nlink" counts the number of actual subdirectories.
+    # While obscure, such functionality certainly is efficient!
+    :string.output $(( $(zstat +nlink -- "${dirname}") - 2 ))
+}
+
+# ....................{ GETTERS ~ first                    }....................
+declare_function_with_stdin <<'/---'
+string get_dir_first(string dirname1, ...)
+
+Get the first passed directory that exists after resolving symbolic links or
+throw an exception if no such directory exists.
+/---
+function get_dir_first() {
+    die_unless_args 'Expected one or more dirnames.'
+    get_dir_first_if_found "${@}" or :die\
+        "$(join_strings_readable: "${@}") not found or not directories."
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, status: bool] get_dir_first_if_found(string dirname1, ...)
+
+Get the first passed directory that exists after resolving symbolic links or
+return failure if no such directory exists.
+/---
+function get_dir_first_if_found() {
+    die_unless_args 'Expected one or more dirnames.'
+    get_path_matching_qualifier_first_if_found "${@}" '-/'
+}
+
+# ....................{ GETTERS ~ first : writable         }....................
+declare_function_with_stdin <<'/---'
+string get_dir_writable_first(string dirname1, ...)
+
+Get the first passed directory writable by the current user after resolving
+symbolic links or throw an exception if no such directory exists.
+/---
+function get_dir_writable_first() {
+    die_unless_args 'Expected one or more dirnames.'
+    get_dir_writable_first_if_found "${@}" or :die\
+        "$(join_strings_readable: "${@}") not found or not writable directories."
+}
+
+declare_function_with_stdin <<'/---'
+[stdout: string, status: bool] get_dir_writable_first_if_found(
+    string dirname1, ...)
+
+Get the first passed directory writable by the current user after resolving
+symbolic links or return failure if no such directory exists.
+/---
+function get_dir_writable_first_if_found() {
+    die_unless_args 'Expected one or more dirnames.'
+    get_path_matching_qualifier_first_if_found\
+        "${@}" '-e{[[ -d $REPLY && -w $REPLY ]]}'
+}
+
+# ....................{ SETTERS                            }....................
+#FIXME: Great function. Now let's generalize this into a lower-level
+#:set_list_to_dir_paths_matching_glob_qualifier() function, which this function
+#then calls like to so as its implementation:
+#
+#    :set_list_to_dir_paths_matching_glob_qualifier()\
+#        "${list_name__sltddr}" "${dirname__sltddr}" **/* /
+#
+#Such function should accept an empty dirname without error, in which it
+#internally globs "**/*(#q/)" rather than "${dirname__sltddr}/**/*(#q/)". This
+#is moderately important, as the former produces shorter and hence more readable
+#dirnames when listing paths.
+#
+#See @{*-core/glob/path/qualifier} for related functionality.
+
+declare_function_with_stdin <<'/---'
+void :set_list_to_dir_dirs_recursive(string list_name, string dirname)
+
+Set the passed list (ideally, list set) to the set of all directories
+recursively found under the passed directory: e.g.,
+
+.:set_list_to_dir_dirs_recursive()
+==========================================
+[source]
+------------------------------------------
+>>> :list on_capital
+>>> :make_dir_if_not_found /das/kapital/volume/{i,ii,iii}
+>>> change_dir /das/kapital
+>>> :set_list_to_dir_dirs_recursive on_capital ''
+>>> :output_strings_newlined "${on_capital[@]}"
+volume/i
+volume/ii
+volume/iii
+------------------------------------------
+==========================================
+
+== Current Directory ==
+
+If the passed directory is the empty string (i.e., `""`), this function
+interprets such string to mean the current directory. While functionally
+equivalent to passing the absolute path of such directory (e.g., ${PWD},
+`$(get_dir)`), passing the empty string aesthetically reduces the resulting list
+items from absolute paths to only the unique suffixes of such paths relative to
+such directory (as exemplified by the above example).
+/---
+function :set_list_to_dir_dirs_recursive() {
+    # Validate sanity.
+    die_unless_args_2 'Expected one list name and one dirname.'
+    :string list_name__sltddr="${1}" dirname__sltddr="${2}"
+    :var.die_unless_type_list "${list_name__sltddr}"
+
+    # If such dirname is the empty string, set such list relative to the current
+    # directory. Dismantled, this is:
+    #
+    # * "**/*", recursively expanding to all paths under such directory.
+    # * "(/)", filtering non-directories from such paths.
+    if { is_string_empty "${dirname__sltddr}" } {
+        set_list_to_evaluation "${list_name__sltddr}" '**/*(/)'
+    # Else, set such list relative to such directory.
+    } else {
+        die_unless_dir "${dirname__sltddr}"
+        set_list_to_evaluation "${list_name__sltddr}" '"${dirname__sltddr}"/**/*(/)'
+    }
+}
+
+# ....................{ CHANGERS                           }....................
+#FIXME: Shift to @{path/command/change/dir}.
+declare_function_with_stdin <<'/---'
+void change_dir(string dirname)
+
+Set the current working directory to the passed directory with the currently
+configured `cd`-specific options (e.g., ${ZESHY_OPTIONS_CD}). Also:
+
+* If the current shell is interactive, implicitly call builtin chpwd() and all
+  functions registered with run_hook_after_dir_set_interactively().
+* If the current shell is non-interactive and:
+** If list global ${ZESHY_OPTIONS_CD_IF_NONINTERACTIVE} retains default option
+   `-q`, do _not_ implicitly call builtin chpwd() or any functions registered
+   with run_hook_after_dir_set_interactively().
+** Else, do.
+
+If the current shell is non-interactive, this function thus behaves idempotently
+(i.e., without implicit side effects) by default.
+/---
+function change_dir() {
+    die_unless_arg 'Expected one dirname.'
+    run_code_with_options_configured 'builtin cd' ZESHY_OPTIONS_CD -- "${(q)1}"
+}
+
+declare_function_with_stdin <<'/---'
+void change_dir_with_options(
+    string cd_option1?, ...,
+    string dirname = "-")
+
+Set the current working directory to the passed directory (defaulting to `-`
+and hence the prior directory on the directory stack, if called directly from
+the command line) with both the currently configured and passed `cd`-specific
+options (e.g., ${ZESHY_OPTIONS_CD}). See change_dir() for further details.
+/---
+function change_dir_with_options() {
+    # Validate sanity.
+    if { is_context_cli_function } {
+        is_args or :args.set '-'
+    } else {
+        die_unless_args_1_or_more\
+            'Expected optional options and one dirname'
+    }
+
+    # Set such directory.
+    run_code_with_options_configured 'builtin cd' ZESHY_OPTIONS_CD "${(q)@}"
+}
+
+# --------------------( WASTELANDS                         )--------------------
+        # eval ${list_name__sltddr}:catch'( "${dirname__sltddr}"/**/*(/) )'
+
+#FUXME: Implement a new change_dir_idempotently() function expanding list global
+#${ZESHY_OPTIONS_CD_IDEMPOTENT}.
+
+# If passed only one source path, default the
+    # target path to the current directory.
+#FUXME: Implement the corresponding is_dir_nonempty() by editing to:
+#   list dirname_if_nonempty; dirname_if_nonempty=( "${1}"(/F) )
+
+    #FUXME: We should really just define a helper function in "path/path"
+    #resembling the current get_first_*_glob_qualifier() functions.
+#   list dirname_if_empty; dirname_if_empty=( "${1}"(/^F) )
+#   is_list_nonempty dirname_if_empty
+
+# ....................{ ALIASES                            }....................
+#alias_cli_substitution {m}k{d}ir='make_dir_if_not_found'
+#alias_cli_substitution {r}m{d}ir='remove_dir_empty'
+
+    # Defer to make_dir(), temporarily appending option "-p" to global list
+    # ${ZESHY_OPTIONS_MKDIR}.
+#   list zeshy_mkdir_options; zeshy_mkdir_options=( "${ZESHY_OPTIONS_MKDIR[@]}" )
+#   list ZESHY_OPTIONS_MKDIR; ZESHY_OPTIONS_MKDIR=( "${zeshy_mkdir_options[@]}" -p )
+#   make_dir "${@}"
