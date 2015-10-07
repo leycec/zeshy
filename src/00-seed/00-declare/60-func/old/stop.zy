@@ -8,6 +8,35 @@ Handle *function prototype parsers* (i.e., functions parsing function
 prototypes, typically as a prerequisite to processing function declarations).
 /---
 
+#FIXME: The current algorithm for parsing prototype arguments is extremely
+#inefficient, requiring recompilating of the
+#${ZESHY_CALLABLE_PROTOTYPE_ARGS_NEXT_PCRE} PCRE on each function definition.
+#As an efficient alternate, recall the clever approach we recently discovered
+#for macro parsing. Specifically, on matching a callable prototype:
+#
+#* We currently:
+#  1. Match the entire argument list string with one PCRE.
+#  2. Iteratively match each argument in that list with another PCRE.
+#* We should instead:
+#  1. Match both the entire argument list string *AND* the last argument in
+#     that list with the original PCRE.
+#  2. Copy the entire argument list string to a local variable.
+#  3. Strip the last argument matched from that local variable.
+#  4. If that variable is non-empty, additional arguments remain to be parsed.
+#     In such case:
+#     1. Fabricate a fake callable prototype definition to be re-matched by the
+#        same PCRE, containing the argument list string stored in that local
+#        variable. All other prototype components (e.g., name, return type) are
+#        ignorable for argument parsing purposes and hence fabricated: e.g.,
+#            function :void _(:string arg1, :int arg2)
+#     2. Match the last argument from that prototype with the same PCRE.
+#     3. Skip to 3. above.
+#
+#Fairly trivial, honestly, *EXCEPT* for the fact that we would then be parsing
+#arguments in reverse order. Doing so is certainly feasible but will probably
+#require non-trivial algorithm changes. In any case, the current approach is
+#sufficiently inefficient as to be unworkable, so we have little choice. Ugh!
+
 #FIXME: In reflection, there's no demonstrable reason to prohibit function
 #prototypes from requesting both defaultable and variadic arguments. After all,
 #Ruby supports heterogenous mixings of the two by simply binding defaultable
@@ -69,9 +98,10 @@ function ::func_.stop() {
     # Reset globals declared above *NOT* specific to subsequent iteration.
     ZESHY__FUNC_PREAMBLE=
     ZESHY__FUNC_ARGS_IS_GLOB=0
+    ZESHY__FUNC_ARGS_IS_UNLOCALIZED=0
 
     # For efficiency, cache frequently expanded function attributes.
-    #
+
     # For efficiency when expanding such global below, define such global to be
     # a two-valued string rather than strictly boolean. Specifically:
     #
@@ -81,7 +111,6 @@ function ::func_.stop() {
     # * Else, set such global to an arbitrary non-empty string. In such case,
     #   expanding such global with expansion pattern ":+" expands such global
     #   to the right-hand side of such pattern.
-
     #
     # Note that such pattern's documentation is incorrect, reading:
     #
@@ -110,25 +139,26 @@ function ::func_.stop() {
     # munging operations requiring *NO* explicit iteration. Indeed, note that:
     #
     # * Omitting single- and double-quoted strings, each "," in an argument
-    #   list suggests such function to accept one more mandatory argument.
+    #   list suggests such function to accept an additional mandatory argument.
     # * Omitting single- and double-quoted strings, each "?" and "=" in an
-    #   argument list suggests such function to accept one more optional
+    #   argument list suggests such function to accept an additional optional
     #   argument.
     # * Each mandatory argument increases the maximum number of arguments such
     #   function accepts by one.
     # * Each optional argument reduces the minimum number of arguments such
     #   function accepts by one.
     #
-    # Efficiently determining such numbers thus reduces to counting the number
+    # Efficiently calculating these numbers thus reduces to counting the number
     # of unquoted ",", "?", and "=" characters in such argument list.
     #
     # Unfortunately, while such determination *IS* demonstrably efficient,
     # conforming to the algorithm implemented below requires reparsing the
     # argument list once for each optional (but *NOT* variadic) argument such
     # function accepts. (Why? Because each additional optional argument implies
-    # such function to accept one additional possible number of arguments and
-    # each such number necessitates distinct code validation and hence
-    # algorithmic handling here.)
+    # such function to accept an additional possible number of arguments -- or,
+    # equivalent, the set of all possible numbers of arguments accepted by such
+    # function to increase by one in size. Each such number requires distinct
+    # code validation and hence detection here.)
     #
     # Unfortunately, eliminating such reparsing would require persisting a list
     # of argument metadata during the first and only pass for subsequent lookup
@@ -141,7 +171,7 @@ function ::func_.stop() {
     # reparsing, such reparsing would indeed be non-ideal. In practice, few
     # zeshy functions accept optional arguments (due to readability and
     # writability concerns associated with such arguments). Since the common
-    # case imposes no argument reparsing, reparsing poses no imposition.
+    # case imposes no argument reparsing, reparsing poses no huge imposition.
     #
     # Note that the above two parse passes are technically invertable by
     # parsing all arguments into a list of all argument in the first pass and
@@ -247,8 +277,9 @@ function ::func_.stop() {
             ZESHY__FUNC_ARG_COUNT - ZESHY__FUNC_ARG_COUNT_MIN ))
         # print -r 'args length '${#ZESHY__FUNC_ARGS}
 
-        # Parse each such argument into canonical list global ${match}, whose
-        # indices we localize as human-readable integers above.
+        # Parse each such argument into canonical list global ${match}. For
+        # readability, all capture groups expanded more than once below are
+        # localized as human-readable local string variables.
         ZPCRE_OP='0 0'
         while {
             print -r 'ZPCRE_OP: '${ZPCRE_OP}' ('${ZPCRE_OP[(w)2]}')'
@@ -256,15 +287,29 @@ function ::func_.stop() {
         } {
             # print -r 'arg '${ZESHY__FUNC_ARG_INDEX}' at bytes ['$(( ${ZPCRE_OP[(w)1]} + 1 ))','${ZPCRE_OP[(w)2]}']: '${ZESHY__FUNC_ARGS[$(( ${ZPCRE_OP[(w)1]} + 1 )),${ZPCRE_OP[(w)2]}]}
 
-            # Localize *ONLY* that subset of argument match substrings expanded
-            # by two or more conditionals below.
-            ZESHY__FUNC_ARG_IS_VARIADIC=${#match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_VARIADIC}]}
+            #FIXME: Actually test these variables below.
+            #FIXME: We also need to handle the "*" and "+" variadic argument
+            #type prefixes far above where we calculate an initial argument
+            #count. (Shouldn't be terribly hard. Please Gods, don't be hard.)
 
-            # If such local subtype is empty, PCRE design guarantees such
-            # argument to indirectly refer to another variable by name,
-            # implying such argument to be a string. Since numerous exception
-            # handlers expect such subtype to be nonempty, do so *BEFORE*
-            # calling such handlers below.
+            # 1 if such argument is a mandatory variadic argument and 0
+            # otherwise.
+            ZESHY__FUNC_ARG_IS_VARIADIC_MANDATORY=${#match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_VARIADIC_MANDATORY}]-}
+
+            # 1 if such argument is a missable variadic argument and 0
+            # otherwise.
+            ZESHY__FUNC_ARG_IS_VARIADIC_MISSABLE=${#match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_VARIADIC_MISSABLE}]-}
+
+            # 1 if such argument is a variadic argument and 0 otherwise.
+            ZESHY__FUNC_ARG_IS_VARIADIC=$((
+                ZESHY__FUNC_ARG_IS_VARIADIC_MANDATORY +
+                ZESHY__FUNC_ARG_IS_VARIADIC_MISSABLE ))
+
+            # Local argument subtype. If such subtype is empty, PCRE design
+            # guarantees such argument to indirectly refer to another variable
+            # by name, implying such argument to be a string. Since numerous
+            # exception handlers expect such subtype to be nonempty, do so
+            # *BEFORE* calling such handlers below.
             ZESHY__FUNC_ARG_SUBTYPE_LOCAL=${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}]:-:string}
 
             # If such argument is *NOT* variadic...
@@ -298,19 +343,27 @@ function ::func_.stop() {
                 # variadic argument lists of arbitrary count, implying there
                 # exists no general means of deciding which such list a passed
                 # string was intended to belong to.
-                (( ! ZESHY__FUNC_ARG_WAS_VARIADIC )) || ::func.die_of_arg_variadic\
-                    'accepts two or more variadic arguments.'
+                (( ! ZESHY__FUNC_ARG_WAS_VARIADIC )) ||
+                    ::func.die_of_arg_variadic\
+                        'accepts two or more variadic arguments.'
 
-                # If another argument is optional, throw an exception. Such case
-                # implies such function to accept one or more optional arguments
-                # *AND* one or more variadic argument lists of arbitrary count,
-                # implying there exists no general means of deciding which such
-                # argument a passed string was intended to correspond to.
+                #FIXME: This doesn't seem quite right, anymore. We no longer
+                #permit the "*" or "+" variadic type prefixes to be coupled
+                #with the "?" missable type prefix. Only one type prefix at a
+                #type is permitted, suggesting the following test can be
+                #radically simplified.
+
+                # If another argument is optional, throw an exception. Such
+                # case implies such function to accept one or more optional
+                # arguments *AND* one or more variadic argument lists of
+                # arbitrary count, implying there exists no general means of
+                # deciding which such argument a passed string was intended to
+                # correspond to.
                 #
-                # Test such condition *AFTER* testing whether a prior argument is
-                # variadic. If such function accepts an optional variadic argument
-                # following a prior variadic argument, the prior exception is more
-                # explanatory than this exception.
+                # Test such condition *AFTER* testing whether a prior argument
+                # is variadic. If such function accepts an optional variadic
+                # argument following a prior variadic argument, the prior
+                # exception is more explanatory than this exception.
                 #
                 # The test that follows is an extreme optimization of:
                 #
@@ -337,15 +390,16 @@ function ::func_.stop() {
                 #   both, such boolean is dynamically computing by summing the
                 #   boolean noting whether such argument is absentable with the
                 #   boolean noting whether such argument is defaultable.
-                # * "ZESHY__FUNC_ARG_COUNT_MAX - ZESHY__FUNC_ARG_COUNT_MIN" is 1 if the current
-                #   variadic argument is optional and 0 otherwise.
+                # * "ZESHY__FUNC_ARG_COUNT_MAX - ZESHY__FUNC_ARG_COUNT_MIN" is
+                #   1 if the current variadic argument is optional and 0
+                #   otherwise.
                 #
                 # In either case, subtracting either from the other *ALWAYS*
                 # results in 0; in any other case, the same subtraction *NEVER*
                 # results in 0. Hence, such test suffices. (Convenient.)
-                (( ${#match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}} +\
-                   ${#match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}]-}\
-                   - ZESHY__FUNC_ARG_COUNT_MAX - ZESHY__FUNC_ARG_COUNT_MIN )) ||
+                (( ${#match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-} +
+                   ZESHY__FUNC_ARG_IS_VARIADIC_MISSABLE -
+                   ZESHY__FUNC_ARG_COUNT_MAX - ZESHY__FUNC_ARG_COUNT_MIN )) ||
                     ::func.die_of_arg_variadic\
                         'accepts both optional and variadic arguments.'
 
@@ -371,8 +425,12 @@ function ::func_.stop() {
             if [[ -n ${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-} ]] {
                 #FIXME: Actually, we *WILL* want to support defaulting of
                 #mandatory variadic arguments. Since our PCRE design implicitly
-                #prohibits absentable arguments from being defaulted, we
-                #needn't explicitly prohibit such case here. (Yay!)
+                #prohibits missable arguments from being defaulted, we needn't
+                #explicitly prohibit such case here. (Yay!)
+                #FIXME: Actually, is the claim that "our PCRE design implicitly
+                #prohibits missable arguments from being defaulted" true for
+                #variadic arguments anymore, now that we have distinct syntax
+                #for missable variadic arguments? Contemplate, please.
 
                 # If such argument is both defaultable and variadic, throw an
                 # exception. While we *COULD* technically permit the first
@@ -459,8 +517,8 @@ function ::func_.stop() {
                     continue
                 }
             # Else if such argument is absentable and hence also optional...
-            } elif [[ -n ${match[
-                ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}]-} ]] {
+            } elif (( ${#match[
+                ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}]-} )) {
                 # If such argument is passed, handle such case. See above.
                 if (( ZESHY__FUNC_ARG_COUNT_OPTIONABLE )) {
                       ZESHY__FUNC_ARG_COUNT_OPTIONABLE+=-1
@@ -488,7 +546,7 @@ function ::func_.stop() {
                     # data without variable indirection.
                     [[ ${ZESHY__FUNC_ARG_SUBTYPE_LOCAL} !=\
                        ':'('list'|'map') ]] ||
-                        #FIXME: Somewhat of a silly function, isn't it? It's
+                        #FIXME: Somewhat of a silly function, isn't it? Its
                         #implementation strikes us as overly complex. Given
                         #that such function is only ever called here,
                         #contemplate supplanting it by the simpler
@@ -618,17 +676,17 @@ function ::func_.stop() {
                     # While such major subtype is typically optional, PCRE
                     # design guarantees such subtype to be non-empty for
                     # indirect arguments and hence safely expandable here.
-                    ZESHY__FUNC_RUNNABLE_NAME=':'${ZESHY__FUNC_ARG_SUBTYPE_MAJOR]}'.is_'
+                    ZESHY__FUNC_CALLABLE_NAME=':'${ZESHY__FUNC_ARG_SUBTYPE_MAJOR]}'.is_'
 
                     # If such argument has a minor subtype, suffix such function.
                     [[ -z ${ZESHY__FUNC_ARG_SUBTYPE_MINOR} ]] ||
-                        ZESHY__FUNC_RUNNABLE_NAME+='_'${ZESHY__FUNC_ARG_SUBTYPE_MINOR}
+                        ZESHY__FUNC_CALLABLE_NAME+='_'${ZESHY__FUNC_ARG_SUBTYPE_MINOR}
 
                     # If such function does *NOT* exist, throw an exception.
                     # For efficiency, inline such test. See :func.is().
-                    (( ${+functions[${ZESHY__FUNC_RUNNABLE_NAME}]} )) ||
+                    (( ${+functions[${ZESHY__FUNC_CALLABLE_NAME}]} )) ||
                         ::func.die_of_arg_type\
-                            'unvalidatable (i.e., function '${ZESHY__FUNC_RUNNABLE_NAME}'() undefined)'
+                            'unvalidatable (i.e., function '${ZESHY__FUNC_CALLABLE_NAME}'() undefined)'
 
                     # Map such function name to such variable expansion.
                     #
@@ -667,12 +725,12 @@ function ::func_.stop() {
                     #   by the current argument to ${MATCH}.
                     # * "${(P)MATCH}", expanding to such variable's value.
                     if (( ZESHY__FUNC_ARG_IS_VARIADIC )) {
-                        ZESHY__FUNC_ARG_VAR_TESTER_TO_EXPANSIONS[${ZESHY__FUNC_RUNNABLE_NAME}]+=' "${(P)'${ZESHY__FUNC_ARG_PARAM}'//(#m)*/${(P)MATCH}}"'
+                        ZESHY__FUNC_ARG_VAR_TESTER_TO_EXPANSIONS[${ZESHY__FUNC_CALLABLE_NAME}]+=' "${(P)'${ZESHY__FUNC_ARG_PARAM}'//(#m)*/${(P)MATCH}}"'
                     # Else, such argument is non-variadic and hence refers to a
                     # single variable. In such case, parameter expansion flag
                     # "(P)" may be applied per usual.
                     } else {
-                        ZESHY__FUNC_ARG_VAR_TESTER_TO_EXPANSIONS[${ZESHY__FUNC_RUNNABLE_NAME}]+=' "${(P)'${ZESHY__FUNC_ARG_PARAM}'}"'
+                        ZESHY__FUNC_ARG_VAR_TESTER_TO_EXPANSIONS[${ZESHY__FUNC_CALLABLE_NAME}]+=' "${(P)'${ZESHY__FUNC_ARG_PARAM}'}"'
                     }
 
                     # If such argument is indirect, convert such major and
@@ -701,20 +759,20 @@ function ::func_.stop() {
                 }
 
                 # Name of the function validating such argument's value.
-                ZESHY__FUNC_RUNNABLE_NAME=':'${ZESHY__FUNC_ARG_SUBTYPE_MAJOR}'.is'
+                ZESHY__FUNC_CALLABLE_NAME=':'${ZESHY__FUNC_ARG_SUBTYPE_MAJOR}'.is'
 
                 # If such argument has a minor subtype, suffix such function.
                 [[ -z ${ZESHY__FUNC_ARG_SUBTYPE_MINOR} ]] ||
-                    ZESHY__FUNC_RUNNABLE_NAME+='_'${ZESHY__FUNC_ARG_SUBTYPE_MINOR}
+                    ZESHY__FUNC_CALLABLE_NAME+='_'${ZESHY__FUNC_ARG_SUBTYPE_MINOR}
 
                 # If such function does *NOT* exist, throw an exception.  For
                 # efficiency, inline such test. See :func.is() for details.
-                (( ${+functions[${ZESHY__FUNC_RUNNABLE_NAME}]} )) ||
+                (( ${+functions[${ZESHY__FUNC_CALLABLE_NAME}]} )) ||
                     ::func.die_of_arg_type\
-                        'unvalidatable (i.e., function '${ZESHY__FUNC_RUNNABLE_NAME}'() undefined)'
+                        'unvalidatable (i.e., function '${ZESHY__FUNC_CALLABLE_NAME}'() undefined)'
 
                 # Map such function name to such argument's expansion.
-                ZESHY__FUNC_ARG_TESTER_TO_EXPANSIONS[${ZESHY__FUNC_RUNNABLE_NAME}]+=' "${'${ZESHY__FUNC_ARG_PARAM}'}"'
+                ZESHY__FUNC_ARG_TESTER_TO_EXPANSIONS[${ZESHY__FUNC_CALLABLE_NAME}]+=' "${'${ZESHY__FUNC_ARG_PARAM}'}"'
             }
 
             # Increment such argument index in preparation for parsing the next
@@ -743,10 +801,10 @@ function ::func_.stop() {
         #   validates such variables as existing and of the expected type,
         #   this iteration validates the values such variables expand to
         #   and hence must be performed *AFTER* the first iteration.
-        for ZESHY__FUNC_RUNNABLE_NAME ZESHY__FUNC_ARGS_EXPANSIONS (
+        for ZESHY__FUNC_CALLABLE_NAME ZESHY__FUNC_ARGS_EXPANSIONS (
             "${(kv@)ZESHY__FUNC_ARG_TESTER_TO_EXPANSIONS}"
             "${(kv@)ZESHY__FUNC_ARG_VAR_TESTER_TO_EXPANSIONS}") {
-            ZESHY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${ZESHY__FUNC_CODE_PREFIX}${ZESHY__FUNC_RUNNABLE_NAME}${ZESHY__FUNC_ARGS_EXPANSIONS}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${ZESHY__FUNC_ARGS_EXPANSIONS}''' '${(q)ZESHY__FUNC_RUNNABLE_NAME}
+            ZESHY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${ZESHY__FUNC_CODE_PREFIX}${ZESHY__FUNC_CALLABLE_NAME}${ZESHY__FUNC_ARGS_EXPANSIONS}' || ::func.die_unless_arg_values_pass_tester "${@}" '''${ZESHY__FUNC_ARGS_EXPANSIONS}''' '${(q)ZESHY__FUNC_CALLABLE_NAME}
         }
 
         # For each alias name and corresponding string localizing arguments
@@ -755,9 +813,9 @@ function ::func_.stop() {
         # *ALWAYS* succeeding and hence requiring no exception handling
         # (e.g., 'my_var="${1}"'). For efficiency, iterate only by keys
         # (rather than by both keys and values).
-        for ZESHY__FUNC_RUNNABLE_NAME (
+        for ZESHY__FUNC_CALLABLE_NAME (
             "${(k@)ZESHY__FUNC_ARG_DECLARER_TO_DECLARATIONS}") {
-            ZESHY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${ZESHY__FUNC_CODE_PREFIX}${ZESHY__FUNC_RUNNABLE_NAME}${ZESHY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${ZESHY__FUNC_RUNNABLE_NAME}]}
+            ZESHY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${ZESHY__FUNC_CODE_PREFIX}${ZESHY__FUNC_CALLABLE_NAME}${ZESHY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${ZESHY__FUNC_CALLABLE_NAME}]}
         }
 
         # If localizing a variadic argument, do so *AFTER* localizing
@@ -856,19 +914,19 @@ function ::func_.stop() {
         # function call conditionally accepts unpassed defaultable arguments
         # (e.g., only when called directly from the command line) or the empty
         # string if such function *ALWAYS* accepts such arguments.
-        ZESHY__FUNC_RUNNABLE_NAME=${ZESHY__FUNC_ATTRS[is_args_defaultable_if]-}
+        ZESHY__FUNC_CALLABLE_NAME=${ZESHY__FUNC_ATTRS[is_args_defaultable_if]-}
 
         # If only conditionally accepting such arguments, do so only when such
         # condition succeeds at runtime.
-        if [[ -n ${ZESHY__FUNC_RUNNABLE_NAME} ]] {
+        if [[ -n ${ZESHY__FUNC_CALLABLE_NAME} ]] {
             # If such alias or function does *NOT* exist, throw an exception.
             # See :alias_command.is() and :func.is().
-            (( ${+aliases[${ZESHY__FUNC_RUNNABLE_NAME}]} +
-               ${+functions[${ZESHY__FUNC_RUNNABLE_NAME}]} )) ||
-               ::func.die 'attribute "default_args_if" alias or function '${ZESHY__FUNC_RUNNABLE_NAME}'() undefined'
+            (( ${+aliases[${ZESHY__FUNC_CALLABLE_NAME}]} +
+               ${+functions[${ZESHY__FUNC_CALLABLE_NAME}]} )) ||
+               ::func.die 'attribute "default_args_if" alias or function '${ZESHY__FUNC_CALLABLE_NAME}'() undefined'
 
             # Default such arguments only if such condition succeeds.
-            ZESHY__FUNC_PREAMBLE='if { '${ZESHY__FUNC_RUNNABLE_NAME}' } {'${ZESHY__FUNC_CODE_PREFIX}${ZESHY__FUNC_PREAMBLE}${ZESHY__FUNC_CODE_PREFIX}'}'
+            ZESHY__FUNC_PREAMBLE='if { '${ZESHY__FUNC_CALLABLE_NAME}' } {'${ZESHY__FUNC_CODE_PREFIX}${ZESHY__FUNC_PREAMBLE}${ZESHY__FUNC_CODE_PREFIX}'}'
         }
 
         # Delimit such code from subsequent code.
@@ -944,32 +1002,32 @@ function ::func_.stop() {
     #   unsupportable functionality, including:
     #   * On detecting an uncaught exception, printing the lines of the
     #     function responsible for initially throwing such exception.
-    local func_name
-    for   func_name ("${ZESHY__FUNC_NAMES[@]}") {
+    for ZESHY__FUNC_NAME ("${ZESHY__FUNC_NAMES[@]}") {
         # Redefine such function in a manner preserving post-parsed form (i.e.,
         # containing no comments or negligible whitespace).
-        functions[${func_name}]=${ZESHY__FUNC_PREAMBLE}${functions[${func_name}]}
+        functions[${ZESHY__FUNC_NAME}]=${ZESHY__FUNC_PREAMBLE}${functions[${ZESHY__FUNC_NAME}]}
 
         # If such function accepts at least one string glob argument, prefix
         # all calls to such function by "noglob" to prevent zsh from expanding
         # such arguments as file globs. To do so, define a simple alias of the
         # same name shadowing all calls to such function in such manner.
         if (( ZESHY__FUNC_ARGS_IS_GLOB )) {
-            :alias_command.define "${func_name}" "noglob ${(q)func_name}"
+            :alias_command.define\
+                "${ZESHY__FUNC_NAME}" "noglob ${(q)ZESHY__FUNC_NAME}"
         }
 
         #FIXME: Fairly lame. See @{*-alias} for commentary.
 
         # Add such function to the current parcel.
-        add_parcel_function "${ZESHY_PARCEL_NAME}" "${func_name}"
+        add_parcel_function "${ZESHY_PARCEL_NAME}" "${ZESHY__FUNC_NAME}"
     }
 
     # If such function is to be called back (i.e., called on some subsequent
     # event), register such callback with such function's first name.
     if (( ${+ZESHY__FUNC_ATTRS[callback]} )) {
-        ZESHY__FUNC_RUNNABLE_NAME='func.callback_'${ZESHY__FUNC_ATTRS[callback]}
-        :func.die_unless "${ZESHY__FUNC_RUNNABLE_NAME}"
-        "${ZESHY__FUNC_RUNNABLE_NAME}" "${ZESHY__FUNC_NAMES[1]}"
+        ZESHY__FUNC_CALLABLE_NAME='func.callback_'${ZESHY__FUNC_ATTRS[callback]}
+        :func.die_unless "${ZESHY__FUNC_CALLABLE_NAME}"
+        "${ZESHY__FUNC_CALLABLE_NAME}" "${ZESHY__FUNC_NAMES[1]}"
     }
 
     #FIXME: Can this function benefit from similar optimization? The answer is
@@ -995,6 +1053,89 @@ function ::func_.stop() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+# Naturally, such PCRE should no longer match the entire such list.
+                # Note that it does *NOT* suffice to test whether such function
+                # accepts at least one optional argument: e.g.,
+                #
+                #    if (( ZESHY__FUNC_ARG_COUNT_MAX !=
+                #          ZESHY__FUNC_ARG_COUNT_MIN )) { ... }
+                #
+                # Such optional argument could in fact be the current variadic
+                # argument, a valid edge case we explicitly support. Hence, we
+                # instead test whether the current variadic argument is optional.
+                #FUXME: This doesn't seem quite right, anymore. We no longer
+                #permit the "*" or "+" variadic type prefixes to be coupled
+                #with the "?" missable type prefix. Only one type prefix at a
+                #type is permitted, suggesting the following test can be
+                #radically simplified.
+
+                # If another argument is optional, throw an exception. Such case
+                # implies such function to accept one or more optional arguments
+                # *AND* one or more variadic argument lists of arbitrary count,
+                # implying there exists no general means of deciding which such
+                # argument a passed string was intended to correspond to.
+                #
+                # Test such condition *AFTER* testing whether a prior argument is
+                # variadic. If such function accepts an optional variadic argument
+                # following a prior variadic argument, the prior exception is more
+                # explanatory than this exception.
+                #
+                # The test that follows is an extreme optimization of:
+                #
+                #    if (( ZESHY__FUNC_ARG_COUNT_MAX != ZESHY__FUNC_ARG_COUNT_MIN )) && {
+                #       (( ! arg_is_optional )) ||
+                #       (( ZESHY__FUNC_ARG_COUNT_MAX - ZESHY__FUNC_ARG_COUNT_MIN > 1 )) } { ... }
+                #
+                # As such logic implies, testing whether such function accepts
+                # at least one optional argument is insufficient. Such argument
+                # could in fact be the current variadic argument, a valid edge
+                # case we explicitly support. Hence, also test whether the
+                # current variadic argument is optional. If so, test whether
+                # any other argument is optional (as implied by the number of
+                # optional arguments being greater than 1, thus ignoring the
+                # current validly optional variadic argument).
+                #
+                # To understand why the test above reduces to the optimization
+                # below, note:
+                #
+                # * ${arg_is_optional} is a hypothetical boolean expanding to 1
+                #   if the current variadic argument is optional (i.e., either
+                #   absentable or defaultable) and 0 otherwise. Since an
+                #   argument may be either absentable *OR* defaultable but not
+                #   both, such boolean is dynamically computing by summing the
+                #   boolean noting whether such argument is absentable with the
+                #   boolean noting whether such argument is defaultable.
+                # * "ZESHY__FUNC_ARG_COUNT_MAX - ZESHY__FUNC_ARG_COUNT_MIN" is 1 if the current
+                #   variadic argument is optional and 0 otherwise.
+                #
+                # In either case, subtracting either from the other *ALWAYS*
+                # results in 0; in any other case, the same subtraction *NEVER*
+                # results in 0. Hence, such test suffices. (Convenient.)
+                # (( ${#match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}} +\
+                #    ${#match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}]-}\
+                #    - ZESHY__FUNC_ARG_COUNT_MAX - ZESHY__FUNC_ARG_COUNT_MIN )) ||
+                #     ::func.die_of_arg_variadic\
+                #         'accepts both optional and variadic arguments.'
+
+#FUXME: Ugh. We eliminated both
+#${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_VARIADIC} and
+#${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}. Ensure all references
+#to such indices have been refactored below.
+
+            # } elif [[ -n ${match[
+            #     ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}]-} ]] {
+            # # Such argument type's modifier if any or the empty string
+            # # otherwise (e.g., "?", signifying such argument to be missable).
+            # ZESHY__FUNC_ARG_TYPE_MODIFIER=${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_MODIFIER}]-}
+            #
+            # # 1 if such argument is a mandatory variadic argument and 0
+            # # otherwise.
+            # [[ "${ZESHY__FUNC_ARG_TYPE_MODIFIER}" ==\
+            #    "${ZESHY__CALLABLE_PROTOTYPE_ARG_TYPE_VARIADIC_MANDATORY}" ]] &&
+            #    ZESHY__FUNC_ARG_IS_VARIADIC_MANDATORY=1
+
+        # Parse each such argument into canonical list global ${match}, whose
+        # indices we localize as human-readable integers above.
             #FUXME: Excise. Horrible debugging is horrible.
             # (( ZESHY__FUNC_ARG_INDEX <= 16 )) || :die '*UHOH*. More than 16 arguments detected.'
 
@@ -1924,7 +2065,7 @@ function ::func_.stop() {
     # local ZESHY__FUNC_CODE_PREFIX=$'\n'' '
 
     #FUXME: Arguably, we've defined 4 redundant locals easily replaceable by a
-    #single new string local entitled ${ZESHY__FUNC_RUNNABLE_NAME}. These are:
+    #single new string local entitled ${ZESHY__FUNC_CALLABLE_NAME}. These are:
     #
     #* ${func_callback}.
     #* ${arg_declarer}.
