@@ -91,25 +91,11 @@ function ::func_.stop() {
     [[ -n ${ZESHY__FUNC_PROTOTYPE-} ]] || :die\
         '"}:func" not preceded by ":func_" or ":func{" (i.e., ${ZESHY__FUNC_PROTOTYPE} undefined or empty).'
 
-    # ..................{ OPTIONS                            }..................
-    # Locally disable the default "multibyte" shell option, permitting
-    # substrings matched by pcre_match() to be indexed by the " "-delimited
-    # byte indices saved to ${ZPCRE_OP}.
-    #
-    # Unfortunately, pcre_match() fails to set the ${MBEGIN} and ${MEND}
-    # integer globals to the character indices of the start and end of the
-    # matched substring. Fortunately, pcre_match() does set the ${ZPCRE_OP}
-    # string global to the " "-delimited byte indices of the start and end of
-    # such substring. Unfortunately, multibyte strings are indexed by character
-    # rather than byte indices under the default "multibyte" shell option.
-    # Fortunately, locally disabling this option permits all strings (multibyte
-    # or not) and hence such substring to be indexed by such byte indices.
-    setopt local_options no_multibyte
-
     # ..................{ INITIALIZATION                     }..................
-    # Canonical string global ${ZPCRE_OP}, localized to avoid overwriting
-    # either global or caller-specific versions of such variable.
-    local ZPCRE_OP
+    # Canonical globals, localized to avoid overwriting existing global and/or
+    # caller versions of such variables.
+    local MATCH
+    local -a match
 
     # Reset globals declared by :{global} independent of subsequent iteration.
     ZESHY__FUNC_PREAMBLE=
@@ -125,10 +111,13 @@ function ::func_.stop() {
         ZESHY__FUNC_ARGS_IS_UNHANDLED=0
     }
 
+    # ..................{ INITIALIZATION ~ arg count         }..................
+    #FIXME: Oh, gods. Do we still need *ANY* of this?
+
     # Parse the minimum and maximum number of arguments such function accepts
     # *BEFORE* parsing such arguments. All reasonably sane implementations of
     # argument parsing require such numbers (e.g., to reliably index and expand
-    # optional and variadic arguments and arguments following such arguments).
+    # missable arguments and arguments following such arguments).
     #
     # Superficially, this appears to necessitate two parse passes over the
     # argument list: the first pass obtaining such numbers and the second pass
@@ -139,21 +128,20 @@ function ::func_.stop() {
     # * Excluding single- and double-quoted strings, each substring of
     #   consecutive whitespace in an argument list implies such function to
     #   accept one additional mandatory argument.
-    # * Excluding single- and double-quoted strings, each "*", "?", and "=" in
-    #   an argument list implies such function to accept one additional
-    #   optional argument.
+    # * Excluding single- and double-quoted strings, each optional argument
+    #   type modifier (e.g., "?", "*") in an argument list implies such
+    #   function to accept one additional optional argument.
     # * Each mandatory argument increases the maximum number of arguments such
     #   function accepts by one.
     # * Each optional argument decreases the minimum number of arguments such
     #   function accepts by one.
     #
     # Efficiently calculating these numbers thus reduces to counting the number
-    # of unquoted "*" and "?" characters *AND* substrings of consecutive
-    # whitespace in such argument list. Unfortunately, while this calculation
-    # is efficient, conforming to the algorithm implemented below requires
-    # reparsing the argument list once for each optional (but *NOT* variadic)
-    # argument such function accepts. Why? Because each additional optional
-    # argument implies:
+    # of argument types preceded by optional type modifiers (e.g., "?", "*").
+    # While this calculation is efficient, conforming to the algorithm
+    # implemented below requires reparsing the argument list once for each
+    # optional argument such function accepts. (So sad.) Why? Because each
+    # optional argument implies:
     #
     # * Such function to accept one additional possible number of arguments.
     # * Equivalently, the set of all possible numbers of arguments accepted by
@@ -203,57 +191,31 @@ function ::func_.stop() {
     #        ...
     #    }
 
-    # Argument list stripped of all single- and double-quoted strings. Note
-    # that the syntax with which single quotes are escaped in single-quoted
-    # strings and double quotes in double-quoted strings substantially differ.
-    ZESHY__FUNC_ARGS_SANS_QUOTES=${ZESHY__FUNC_ARGS//(\'([^\']|\'\')#\'|\"(\\\"|[^\"])#\")}
+    # Maximum argument count. Since ${ZESHY__FUNC_ARGS_BASIC} contains both the
+    # type and name of each argument as distinct list items, the size of this
+    # list is the number of argument types and names. Hence, halving this size
+    # reveals the number of arguments.
+    ZESHY__FUNC_ARG_COUNT_MAX=$(( ${#ZESHY__FUNC_ARGS_BASIC} / 2 ))
 
-    # Maximum argument count. Dismantled, this is (in order):
+    # Minimum argument count, obtained by subtracting the number of optional
+    # arguments from the maximum argument count. Dismantled, this is:
     #
-    # * "{...//[ \t$'\n']##/ }", reducing all substrings of consecutive
-    #   whitespace to a single space.
-    # * "{...//[^ ]##}", removing all non-spaces from such result.
-    # * "{#...}", counting the number of spaces and hence substrings of
-    #   consecutive whitespace.
-    # * "( ... + 1 ) / 2". Since each argument is comprised of a mandatory type
-    #   and name delimited by whitespace, the number of arguments is given by
-    #   the number of substrings of consecutive whitespace:
-    #   * Plus one, thus accounting for the last argument. By PCRE design,
-    #     the first matched argument is guaranteed *NOT* to be prefixed by
-    #     optional whitespace and the last matched argument is guaranteed *NOT*
-    #     to be suffixed by optional whitespace.
-    #   * Divided by two, thus discarding the internal whitespace delimiting
-    #     argument types from names.
-    #
-    # By PCRE design, the current argument list (as previously captured into
-    # ${ZESHY__FUNC_ARGS} by :func_.start()) is guaranteed *NOT* to be suffixed
-    # by an ignorable comma. Hence, each comma unconditionally delimits two
-    # arguments, permitting efficient counting.
-    ZESHY__FUNC_ARG_COUNT_MAX=$(( (
-        ${#${ZESHY__FUNC_ARGS_SANS_QUOTES//[ $'\t\n']##/ }//[^ ]##} + 1 ) / 2
-    ))
-
-    # Minimum argument count. Dismantled, this is:
-    #
-    # * "${...//[^*?]##}", removing all characters except "*" and "?"
-    #   characters from such argument list. Both unequivocally denote
-    #   optional arguments, permitting efficient counting.
+    # * "${(M)#...:#...}", the number of optional arguments, given by:
+    #   1. Removing all mandatory arguments from the list of all argument types
+    #      and names. Since argument names are effectively variable names and
+    #      hence prohibited by zsh from containing any character signifying
+    #      such a type, this removal is guaranteed to preserve argument names.
+    #   2. Counting the number of remaining list items.
     ZESHY__FUNC_ARG_COUNT_MIN=$((
         ZESHY__FUNC_ARG_COUNT_MAX -
-        ${#ZESHY__FUNC_ARGS_SANS_QUOTES//[^*?]##} ))
+        ${(M)#ZESHY__FUNC_ARGS_BASIC:#${~ZESHY__CALLABLE_PROTOTYPE_ARG_TYPE_OPTIONAL_GLOB}} ))
     print -r 'arg list (sans quotes): '${ZESHY__FUNC_ARGS_SANS_QUOTES}
     print -r 'arg list (part reduced): <'${ZESHY__FUNC_ARGS_SANS_QUOTES//[ $'\t\n']##/ }'>'
     print -r 'arg list (full reduced): <'${${ZESHY__FUNC_ARGS_SANS_QUOTES//[ $'\t\n']##/ }//[^ ]##}'>'
     print -r 'arg count max: '${ZESHY__FUNC_ARG_COUNT_MAX}
     print -r 'arg count min: '${ZESHY__FUNC_ARG_COUNT_MIN}
 
-    #FIXME: !!!UGH!!!
-
-    # Compile such PCRE for efficiency.
-    pcre_compile -- "${ZESHY_CALLABLE_PROTOTYPE_ARGS_NEXT_PCRE}"
-    pcre_study
-    # print -r "${ZESHY__FUNC_NAMES[1]} args: ${ZESHY__FUNC_ARGS}"
-
+    # ..................{ PROCESS                            }..................
     # For each possible number of arguments between the minimum and maximum
     # established above, define code validating the types of all passed
     # arguments when the caller passes that number of arguments.
@@ -269,6 +231,13 @@ function ::func_.stop() {
     # passed until the current argument count indicates all such arguments to
     # have been passed, at which point all remaining defaultable arguments are
     # unpassed and hence assigned default values in a rightmost manner.
+    #
+    # By PCRE design, argument syntax corresponds to shell word syntax. Hence,
+    # such arguments are efficiently matchable with built-in shell word
+    # splitting rather than more costly and complex alternatives. While it is
+    # technically be feasible to iteratively match arguments in reverse order
+    # via the previously compiled ${ZESHY_CALLABLE_PROTOTYPE_PCRE} PCRE, doing
+    # so incurs non-trivial complications *NOT* incurred by word splitting.
     for ZESHY__FUNC_ARG_COUNT_CUR (
         {${ZESHY__FUNC_ARG_COUNT_MIN}..${ZESHY__FUNC_ARG_COUNT_MAX}}) {
         # Clear such maps. See ::map.clear() for further details.
@@ -1079,6 +1048,178 @@ function ::func_.stop() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+    # Minimum argument count. Dismantled, this is:
+    #
+    # * "${#...:#...}", the number of optional argument types. Since zsh
+    #   prohibits argument names from containing any character signifying such
+    #   a types, such removal is guaranteed to never remove argument names.
+    #
+    # After removing all optional argument types, all names following and hence
+    # corresponding to such types must also be removed. Let:
+    #
+    # * o be the number of list items *BEFORE* removing all mandatory types
+    #   (i.e., ${#ZESHY__FUNC_ARGS_BASIC}).
+    # * r be the number of list items *AFTER* removing all mandatory types
+    #   (i.e., ${(M)#ZESHY__FUNC_ARGS_BASIC:#...}).
+    #
+    # Then the number of optional arguments is given by the equation 2(o - r)
+    # and the number of mandatory arguments
+    # Then the number of optional arguments (conveniently equivalent to the
+    # minimum argument count), is given by the following equation:
+    #
+    #     (o - 2r) / 2 = o - 2o + 2r = 2r - o
+# ZESHY__FUNC_ARG_COUNT_MAX
+#     ZESHY__FUNC_ARG_COUNT_MIN=$((
+#         2 * ${(M)#ZESHY__FUNC_ARGS_BASIC:#${~ZESHY__CALLABLE_PROTOTYPE_ARG_TYPE_OPTIONAL_GLOB}} -
+#         ${#ZESHY__FUNC_ARGS_BASIC} ))
+
+#list items *AFTER* removing all
+
+    # Parse the minimum and maximum number of arguments such function accepts
+    # *BEFORE* parsing such arguments. All reasonably sane implementations of
+    # argument parsing require such numbers (e.g., to reliably index and expand
+    # optional and variadic arguments and arguments following such arguments).
+    #
+    # Superficially, this appears to necessitate two parse passes over the
+    # argument list: the first pass obtaining such numbers and the second pass
+    # actually parsing such arguments. In practice, however, careful choices in
+    # callable prototype syntax reduce the first pass to efficient string
+    # munging operations requiring *NO* explicit iteration. Indeed, note that:
+    #
+    # * Excluding single- and double-quoted strings, each substring of
+    #   consecutive whitespace in an argument list implies such function to
+    #   accept one additional mandatory argument.
+    # * Excluding single- and double-quoted strings, each "*", "?", and "=" in
+    #   an argument list implies such function to accept one additional
+    #   optional argument.
+    # * Each mandatory argument increases the maximum number of arguments such
+    #   function accepts by one.
+    # * Each optional argument decreases the minimum number of arguments such
+    #   function accepts by one.
+    #
+    # Efficiently calculating these numbers thus reduces to counting the number
+    # of unquoted "*" and "?" characters *AND* substrings of consecutive
+    # whitespace in such argument list. Unfortunately, while this calculation
+    # is efficient, conforming to the algorithm implemented below requires
+    # reparsing the argument list once for each optional (but *NOT* variadic)
+    # argument such function accepts. Why? Because each additional optional
+    # argument implies:
+    #
+    # * Such function to accept one additional possible number of arguments.
+    # * Equivalently, the set of all possible numbers of arguments accepted by
+    #   such function to increase by one in size.
+    #
+    # Each such number requires distinct validation and hence detection here.
+    # Unfortunately, eliminating such reparsing would require persisting a list
+    # of argument metadata during the first and only pass for subsequent lookup
+    # (as detailed below), itself imposing non-negligible inefficiencies. The
+    # question then reduces to: which is less efficient, reparsing each
+    # argument multiple times or parsing such arguments into a list only once?
+    #
+    # To answer this question, consider the common case. If most or even many
+    # zeshy functions accepted optional arguments and hence required such
+    # reparsing, such reparsing would indeed be non-ideal. In practice, few
+    # zeshy functions accept optional arguments (due to readability and
+    # writability concerns associated with such arguments). Since the common
+    # case imposes no argument reparsing, reparsing poses no huge imposition.
+    #
+    # Note that the above two parse passes are technically invertable by
+    # parsing all arguments into a list of all argument in the first pass and
+    # iterating over such list in the second. In practice, the infrastructure
+    # required by such iteration imposes significant space and time costs --
+    # which is bad. For example, consider an "inverted" implementation such as:
+    #
+    #    local -a args_metadata
+    #    while {
+    #        pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${ZESHY__FUNC_ARGS}"
+    #    } {
+    #        ...
+    #        args_metadata+=(
+    #            "${ZESHY__FUNC_ARG_COUNT_MAX}"
+    #            "${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPES}]}"
+    #            "${match[${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}]}"
+    #            "${ZESHY__FUNC_ARG_IS_VARIADIC}" )
+    #    }
+    #
+    #    for ZESHY__FUNC_ARG_COUNT_CUR ({${ZESHY__FUNC_ARG_COUNT_MIN}..${ZESHY__FUNC_ARG_COUNT_MAX}}) {
+    #        ...
+    #        for ZESHY__FUNC_ARG_INDEX\
+    #            ZESHY__FUNC_ARG_SUBTYPE_LOCAL\
+    #            ZESHY__FUNC_ARG_IS_MISSABLE\
+    #            ZESHY__FUNC_ARG_IS_VARIADIC (
+    #            "${args_metadata[@]}") {
+    #            ...
+    #        }
+    #        ...
+    #    }
+
+    # Argument list stripped of all single- and double-quoted strings. Note
+    # that the syntax with which single quotes are escaped in single-quoted
+    # strings and double quotes in double-quoted strings substantially differ.
+    # ZESHY__FUNC_ARGS_SANS_QUOTES=${ZESHY__FUNC_ARGS//(\'([^\']|\'\')#\'|\"(\\\"|[^\"])#\")}
+
+    # Maximum argument count. Dismantled, this is (in order):
+    #
+    # * "{...//[ \t$'\n']##/ }", reducing all substrings of consecutive
+    #   whitespace to a single space.
+    # * "{...//[^ ]##}", removing all non-spaces from such result.
+    # * "{#...}", counting the number of spaces and hence substrings of
+    #   consecutive whitespace.
+    # * "( ... + 1 ) / 2". Since each argument is comprised of a mandatory type
+    #   and name delimited by whitespace, the number of arguments is given by
+    #   the number of substrings of consecutive whitespace:
+    #   * Plus one, thus accounting for the last argument. By PCRE design,
+    #     the first matched argument is guaranteed *NOT* to be prefixed by
+    #     optional whitespace and the last matched argument is guaranteed *NOT*
+    #     to be suffixed by optional whitespace.
+    #   * Divided by two, thus discarding the internal whitespace delimiting
+    #     argument types from names.
+    #
+    # By PCRE design, the current argument list (as previously captured into
+    # ${ZESHY__FUNC_ARGS} by :func_.start()) is guaranteed *NOT* to be suffixed
+    # by ignorable whitespace. Hence, each comma unconditionally delimits two
+    # arguments, permitting efficient counting.
+    # ZESHY__FUNC_ARG_COUNT_MAX=$(( (
+    #     ${#${ZESHY__FUNC_ARGS_SANS_QUOTES//[ $'\t\n']##/ }//[^ ]##} + 1 ) / 2
+    # ))
+
+    # Minimum argument count. Dismantled, this is:
+    #
+    # * "${...//[^*?]##}", removing all characters except "*" and "?"
+    #   characters from such argument list. Both unequivocally denote
+    #   optional arguments, permitting efficient counting.
+    # ZESHY__FUNC_ARG_COUNT_MIN=$((
+    #     ZESHY__FUNC_ARG_COUNT_MAX -
+    #     ${#ZESHY__FUNC_ARGS_SANS_QUOTES//[^*?]##} ))
+
+    # # ..................{ OPTIONS                            }..................
+    # # Locally disable the default "multibyte" shell option, permitting
+    # # substrings matched by pcre_match() to be indexed by the " "-delimited
+    # # byte indices saved to ${ZPCRE_OP}.
+    # #
+    # # Unfortunately, pcre_match() fails to set the ${MBEGIN} and ${MEND}
+    # # integer globals to the character indices of the start and end of the
+    # # matched substring. Fortunately, pcre_match() does set the ${ZPCRE_OP}
+    # # string global to the " "-delimited byte indices of the start and end of
+    # # such substring. Unfortunately, multibyte strings are indexed by character
+    # # rather than byte indices under the default "multibyte" shell option.
+    # # Fortunately, locally disabling this option permits all strings (multibyte
+    # # or not) and hence such substring to be indexed by such byte indices.
+    # setopt local_options no_multibyte
+
+    # Compile the PCRE matching all callable prototype argument syntax. Since
+    # this is the PCRE matching all callable prototype syntax as well, this
+    # PCRE *SHOULD* already be compiled. Due to PCRE caching performed by this
+    # function call, guaranteeing this to be the case incurs no penalties.
+    # :pcre.compile "${ZESHY_CALLABLE_PROTOTYPE_PCRE}"
+
+    #FUXME: !!!UGH!!!
+
+    # Compile such PCRE for efficiency.
+    # pcre_compile -- "${ZESHY_CALLABLE_PROTOTYPE_ARGS_NEXT_PCRE}"
+    # pcre_study
+    # print -r "${ZESHY__FUNC_NAMES[1]} args: ${ZESHY__FUNC_ARGS}"
+
             # if [[ -z ${ZESHY__FUNC_ARGS_IS_UNHANDLED:+${match[
             #     ${ZESHY_CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]}} &&
             # if [[ -z ${ZESHY__FUNC_ARGS_IS_UNHANDLED:+${match[
