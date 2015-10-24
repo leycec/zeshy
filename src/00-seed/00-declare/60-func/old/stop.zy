@@ -8,34 +8,74 @@ Handle *function prototype parsers* (i.e., functions parsing function
 prototypes, typically as a prerequisite to processing function declarations).
 /---
 
-#FIXME: The current algorithm for parsing prototype arguments is extremely
-#inefficient, requiring recompilating of the
-#${ZESHY_CALLABLE_PROTOTYPE_ARGS_NEXT_PCRE} PCRE on each function definition.
-#As an efficient alternate, recall the clever approach we recently discovered
-#for macro parsing. Specifically, on matching a callable prototype:
+#FIXME; *COMPLETE UGH*. Yet another flagrant case of design overkill. We've
+#belatedly realized that the current syntax for specifying indirect arguments
+#(the "^" prefix) is not only overkill but completely wrong. To see why,
+#consider the following function prototype:
 #
-#* We currently:
-#  1. Match the entire argument list string with one PCRE.
-#  2. Iteratively match each argument in that list with another PCRE.
-#* We should instead:
-#  1. Match both the entire argument list string *AND* the last argument in
-#     that list with the original PCRE.
-#  2. Copy the entire argument list string to a local variable.
-#  3. Strip the last argument matched from that local variable.
-#  4. If that variable is non-empty, additional arguments remain to be parsed.
-#     In such case:
-#     1. Fabricate a fake callable prototype definition to be re-matched by the
-#        same PCRE, containing the argument list string stored in that local
-#        variable. All other prototype components (e.g., name, return type) are
-#        ignorable for argument parsing purposes and hence fabricated: e.g.,
-#            function :void _(:string arg1, :int arg2)
-#     2. Match the last argument from that prototype with the same PCRE.
-#     3. Skip to 3. above.
+#    :void :mappo(^:map+nonempty muh_map_name)
 #
-#Fairly trivial, honestly, *EXCEPT* for the fact that we would then be parsing
-#arguments in reverse order. Doing so is certainly feasible but will probably
-#require non-trivial algorithm changes. In any case, the current approach is
-#sufficiently inefficient as to be unworkable, so we have little choice. Ugh!
+#Looks good, right? Wrong. The logic below will attempt to validate such
+#argument as follows:
+#
+#    # This is what currently happens...
+#    :map.is_nonempty "${(P)1}" ||
+#        ::func.die_unless_arg_values_pass_tester\
+#        "${(P)1}" '"${(P)1}"' :map.is_nonempty
+#
+#    # ...but this is what *SHOULD* happen!
+#    :map.is_nonempty "${1}" ||
+#        ::func.die_unless_arg_values_pass_tester\
+#        "${1}" '"${1}"' :map.is_nonempty
+#
+#See what went wrong there? We currently unconditionally dereference all
+#indirect arguments, even those referring to non-scalar variables. Which, of
+#course, is completely wrong.
+#
+#Fortunately, there's an elegant solution: *STOP TRYING TO DIFFERENTIATE
+#INDIRECT FROM DIRECT VARIABLES.* There's literally no compelling reason to
+#ever want to do this. As the example above demonstrates, even if we *DID* want
+#to do this, it's non-trivial (if not infeasible) to attempt to differentiate
+#the cases in which we want to dereference indirect arguments from the cases
+#in which we do *NOT* want to dereference such arguments.
+#
+#Given that, here's the game plan:
+#
+#* Define the following new alias types:
+#
+#    # And so on.
+#    alias :String='local'
+#    alias :Bool='local'
+#    alias :Int='local'
+#
+#  Hence, capitalized variable types denote indirect variables referring to
+#  other variables. Since the direct types of all such types are strings,
+#  such aliases must all resolve to string types. While defining such types may
+#  seem pointless, it's actually required to ensure that function prototypes
+#  accepting such types behave as expected: e.g.,
+#
+#      # This prototype...
+#      :void :yamo(:Bool is_speechless)
+#
+#      # ...will result in localization and validation resembling:
+#      :Bool.is "${1}" ||
+#          ::func.die_unless_arg_values_pass_tester\
+#          "${1}" '"${1}"' :Bool.is
+#      :Bool is_speechless="${1}"
+#
+#  What's phenomenal about this is that indirect argument support now requires
+#  *NO* explicit support from the function prototype parser defined below. We
+#  should be able to excise *EVERYTHING* relating to indirect arguments below.
+#* Excise everything relating to indirect arguments from the following other
+#  parcels as well:
+#  * :{*-pcre/pcre}. Excise the "^" prefix and indirect type matching.
+#  * :{*-func/global}. Excise the "${ZESHY__FUNC_ARG_VAR_TESTER_TO_EXPANSIONS}"
+#    list global... and possibly more?
+#* Complete all instructions stated under the similar
+#  "FIXME: *COMPLETE UGH*." comment below.
+#
+#While I'm fairly annoyed that the original design was so overdesigned, the new
+#design is sufficiently elegant that the future remains brightly shiny.
 
 #FIXME: In reflection, there's no demonstrable reason to prohibit function
 #prototypes from requesting both defaultable and variadic arguments. After all,
@@ -670,6 +710,45 @@ function ::func_.stop() {
                 ZESHY__FUNC_ARG_SUBTYPE_MINOR=${match[
                     ${ZESHY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_MINOR}]-}
 
+                #FIXME; *COMPLETE UGH*. Yet another flagrant case of design
+                #overkill. By replacing the syntax for specifying indirect
+                #arguments from the "^" prefix to capitalized argument types
+                #(e.g., ":Map"), we appear to have single-handedly eliminated
+                #the need for most of the logic below. Instead, we probably
+                #want to unify the currently separated implementations for
+                #handling indirect and direct arguments into a single
+                #implementation such that:
+                #
+                #* If the first letter of the current argument is capitalized,
+                #  this argument is indirect; else, this argument is direct.
+                #  Note that differentiating the two requires capturing the
+                #  first alphabetic character of such argument's local type --
+                #  which, since such types are all defined by zeshy, are
+                #  guaranteed to be of the form ":${type_name}". Hence, it
+                #  suffices for the moment to just test:
+                #
+                #  # Don't forget to declare a new
+                #  # ${ZESHY__FUNC_ARG_IS_INDIRECT} boolean global!
+                #  (( ${#ZESHY__FUNC_ARG_SUBTYPE_LOCAL} >= 2 )) ||
+                #      ::func.die_of_arg 'local subtype "'${ZESHY__FUNC_ARG_SUBTYPE_LOCAL}'" either empty or only one character.'
+                #  if [[ ${ZESHY__FUNC_ARG_SUBTYPE_LOCAL[2]} == [A-Z] ]] {
+                #      ZESHY__FUNC_ARG_IS_INDIRECT=1
+                #  } else {
+                #      ZESHY__FUNC_ARG_IS_INDIRECT=0
+                #  }
+                #
+                #Actually, that's fine and all -- but do we ever actually care
+                #whether ${ZESHY__FUNC_ARG_IS_INDIRECT}? We suspect not. The
+                #validating functions should handle everything. For example:
+                #
+                #    # In this case, such variable would be validated by
+                #    # calling a function :String.is_nonempty(). Simple! No
+                #    # custom logic to support indirect arguments required.
+                #    :void :yum(:String+nonempty muh_var_name)
+                #
+                #Given this, we can probably simply outright eliminate the
+                #entire indirect-specific conditional below. Wow! Nice if true.
+
                 # If such argument is indirect, such subtype applies to
                 # the value of the variable such argument refers to rather
                 # than such variable's type. In contrast to the customary
@@ -701,17 +780,17 @@ function ::func_.stop() {
                 # Three pence for the grizzly gentleman in the well-bearded
                 # coat if you can guess which approach we adopted. (#2.)
                 #
-                # For simplicity, validate such variable's value *BEFORE*
-                # validating such argument's value (i.e., such variable's
+                # For simplicity, validate this variable's value *BEFORE*
+                # validating this argument's value (i.e., this variable's
                 # type). While such validation could be performed in either
-                # order, this order simplifies such logic substantially.
+                # order, this order simplifies logic substantially.
                 if (( ${#match[
-                    ${ZESHY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_INDIRECT}]} )) {
-                    # Name of the function validating such variable's value.
+                    ${ZESHY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_INDIRECT}]-} )) {
+                    # Name of the callable validating this variable's value.
                     # While such major subtype is typically optional, PCRE
                     # design guarantees such subtype to be non-empty for
                     # indirect arguments and hence safely expandable here.
-                    ZESHY__FUNC_CALLABLE_NAME=':'${ZESHY__FUNC_ARG_SUBTYPE_MAJOR]}'.is_'
+                    ZESHY__FUNC_CALLABLE_NAME=${ZESHY__FUNC_ARG_SUBTYPE_MAJOR]}'.is'
 
                     # If such argument has a minor subtype, suffix such function.
                     (( ! ${#ZESHY__FUNC_ARG_SUBTYPE_MINOR} )) ||
@@ -1092,6 +1171,37 @@ function ::func_.stop() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+#FUXME: The current algorithm for parsing prototype arguments is extremely
+#inefficient, requiring recompilating of the
+#${ZESHY_CALLABLE_PROTOTYPE_ARGS_NEXT_PCRE} PCRE on each function definition.
+#As an efficient alternate, recall the clever approach we recently discovered
+#for macro parsing. Specifically, on matching a callable prototype:
+#
+#* We currently:
+#  1. Match the entire argument list string with one PCRE.
+#  2. Iteratively match each argument in that list with another PCRE.
+#* We should instead:
+#  1. Match both the entire argument list string *AND* the last argument in
+#     that list with the original PCRE.
+#  2. Copy the entire argument list string to a local variable.
+#  3. Strip the last argument matched from that local variable.
+#  4. If that variable is non-empty, additional arguments remain to be parsed.
+#     In such case:
+#     1. Fabricate a fake callable prototype definition to be re-matched by the
+#        same PCRE, containing the argument list string stored in that local
+#        variable. All other prototype components (e.g., name, return type) are
+#        ignorable for argument parsing purposes and hence fabricated: e.g.,
+#            function :void _(:string arg1, :int arg2)
+#     2. Match the last argument from that prototype with the same PCRE.
+#     3. Skip to 3. above.
+#
+#Fairly trivial, honestly, *EXCEPT* for the fact that we would then be parsing
+#arguments in reverse order. Doing so is certainly feasible but will probably
+#require non-trivial algorithm changes. In any case, the current approach is
+#sufficiently inefficient as to be unworkable, so we have little choice. Ugh!
+
+#FUXME: ::func.die_unless_arg_values_pass_tester() appears to be undefined.
+
                 # 'x x('${ZESHY__FUNC_ARGS_BASIC[
                 #     ${ZESHY__FUNC_ARG_TYPE_INDEX},
                 #     $(( ZESHY__FUNC_ARG_TYPE_INDEX + 1 ))]}')' ||
