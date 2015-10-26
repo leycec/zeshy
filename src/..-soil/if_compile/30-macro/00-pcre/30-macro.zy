@@ -50,6 +50,276 @@
 #
 #This is absolutely essential, folks.
 
+#FIXME: In theory, the above syntactic simplification *COULD* allow us to
+#simplify the PCRE below even further. How? By matching macros globally (i.e.,
+#in any shell word position) rather than merely in command position. Since
+#"@"-prefixed words should be exceedingly rare in real-world zsh code, it's
+#reasonably safe to assume all such words to be zeshy-specific macros.  Given
+#that, it's unclear whether there's any benefit to constraining macro matching
+#to just command position. What's the point, you know? We'd might as well go
+#the distance and match them everywhere.
+#
+#It's certainly worth considering, anyway. We currently go to excrutiating
+#lengths to match macros only in command position. Matching globally would
+#profitably eliminate a good deal of the PCRE below. That said, we'd still
+#need to:
+#
+#* Match macro scalar arguments.
+#* Match "{"- and "}"-delimited macro block arguments.
+#* Match "("- and ")"-delimited macro list and map arguments. (Maybe? It's
+#  currently unclear how critical such arguments are.)
+#* Match the end of a macro.
+#* Match arbitrary shell words.
+#
+#The latter will be the hardest part. In theory, we *COULD* offload such
+#parsing to zsh ala:
+#
+#      :list shell_words; shell_words=( "${(z)input_code}" )
+#
+#Scanning for macros then reduces to searching such list for "@"-prefixed
+#strings. Of course, there are a few difficulties with such approach:
+#
+#* Such approach converts newlines to semicolons *AND* discards comments,
+#  seemingly preventing us from associating lines of unpreprocessed input code
+#  with lines of preprocessed output code to help decipher syntactic errors
+#  emitted by the zsh parser. That's not just bad; *THAT'S A DEAL BREAKER.*
+#  Unless we can circumvent this, the above "(z)" approach is right out. That
+#  said, note that:
+#  * Comments are preservable by using "(Z~c~)" instead if we recall right.
+#    So, perhaps we still would be able to perform such mapping by suffixing
+#    each input line with a comment containing that line's line number *BEFORE*
+#    performing such splitting.
+#* Once we've found such macro, what do we do with it? We'd *STILL* need to
+#  match "{"- and "}"-delimited macro block arguments and find the end of that
+#  macro. The most efficient way to do both might be to go back to the
+#  original input code and parse that instead. Assuming we use the above
+#  "(Z~c~)" approach, we should be able to retrieve the currently matched
+#  macro's original line number and then parse that.
+#
+#*UGH.* Would it be simpler to parse shell words ourselves? Hmmmm.... Right.
+#Probably not. Attempting to do that execrable chore is what got us into the
+#heap of trouble that happened below. We *REALLY* do not want to go back there.
+#Shell word parsing is highly non-trivial. Hmmmm... that said, is it, really?
+#Our purposes our rather simple. We don't particularly care about context.
+#We *HAVE* already specced out most of the language, below. Perhaps we can
+#reuse some of that hard work to parse shell words in a context-neutral manner.
+#Of course, what constitutes a shell word *DOES* change with context. But maybe
+#we can ignore most or all such changes for simplicity and still get a
+#reasonably stable parser up and running? Consider it. If all else fails, the
+#"(Z~c~)" approach should certainly work.
+#
+#Here's an instructive edge-case example to help us decide which of these two
+#approaches is more appropriate:
+#
+#    "${foo//$(@bar bell) @bar bell}"
+#
+#Simple, right? *WRONG.* We want to parse the inner "@bar bell" in "$(@bar
+#bell)" as a macro but *NOT* the outer "@bar bell" in the variable expansion.
+#We're not entirely convinced that the "(Z~c~)" approach will support such
+#fine-grained parsing. Doesn't such flag parse the input into coarse-grained
+#shell words, in which the entire "${foo...}" variable expansion would be
+#parsed as a single word -- right?
+#
+#But that's *NOT* what we want. We want to be able to parse where the start of
+#each word is so that we can match a "@" there. To do that, we clearly need to
+#be able to pass word terminators: e.g., "||", "&&", ";", newline, "$(", and
+#so on. We already do that, so we're golden. Right. That pretty much settles
+#it then. We'll be parsing this ourselves, leveraging work already performed
+#below. Thankfully, we'll no longer need to recursively parse syntactic
+#embeddings. (Praise be to the mournful goddess.) We'll only need to parse
+#word terminators in a context-less manner, thus ignoring such finer syntactic
+#points such as list context and so on.
+#
+#Oh, wait. How do we avoid parsing the outer "@bar bell" in the variable
+#expansion? *UGH.* Pretty much no way to do that without preserving syntactic
+#context across PCRE match attempts -- which, of course, we cannot do. Let's
+#see what "(Z~c~)" does with the above edge-case, shall we?
+#
+#Oh, Gods. You know, we just had a totally crazy thought. It's utterly insane,
+#but... what if, for each macro "@muh_macro" we defined a corresponding global
+#alias "@muh_macro"? Given such aliases, we could then have zsh expand such
+#aliases embedding the input code in a dynamically defined function and
+#examining such function's body after definition. Hmm; we're pretty sure that
+#discards comments, however, preventing us from correlating the output to the
+#input. Anyway, the idea was that we could then just perform a simple diff of
+#the output and the input to efficiently find all the places where we should
+#perform macro expansions. Yeah; yeah. Pretty crazy, we know. [Verified: yes,
+#comments are discarded. That's right out, then. Probably for the best.]
+#
+#Aww, yah. Nailed it. See the next FIXME comment for details. Given that, it's
+#on with the show we go!
+#
+#O.K.; that's dramatically simpler. Oh, and there's one final benefit to
+#matching macros globally -- and it's a real biggy:
+#
+#* Syntactic context no longer matters, implying that macros could be matched
+#  within embedded syntax (e.g., process substitutions) *TO INFINITE DEPTH*.
+#
+#Yeah. Massive, eh? The current approach is constrained to matching macros
+#within embedded syntax (e.g., process substitutions) to... well, we can't
+#quite remember, but it's either to only one level of depth or maybe not at
+#all. In either case, that's extremely shoddy, and will require quite a bit of
+#ugly hand-waving in FAQ entries and such. Not to mention the inevitable
+#headaches caused to users (...and myself!) that inevitably forget.
+#
+#That's obviously shameful. Any alternative circumventing such shoddiness
+#should absolutely be contemplated. This is that alternative. (Also, the
+#resulting PCRE will be *CONSIDERABLY* easier to debug. It may not actually be
+#feasible to ever fully debug the PCRE below. Well, not in my gladspun
+#lifespan, anyway.)
+#
+#Nordic God(s) be praised, but what *WAS* I thinking? I really needed to give
+#the current approach to macro syntax a second thought a year or two earlier.
+#Instead, I just gritted my teeth and soldiered on -- squandering at least a
+#month, if not more, on a fundamentally flawed PCRE design. I'll happily
+#admit: I'm fairly frustrated with myself at the moment. Here's hoping that
+#future design improvements will come faster, earlier, and more blatantly.
+#FIXME: Oh. Oh. Oh. We finally glommed it: an efficient, reasonably simple
+#mechanism for reliably "parsing" zsh with zsh itself. Specifically, we use zsh
+#to differentiate "@"-prefixed macro-like strings that should be expanded as
+#macros from "@"-prefixed macro-like strings that should *NOT* be expanded as
+#macros. As we now know, this is a highly non-trivial problem -- sufficiently
+#non-trivial, in fact, that we basically cannot do it without a real parser.
+#Enter zsh.
+#
+#The approach outlined below leverages zsh's parsing of command and word macros
+#to discover macros at command and word positions in input unpreprocessed code.
+#That's all we leverage such parsing for. Our PCRE picks up the remainder of
+#the parser slack by parsing macro arguments -- which is also highly non-
+#trivial but at least generally feasible, unlike macro detection.
+#
+#Because this approach leverages both command and word aliases, there now exist
+#exactly two and only two types of macros:
+#
+#* "@"-prefixed command macros, matched only at command position.
+#* "@"-prefixed word macros, matched at any shell word position.
+#
+#That's it. We *NEED* to use low-level zsh aliases for reasons that will
+#become subsequently clear and hence have little alternative but to confine
+#macro types to the same categories as alias types.
+#
+#For simplicity, we consider only the case of parsing command macros. Parsing
+#word macros is, of course, exactly the same; merely substitute "command" for
+#"word." Here's the general algorithmic idea for parsing command macros:
+#
+#* Create a new PCRE halting matching at each "@"-prefixed macro-like
+#  substring of a subject string. This PCRE should *NOT* actually attempt to
+#  parse zsh syntax. All it should do is match arbitrary characters preceding
+#  a "@"-prefixed macro-like substring and capture the first "@"-prefixed
+#  word of such substring. To do so efficiently, note that command macros:
+#  * Are matched only at command position and hence *MUST* be prefixed by
+#    either a command terminator or the string start (e.g.,
+#    "(?>[\n|&({;]|\A)").
+#  * Are prefixed by a "@" followed by a character *NOT* already reserved by
+#    core zsh syntax. Using a negative character class here allows us to
+#    transparently support macro names whose first character is non-ASCII,
+#    which is quite essential.
+#  This gives a PCRE fragment for matching macro-like substrings resembling:
+#      (?>[\n|&({;]|\A)(@[^'"=!#$&|*?()[]{}<>\\;`])
+#  We'll need to closely scrutinize and refine that, but it shouldn't be
+#  *TOO* far off. The jist is there, anyway.
+#* Create a ${ZESHY__MACROS_MATCHED} list global, initialized to the empty
+#  list. This list will contain the names of all "@"-prefixed command macro-
+#  like words matched for the current input code.
+#* Create a ${ZESHY__MACRO_PREALIASED} string global, initialized to the
+#  contents of the current unpreprocessed input code. This global is used
+#  *ONLY* for purposes of differentiating macros from non-macros.
+#* Create a ${ZESHY__MACRO_POSTALIASED} string global, initialized to the
+#  empty string. This global is used *ONLY* for purposes of differentiating
+#  macros from non-macros.
+#* Iteratively match each "@"-prefixed command macro-like word of the input
+#  code using the typical pcre_compile(), pcre_study(), pcre_match()-via-
+#  ${ZPCRE_OP}-in-a-while-loop approach. For each matching word:
+#  * If such word is the name of an existing command macro:
+#    * Define a temporary command alias of the name
+#      "@@${line_number},${line_at_number},${macro_name}" whose alias
+#      expansion is a single newline, where ${line_number} is the line number
+#      on which this macro was matched, ${line_at_number} is the number of
+#      other "@"-prefixed command macro-like words matched on the same line,
+#      and ${macro_name} is this macro's original name sans "@" prefix. For
+#      example, if the second "@foo" macro is matched from line 57 of the input
+#      code, the following command alias would be created:
+#          ${aliases[@@57,2,foo]=$'\n'
+#      In theory, expanding to a newline should help preserve syntactic
+#      correctness -- even for oddball input. (We'll probably want to consider
+#      that a bit more deeply, of course.)
+#    * Append the string "@@${line_number},${line_at_number},${macro_name}" to
+#      ${ZESHY__MACROS_MATCHED}.
+#    * Replace the currently matched macro's name in
+#      ${ZESHY__MACRO_PREALIASED} with
+#      "@@${line_number},${line_at_number},${macro_name}". For example, when
+#      the second "@foo" macro is matched from line 57 of the input code:
+#
+#          # This is the original matched line 57.
+#          "${bar$(@foo)// @foo}"
+#
+#          # This is its replacement line in ${ZESHY__MACRO_PREALIASED} after
+#          # processing both of the above "@foo" instances.
+#          "${bar$(@@57,1,foo)// @@57,2,foo}"
+#* Dynamically define a new function ::func.postaliased() equal to the value of
+#  ${ZESHY__MACRO_PREALIASED}: e.g.,
+#      functions[::func.postaliased]=${ZESHY__MACRO_PREALIASED}
+#  Naturally, we'll need to handle detection of syntactic errors and such. See
+#  the existing :func.define() function for similar logic.
+#* Due to zsh magic, the body of ::func.postaliased() now contains only
+#  "@"-prefixed command macro-like words that are *NOT* in command position.
+#  "@"-prefixed command macro-like words in command position have all been
+#  replaced by their alias expansion -- namely, a single newline.
+#* Undefine all command aliases temporarily defined above: e.g.,
+#      unalias -- "${ZESHY__MACROS_MATCHED[@]}"
+#* Create a ${ZESHY__MACRO_NAMES_UNALIASED} list global, initialized to the
+#  empty list. This list will contain all substrings of the form
+#  "@@${line_number},${line_at_number},${macro_name}" matched from
+#  ${functions[::func.postaliased]}, thus describing all
+#  "@"-prefixed command macro-like words that are *NOT* in command position
+#  and hence ignorable. All other macro-like words are non-ignorable.
+#* Iteratively match each substring of the form
+#  "@@${line_number},${line_at_number},${macro_name}" from
+#  ${functions[::func.postaliased]} using the typical pcre_compile(),
+#  pcre_study(), pcre_match()-via-${ZPCRE_OP}-in-a-while-loop approach. For
+#  each matching word:
+#  * For each such match, append such match to ${ZESHY__MACROS_UNALIASED}.
+#* Create a ${ZESHY__MACROS_ALIASED} list global, initialized to the list
+#  difference of the ${ZESHY__MACROS_MATCHED} list minus the
+#  ${ZESHY__MACRO_NAMES_UNALIASED} list. This list now contains all substrings
+#  of the form "@@${line_number},${line_at_number},${macro_name}" expanded to
+#  newlines in ${functions[::func.postaliased]}, thus describing all
+#  "@"-prefixed command macro-like words that are in command position and hence
+#  non-ignorable.
+#* For each list item of ${ZESHY__MACROS_ALIASED} sorted in *REVERSE ORDER*
+#  (to preserve previously recorded line numbers across macro expansions), find
+#  and expand the corresponding macro in the *ORIGINAL* unpreprocessed and
+#  still unmodified input code.
+#
+#Voila! Pretty trivial, actually. It's a bit more complicated than it seems,
+#and can probably be significantly optimized from the above cursory outline.
+#But, roughly speaking, that should do it. True awesomeness in comment form.
+#FIXME: You might notice that, in the above discussion, we contemplate
+#recompiling at least three PCREs for each input code to be preprocessed.
+#Since the first two PCREs appear to be trivially small, recompiling these
+#PCREs is (probably) no hardship. The latter PCRE, however, matches "{"- and
+#"}"-delimited macro block arguments in a context-free manner and hence is
+#unfathomably large; recompiling this PCRE for each input code is a terrible
+#idea. The question then remains: can we do anything?
+#
+#*YES.* Yes, we can. It's actually quite simple, clever, and kludgy. The
+#solution is to aggregate the three PCREs discussed above into a single
+#composite PCRE constructed like so:
+#
+#    ZESHY__SUBPCRE_1='...'
+#    ZESHY__SUBPCRE_2='...'
+#    ZESHY__SUBPCRE_3='...'
+#    ZESHY__PCRE='(?>a'${ZESHY__SUBPCRE_1}'|b'${ZESHY__SUBPCRE_2}'|c'${ZESHY__SUBPCRE_3}')'
+#
+#Super clever, yo. (Reasonably clever, anyway.)
+#
+#The subject string passed to each call to pcre_match() must then be prepended
+#by a gating prefix: "a" to select the first PCRE, "b" the second, and "c" the
+#third. Since matching a single literal character is trivially fast, this
+#should impose no measurable costs while entirely preventing recompilation.
+#Extreme shell scripting optimization for the win. "What is this: the Finnish
+#64Kb demoscene!?"
+
 #FIXME: We need a reasonably complete and comprehensive plan for how to
 #actually get macro preprocessing to work -- because, let's be miserably
 #honest, the prior default gameplan of "just throw a 16KB PCRE at RegexBuddy
@@ -3366,6 +3636,9 @@ typeset -g ZESHY__MACRO_COMMAND_NAME_PLACEHOLDER='ZESHY__MACRO_COMMAND_NAME'
 
 return 0
 # --------------------( WASTELANDS                         )--------------------
+#    * Append such name to ${ZESHY__MACROS_MATCHED}. Actually, is this
+#      list of any value? We don't appear to care about or use this.
+
     #FUXME: ${pcre_terminator_unspacing_body} is undefined. Even if it *WAS*
     #defined, however, we wouldn't actually want to expand that below. Instead,
     #we want to define above and expand here a new PCRE named something like
