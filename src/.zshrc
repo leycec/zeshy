@@ -43,14 +43,14 @@ setopt err_return no_unset warn_create_global
 # If even one global referenced below was not previously defined by the caller,
 # such caller cannot be the "zeshy" wrapper script, the only caller permitted
 # to source this script. Print an error and return nonzero exit status.
-(( ${+ZESHY_ARGS} + ${+ZESHY_MAIN_SCRIPT} == 2 )) || {
-    # print "ZESHY_MAIN_SCRIPT: ${ZESHY_MAIN_SCRIPT}"
-    print 'zeshy: ${ZESHY_ARGS} and/or ${ZESHY_MAIN_SCRIPT} undefined.'
+(( ${+ZY_ARGS} + ${+ZY_MAIN_SCRIPT} == 2 )) || {
+    # print "ZY_MAIN_SCRIPT: ${ZY_MAIN_SCRIPT}"
+    print 'zeshy: ${ZY_ARGS} and/or ${ZY_MAIN_SCRIPT} undefined.'
     print 'zeshy: Script "'${0}'" not sourced by "zeshy" or "zeshy-login".'
     return 1
 } 1>&2
-#print "[${0}] sourcing ${ZESHY_MAIN_SCRIPT} ${(Qz)ZESHY_ARGS}"
-#print "[${0}] ZESHY_ARGS=${ZESHY_ARGS}"
+#print "[${0}] sourcing ${ZY_MAIN_SCRIPT} ${(Qz)ZY_ARGS}"
+#print "[${0}] ZY_ARGS=${ZY_ARGS}"
 
 # Source zeshy's entry script immediately *BEFORE* printing the first command
 # prompt for the current interactive shell. (This script is sourced only under
@@ -79,10 +79,10 @@ function precmd() {
     # original list. Since only scalars (and hence *NOT* lists) can be
     # inherited by child shells, such circumlocution is sadly unavoidable. See
     # restore_list() for further details.
-    source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
-    # print "dir stack [main/after]: ${ZESHY_USER_DIR_STACK_FILE}"
-    # typeset -g ZESHY_USER_DIR_STACK_FILE="${ZESHY_USER_CACHE_DIR}/dir_stack"
-    # typeset -g Z="${ZESHY_USER_CACHE_DIR}/dir_stack"
+    source -- "${ZY_MAIN_SCRIPT}" "${(Qz)ZY_ARGS}"
+    # print "dir stack [main/after]: ${ZY_USER_DIR_STACK_FILE}"
+    # typeset -g ZY_USER_DIR_STACK_FILE="${ZY_USER_CACHE_DIR}/dir_stack"
+    # typeset -g Z="${ZY_USER_CACHE_DIR}/dir_stack"
 }
 
 # --------------------( WASTELANDS                         )--------------------
@@ -94,7 +94,7 @@ function precmd() {
 # insufficient to actually enable such trap handler during zeshy startup.)
 
 #FUXME: O.K.; this is currently broken under my home setup. The reason is
-#fairly subtle but simple: @{main} undefines all globals matching "ZESHY_"*
+#fairly subtle but simple: @{main} undefines all globals matching "ZY_"*
 #*AFTER* wrapper script "bin/zeshy" sets such globals. Why does this
 #unexpectedly occur? Because we currently source zeshy from "/etc/zsh/zshrc"
 #and friends in our home setup, which *IS BLATANTLY WRONG.* It's time to fully
@@ -110,12 +110,12 @@ function precmd() {
 #
 #Then edit "/etc/passwd" accordingly. See "bin/zeshy" for further details.
 
-# source -- "${ZESHY_MAIN_SCRIPT}" "${(Qz)ZESHY_ARGS}"
+# source -- "${ZY_MAIN_SCRIPT}" "${(Qz)ZY_ARGS}"
 # the main zeshy script, thus loading zeshy.
-# (( ${+ZESHY_ARGS} + ${+ZESHY_MAIN_SCRIPT} + ${+ZESHY_ZDOTDIR_USER} == 3 )) || {
-#     # print "ZESHY_MAIN_SCRIPT: ${ZESHY_MAIN_SCRIPT}"
-#     print 'zeshy: At least one of ${ZESHY_ARGS}, ${ZESHY_MAIN_SCRIPT}, and/or'
-#     print 'zeshy: ${ZESHY_ZDOTDIR_USER} undefined.'
+# (( ${+ZY_ARGS} + ${+ZY_MAIN_SCRIPT} + ${+ZY_ZDOTDIR_USER} == 3 )) || {
+#     # print "ZY_MAIN_SCRIPT: ${ZY_MAIN_SCRIPT}"
+#     print 'zeshy: At least one of ${ZY_ARGS}, ${ZY_MAIN_SCRIPT}, and/or'
+#     print 'zeshy: ${ZY_ZDOTDIR_USER} undefined.'
 #     print 'zeshy: Script "'${0}'" not sourced by wrapper "zeshy".'
 #     return 1
 # } 1>&2
@@ -123,14 +123,14 @@ function precmd() {
 # # If the current's user ${ZDOTDIR} is zeshy's ${ZDOTDIR}, something has gone
 # # terribly awry. To avoid infinite recursion, print an error and return non-zero
 # # exit status.
-# if [[ "${ZESHY_ZDOTDIR_USER}" == "${ZDOTDIR}" ]] {
-#     print 'zeshy: User ${ZDOTDIR} is zeshy''s ${ZDOTDIR} "'${ZESHY_ZDOTDIR_USER}'".'
+# if [[ "${ZY_ZDOTDIR_USER}" == "${ZDOTDIR}" ]] {
+#     print 'zeshy: User ${ZDOTDIR} is zeshy''s ${ZDOTDIR} "'${ZY_ZDOTDIR_USER}'".'
 #     print 'zeshy: Prematurely terminating to avoid infinite recursion.'
 #     return 1
 # } 1>&2
 #
 # # Absolute path of the current user's ".zshrc".
-# local zshrc_user_filename="${ZESHY_ZDOTDIR_USER}/.zshrc"
+# local zshrc_user_filename="${ZY_ZDOTDIR_USER}/.zshrc"
 # 
 # # Source such script, if found.
 # if [[ -f "${zshrc_user_filename}" ]] {
@@ -143,11 +143,11 @@ function precmd() {
 #
 #    >>> sudo ln -s /usr/local/bin/zeshy /usr/local/bin/zeshy-login
 
-# (( ${+ZESHY_ARGS} + ${+ZESHY_MAIN_SCRIPT} + ${+ZESHY_ZDOTDIR_USER} == 3 )) || {
-#     print 'zeshy: At least one of ${ZESHY_ARGS}, ${ZESHY_MAIN_SCRIPT}, and/or'
-#     print 'zeshy: ${ZESHY_ZDOTDIR_USER} undefined.'
+# (( ${+ZY_ARGS} + ${+ZY_MAIN_SCRIPT} + ${+ZY_ZDOTDIR_USER} == 3 )) || {
+#     print 'zeshy: At least one of ${ZY_ARGS}, ${ZY_MAIN_SCRIPT}, and/or'
+#     print 'zeshy: ${ZY_ZDOTDIR_USER} undefined.'
 
-#   ZESHY_ZDOTDIR_USER="${HOME}"
+#   ZY_ZDOTDIR_USER="${HOME}"
 #   print "${zshrc_filename}"(:A)
 #   print "${0}"(:A)
 #   local zshrc_user_filename; zeshy_filename="$(print -- "${0}"(:A))" &>/dev/null || {
@@ -163,6 +163,6 @@ function precmd() {
 # script was probably not run by "zeshy". Throw an exception!
 # If the list of previously passed arguments was not previously defined, this
 # script was probably not run by "zeshy". Throw an exception!
-#source -- "${ZESHY_MAIN_SCRIPT}" "${(z)ZESHY_ARGS}"
-    #FUXME: ZESHY_ARGS="${@}" is wrong; we need to export a proper list, here.
+#source -- "${ZY_MAIN_SCRIPT}" "${(z)ZY_ARGS}"
+    #FUXME: ZY_ARGS="${@}" is wrong; we need to export a proper list, here.
     #Verify that ".zshrc" actually imports a proper zsh list.
