@@ -62,11 +62,14 @@ function ::func_.stop() {
         '"}:func" not preceded by ":func_" or ":func{" (i.e., ${ZY__FUNC_PROTOTYPE} undefined or empty).'
 
     # ..................{ INITIALIZATION                     }..................
-    # Reset globals declared by zy:./global independent of subsequent
+    # Reset globals declared by "global.zy" independent of subsequent
     # iteration.
     ZY__FUNC_PREAMBLE=
     ZY__FUNC_ARGS_IS_GLOB=0
     ZY__FUNC_ARGS_IS_UNLOCALIZED=0
+
+    # Suffix for all local variable names declared by this function's preamble.
+    ZY__FUNC_VAR_NAME_SUFFIX=${ZY__FUNC_ATTRS[var_name_suffix]-}
 
     # 0 if all arguments are to be defaulted, localized, and validated by
     # default (i.e., unless explicitly relaxed) and 1 otherwise.
@@ -77,16 +80,11 @@ function ::func_.stop() {
         ZY__FUNC_ARGS_IS_UNHANDLED=0
     }
 
-    # Suffix for all local variable names declared by this function's preamble.
-    ZY__FUNC_VAR_NAME_SUFFIX=${ZY__FUNC_ATTRS[var_name_suffix]-}
-
     # ..................{ INITIALIZATION ~ arg count         }..................
-    #FIXME: Oh, gods. Do we still need *ANY* of this?
-
-    # Parse the minimum and maximum number of arguments such function accepts
-    # *BEFORE* parsing such arguments. All reasonably sane implementations of
-    # argument parsing require such numbers (e.g., to reliably index and expand
-    # missable arguments and arguments following such arguments).
+    # Parse the minimum and maximum number of arguments this function accepts
+    # *BEFORE* parsing these arguments. All reasonably sane implementations of
+    # argument parsing require these numbers (e.g., to reliably index and
+    # expand missable arguments and arguments following such arguments).
     #
     # Superficially, this appears to necessitate two parse passes over the
     # argument list: the first pass obtaining such numbers and the second pass
@@ -160,11 +158,11 @@ function ::func_.stop() {
     #        ...
     #    }
 
-    # Maximum argument count. Since ${ZY__FUNC_ARGS_BASIC} contains both the
+    # Maximum argument count. Since ${ZY__FUNC_ARGS_RAW} contains both the
     # type and name of each argument as distinct list items, the size of this
     # list is the number of argument types and names. Hence, halving this size
     # reveals the number of arguments.
-    ZY__FUNC_ARG_COUNT_MAX=$(( ${#ZY__FUNC_ARGS_BASIC} / 2 ))
+    ZY__FUNC_ARG_COUNT_MAX=$(( ${#ZY__FUNC_ARGS_RAW} / 2 ))
 
     # Minimum argument count, obtained by subtracting the number of optional
     # arguments from the maximum argument count. Dismantled, this is:
@@ -172,15 +170,12 @@ function ::func_.stop() {
     # * "${(M)#...:#...}", the number of optional arguments, given by:
     #   1. Removing all mandatory arguments from the list of all argument types
     #      and names. Since argument names are effectively variable names and
-    #      hence prohibited by zsh from containing any character signifying
-    #      such a type, this removal is guaranteed to preserve argument names.
+    #      hence prohibited by zsh from containing any character signifying an
+    #      argument type, this is guaranteed to remove all argument names.
     #   2. Counting the number of remaining list items.
     ZY__FUNC_ARG_COUNT_MIN=$((
         ZY__FUNC_ARG_COUNT_MAX -
-        ${(M)#ZY__FUNC_ARGS_BASIC:#${~ZY__CALLABLE_PROTOTYPE_ARG_TYPE_OPTIONAL_GLOB}} ))
-    print -r 'arg list (sans quotes): '${ZY__FUNC_ARGS_SANS_QUOTES}
-    print -r 'arg list (part reduced): <'${ZY__FUNC_ARGS_SANS_QUOTES//[ $'\t\n']##/ }'>'
-    print -r 'arg list (full reduced): <'${${ZY__FUNC_ARGS_SANS_QUOTES//[ $'\t\n']##/ }//[^ ]##}'>'
+        ${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_MISSABLE_PREFIX_GLOB}} ))
     print -r 'arg count max: '${ZY__FUNC_ARG_COUNT_MAX}
     print -r 'arg count min: '${ZY__FUNC_ARG_COUNT_MIN}
 
@@ -215,20 +210,22 @@ function ::func_.stop() {
     # so incurs non-trivial complications *NOT* incurred by word splitting.
     for ZY__FUNC_ARG_COUNT_CUR (
         {${ZY__FUNC_ARG_COUNT_MIN}..${ZY__FUNC_ARG_COUNT_MAX}}) {
-        # Reset scalar globals declared by :{global} specific to this loop.
+        # Reset scalar globals declared by "global.zy" specific to this loop.
         ZY__FUNC_ARG_COUNT_CUR_DEFAULTED=0
         ZY__FUNC_ARG_WAS_VARIADIC=0
         ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT=
         ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC=
 
         # 1-based index of the current argument in the current argument list.
-        ZY__FUNC_ARG_INDEX=1
+        # This will be incremented by 1 to 1 in the first loop iteration below.
+        ZY__FUNC_ARG_INDEX=0
 
         # 1-based index of the current argument type in the
-        # ${ZY__FUNC_ARGS_BASIC} list of all argument types and names.
-        ZY__FUNC_ARG_TYPE_INDEX=1
+        # ${ZY__FUNC_ARGS_RAW} list of all argument types and names. This will
+        # be incremented by 2 to 1 in the first loop iteration below.
+        ZY__FUNC_ARG_TYPE_INDEX=-1
 
-        # Clear map globals declared by :{global} specific to this loop. See
+        # Clear map globals declared by "global.zy" specific to this loop. See
         # ::map.clear() for further details.
         set -A ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS
         set -A ZY__FUNC_ARG_TESTER_TO_EXPANSIONS
@@ -241,14 +238,25 @@ function ::func_.stop() {
         print -r 'arg count current: '${ZY__FUNC_ARG_COUNT_CUR}
         print -r 'arg count current unoptioned: '${ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED}
 
-        # While unparsed arguments remain, parse the current argument.
-        while (( ZY__FUNC_ARG_TYPE_INDEX < ${#ZY__FUNC_ARGS_BASIC} )) {
-            # If the current argument has *NOT* already been parsed into the
-            # canonical ${match} list global, do so. Since the initial
-            # pcre_match() call parses the first argument into this list for
-            # function prototypes declaring *NO* argument channels, we
-            # avoid reparsing such argument in such case. In all other cases,
-            # the current argument must be parsed.
+        # While unparsed arguments remain, parse the next argument.
+        while { true } {
+            # Increment the current argument index. While this could be
+            # incremented as the last rather than first loop statement, doing
+            # so would complicate the use of the "continue" built-in below.
+            # Why? Because using that built-in would skip this incrementation!
+            ZY__FUNC_ARG_INDEX+=1
+            # print -r 'arg index handled: '${ZY__FUNC_ARG_INDEX}
+
+            # Increment the current argument type index. Since each argument
+            # type is followed by a corresponding argument name in the
+            # ${ZY__FUNC_ARGS_RAW} list global, this index must be incremented
+            # past both the current argument type and name.
+            ZY__FUNC_ARG_TYPE_INDEX+=2
+
+            # If no unparsed arguments remain, cease parsing arguments.
+            (( ZY__FUNC_ARG_TYPE_INDEX < ${#ZY__FUNC_ARGS_RAW} )) || break
+
+            # Parse the current argument.
             #
             # Since all arguments have already been parsed by the initial
             # pcre_match() call, this parse should always succeed. For sanity,
@@ -267,100 +275,95 @@ function ::func_.stop() {
             #
             # For both efficiency and readability, captured match groups
             # expanded multiple times below are localized to string variables.
-            (( ! ${#match[
-                ${ZY__CALLABLE_PROTOTYPE_MATCH_INDEX_ARG_CHANNEL_FIRST_ARGS}]-}
-            )) || pcre_match --\
-                "x x(${ZY__FUNC_ARGS_BASIC[
+            #
+            # For function prototypes declaring *NO* argument channels (i.e.,
+            # only declaring an argument list), the initial pcre_match() call
+            # already parsed the first argument into the canonical ${match}
+            # list global. While we could attempt to avoid reparsing that
+            # argument, doing so would require retesting a condition for each
+            # argument and hence arguably save no time (and could indeed cost
+            # more time for long argument lists). Avoid premature optimization!
+            #
+            # For obscure reasons relating to zsh parsing, double- rather than
+            # single-quotes *MUST* be used here.
+            pcre_match --\
+                "x x(${ZY__FUNC_ARGS_RAW[
                     ${ZY__FUNC_ARG_TYPE_INDEX},
-                    $(( ZY__FUNC_ARG_TYPE_INDEX + 1 ))]})" ||
+                    $(( ZY__FUNC_ARG_TYPE_INDEX + 1 ))]})" ||  # double-quotes!
                 ::func.die 'argument at index '$((
                     (ZY__FUNC_ARG_TYPE_INDEX + 1) / 2 ))' unparsable.'
+            print -r 'argument type index: '${ZY__FUNC_ARG_TYPE_INDEX}
+            integer match_index; for match_index ({1..${ZY__CALLABLE_PROTOTYPE_MATCH_INDEX_ARG_CHANNEL_SECOND_ARGS}}) { print -r 'match '${match_index}': '${match[${match_index}]-} }
 
-            # 1 if such argument is a mandatory variadic argument or 0
+            # 1 if this argument is a mandatory variadic argument or 0
             # otherwise.
             ZY__FUNC_ARG_IS_VARIADIC_MANDATORY=${#match[
                 ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_VARIADIC_MANDATORY}]-}
 
-            # 1 if such argument is a missable variadic argument or 0
+            # 1 if this argument is a missable variadic argument or 0
             # otherwise.
             ZY__FUNC_ARG_IS_VARIADIC_MISSABLE=${#match[
                 ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_VARIADIC_MISSABLE}]-}
 
-            # 1 if such argument is variadic or 0 otherwise.
+            # 1 if this argument is variadic or 0 otherwise.
             ZY__FUNC_ARG_IS_VARIADIC=$((
                 ZY__FUNC_ARG_IS_VARIADIC_MANDATORY +
                 ZY__FUNC_ARG_IS_VARIADIC_MISSABLE ))
 
-            # 1 if such argument is missable or 0 otherwise. By definition,
-            # both missable variadic and non-variadic arguments are missable.
-            # Since the two conditions are mutually exclusive, adding them
-            # suffices to obtain the desired boolean.
+            # 1 if this argument is missable or 0 otherwise. By definition,
+            # both missable variadic arguments and missable non-variadic
+            # arguments are missable. Since those two conditions are mutually
+            # exclusive, adding them suffices to obtain the desired boolean.
             ZY__FUNC_ARG_IS_MISSABLE=$((
                 ZY__FUNC_ARG_IS_VARIADIC_MISSABLE +
                 ${#match[
                     ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_NONVARIADIC_MISSABLE}]-}
             ))
 
-            # Local argument subtype, defaulting to ":str" if empty. If
-            # empty, such argument is guaranteed by PCRE design to indirectly
-            # refer to another variable by name and hence *MUST* be a string.
-            # Since most exception handlers expect such subtype to be nonempty,
-            # default such subtype *BEFORE* calling such handlers below.
-            ZY__FUNC_ARG_SUBTYPE_LOCAL=${match[
-                ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}
-            ]:-:str}
-
-            # If such argument is *NOT* variadic...
+            # If this argument is *NOT* variadic...
             if (( ! ZY__FUNC_ARG_IS_VARIADIC )) {
-                # If such argument does *NOT* follow a variadic argument, such
+                # If this argument does *NOT* follow a variadic argument, this
                 # argument is reliably expandable by its positive index (i.e.,
                 # relative to the beginning of the current argument list).
                 if (( ! ZY__FUNC_ARG_WAS_VARIADIC )) {
                     ZY__FUNC_ARG_PARAM=${ZY__FUNC_ARG_INDEX}
-                # Else such argument follows a variadic argument and hence a
-                # countably infinite number of arguments. In such case,
-                # such argument is only reliably expandable by its negative
+                # Else this argument follows a variadic argument and hence a
+                # countably infinite number of arguments. In this case,
+                # this argument is only reliably expandable by its negative
                 # index (i.e., relative to the end of the current argument
                 # list). Happily, the same index applies regardless of whether
-                # such variadic argument was mandatory or optional.
+                # this variadic argument was mandatory or optional.
                 #
-                # Since negative sign "-" conflicts with parameter expansion
+                # Since a negative sign "-" conflicts with parameter expansion
                 # syntax, negative indices may only be referenced by indexing
-                # canonical list global ${@} or ${argv} with such index. For
+                # canonical list global ${@} or ${argv} with this index. For
                 # brevity, we prefer the former. Since subsequent logic may
-                # conditionally prefix such string with parameter expansion
-                # flags (e.g., "(P)"), avoid delimiting such string with "${"
+                # conditionally prefix this string with parameter expansion
+                # flags (e.g., "(P)"), avoid delimiting this string with "${"
                 # and "}" until *AFTER* performing such logic below.
                 } else {
                     ZY__FUNC_ARG_PARAM='@['$(( ZY__FUNC_ARG_INDEX - ZY__FUNC_ARG_COUNT_MAX - 1 ))']'
                 }
-            # Else such argument is variadic.
+            # Else this argument is variadic.
             } else {
                 # If a prior argument is also variadic, throw an exception.
-                # Such case implies such function to accept two or more
-                # variadic argument lists of arbitrary count, implying there
-                # exists no general means of deciding which such list a passed
-                # string was intended to belong to.
+                # This case implies this function to accept two or more
+                # variadic argument lists of arbitrary count, in which case
+                # there exists no means of deciding which list a passed
+                # argument was intended to belong to.
                 (( ! ZY__FUNC_ARG_WAS_VARIADIC )) ||
                     ::func.die_of_arg_variadic\
                         'accepts two or more variadic arguments.'
 
-                #FIXME: This doesn't seem quite right, anymore. We no longer
-                #permit the "*" or "+" variadic type prefixes to be coupled
-                #with the "?" missable type prefix. Likewise, we require that
-                #default values always be coupled with either the "*" or "?"
-                #type prefix. Only one type prefix at a type is permitted,
-                #suggesting the following test can be radically simplified.
-
-                # If another argument is optional, throw an exception. Such
-                # case implies such function to accept one or more optional
+                # If another argument is optional, throw an exception. This
+                # case implies this function to accept one or more optional
                 # arguments *AND* one or more variadic argument lists of
-                # arbitrary count, implying there exists no general means of
-                # deciding which such argument a passed string was intended to
-                # correspond to.
+                # arbitrary count, in which case there exists no means of
+                # deciding which argument index a passed argument was intended
+                # to correspond to.
                 #
-                # Test such condition *AFTER* testing whether a prior argument
-                # is variadic. If such function accepts an optional variadic
+                # Test this condition *AFTER* testing whether a prior argument
+                # is variadic. If this function accepts an optional variadic
                 # argument following a prior variadic argument, the prior
                 # exception is more explanatory than this exception.
                 #
@@ -370,11 +373,11 @@ function ::func_.stop() {
                 #       (( ! arg_is_optional )) ||
                 #       (( ZY__FUNC_ARG_COUNT_MAX - ZY__FUNC_ARG_COUNT_MIN > 1 )) } { ... }
                 #
-                # As such logic implies, testing whether such function accepts
-                # at least one optional argument is insufficient. Such argument
+                # As that logic implies, testing whether this function accepts
+                # at least one optional argument is insufficient. That argument
                 # could in fact be the current variadic argument, a valid edge
-                # case we explicitly support. Hence, also test whether the
-                # current variadic argument is optional. If so, test whether
+                # case we explicitly support. Hence, we also test whether the
+                # current variadic argument is missable. If so, test whether
                 # any other argument is optional (as implied by the number of
                 # optional arguments being greater than 1, thus ignoring the
                 # current validly optional variadic argument).
@@ -402,11 +405,11 @@ function ::func_.stop() {
                     ::func.die_of_arg_variadic\
                         'accepts both optional and variadic arguments.'
 
-                # Notify subsequent parse iterations of such fact. For safety,
-                # set such boolean *AFTER* all tests of such boolean above.
+                # Notify subsequent parse iterations of this fact. For safety,
+                # set this boolean *AFTER* all tests of this boolean above.
                 ZY__FUNC_ARG_WAS_VARIADIC=1
 
-                # Expand such argument and all subsequent optional variadic
+                # Expand this argument and all subsequent optional variadic
                 # arguments with an argument range starting at the current
                 # positive index and ending at the negative index of the last
                 # such argument. See above for related logic.
@@ -414,13 +417,13 @@ function ::func_.stop() {
                     ZY__FUNC_ARG_INDEX - ZY__FUNC_ARG_COUNT_MAX - 1 ))']'
             }
 
-            # If such argument is defaultable and hence optional, handle such
+            # If this argument is defaultable and hence optional, handle this
             # argument. By PCRE design, this is testable by testing whether
-            # such argument's default value is non-empty. Since such value is
+            # this argument's default value is non-empty. Since this value is
             # guaranteed to be a scalar zsh value (i.e., either a single- or
             # double-quoted string, integer, or float) *AND* since the length
-            # of such value is thus non-zero if defined and zero otherwise,
-            # such length suffices to indicate whether a default value was
+            # of this value is thus non-zero if defined and zero otherwise,
+            # this length suffices to indicate whether a default value was
             # specified. Hence, no boolean ${arg_is_defaulted} is required.
             if (( ${#match[
                 ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}
@@ -462,17 +465,18 @@ function ::func_.stop() {
                 } elif ! (( ZY__FUNC_ARGS_IS_UNHANDLED + ${#match[
                     ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE_IS_RELAXED}]-} )) {
                     # If this is the first argument to be defaulted for the
-                    # current argument count, prefix such default by an if
-                    # conditional applying such default only under such count.
+                    # current argument count, prefix that default by an if
+                    # conditional applying that default only under this count.
                     if (( ! ZY__FUNC_ARG_COUNT_CUR_DEFAULTED )) {
                         # If at least one argument has been defaulted for a
                         # prior argument count, an if conditional for doing so
-                        # has already been initiated. In such case, continue
-                        # such conditional with a new branch.
+                        # has already been initiated. In that case, continue
+                        # this conditional with a new branch.
                         (( ! ${#ZY__FUNC_PREAMBLE} )) ||
                             ZY__FUNC_PREAMBLE+=' el'
 
-                        # Default such arguments only for the current argument count.
+                        # Default this argument only for the current argument
+                        # count.
                         ZY__FUNC_PREAMBLE+='if (( # == '${ZY__FUNC_ARG_COUNT_CUR}' )) {'
                     }
 
@@ -487,11 +491,11 @@ function ::func_.stop() {
                           ZY__FUNC_ARG_COUNT_MAX )) {
                         ZY__FUNC_PREAMBLE+=${ZY__FUNC_CODE_PREFIX}'argv+='${match[
                             ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}
-                    # Else if such argument is the first explicit argument such
+                    # Else if this argument is the first explicit argument this
                     # function accepts, inefficiently replace the current
                     # argument list with one in which the indices of all other
                     # explicit arguments are increased by 1 and the first index
-                    # of such list is set to such argument's default value.
+                    # of this list is set to such argument's default value.
                     } elif (( ZY__FUNC_ARG_INDEX == 1 )) {
                         ZY__FUNC_PREAMBLE+=${ZY__FUNC_CODE_PREFIX}'argv=( '${match[
                             ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}' "${@}" )'
@@ -506,21 +510,21 @@ function ::func_.stop() {
                             ZY__FUNC_ARG_INDEX - 1 ))']+=( '${match[
                             ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}' )'
                     }
-                # Else, such unpassed argument is undefaulted and hence absent.
-                # In such case, skip to the next argument. Note that this
+                # Else, this unpassed argument is undefaulted and hence absent.
+                # In this case, skip to the next argument. Note that this
                 # implicitly prevents the current argument index from being
-                # incremented below, thus preserving such index for the next
+                # incremented below, thus preserving this index for the next
                 # argument as desired. (Absent arguments are *NOT* in the
                 # current argument list and hence cannot be indexed.)
                 } else {
                     continue
                 }
-            # Else if such argument is absentable and hence also optional...
+            # Else if this argument is absentable and hence also optional...
             } elif (( ZY__FUNC_ARG_IS_MISSABLE )) {
-                # If such argument is passed, handle such case. See above.
+                # If this argument is passed, handle this case. See above.
                 if (( ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED )) {
                       ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED+=-1
-                # Else, such argument is unpassed. See above.
+                # Else, this argument is unpassed. See above.
                 } else {
                     continue
                 }
@@ -531,20 +535,22 @@ function ::func_.stop() {
             if ! (( ZY__FUNC_ARGS_IS_UNHANDLED + ${#match[
                 ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_NAME_IS_RELAXED}]-}
             )) {
-                # Name of the local variable binding this argument.
+                # Name of the local variable to which this argument is bound.
                 ZY__FUNC_ARG_NAME=${match[
-                    ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_LOCAL}]-}${match[
-                    ${ZY__FUNC_VAR_NAME_SUFFIX}]-}
+                    ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_LOCAL}]-}${ZY__FUNC_VAR_NAME_SUFFIX}
 
                 # If this argument is *NOT* variadic, localize this argument in
                 # the expected way (i.e., via a local scalar variable).
                 if (( ! ZY__FUNC_ARG_IS_VARIADIC )) {
-                    # If this subtype is nonscalar (i.e., list, map), throw an
-                    # exception. By zsh mandate, arguments are *ALWAYS* passed
-                    # as untyped strings and hence cannot encapsulate nonscalar
-                    # data without variable indirection.
-                    [[ ${ZY__FUNC_ARG_SUBTYPE_LOCAL} !=\
-                       ':'('list'|'map') ]] ||
+                    # Argument local subtype.
+                    ZY__FUNC_ARG_SUBTYPE_LOCAL=${match[
+                        ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}}
+
+                    # If this subtype is nonscalar (e.g., ":list", ":map"),
+                    # throw an exception. By zsh design, arguments are
+                    # *ALWAYS* passed as untyped strings and hence cannot
+                    # encapsulate nonscalar data without variable indirection.
+                    [[ ${ZY__FUNC_ARG_SUBTYPE_LOCAL} != ':'('list'|'map') ]] ||
                         #FIXME: Somewhat of a silly function, isn't it? Its
                         #implementation strikes us as overly complex. Given
                         #that such function is only ever called here,
@@ -628,13 +634,12 @@ function ::func_.stop() {
             if ! (( ZY__FUNC_ARGS_IS_UNHANDLED + ${#match[
                 ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]-}
             )) {
-                # This argument's major validation-specific subtype, defaulting
-                # to this argument's localization-specific subtype.
+                # Argument major subtype, defaulting to the local subtype.
                 ZY__FUNC_ARG_SUBTYPE_MAJOR=${match[
-                    ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]:-${ZY__FUNC_ARG_SUBTYPE_LOCAL}}
+                    ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_MAJOR}]:-${match[
+                    ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}}}
 
-                # This argument's minor validation-specific subtype, defaulting
-                # to the empty string.
+                # Argument minor subtype, defaulting to the empty string.
                 ZY__FUNC_ARG_SUBTYPE_MINOR=${match[
                     ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_MINOR}]-}
 
@@ -652,39 +657,38 @@ function ::func_.stop() {
                     [[ ${ZY__FUNC_ARG_SUBTYPE_MAJOR} != ':glob' ]] ||
                         ZY__FUNC_ARGS_IS_GLOB=1
 
-                    # Name of the function validating this argument's value.
+                    # Name of the function validating this argument's value
+                    # (e.g., :Int.is() for an argument of type ":Int").
+                    #
+                    # Note that:
+                    #
+                    # * zy:../*-test/var.zy defines private validators for all
+                    #   default indirect types (e.g., ::Int.is()).
+                    # * zy://*-root//var/type.zy defines public validators for
+                    #   all default indirect types (e.g., :Int.is()).
                     ZY__FUNC_CALLABLE_NAME=${ZY__FUNC_ARG_SUBTYPE_MAJOR}'.is'
 
                     # If this argument has a minor subtype, suffix this
                     # function name by this subtype delimited by "_".
-                    (( ! ${#ZY__FUNC_ARG_SUBTYPE_MINOR} )) ||
+                    if (( ! ${#ZY__FUNC_ARG_SUBTYPE_MINOR} )) ||
                         ZY__FUNC_CALLABLE_NAME+='_'${ZY__FUNC_ARG_SUBTYPE_MINOR}
 
                     # If this function does *NOT* exist, throw an exception.
-                    # For efficiency and simplicity, we inline this test. See
-                    # :func.is() for details.
+                    # For efficiency, this test is inlined. See :func.is().
                     (( ${+functions[${ZY__FUNC_CALLABLE_NAME}]} )) ||
                         ::func.die_of_arg_type\
-                            'unvalidatable (i.e., function '${ZY__FUNC_CALLABLE_NAME}'() undefined)'
+                            'unrecognized (i.e., function '${ZY__FUNC_CALLABLE_NAME}'() undefined)'
 
                     # Map such function name to such argument's expansion.
                     ZY__FUNC_ARG_TESTER_TO_EXPANSIONS[${ZY__FUNC_CALLABLE_NAME}]+=' "${'${ZY__FUNC_ARG_PARAM}'}"'
                 }
             }
 
-            # Increment the current argument index in preparation for parsing
-            # the next argument. For simplicity, such argument is incremented
-            # as the last rather than first loop statement. While feasible, the
-            # latter complicates logic above.
-            ZY__FUNC_ARG_INDEX+=1
-            # print -r 'arg index handled: '${ZY__FUNC_ARG_INDEX}
-
-            # Increment the current argument type index in preparation for
-            # parsing the next argument. Since each argument type is followed
-            # by a corresponding argument name in the ${ZY__FUNC_ARGS_BASIC}
-            # list global, such index must be incremented past both the current
-            # argument type and name.
-            ZY__FUNC_ARG_TYPE_INDEX+=2
+            #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # NOTE: To permit the use of the "continue" built-in above, this
+            # block should remain empty. Any commands run here will *NOT* be
+            # run when "continue" is called above.
+            #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         }
 
         # If the current argument count defaulted at least one argument,
@@ -943,6 +947,58 @@ function ::func_.stop() {
 }
 
 # --------------------( WASTELANDS                         )--------------------
+            # Local argument subtype, defaulting to ":str" if empty. If
+            # empty, this argument is guaranteed by PCRE design to indirectly
+            # refer to another variable by name and hence *MUST* be a string.
+            # Since most exception handlers expect such subtype to be nonempty,
+            # default such subtype *BEFORE* calling such handlers below.
+            # ZY__FUNC_ARG_SUBTYPE_LOCAL=${match[
+            #     ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBTYPE_LOCAL}
+            # ]:-:str}
+
+    #FUXME: Oh, gods. Do we still need *ANY* of this?
+    # print -r 'arg list (sans quotes): '${ZY__FUNC_ARGS_SANS_QUOTES}
+    # print -r 'arg list (part reduced): <'${ZY__FUNC_ARGS_SANS_QUOTES//[ $'\t\n']##/ }'>'
+    # print -r 'arg list (full reduced): <'${${ZY__FUNC_ARGS_SANS_QUOTES//[ $'\t\n']##/ }//[^ ]##}'>'
+
+                #FUXME: This doesn't seem quite right, anymore. We no longer
+                #permit the "*" or "+" variadic type prefixes to be coupled
+                #with the "?" missable type prefix. Likewise, we require that
+                #default values always be coupled with either the "*" or "?"
+                #type prefix. Only one type prefix at a type is permitted,
+                #suggesting the following test can be radically simplified.
+
+            # If the current argument has *NOT* already been parsed into the
+            # canonical ${match} list global, do so. Since the initial
+            # pcre_match() call parses the first argument into this list for
+            # function prototypes declaring *NO* argument channels, we
+            # avoid reparsing this argument in that case. In all other cases,
+            # the current argument must be parsed.
+            #
+            # Since all arguments have already been parsed by the initial
+            # pcre_match() call, this parse should always succeed. For sanity,
+            # we nonetheless guarantee this by throwing exceptions on failure.
+            #
+            # For both efficiency and simplicity, the previously compiled PCRE
+            # matching function prototype syntax is reused to match function
+            # prototype argument syntax as well. To do so, a "fake" function
+            # prototype containing only the current argument to be parsed is
+            # dynamically fabricated "on the fly" and passed to PCRE matching
+            # machinery. All captured match groups except those pertaining to
+            # the current argument will be ignored.
+            #
+            # For example, if the current argument is ":str UBI", the fake
+            # prototype "x x(:str UBI)" will be fabricated.
+            #
+            # For both efficiency and readability, captured match groups
+            # expanded multiple times below are localized to string variables.
+            #FUXME: Fairly silly and error-prone. Also, since this condition is
+            #retested each iteration, it gains us exceedingly little. Let's
+            #excise this premature optimization, please.
+            # (( ! ${#match[
+            #     ${ZY__CALLABLE_PROTOTYPE_MATCH_INDEX_ARG_CHANNEL_FIRST_ARGS}]-}
+            # )) || pcre_match --\
+
 #FUXME: Replace use of ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_MINOR}
 #everywhere, including both here and in zy://pcre.
 
@@ -1234,7 +1290,7 @@ function ::func_.stop() {
 
 #FUXME: ::func.die_unless_args_pass_tester() appears to be undefined.
 
-                # 'x x('${ZY__FUNC_ARGS_BASIC[
+                # 'x x('${ZY__FUNC_ARGS_RAW[
                 #     ${ZY__FUNC_ARG_TYPE_INDEX},
                 #     $(( ZY__FUNC_ARG_TYPE_INDEX + 1 ))]}')' ||
         # Parse the current argument previously parsed into the canonical
@@ -1268,9 +1324,9 @@ function ::func_.stop() {
     # corresponding to such types must also be removed. Let:
     #
     # * o be the number of list items *BEFORE* removing all mandatory types
-    #   (i.e., ${#ZY__FUNC_ARGS_BASIC}).
+    #   (i.e., ${#ZY__FUNC_ARGS_RAW}).
     # * r be the number of list items *AFTER* removing all mandatory types
-    #   (i.e., ${(M)#ZY__FUNC_ARGS_BASIC:#...}).
+    #   (i.e., ${(M)#ZY__FUNC_ARGS_RAW:#...}).
     #
     # Then the number of optional arguments is given by the equation 2(o - r)
     # and the number of mandatory arguments
@@ -1280,8 +1336,8 @@ function ::func_.stop() {
     #     (o - 2r) / 2 = o - 2o + 2r = 2r - o
 # ZY__FUNC_ARG_COUNT_MAX
 #     ZY__FUNC_ARG_COUNT_MIN=$((
-#         2 * ${(M)#ZY__FUNC_ARGS_BASIC:#${~ZY__CALLABLE_PROTOTYPE_ARG_TYPE_OPTIONAL_GLOB}} -
-#         ${#ZY__FUNC_ARGS_BASIC} ))
+#         2 * ${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_MISSABLE_PREFIX_GLOB}} -
+#         ${#ZY__FUNC_ARGS_RAW} ))
 
 #list items *AFTER* removing all
 
