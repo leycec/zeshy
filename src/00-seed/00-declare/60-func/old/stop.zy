@@ -8,6 +8,11 @@ Handle *function prototype parsers* (i.e., functions parsing function
 prototypes, typically as a prerequisite to processing function declarations).
 /---
 
+#FIXME: The code below generates quite a bit of duplication in function
+#preambles. Why? Because we relocalize and revalidate all mandatory arguments
+#for all possible argument counts for each function. There probably exist
+#specific cases in which it is safe to condense this duplication.
+
 #FIXME: In reflection, there's no demonstrable reason to prohibit function
 #prototypes from requesting both defaultable and variadic arguments. After all,
 #Ruby supports heterogenous mixings of the two by simply binding defaultable
@@ -66,7 +71,8 @@ function ::func_.stop() {
     # iteration.
     ZY__FUNC_ARGS_IS_GLOB=0
     ZY__FUNC_ARGS_IS_UNLOCALIZED=0
-    ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID=
+    ZY__FUNC_ARGS_CODE_DEFAULT=
+    ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE=
     ZY__FUNC_PREAMBLE=
 
     # Suffix for all local variable names declared by this function's preamble,
@@ -109,22 +115,20 @@ function ::func_.stop() {
     # While this calculation is efficient, conforming to the algorithm
     # implemented below requires reparsing the argument list once for each
     # optional argument such function accepts. (So sad.) Why? Because each
-    # optional argument implies:
-    #
-    # * Such function to accept one additional possible number of arguments.
-    # * Equivalently, the set of all possible numbers of arguments accepted by
-    #   such function to increase by one in size.
+    # optional argument implies this function to accept one additional possible
+    # number of arguments -- or, equivalently, that the set of all possible
+    # numbers of arguments accepted by this function increases by one in size.
     #
     # Each such number requires distinct validation and hence detection here.
-    # Unfortunately, eliminating such reparsing would require persisting a list
+    # Unfortunately, eliminating this reparsing would require persisting a list
     # of argument metadata during the first and only pass for subsequent lookup
     # (as detailed below), itself imposing non-negligible inefficiencies. The
     # question then reduces to: which is less efficient, reparsing each
-    # argument multiple times or parsing such arguments into a list only once?
+    # argument multiple times or parsing these arguments into a list only once?
     #
     # To answer this question, consider the common case. If most or even many
-    # zeshy functions accepted optional arguments and hence required such
-    # reparsing, such reparsing would indeed be non-ideal. In practice, few
+    # zeshy functions accepted optional arguments and hence required this
+    # reparsing, this reparsing would indeed be non-ideal. In practice, few
     # zeshy functions accept optional arguments (due to readability and
     # writability concerns associated with such arguments). Since the common
     # case imposes no argument reparsing, reparsing poses no huge imposition.
@@ -151,7 +155,7 @@ function ::func_.stop() {
     #        ...
     #        for ZY__FUNC_ARG_INDEX\
     #            ZY__FUNC_ARG_SUBTYPE_LOCAL\
-    #            ZY__FUNC_ARG_IS_MISSABLE\
+    #            ZY__FUNC_ARG_IS_OPTIONAL\
     #            ZY__FUNC_ARG_IS_VARIADIC (
     #            "${args_metadata[@]}") {
     #            ...
@@ -165,20 +169,34 @@ function ::func_.stop() {
     # reveals the number of arguments.
     ZY__FUNC_ARG_COUNT_MAX=$(( ${#ZY__FUNC_ARGS_RAW} / 2 ))
 
-    # Minimum argument count, obtained by subtracting the number of optional
-    # arguments from the maximum argument count. Dismantled, this is:
+    # Number of optional arguments. Dismantled, this is:
     #
-    # * "${(M)#...:#...}", the number of optional arguments, given by:
-    #   1. Removing all mandatory arguments from the list of all argument types
-    #      and names. Since argument names are effectively variable names and
-    #      hence prohibited by zsh from containing any character signifying an
-    #      argument type, this is guaranteed to remove all argument names.
-    #   2. Counting the number of remaining list items.
+    # * "${(M)...:#...}", removing all mandatory arguments from the list of all
+    #   argument types and names. Since argument names are variable names and
+    #   hence prohibited by zsh from containing any character signifying an
+    #   argument type, this is guaranteed to remove all argument names.
+    # * "${...#...}", counting the number of remaining arguments.
+    ZY__FUNC_ARG_COUNT_OPTIONAL=${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_OPTIONAL_PREFIX_GLOB}}
+
+    # Minimum argument count.
     ZY__FUNC_ARG_COUNT_MIN=$((
-        ZY__FUNC_ARG_COUNT_MAX -
-        ${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_MISSABLE_PREFIX_GLOB}} ))
+        ZY__FUNC_ARG_COUNT_MAX - ZY__FUNC_ARG_COUNT_OPTIONAL ))
     print -r 'arg count max: '${ZY__FUNC_ARG_COUNT_MAX}
     print -r 'arg count min: '${ZY__FUNC_ARG_COUNT_MIN}
+    print -r 'arg count optional: '${ZY__FUNC_ARG_COUNT_OPTIONAL}
+
+    #FIXME: Define two new counts:
+    #
+    #    ZY__FUNC_ARG_COUNT_MISSABLE=$((
+    #        ZY__FUNC_ARG_COUNT_OPTIONAL -
+    #        ${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_DEFAULT_GLOB} ))
+    #    ZY__FUNC_ARG_COUNT_UNMISSABLE=$((
+    #        ZY__FUNC_ARG_COUNT_MAX - ZY__FUNC_ARG_COUNT_MISSABLE ))
+    #
+    #The issue is defining the ${ZY__CALLABLE_PROTOTYPE_ARG_DEFAULT_GLOB} to
+    #match all "="-delimited argument names. Shouldn't be terribly arduous.
+    ZY__FUNC_ARG_COUNT_MISSABLE=0
+    ZY__FUNC_ARG_COUNT_UNMISSABLE=0
 
     # ..................{ PROCESS                            }..................
     # Compile the PCRE matching all callable prototype argument syntax. Since
@@ -214,8 +232,8 @@ function ::func_.stop() {
         # Reset scalar globals declared by "global.zy" specific to this loop.
         ZY__FUNC_ARG_COUNT_CUR_DEFAULTED=0
         ZY__FUNC_ARG_WAS_VARIADIC=0
-        ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT=
-        ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC=
+        ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE=
+        ZY__FUNC_ARG_CODE_VARIADIC=
 
         # 1-based index of the current argument in the current argument list.
         # This will be incremented by 1 to 1 in the first loop iteration below.
@@ -231,13 +249,20 @@ function ::func_.stop() {
         set -A ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS
         set -A ZY__FUNC_ARG_TESTER_TO_EXPANSIONS
 
-        # Number of passed optional arguments permitted by the current argument
-        # count, defined as the difference of the current argument count and
-        # the number of mandatory arguments such argument accepts.
-        ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED=$((
+        # Passed optional argument count (i.e., the number of remaining
+        # optional arguments treated as passed by the current argument count),
+        # defined as the difference of the current argument count and the
+        # number of mandatory arguments this function accepts.
+        #
+        # This count is decremented by 1 for each optional argument parsed for
+        # the current argument count; on decrementing this count to 0, all
+        # subsequent optional arguments will be treated as unpassed for the
+        # current argument count. If this function accepts no optional
+        # arguments, this count is 0.
+        ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED=$((
             ZY__FUNC_ARG_COUNT_CUR - ZY__FUNC_ARG_COUNT_MIN ))
         print -r 'arg count current: '${ZY__FUNC_ARG_COUNT_CUR}
-        print -r 'arg count current unoptioned: '${ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED}
+        print -r 'arg count current unoptioned: '${ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED}
 
         # While unparsed arguments remain, parse the next argument.
         while { true } {
@@ -303,22 +328,21 @@ function ::func_.stop() {
 
             # 1 if this argument is a missable variadic argument or 0
             # otherwise.
-            ZY__FUNC_ARG_IS_VARIADIC_MISSABLE=${#match[
-                ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_VARIADIC_MISSABLE}]-}
+            ZY__FUNC_ARG_IS_VARIADIC_OPTIONAL=${#match[
+                ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_VARIADIC_OPTIONAL}]-}
 
             # 1 if this argument is variadic or 0 otherwise.
             ZY__FUNC_ARG_IS_VARIADIC=$((
                 ZY__FUNC_ARG_IS_VARIADIC_MANDATORY +
-                ZY__FUNC_ARG_IS_VARIADIC_MISSABLE ))
+                ZY__FUNC_ARG_IS_VARIADIC_OPTIONAL ))
 
             # 1 if this argument is missable or 0 otherwise. By definition,
-            # both missable variadic arguments and missable non-variadic
-            # arguments are missable. Since those two conditions are mutually
-            # exclusive, adding them suffices to obtain the desired boolean.
-            ZY__FUNC_ARG_IS_MISSABLE=$((
-                ZY__FUNC_ARG_IS_VARIADIC_MISSABLE +
-                ${#match[
-                    ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_NONVARIADIC_MISSABLE}]-}
+            # both missable variadic and non-variadic arguments are missable.
+            # Since those two conditions are mutually exclusive, adding them
+            # suffices to obtain the desired boolean.
+            ZY__FUNC_ARG_IS_OPTIONAL=$((
+                ZY__FUNC_ARG_IS_VARIADIC_OPTIONAL + ${#match[
+                    ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_SCALAR_OPTIONAL}]-}
             ))
 
             # If this argument is *NOT* variadic...
@@ -343,10 +367,16 @@ function ::func_.stop() {
                 # flags (e.g., "(P)"), avoid delimiting this string with "${"
                 # and "}" until *AFTER* performing such logic below.
                 } else {
-                    ZY__FUNC_ARG_PARAM='@['$(( ZY__FUNC_ARG_INDEX - ZY__FUNC_ARG_COUNT_MAX - 1 ))']'
+                    ZY__FUNC_ARG_PARAM='@['$((
+                        ZY__FUNC_ARG_INDEX - ZY__FUNC_ARG_COUNT_MAX - 1 ))']'
                 }
             # Else this argument is variadic.
             } else {
+                #FIXME: This is much more simply and efficiently testable at
+                #the top function level *BEFORE* the outermost iteration above
+                #by simply finding the number of "*"-prefixed argument types
+                #in the function prototype and responding accordingly. Trivial.
+
                 # If a prior argument is also variadic, throw an exception.
                 # This case implies this function to accept two or more
                 # variadic argument lists of arbitrary count, in which case
@@ -355,6 +385,11 @@ function ::func_.stop() {
                 (( ! ZY__FUNC_ARG_WAS_VARIADIC )) ||
                     ::func.die_of_arg_variadic\
                         'accepts two or more variadic arguments.'
+
+                #FIXME: This is much more simply and efficiently testable at
+                #the top function level *BEFORE* the outermost iteration above
+                #by simply finding the number of "*"-prefixed argument types
+                #in the function prototype and responding accordingly. Trivial.
 
                 # If another argument is optional, throw an exception. This
                 # case implies this function to accept one or more optional
@@ -390,19 +425,17 @@ function ::func_.stop() {
                 #   if the current variadic argument is optional (i.e., either
                 #   missable or defaultable) and 0 otherwise. Since an
                 #   argument may be either missable *OR* defaultable but not
-                #   both, such boolean is dynamically computing by summing the
-                #   boolean noting whether such argument is absentable with the
-                #   boolean noting whether such argument is defaultable.
-                # * "ZY__FUNC_ARG_COUNT_MAX - ZY__FUNC_ARG_COUNT_MIN" is
-                #   1 if the current variadic argument is optional and 0
-                #   otherwise.
+                #   both, this boolean is dynamically computing by summing the
+                #   boolean noting whether this argument is optional with the
+                #   boolean noting whether this argument is defaultable.
+                # * "ZY__FUNC_ARG_COUNT_OPTIONAL" is 1 if the current variadic
+                #   argument is optional and 0 otherwise.
                 #
                 # In either case, subtracting either from the other *ALWAYS*
                 # results in 0; in any other case, the same subtraction *NEVER*
-                # results in 0. Hence, such test suffices. (Convenient.)
-                (( ZY__FUNC_ARG_IS_VARIADIC_MISSABLE -
-                   ZY__FUNC_ARG_COUNT_MAX -
-                   ZY__FUNC_ARG_COUNT_MIN )) ||
+                # results in 0. Hence, this test suffices. (Convenient.)
+                (( ZY__FUNC_ARG_IS_VARIADIC_OPTIONAL -
+                   ZY__FUNC_ARG_COUNT_OPTIONAL )) ||
                     ::func.die_of_arg_variadic\
                         'accepts both optional and variadic arguments.'
 
@@ -433,64 +466,51 @@ function ::func_.stop() {
 
                 # If such argument is *NOT* missable, throw an exception. For
                 # sanity, only missable arguments are defaultable.
-                (( ZY__FUNC_ARG_IS_MISSABLE )) || ::func.die_of_arg_type\
+                (( ZY__FUNC_ARG_IS_OPTIONAL )) || ::func.die_of_arg_type\
                     'not missable (i.e., not prefixed by "?") but assigned a default value.'
-
-                # If such argument is also a mandatory variadic argument, throw
-                # an exception. While we *COULD* technically permit the first
-                # argument in a sublist of mandatory variadic arguments to be
-                # defaulted if unpassed, such functionality is already
-                # supported by:
-                #
-                # * Converting such mandatory variadic argument into an
-                #   optional variadic argument.
-                # * Prefixing such argument by the desired defaultable
-                #   argument.
-                #
-                # Given that, we currently elect to make no change.
-                (( ! ZY__FUNC_ARG_IS_VARIADIC_MANDATORY )) ||
-                    ::func.die_of_arg_variadic\
-                        'accepts a defaultable mandatory variadic argument.'
-
-                # If the number of optional arguments the current argument
-                # count accepts is positive, the current optional argument has
-                # effectively been "passed". In such case, decrement such
-                # number by 1, implying such count to now accept one less
-                # optional argument. (The current optional argument "consumes"
-                # one available optional argument "slot" under such count.)
-                if (( ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED )) {
-                      ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED+=-1
-                # Else, such argument is unpassed. If defaulting such argument
-                # (i.e., if such argument is assigned an unrelaxed default
-                # value), do so.
+                # If this defaultable argument is passed rather than defaulted
+                # (as implied by the existence of one or more remaining
+                # optional arguments treated as passed by the current argument
+                # count), modify the current argument count to accept one less
+                # optional argument. This defaultable argument "consumes" one
+                # available optional argument "slot" for the current argument
+                # count.
+                if (( ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED )) {
+                      ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED+=-1
+                # Else, this defaultable argument is unpassed. If defaulting
+                # this argument (i.e., if this argument is assigned an
+                # unrelaxed default value), do so.
                 } elif ! (( ZY__FUNC_ARGS_IS_UNHANDLED + ${#match[
                     ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE_IS_RELAXED}]-} )) {
                     # If this is the first argument to be defaulted for the
-                    # current argument count, prefix that default by an if
-                    # conditional applying that default only under this count.
+                    # current argument count, prefix this default by an if
+                    # conditional applying this default only under this count.
                     if (( ! ZY__FUNC_ARG_COUNT_CUR_DEFAULTED )) {
-                        # If at least one argument has been defaulted for a
-                        # prior argument count, an if conditional for doing so
-                        # has already been initiated. In that case, continue
-                        # this conditional with a new branch.
-                        (( ! ${#ZY__FUNC_PREAMBLE} )) ||
-                            ZY__FUNC_PREAMBLE+=' el'
-
-                        # Default this argument only for the current argument
-                        # count.
-                        ZY__FUNC_PREAMBLE+='if (( # == '${ZY__FUNC_ARG_COUNT_CUR}' )) {'
+                        # If no arguments have been defaulted for a prior
+                        # argument count, this is the first argument to be
+                        # defaulted for any count. Create the first branch of a
+                        # new conditional specific to the current count.
+                        if (( ! ${#ZY__FUNC_ARGS_CODE_DEFAULT} )) {
+                            ZY__FUNC_ARGS_CODE_DEFAULT+=${ZY__FUNC_LINE_PREFIX}'if (( # == '${ZY__FUNC_ARG_COUNT_CUR}' )) {'
+                        # Else, one or more arguments have been defaulted for a
+                        # prior argument count, in which case an if conditional
+                        # for doing so exists. Continue that conditional with a
+                        # new branch specific to the current count.
+                        } else {
+                            ZY__FUNC_ARGS_CODE_DEFAULT+=' elif (( # == '${ZY__FUNC_ARG_COUNT_CUR}' )) {'
+                        }
                     }
 
-                    # Increment the current defaulted argument count.
+                    # Increment the current defaulted argument count *AFTER*
+                    # testing this count above.
                     ZY__FUNC_ARG_COUNT_CUR_DEFAULTED+=1
 
-                    # If such argument is the last explicit argument such
+                    # If this argument is the last explicit argument this
                     # function accepts (ignoring all subsequent optional
-                    # variadic list arguments), efficiently append such
-                    # argument's default value to the current argument list.
-                    if (( ZY__FUNC_ARG_INDEX ==
-                          ZY__FUNC_ARG_COUNT_MAX )) {
-                        ZY__FUNC_PREAMBLE+=${ZY__FUNC_LINE_PREFIX}'argv+='${match[
+                    # variadic list arguments), append this argument's default
+                    # value to the current argument list.
+                    if (( ZY__FUNC_ARG_INDEX == ZY__FUNC_ARG_COUNT_MAX )) {
+                        ZY__FUNC_ARGS_CODE_DEFAULT+=${ZY__FUNC_LINE_PREFIX}'argv+='${match[
                             ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}
                     # Else if this argument is the first explicit argument this
                     # function accepts, inefficiently replace the current
@@ -498,33 +518,34 @@ function ::func_.stop() {
                     # explicit arguments are increased by 1 and the first index
                     # of this list is set to such argument's default value.
                     } elif (( ZY__FUNC_ARG_INDEX == 1 )) {
-                        ZY__FUNC_PREAMBLE+=${ZY__FUNC_LINE_PREFIX}'argv=( '${match[
+                        ZY__FUNC_ARGS_CODE_DEFAULT+=${ZY__FUNC_LINE_PREFIX}'argv=( '${match[
                             ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}' "${@}" )'
-                    # Else such argument is neither the first or last explicit
-                    # argument such function accepts and hence is both preceded
-                    # *AND* succeeded by at least one such argument. In such
-                    # case, an efficient alternative to replacing the current
-                    # argument list presents itself: append such argument's
-                    # default value to the prior argument. (Yes, this works.)
+                    # Else this argument is neither the first nor last explicit
+                    # argument this function accepts and hence is both preceded
+                    # *AND* succeeded by one or more other such arguments. In
+                    # this case, an efficient alternative to replacing the
+                    # current argument list presents itself: append this
+                    # argument's default value to the prior argument's index in
+                    # the current argument list. (Yes, this actually works.)
                     } else {
-                        ZY__FUNC_PREAMBLE+=${ZY__FUNC_LINE_PREFIX}'argv['$((
+                        ZY__FUNC_ARGS_CODE_DEFAULT+=${ZY__FUNC_LINE_PREFIX}'argv['$((
                             ZY__FUNC_ARG_INDEX - 1 ))']+=( '${match[
                             ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]-}' )'
                     }
-                # Else, this unpassed argument is undefaulted and hence absent.
-                # In this case, skip to the next argument. Note that this
-                # implicitly prevents the current argument index from being
-                # incremented below, thus preserving this index for the next
-                # argument as desired. (Absent arguments are *NOT* in the
+                # Else, this unpassed optional argument is undefaulted and
+                # hence missing. In this case, skip to the next argument. Note
+                # that this implicitly prevents the current argument index from
+                # being incremented below, thus preserving this index for the
+                # next argument as desired. (Missing arguments are *NOT* in the
                 # current argument list and hence cannot be indexed.)
                 } else {
                     continue
                 }
-            # Else if this argument is absentable and hence also optional...
-            } elif (( ZY__FUNC_ARG_IS_MISSABLE )) {
+            # Else if this argument is missable and hence optional...
+            } elif (( ZY__FUNC_ARG_IS_OPTIONAL )) {
                 # If this argument is passed, handle this case. See above.
-                if (( ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED )) {
-                      ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED+=-1
+                if (( ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED )) {
+                      ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED+=-1
                 # Else, this argument is unpassed. See above.
                 } else {
                     continue
@@ -573,54 +594,53 @@ function ::func_.stop() {
                     # Map this subtype to a definition assigning this argument
                     # value to a local variable of the same name.
                     ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${ZY__FUNC_ARG_SUBTYPE_LOCAL}]+=' '${ZY__FUNC_ARG_NAME}'="${'${ZY__FUNC_ARG_PARAM}'}"'
-                # Else this argument is variadic, signifying an arbitrary
-                # number of arguments. Since these arguments are unavailable
-                # until function call time and hence *NOT* localizable at
-                # function definition time (i.e., now) as a hardcoded set of
-                # local variables, these arguments must be localized as a list.
+                # Else this argument is variadic and hence comprises an
+                # arbitrary number of passed strings. Since these strings are
+                # unavailable until function call time and hence *NOT*
+                # localizable at function definition time (i.e., now) as a
+                # hardcoded set of local scalar variables, these strings are
+                # localized into a local list variable instead.
                 #
                 # If this argument name is neither "@" or "argv" (both of which
                 # signify the current argument list), this argument is
-                # localized by:
-                #
-                # * Declaring a new list local with this argument name.
-                # * Defining such list to these variadic arguments.
+                # localized by declaring a new list local with this argument
+                # name defined to contain all such string arguments.
                 } elif [[ ${ZY__FUNC_ARG_NAME} != ('@'|'argv') ]] {
                     # Map the local list type ":list" to this argument's
-                    # declaration, but *NOT* definition. By zsh mandates,
+                    # declaration, but *NOT* definition. Due to zsh design,
                     # lists cannot be defined at declaration time.
                     ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS[:list]+=' '${ZY__FUNC_ARG_NAME}
 
-                    # Initialize such list to all such variadic arguments.
-                    ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${ZY__FUNC_LINE_PREFIX}${ZY__FUNC_ARG_NAME}'=( "${'${ZY__FUNC_ARG_PARAM}'}" )'
-                # Else, such argument name is either "@" or "argv". In such
-                # case, reduce the current argument list to variadic arguments.
+                    # Initialize this list to all such string arguments.
+                    ZY__FUNC_ARG_CODE_VARIADIC+=${ZY__FUNC_LINE_PREFIX}${ZY__FUNC_ARG_NAME}'=( "${'${ZY__FUNC_ARG_PARAM}'}" )'
+                # Else, this argument name is either "@" or "argv". Reduce the
+                # current argument list to only variadic arguments.
                 } else {
-                    # Note such fact for subsequent testing.
+                    # Note this fact for subsequent testing.
                     ZY__FUNC_ARG_WAS_VARIADIC=${ZY__FUNC_ARG_WAS_VARIADIC_AS_ARGV}
 
-                    # If such argument is *NOT* the first argument, remove all
+                    # If this argument is *NOT* the first argument, remove all
                     # prior arguments from the current argument list. Since zsh
                     # offers a simple builtin for removing prefixing but *NOT*
-                    # suffixing arguments, such code is simpler than below.
+                    # suffixing arguments, this code is simpler than below.
                     (( ZY__FUNC_ARG_INDEX == 1 )) ||
-                        ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${ZY__FUNC_LINE_PREFIX}'shift '$((
+                        ZY__FUNC_ARG_CODE_VARIADIC+=${ZY__FUNC_LINE_PREFIX}'shift '$((
                             ZY__FUNC_ARG_INDEX - 1 ))
 
-                    # If such argument is *NOT* the last argument, remove all
+                    # If this argument is *NOT* the last argument, remove all
                     # subsequent arguments from the current argument list.
                     if (( ZY__FUNC_ARG_INDEX !=
                           ZY__FUNC_ARG_COUNT_MAX )) {
-                        # If such argument is the second-to-last argument,
+                        # If this argument is the second-to-last argument,
                         # remove only the last argument. See pop_arg().
                         if (( ZY__FUNC_ARG_INDEX ==
                               ZY__FUNC_ARG_COUNT_MAX - 1 )) {
-                            ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${ZY__FUNC_LINE_PREFIX}'argv[-1]=()'
+                            ZY__FUNC_ARG_CODE_VARIADIC+=${ZY__FUNC_LINE_PREFIX}'argv[-1]=()'
                         # Else, such argument precedes the second-to-last
                         # argument. Remove all subsequent arguments with
                         # ranged indices. See shift_args_2().
                         } else {
-                            ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${ZY__FUNC_LINE_PREFIX}'argv['$((
+                            ZY__FUNC_ARG_CODE_VARIADIC+=${ZY__FUNC_LINE_PREFIX}'argv['$((
                                 ZY__FUNC_ARG_INDEX -
                                 ZY__FUNC_ARG_COUNT_MAX ))',-1]=()'
                         }
@@ -651,8 +671,7 @@ function ::func_.stop() {
                 # validated. Since all arguments are passed as untyped scalars
                 # and hence strings by POSIX calling conventions, string
                 # arguments are always inherently valid.
-                if [[\
-                   ${ZY__FUNC_ARG_SUBTYPE_MAJOR}${ZY__CALLABLE_PROTOTYPE_ARG_SUBTYPE_MINOR_PREFIX}${ZY__FUNC_ARG_SUBTYPE_MINOR} !=\
+                if [[ ${ZY__FUNC_ARG_SUBTYPE_MAJOR}${ZY__CALLABLE_PROTOTYPE_ARG_SUBTYPE_MINOR_PREFIX}${ZY__FUNC_ARG_SUBTYPE_MINOR} !=\
                    ':str'${ZY__CALLABLE_PROTOTYPE_ARG_SUBTYPE_MINOR_PREFIX}\
                    ]] {
                     # If this argument is a glob, note this for later testing.
@@ -702,28 +721,27 @@ function ::func_.stop() {
             #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         }
 
-        # If the current argument count defaulted at least one argument,
-        # terminate the if conditional doing so.
-        if (( ZY__FUNC_ARG_COUNT_CUR_DEFAULTED )) {
-            ZY__FUNC_PREAMBLE+=${ZY__FUNC_LINE_PREFIX}'}'
-        }
+        # If the current argument count defaulted one or more unpassed
+        # arguments, terminate the if conditional doing so.
+        (( ! ZY__FUNC_ARG_COUNT_CUR_DEFAULTED )) ||
+            ZY__FUNC_ARGS_CODE_DEFAULT+=${ZY__FUNC_LINE_PREFIX}'}'
 
-        # For each function name and corresponding string expanding all
-        # arguments validated by calling this function, do so.
+        # For each name of a variable tester function and corresponding string
+        # expanding all arguments to be validated by this function, do so.
         for ZY__FUNC_CALLABLE_NAME ZY__FUNC_ARGS_EXPANSIONS (
             "${(kv@)ZY__FUNC_ARG_TESTER_TO_EXPANSIONS}") {
-            ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${ZY__FUNC_LINE_PREFIX}${ZY__FUNC_CALLABLE_NAME}${ZY__FUNC_ARGS_EXPANSIONS}' || ::func.die_unless_args_pass_tester "${@}" '''${ZY__FUNC_ARGS_EXPANSIONS}''' '${(q)ZY__FUNC_CALLABLE_NAME}
+            ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+=${ZY__FUNC_LINE_PREFIX}${ZY__FUNC_CALLABLE_NAME}${ZY__FUNC_ARGS_EXPANSIONS}' || ::func.die_unless_args_pass_tester "${@}" '''${ZY__FUNC_ARGS_EXPANSIONS}''' '${(q)ZY__FUNC_CALLABLE_NAME}
         }
 
-        # For each alias name and corresponding string localizing arguments
-        # into locals declared by expanding this alias, do so. By design,
-        # these declarations consist only of simple string assignments
-        # unconditionally succeeding and hence requiring no exception handling
-        # (e.g., 'my_var="${1}"'). For efficiency, we iterate only by keys
-        # (rather than by both keys and values).
+        # For each name of a variable declaration alias and corresponding
+        # string declaring all arguments to be localized by this alias, do so.
+        # By design, these declarations consist only of simple string
+        # assignments unconditionally succeeding and hence requiring no
+        # exception handling (e.g., 'my_var="${1}"'). For efficiency, iterate
+        # only by keys (rather than by both keys and values).
         for ZY__FUNC_CALLABLE_NAME (
             "${(k@)ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS}") {
-            ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${ZY__FUNC_LINE_PREFIX}${ZY__FUNC_CALLABLE_NAME}${ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${ZY__FUNC_CALLABLE_NAME}]}
+            ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+=${ZY__FUNC_LINE_PREFIX}${ZY__FUNC_CALLABLE_NAME}${ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${ZY__FUNC_CALLABLE_NAME}]}
         }
 
         # If localizing a variadic argument, do so *AFTER* localizing
@@ -731,55 +749,111 @@ function ::func_.stop() {
         # the latter from the current argument list when localizing to such
         # list, only do so *AFTER* all non-variadic arguments have been copied
         # from such list into local variables.
-        if (( ${#ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC} )) {
-            # Throw an exception if:
-            #
-            # * Localizing a variadic argument to the current argument list.
-            # * At least one non-variadic argument is unlocalized.
-            #
-            # Removing such arguments from the current argument list would
-            # prevent subsequent code from expanding such arguments!
+        if (( ${#ZY__FUNC_ARG_CODE_VARIADIC} )) {
+            #FIXME: Presuming we remove the relaxant prefix (then "`", now "~")
+            #and hence require localization to be all-or-nothing, the following
+            #test will always evaluate to true and hence be removable.
+
+            # Throw an exception if localizing a variadic argument to the
+            # current argument list *AND* at least one non-variadic argument is
+            # unlocalized. Removing these arguments from the argument list
+            # would prevent subsequent code from expanding these arguments.
             [[ ${ZY__FUNC_ARG_WAS_VARIADIC} !=\
                ${ZY__FUNC_ARG_WAS_VARIADIC_AS_ARGV} ]] ||
             (( ! ZY__FUNC_ARGS_IS_UNLOCALIZED )) || ::func.die\
-                'variadic argument unlocalizable into ${@} due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing the "`" prefixing all non-variadic argument names'
+                'variadic argument unlocalizable into ${@} due to unlocalized non-variadic arguments; consider either prefixing this variadic argument name by "`" or removing the "`" prefixing all non-variadic argument names'
 
-            # Localize such variadic argument.
-            ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC}
+            # Localize this variadic argument.
+            ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+=${ZY__FUNC_ARG_CODE_VARIADIC}
         }
 
         # If localizing and/or validating at least one argument, do so.
-        if (( ${#ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT} )) {
-            # Number of passed arguments plus the number of upassed defaulted
-            # arguments. Since defaulting the latter inserted the default
-            # values for such arguments into the current argument list and
-            # hence increased the size of such list, the current argument count
-            # ${ZY__FUNC_ARG_COUNT_CUR} no longer accurately reflects such size
-            # and must *NOT* be tested below.
-            ZY__FUNC_ARG_COUNT_CUR_DEFAULTED+=${ZY__FUNC_ARG_COUNT_CUR}
-
-            # If such number equals the maximum argument count, such function
-            # accepts no absentable arguments. (Why? Because if such function
-            # accepted at least one absentable argument, then such number would
-            # be strictly smaller than the maximum argument count.)
+        if (( ${#ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE} )) {
+            #FIXME: What? This conditional is equivalent to the following
+            #conditional. The latter appears to be the correct test; this
+            #duplicate test here, however, appears to be incorrect. What did we
+            #*TRULY* mean to test?
+            #FIXME: Perhaps unrelatedly, we have an issue with respect to
+            #variadic arguments. We erroneously refer to "*"-style variadic
+            #arguments as "missable" and set the ${ZY__FUNC_ARG_IS_OPTIONAL}
+            #boolean to true for such arguments. This is completely wrong,
+            #however; only "?"-style non-variadic arguments are "missable" in
+            #the meaningful sense of that word (i.e., such arguments are *NOT*
+            #localized when unpassed, the only arguments for which this is the
+            #case). When unpassed, "*"-style variadic arguments should simply
+            #be localized as the empty list. This suggests:
             #
-            # In such case, such function effectively *ALWAYS* accepts the same
-            # number of arguments (as unpassed defaultable arguments will
-            # simply be defaulted). Hence, do *NOT* embed such code in an if
+            #* The definition of the ${ZY__FUNC_ARG_IS_OPTIONAL} boolean should
+            #  be reduced to simply:
+            #
+            #      ZY__FUNC_ARG_IS_OPTIONAL=${#match[
+            #          ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_SCALAR_OPTIONAL}]-}
+            #* Wherever we currently test ${ZY__FUNC_ARG_IS_OPTIONAL}, we
+            #  probably want to ensure that we do so *ONLY* when applicable to
+            #  "?"-style non-variadic arguments.
+            #* We need to default "*"-style variadic arguments to the empty
+            #  list when unpassed. A reasonable place for this to happen would
+            #  probably be somewhere around where we handle default arguments.
+            #  Indeed, defaulting "*"-style variadic arguments to the empty
+            #  list could indeed be considered a type of default handling.
+            #
+            #Investigate further, please!
+            #FIXME: O.K.; we've sort-of come to the heart of the issue.
+            #Basically, we reuse ${ZY__FUNC_ARG_COUNT_MIN} for one too many
+            #things at the moment. We need to define two new counts, as
+            #described above in a separate "FIXME":
+            #
+            #* ${ZY__FUNC_ARG_COUNT_MISSABLE}, defined to be the number of
+            #  missable arguments (i.e., arguments with either "*"- or "?"-
+            #  prefixed types and no "="-delimited names).
+            #* ${ZY__FUNC_ARG_COUNT_UNMISSABLE}, defined to be the number of
+            #  all other arguments.
+            #
+            #Given those, we then need to refactor the outermost iteration
+            #above. We currently iterate over all possible argument counts --
+            #even for counts that are effectively the same due to unpassed
+            #defaultable arguments being defaulted *BEFORE* anything else is
+            #done in the function preamble. Instead, we need to iterate only
+            #over the following constrained range:
+            #
+            #    for ZY__FUNC_ARG_COUNT_CUR (
+            #        {${ZY__FUNC_ARG_COUNT_UNMISSABLE}..${ZY__FUNC_ARG_COUNT_MAX}}) {
+
+            # If this function accepts no missable arguments,
+
+            # number equals the maximum argument count, no missable
+            # arguments were accepted for the current argument count. If one or
+            # more such arguments were accepted for this count, then this
+            # number would be smaller than the maximum argument count.
+            #
+            # In this case, this function effectively *ALWAYS* accepts the same
+            # number of arguments (as defaultable unpassed arguments will
+            # simply be defaulted). Hence, do *NOT* embed this code in an if
             # conditional testing the current argument count.
-            if (( ZY__FUNC_ARG_COUNT_CUR_DEFAULTED ==
-                  ZY__FUNC_ARG_COUNT_MAX )) {
-                ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT}
-            # Else such function accepts at least one absentable argument and
-            # hence a variable number of arguments. Embed such code in an if
+
+            #FIXME: Define this. See above.
+            if (( ! ZY__FUNC_ARG_COUNT_MISSABLE )) {
+                print 'Spitting out code unconditionally!'
+                ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE}
+            # Else this function accepts one or more optional arguments and
+            # hence a variable number of arguments. Embed this code in an if
             # conditional testing the current argument count.
             } else {
-                # If such count is the maximum, terminate the current if
+                # Number of passed arguments plus the number of unpassed
+                # arguments defaulted for the current argument count.
+                # Defaulting one or more unpassed arguments above inserted the
+                # default values for those arguments into the current argument
+                # list and hence increased the size of that list. The current
+                # argument count ${ZY__FUNC_ARG_COUNT_CUR} no longer accurately
+                # reflects that list's size and must *NOT* be tested as is.
+                ZY__FUNC_ARG_COUNT_CUR_DEFAULTED+=${ZY__FUNC_ARG_COUNT_CUR}
+
+                # If this count is the maximum, terminate the current if
                 # conditional with a final branch. Since the prior branch of
-                # such conditional already ended on "}", omit such prefix here.
-                if (( ZY__FUNC_ARG_COUNT_CUR_DEFAULTED ==\
+                # this conditional already ended on "}", omit that prefix here.
+                if (( ZY__FUNC_ARG_COUNT_CUR_DEFAULTED ==
                       ZY__FUNC_ARG_COUNT_MAX )) {
-                    ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=' else'
+                    ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=' else'
                 # Else the current argument count is less than the maximum.
                 } else {
                     # If the current argument count is the minimum, initiate a
@@ -797,35 +871,35 @@ function ::func_.stop() {
                     # 2. The maximum number of non-variadic arguments and hence
                     #    passed at least such optional variadic argument, which
                     #    the branch above suffices to test.
-                    if (( ZY__FUNC_ARG_COUNT_CUR_DEFAULTED ==\
+                    if (( ZY__FUNC_ARG_COUNT_CUR_DEFAULTED ==
                           ZY__FUNC_ARG_COUNT_MIN )) {
-                        ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${ZY__FUNC_LINE_PREFIX}
+                        ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${ZY__FUNC_LINE_PREFIX}
                     # Else the current argument count is more than the minimum.
                     # Continue the current if conditional with a new branch.
                     } else {
-                        ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=' el'
+                        ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=' el'
                     }
 
                     # Test this branch.
-                    ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+='if (( # == '${ZY__FUNC_ARG_COUNT_CUR_DEFAULTED}' ))'
+                    ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+='if (( # == '${ZY__FUNC_ARG_COUNT_CUR_DEFAULTED}' ))'
                 }
 
                 # Implement this branch's body.
-                ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=' {'${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT}${ZY__FUNC_LINE_PREFIX}'}'
+                ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=' {'${ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE}${ZY__FUNC_LINE_PREFIX}'}'
             }
         }
     }
 
-    # If defaulting arguments, customize such code for interpolation below.
-    if (( ${#ZY__FUNC_PREAMBLE} )) {
+    # If defaulting any arguments, customize this code for interpolation below.
+    if (( ${#ZY__FUNC_ARGS_CODE_DEFAULT} )) {
         # Name of the alias or function testing at runtime whether the current
         # function call conditionally accepts unpassed defaultable arguments
         # (e.g., only when called directly from the command line) or the empty
-        # string if such function *ALWAYS* accepts such arguments.
+        # string if this function *ALWAYS* accepts such arguments.
         ZY__FUNC_CALLABLE_NAME=${ZY__FUNC_ATTRS[is_args_defaultable_if]-}
 
-        # If only conditionally accepting such arguments, do so only when such
-        # condition succeeds at runtime.
+        # If only conditionally accepting these arguments, do so only when that
+        # function call reports success at runtime.
         if (( ${#ZY__FUNC_CALLABLE_NAME} )) {
             # If such alias or function does *NOT* exist, throw an exception.
             # See :alias_command.is() and :func.is().
@@ -833,12 +907,12 @@ function ::func_.stop() {
                ${+functions[${ZY__FUNC_CALLABLE_NAME}]} )) ||
                ::func.die 'attribute "default_args_if" alias or function '${ZY__FUNC_CALLABLE_NAME}'() undefined'
 
-            # Default such arguments only if such condition succeeds.
-            ZY__FUNC_PREAMBLE='if { '${ZY__FUNC_CALLABLE_NAME}' } {'${ZY__FUNC_LINE_PREFIX}${ZY__FUNC_PREAMBLE}${ZY__FUNC_LINE_PREFIX}'}'
+            # Default these arguments only if this call succeeds.
+            ZY__FUNC_ARGS_CODE_DEFAULT='if { '${ZY__FUNC_CALLABLE_NAME}' } {'${ZY__FUNC_LINE_PREFIX}${ZY__FUNC_ARGS_CODE_DEFAULT}${ZY__FUNC_LINE_PREFIX}'}'
         }
 
-        # Delimit such code from subsequent code.
-        ZY__FUNC_PREAMBLE+=${ZY__FUNC_LINE_PREFIX}
+        # Prepend this function's body by such defaults.
+        ZY__FUNC_PREAMBLE=${ZY__FUNC_ARGS_CODE_DEFAULT}
     }
 
     # Validate the number of arguments passed to such function.
@@ -858,9 +932,9 @@ function ::func_.stop() {
         ZY__FUNC_PREAMBLE+=${ZY__FUNC_LINE_PREFIX}'(( '${ZY__FUNC_ARG_COUNT_MIN}' <= # && # <= '${ZY__FUNC_ARG_COUNT_MAX}' )) || ::func.die_of_arg_count_not_ranging "${@}" '${ZY__FUNC_ARG_COUNT_MIN}' '${ZY__FUNC_ARG_COUNT_MAX}
     }
 
-    # If localizing and/or validating arguments, do so.
-    (( ! ${#ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID} )) ||
-        ZY__FUNC_PREAMBLE+=${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID}
+    # If localizing and/or validating any arguments, do so.
+    (( ! ${#ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE} )) ||
+        ZY__FUNC_PREAMBLE+=${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE}
 
     # If a preamble was defined for this function above, delimit this preamble
     # from subsequent user-defined code.
@@ -957,7 +1031,64 @@ function ::func_.stop() {
     ZY__FUNC_PROTOTYPE=
 }
 
+return 0
 # --------------------( WASTELANDS                         )--------------------
+    # Number of optional arguments.
+    # ZY__FUNC_ARG_COUNT_OPTIONAL=$((
+    #     ZY__FUNC_ARG_COUNT_MAX - ZY__FUNC_ARG_COUNT_MIN ))
+
+    #FUXME: Use below wherever we currently calculate this.
+        # ZY__FUNC_ARG_COUNT_MAX -
+        # ${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_OPTIONAL_PREFIX_GLOB}} ))
+#, obtained by subtracting the number of optional
+    # arguments from the maximum argument count
+    #   2. Counting the number of remaining list items.
+                # If such argument is also a mandatory variadic argument, throw
+                # an exception. While we *COULD* technically permit the first
+                # argument in a sublist of mandatory variadic arguments to be
+                # defaulted if unpassed, such functionality is already
+                # supported by:
+                #
+                # * Converting such mandatory variadic argument into an
+                #   optional variadic argument.
+                # * Prefixing such argument by the desired defaultable
+                #   argument.
+                #
+                # Given that, we currently elect to make no change.
+                # (( ! ZY__FUNC_ARG_IS_VARIADIC_MANDATORY )) ||
+                #     ::func.die_of_arg_variadic\
+                #         'accepts a defaultable mandatory variadic argument.'
+
+# We could probably brute-force our way through this
+    #with a two-step process, obtaining:
+    #
+    #1. The number of all "*"- and "?"-prefixed argument types.
+    #2. Subtracting that by the number of all "="-delimited argument names.
+    #
+    #At the moment, we don't particularly see much of a way around that.
+    #    ${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_MISSABLE_GLOB}
+            #FUXME: Define ${ZY__FUNC_ARG_COUNT_MISSABLE} to be the total
+            #number of missable arguments passed to this function (i.e., the
+            #number of "?"-style arguments with no "="-style default value). 
+            # if (( ZY__FUNC_ARG_COUNT_OPTIONAL !=
+            #       ZY__FUNC_ARG_COUNT_DEFAULTABLE )) {
+        # Delimit this code from subsequent code.
+        # ZY__FUNC_ARGS_CODE_DEFAULT+=${ZY__FUNC_LINE_PREFIX}
+
+    # Code generated from this function's prototype to prepend this function's
+    # body. Since  For efficiency, 
+            # If this number equals the maximum argument count, no missable
+            # arguments were accepted for the current argument count. If one or
+            # more such arguments were accepted for this count, then this
+            # number would be smaller than the maximum argument count.
+            #
+            # In this case, this function effectively *ALWAYS* accepts the same
+            # number of arguments (as defaultable unpassed arguments will
+            # simply be defaulted). Hence, do *NOT* embed this code in an if
+            # conditional testing the current argument count.
+
+                    # if (( ZY__FUNC_ARG_COUNT_CUR_DEFAULTED ==
+                    #       ZY__FUNC_ARG_COUNT_MIN )) {
 # print 'func line: '${functions[::func_.stop][(f)487]}
 
             # Local argument subtype, defaulting to ":str" if empty. If
@@ -1349,7 +1480,7 @@ function ::func_.stop() {
     #     (o - 2r) / 2 = o - 2o + 2r = 2r - o
 # ZY__FUNC_ARG_COUNT_MAX
 #     ZY__FUNC_ARG_COUNT_MIN=$((
-#         2 * ${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_MISSABLE_PREFIX_GLOB}} -
+#         2 * ${(M)#ZY__FUNC_ARGS_RAW:#${~ZY__CALLABLE_PROTOTYPE_ARG_OPTIONAL_PREFIX_GLOB}} -
 #         ${#ZY__FUNC_ARGS_RAW} ))
 
 #list items *AFTER* removing all
@@ -1424,7 +1555,7 @@ function ::func_.stop() {
     #        ...
     #        for ZY__FUNC_ARG_INDEX\
     #            ZY__FUNC_ARG_SUBTYPE_LOCAL\
-    #            ZY__FUNC_ARG_IS_MISSABLE\
+    #            ZY__FUNC_ARG_IS_OPTIONAL\
     #            ZY__FUNC_ARG_IS_VARIADIC (
     #            "${args_metadata[@]}") {
     #            ...
@@ -1603,7 +1734,7 @@ function ::func_.stop() {
                 #   missable or defaultable) and 0 otherwise. Since an
                 #   argument may be either missable *OR* defaultable but not
                 #   both, such boolean is dynamically computing by summing the
-                #   boolean noting whether such argument is absentable with the
+                #   boolean noting whether such argument is optional with the
                 #   boolean noting whether such argument is defaultable.
                 # * "ZY__FUNC_ARG_COUNT_MAX - ZY__FUNC_ARG_COUNT_MIN" is
                 #   1 if the current variadic argument is optional and 0
@@ -1613,7 +1744,7 @@ function ::func_.stop() {
                 # results in 0; in any other case, the same subtraction *NEVER*
                 # results in 0. Hence, such test suffices. (Convenient.)
                 # (( ZY__FUNC_ARG_IS_DEFAULTABLE +
-                #    ZY__FUNC_ARG_IS_VARIADIC_MISSABLE -
+                #    ZY__FUNC_ARG_IS_VARIADIC_OPTIONAL -
                 #    ZY__FUNC_ARG_COUNT_MAX - ZY__FUNC_ARG_COUNT_MIN )) ||
                 #     ::func.die_of_arg_variadic\
                 #         'accepts both optional and variadic arguments.'
@@ -1697,10 +1828,10 @@ function ::func_.stop() {
                 #
                 # * ${arg_is_optional} is a hypothetical boolean expanding to 1
                 #   if the current variadic argument is optional (i.e., either
-                #   absentable or defaultable) and 0 otherwise. Since an
-                #   argument may be either absentable *OR* defaultable but not
+                #   optional or defaultable) and 0 otherwise. Since an
+                #   argument may be either optional *OR* defaultable but not
                 #   both, such boolean is dynamically computing by summing the
-                #   boolean noting whether such argument is absentable with the
+                #   boolean noting whether such argument is optional with the
                 #   boolean noting whether such argument is defaultable.
                 # * "ZY__FUNC_ARG_COUNT_MAX - ZY__FUNC_ARG_COUNT_MIN" is 1 if the current
                 #   variadic argument is optional and 0 otherwise.
@@ -2152,7 +2283,7 @@ function ::func_.stop() {
                     # argument index for the next argument.
                     # ZY__FUNC_ARG_INDEX+=-1
 
-                #FUXME: Probably incorrect for absentable variadic arguments.
+                #FUXME: Probably incorrect for optional variadic arguments.
 
             #FUXME: If the current argument is variadic and...
             #  [[ ${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_SUBNAME_MAJOR} ==\
@@ -2165,7 +2296,7 @@ function ::func_.stop() {
                     #FUXME: Uhm; what? We probably require a new global, merely
                     #for the purpose of placing such initialization in the
                     #proper place in the code emitted below.
-                    #FUXME: Variadic arguments can be absentable. Does this
+                    #FUXME: Variadic arguments can be optional. Does this
                     #handle that?
 #@['${ZY__FUNC_ARG_INDEX}','${ZY__FUNC_ARG_COUNT_MAX}']
 
@@ -2483,7 +2614,7 @@ function ::func_.stop() {
                 #${arg_is_optional}! We'll need, therefore, to refactor this
                 #into... well, something. Fortunately, we shouldn't need to
                 #account for relaxation; we *SHOULD*, however, need to detect
-                #both absentable and defaultable syntax: e.g.,
+                #both optional and defaultable syntax: e.g.,
                 #
                 # (( ! (\
                 #     ${#match[${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_DEFAULT_VALUE}]} +\
@@ -2639,18 +2770,18 @@ function ::func_.stop() {
 
     # # Code localizing and/or validating arguments passed to such function for
     # # all possible argument counts.
-    # local ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID
+    # local ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE
 
     # # Code localizing and/or validating arguments passed to such function for
     # # the current argument count.
-    # local ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT
+    # local ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE
 
     # # Code localizing variadic arguments passed to such function by removing
     # # all non-variadic arguments from the current argument list and hence
     # # reducing such list to only variadic arguments. Since non-variadic
     # # arguments may only be removed from such list *AFTER* localizing such
     # # arguments, separate such code into different string locals.
-    # local ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC
+    # local ZY__FUNC_ARG_CODE_VARIADIC
 
     # #FUXME: Refactor as a global constant declared above. Any other constants
     # #to be extracted? Probably not, but worth a glimmer.
@@ -2751,9 +2882,9 @@ function ::func_.stop() {
             # arg_is_validated=$((
             #     ! ${#match[${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_TYPE_IS_RELAXED}]} ))
 
-    # 1 if the current argument is absentable and 0 otherwise.
-    # integer arg_is_absentable
-            # arg_is_absentable=${#match[${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}]}
+    # 1 if the current argument is optional and 0 otherwise.
+    # integer arg_is_optional
+            # arg_is_optional=${#match[${ZY__CALLABLE_PROTOTYPE_ARG_MATCH_INDEX_IS_MISSABLE}]}
 
     # 1 if at least one argument is optional and 0 otherwise.
     # integer args_is_optional=$(( ZY__FUNC_ARG_COUNT_MIN != ZY__FUNC_ARG_COUNT_MAX ))
@@ -2882,14 +3013,14 @@ function ::func_.stop() {
     #     # however, the latter need *NOT* be explicitly tested here.
     #     if (( ${#ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS} +\
     #           ${#ZY__FUNC_ARG_TESTER_TO_EXPANSIONS} +\
-    #           ${#ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC} )) {
+    #           ${#ZY__FUNC_ARG_CODE_VARIADIC} )) {
     #         # If such function accepts at least one optional argument, subsequent
     #         # argument type validation assumes such function's caller passed the
     #         # current number of arguments. Prefix such validation by an if
     #         # conditional guaranteeing such assumption.
     #         if (( args_is_optional )) {
     #             # Indent the following if conditional.
-    #             ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=${code_indent_outer}
+    #             ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+=${code_indent_outer}
 
     #             # If parsing the maximum number of arguments, end the current if
     #             # conditional. Since the prior branch of such conditional
@@ -2898,7 +3029,7 @@ function ::func_.stop() {
     #             # default arguments, do *NOT* test
     #             # ${args_is_defaultable_tester} as below.
     #             if (( arg_count_after_default == ZY__FUNC_ARG_COUNT_MAX )) {
-    #                 ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=' else {'
+    #                 ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+=' else {'
     #             # Else we are parsing less than such number of arguments.
     #             } else {
     #                 # If parsing more than the minimum number of arguments,
@@ -2919,11 +3050,11 @@ function ::func_.stop() {
     #                 #    passed at least such optional variadic argument, which
     #                 #    the branch above suffices to test.
     #                 if (( arg_count_after_default > ZY__FUNC_ARG_COUNT_MIN )) {
-    #                     ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=' el'
+    #                     ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+=' el'
     #                 }
 
     #                 # Complete the current branch of such if conditional.
-    #                 ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+='if (( # == '${arg_count_after_default}' )) {'
+    #                 ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+='if (( # == '${arg_count_after_default}' )) {'
     #             }
     #         }
 
@@ -2942,7 +3073,7 @@ function ::func_.stop() {
     #         for arg_tester ZY__FUNC_ARGS_EXPANSIONS (
     #             "${(kv@)ZY__FUNC_ARG_TESTER_TO_EXPANSIONS}"
     #             "${(kv@)ZY__FUNC_ARG_VAR_TESTER_TO_EXPANSIONS}") {
-    #             ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${code_indent_inner_if_nested_or_outer}${arg_tester}${ZY__FUNC_ARGS_EXPANSIONS}' || ::func.die_unless_args_pass_tester "${@}" '''${ZY__FUNC_ARGS_EXPANSIONS}''' '${(q)arg_tester}
+    #             ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${code_indent_inner_if_nested_or_outer}${arg_tester}${ZY__FUNC_ARGS_EXPANSIONS}' || ::func.die_unless_args_pass_tester "${@}" '''${ZY__FUNC_ARGS_EXPANSIONS}''' '${(q)arg_tester}
     #         }
 
     #         # For each alias name and corresponding string localizing arguments
@@ -2952,11 +3083,11 @@ function ::func_.stop() {
     #         # (e.g., 'my_var="${1}"'). For efficiency, iterate only by keys
     #         # (rather than by both keys and values).
     #         for arg_declarer ("${(k@)ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS}") {
-    #             ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${code_indent_inner_if_nested_or_outer}${arg_declarer}${ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${arg_declarer}]}
+    #             ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${code_indent_inner_if_nested_or_outer}${arg_declarer}${ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS[${arg_declarer}]}
     #         }
 
     #         # If localizing a variadic argument, do so.
-    #         if [[ -n "${ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC}" ]] {
+    #         if [[ -n "${ZY__FUNC_ARG_CODE_VARIADIC}" ]] {
     #             # If at least one non-variadic argument is unlocalized, throw
     #             # an exception. Since variadic arguments are localized by
     #             # removing *ALL* non-variadic arguments from the current
@@ -2967,13 +3098,13 @@ function ::func_.stop() {
     #                 'variadic argument unlocalizable due to unlocalized non-variadic arguments; consider either prefixing such variadic argument name by "`" or removing such prefix from all non-variadic argument names'
 
     #             # Localize such variadic argument.
-    #             ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC}
+    #             ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${ZY__FUNC_ARG_CODE_VARIADIC}
     #         }
 
     #         # If such function accepts at least one optional argument and hence
     #         # prefixed such validation by an if conditional, end such conditional.
     #         if (( args_is_optional )) {
-    #             ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${code_indent_outer}'}'
+    #             ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${code_indent_outer}'}'
     #         }
     #     }
     # }
@@ -2986,7 +3117,7 @@ function ::func_.stop() {
 
     # String expanded at the start of such function's body, thus localizing and
     # validing arguments *BEFORE* all user-defined logic.
-    # ZY__FUNC_PREAMBLE+=${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID}
+    # ZY__FUNC_PREAMBLE+=${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE}
 
     #FUXME: For a similar reason, we don't actually need a separate string
     #local ${code_arg_count} either. Instead, append ${ZY__FUNC_PREAMBLE} directly.
@@ -3016,7 +3147,7 @@ function ::func_.stop() {
         # such code should *ALWAYS* prefixes such function preamble,
                 #FUXME: Implement me. To do so sanely:
                 #
-                #* Declare new string local ${ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC} above.
+                #* Declare new string local ${ZY__FUNC_ARG_CODE_VARIADIC} above.
                 #* Clear such string each argument count iteration.
                 #* Since there exists at most one variadic argument each
                 #  such iteration, set such string in the conditional branch
@@ -3040,16 +3171,16 @@ function ::func_.stop() {
         #FUXME: Such test does work, but is becoming increasingly fragile,
         #inefficient, and cumbersome. It may be preferable, at some point, to:
         #
-        #* Declare a new string local ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT}.
+        #* Declare a new string local ${ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE}.
         #* Reset such string to the empty string each argument count iteration.
         #* Append localization and validation code to such string (rather than
-        #  ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID}).
-        #* If ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT} (after all such possible
-        #  appendings) is nonempty, append ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID} by (in
+        #  ${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE}).
+        #* If ${ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE} (after all such possible
+        #  appendings) is nonempty, append ${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE} by (in
         #  order):
         #  * An if conditional branch testing the current argument code (as
         #    below).
-        #  * ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT}.
+        #  * ${ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE}.
         #  * Code delimiting such branch.
         #
         #Note this also eliminates the need for one of the "if ((
@@ -3057,10 +3188,10 @@ function ::func_.stop() {
         #somewhat more streamlined code.
 
                 # Indent the following if conditional.
-                # ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${code_indent_outer}
+                # ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${code_indent_outer}
 
                     # if (( arg_count_after_default > ZY__FUNC_ARG_COUNT_MIN )) {
-                    #     ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=' el'
+                    #     ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=' el'
                     # } else {
                     #     ${code_indent_outer}
                     # }
@@ -3073,16 +3204,16 @@ function ::func_.stop() {
             # and hence .
 
                     # if (( arg_count_after_default == ZY__FUNC_ARG_COUNT_MIN )) {
-                    #     ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+='if (( # == '${arg_count_after_default}' ))'
+                    #     ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+='if (( # == '${arg_count_after_default}' ))'
                     # # Else, extend such if conditional in a similar manner.
                     # } else {
-                    #     ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID_CURRENT+=' elif (( # == '${arg_count_after_default}' ))'
+                    #     ZY__FUNC_ARG_CODE_VALIDATE_LOCALIZE+=' elif (( # == '${arg_count_after_default}' ))'
                     # }
 
 #Avoid delimiting such conditional yet, as
                     # subsequent logic may interpose additional tests.
                     # Terminate the current branch of such if conditional.
-                    # ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=' {'
+                    # ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=' {'
 
                     #FUXME: If some such argument is variadic *AND* passed, we
                     #need to emit code *HERE* popping all prior non-variadic
@@ -3123,12 +3254,12 @@ function ::func_.stop() {
                         # # If such argument is the second argument, remove the
                         # # first argument. See shift_arg() for further details.
                         # if (( ZY__FUNC_ARG_INDEX == 2 )) {
-                        #     ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${code_indent_inner}'argv[1]=()'
+                        #     ZY__FUNC_ARG_CODE_VARIADIC+=${code_indent_inner}'argv[1]=()'
                         # # Else, such argument follows the second argument.
                         # # Remove all prior arguments with ranged indices. See
                         # # shift_args_2() for further details.
                         # } else {
-                        #     ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC+=${code_indent_inner}'argv[-1]=()'
+                        #     ZY__FUNC_ARG_CODE_VARIADIC+=${code_indent_inner}'argv[-1]=()'
                         # }
 
                 # As an absurdly minor optimization, only do so if there exists 
@@ -3151,16 +3282,16 @@ function ::func_.stop() {
 
                 #FUXME: Close, but no e-cigar. While this test is appropriate,
                 #we need an "} else {" branch whose body is *IDENTICAL* to that
-                #of the "} elif (( arg_is_absentable )) {" branch below.
+                #of the "} elif (( arg_is_optional )) {" branch below.
                 #Clearly, the two should be unified. The simplest way is
                 #probably as follows:
                 #
                 #} else {
-                #    arg_is_absentable=1
+                #    arg_is_optional=1
                 #}
                 #
-                #Then, convert such "} elif (( arg_is_absentable )) {" branch
-                #to a new "if (( arg_is_absentable )) {" conditional.
+                #Then, convert such "} elif (( arg_is_optional )) {" branch
+                #to a new "if (( arg_is_optional )) {" conditional.
                 #FUXME: Actually, there's little impactful point to such
                 #complexity; just concoct an "} else {" branch here resembling:
                 #
@@ -3177,21 +3308,21 @@ function ::func_.stop() {
             # optional, as we further munge such index below.
 
             #FUXME: Since these two cases no longer share any code (aside from
-            #the easly replicable line "ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED+=-1"), split them
+            #the easly replicable line "ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED+=-1"), split them
             #here into two top-level if conditional branches. Yay!
             #FUXME: Obsolete. See above!
 
-            # # If such argument is either absentable or defaultable, such
+            # # If such argument is either optional or defaultable, such
             # # argument is optional. Note such fact.
-            # if (( arg_is_absentable + ${#arg_default_value} )) {
+            # if (( arg_is_optional + ${#arg_default_value} )) {
             #     # If the current argument count supports at least one more
             #     # optional argument, such argument has been passed.
-            #     if (( ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED )) {
+            #     if (( ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED )) {
             #         # Decrement the current optional argument count, implying such
             #         # count to subsequently support one less optional argument.
             #         # (The current optional argument "consumes" one of the
             #         # available optional argument "slots" permitted by such count.)
-            #         ZY__FUNC_ARG_COUNT_CUR_UNOPTIONED+=-1
+            #         ZY__FUNC_ARG_COUNT_CUR_OPTIONAL_PASSED+=-1
             #     #FUXME: Compact the following two conditional branches.
 
             #     # Else the current argument count supports no additional
@@ -3234,22 +3365,22 @@ function ::func_.stop() {
             #             #    #     :int a, :int b, :int c)
             #             #    # ...we might want a preamble containing:
             #             #    if (( # == 6 )) {
-            #             #        ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+='argv=( '${arg_default_value_x}' "${@[1,3]}" "${arg_default_value_y}" "${@[4,6]}" )'
+            #             #        ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+='argv=( '${arg_default_value_x}' "${@[1,3]}" "${arg_default_value_y}" "${@[4,6]}" )'
             #             #    } elif (( # == 7 )) {
-            #             #        ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+='argv[4]+="${arg_default_value_y}"
+            #             #        ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+='argv[4]+="${arg_default_value_y}"
             #             #    }
             #             #
             #             #Brutal. There's clearly a way to identify and handle
             #             #such cases; now, we just have to doctor it up.
             #             #FUXME: O.K.; to reasonably implement this, we'll want
             #             #a new string local ${code_args_default} to which we
-            #             #append here rather than to ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID}.
+            #             #append here rather than to ${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE}.
             #             #Ensure that we:
             #             #
             #             #* Reset 'code_args_default=' each loop iteration.
             #             #* Test '[[ -n "${code_args_default}" ]]' far below; if
             #             #  such test succeeds, then and only then append
-            #             #  ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID} by ${code_args_default}.
+            #             #  ${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE} by ${code_args_default}.
             #             #  As the above example demonstrates, we test for the
             #             #  current argument count exactly. We do *NOT* need an
             #             #  "else" branch (indeed, that would be quite
@@ -3278,7 +3409,7 @@ function ::func_.stop() {
             #             # If such argument is also variadic, ...
             #             if (( ZY__FUNC_ARG_IS_VARIADIC )) {
             #                 # Initiate such conditional.
-            #                 ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${code_indent_outer}'if (( # == '${ZY__FUNC_ARG_COUNT_CUR}' )) {'${code_indent_inner}
+            #                 ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${code_indent_outer}'if (( # == '${ZY__FUNC_ARG_COUNT_CUR}' )) {'${code_indent_inner}
 
             #                 # If such argument is the last explicit argument
             #                 # such function accepts (ignoring all subsequent
@@ -3308,15 +3439,15 @@ function ::func_.stop() {
             #                 }
 
             #                 # Terminate such conditional.
-            #                 ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${code_indent_outer}'}'
+            #                 ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${code_indent_outer}'}'
             #             }
 
             #             # Expand such argument after such assignment by name.
             #             ZY__FUNC_ARG_PARAM=${ZY__FUNC_ARG_NAME}
             #         # Else such argument is *NOT* defaultable. Since prior
             #         # conditionals guarantee such argument to be unpassed and
-            #         # either absentable *OR* defaultable, such argument is
-            #         # unpassed and absentable, suggesting such argument to not
+            #         # either optional *OR* defaultable, such argument is
+            #         # unpassed and optional, suggesting such argument to not
             #         # exist and hence be neither localizable or validatable. To
             #         # guarantee this, skip to the next argument entirely.
             #         } else {
@@ -3414,7 +3545,7 @@ function ::func_.stop() {
                     # current function call accepts default arguments.
                     # if (( ${#args_is_defaultable_tester} &&\
                     #       ${#args_definitions_default} )) {
-                    #     ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=' { '${args_is_defaultable_tester}' }'
+                    #     ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=' { '${args_is_defaultable_tester}' }'
                     # }
 
             #FUXME: Incorporate ${args_is_defaultable_tester} logic from below.
@@ -3438,7 +3569,7 @@ function ::func_.stop() {
         #FUXME: The current test is insufficient. Specifically, this:
         #    if (( ${#ZY__FUNC_ARG_DECLARER_TO_DECLARATIONS} +\
         #          ${#ZY__FUNC_ARG_TESTER_TO_EXPANSIONS} )) {
-        #...should also include a test of "+ ${#ZY__FUNC_CODE_ARGS_LOCAL_VARIADIC}" or
+        #...should also include a test of "+ ${#ZY__FUNC_ARG_CODE_VARIADIC}" or
         #some such. *yawn morosely*
 
     #FUXME: Actually, stripping a prefixing newline should no longer be
@@ -3458,7 +3589,7 @@ function ::func_.stop() {
     # # such newline has two possible sources (either ${code_args_default} or
     # # ${code_arg_count}, depending on whether at least one unpassed argument is
     # # defaulted) and hence is non-trivially removable. This is much simpler.
-    # ZY__FUNC_PREAMBLE=${${:-${code_args_default}${code_arg_count}${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID}}#$'\n'}
+    # ZY__FUNC_PREAMBLE=${${:-${code_args_default}${code_arg_count}${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE}}#$'\n'}
 
             # # If defaulting at least one argument for a prior argument count,
             # # there already exists an if conditional doing so. In such case,
@@ -3495,7 +3626,7 @@ function ::func_.stop() {
                         # # unpassed variadic list a default value is feasible,
                         # # doing so imposes hitherto unaddressed complexities;
                         # # given the conditional logic below, we would need to
-                        # # prepend ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID} with an
+                        # # prepend ${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE} with an
                         # # additional if conditional (probably with only a
                         # # single branch) testing whether 
                         # #
@@ -3518,7 +3649,7 @@ function ::func_.stop() {
 
                     # If a prior argument is variadic, throw an exception. Note
                     # we ignore the valid case that the current argument is
-                    # both variadic and absentable (e.g., ":int arg1?, ...").
+                    # both variadic and optional (e.g., ":int arg1?, ...").
                     # (( ! ZY__FUNC_ARG_WAS_VARIADIC )) ||
                     #     ::func.die_of_arg_variadic\
                     #         'accepts both optional and variadic arguments'
@@ -3549,7 +3680,7 @@ function ::func_.stop() {
     #         # If such argument was optional and/or variadic, notify subsequent
     #         # parse iterations of such fact. For safety, set such boolean
     #         # *AFTER* all tests of such boolean above.
-    #         if (( arg_is_absentable + arg_is_defaultable )) {
+    #         if (( arg_is_optional + arg_is_defaultable )) {
     #             arg_was_optional=1
     #         }
 
@@ -3584,7 +3715,7 @@ function ::func_.stop() {
             #FUXME: Due to the "! ZY__FUNC_ARG_IS_VARIADIC" constraint below, this is
             #probably shiftable into the prior conditional, no?
             #FUXME: Actually, even this condition isn't *QUITE* sufficient. We
-            #also want to avoid localizing unpassed absentable arguments, for
+            #also want to avoid localizing unpassed optional arguments, for
             #obvious reasons (e.g., to ensure unpassed arguments are
             #distinguishable from the empty string, 0, and 0.0). This probably
             #ties into our currently erroneous use of "continue" above; oh,
@@ -3595,7 +3726,7 @@ function ::func_.stop() {
                         #FUXME: And another subtle point: after implementing
                         #such conditional logic, the size of the current
                         #argument list is increased by 1 for each defaulted
-                        #argument, implying that the ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID}-
+                        #argument, implying that the ${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE}-
                         #based conditional below will be testing the wrong
                         #argument count. Happily, this is easily correctable by
                         #maintaining a new argument count incremented by 1 here
@@ -3606,7 +3737,7 @@ function ::func_.stop() {
                         #FUXME: The right idea; however, we need to be doing
                         #just the *OPPOSITE*. If the current argument is both
                         #unpassed *AND* undefaulted (which can occur due to any
-                        #number of root causes, such as being absentable *OR*
+                        #number of root causes, such as being optional *OR*
                         #being relaxedly defaultable), we need to:
                         # arg_count_after_default-=1
 
@@ -3649,7 +3780,7 @@ function ::func_.stop() {
 
             # Assign unpassed defaultable arguments default values *BEFORE*
             # subsequent iteration validates such arguments.
-            # ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID+=${args_definitions_default}
+            # ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE+=${args_definitions_default}
 
     #FUXME: Improve commentary.
 
@@ -3697,7 +3828,7 @@ function ::func_.stop() {
                         #Specifically:
                         #
                         #* If such defaultable argument is also variadic,
-                        #  prepend ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID} with an
+                        #  prepend ${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE} with an
                         #  additional if conditional (probably with only a
                         #  single branch) testing whether such argument was
                         #  passed or not.
@@ -3738,7 +3869,7 @@ function ::func_.stop() {
 
                         #FUXME: While such code does appear to work here, would
                         #it not be more logically consistent to shift it below
-                        #where we append to ${ZY__FUNC_CODE_ARGS_LOCAL_OR_VALID}
+                        #where we append to ${ZY__FUNC_ARGS_CODE_VALIDATE_LOCALIZE}
                         #en-masse? Hmm; certainly not, as we require the index
                         #of such argument. Note this below.
 
