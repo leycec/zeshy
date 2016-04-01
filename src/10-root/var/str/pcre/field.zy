@@ -1,0 +1,777 @@
+#!/usr/bin/env zeshy
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2016 by Cecil Curry.
+# See "LICENSE" for additional details.
+
+:parcel <<'/---'
+*PCRE-matched fields* (i.e., substring-separated substrings on a line matched
+with PCRE or PCRE character classes).
+/---
+
+# ....................{ SETTERS                            }....................
+#FIXME: Excise the fourth passed argument. Fixup documentation and
+#implementation, which should now defer to
+#for_string_line_fields_split_on_whitespace().
+
+:func.doc <<'/---'
+string set_list_to_string_column(
+    string list_name,
+    string text,
+    int column_index,
+    char column_separator_class = "[:space:]")
+
+Set the passed list to the column with the passed 1-based index delimited by one
+or more characters of the passed `zsh`-specific character class (defaulting to
+"[:space:]", matching all whitespace characters) from the passed string, split on
+newlines. For efficiency, this function leverages character classes rather than
+globs or PCREs. See subsection ``Glob Operators'' of `man zshexpn` for details on
+such classes: e.g.,
+
+.set_list_to_string_column()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_growth="
+...     Capitalist society, however,
+...     can only survive
+...     by defying the
+...     laws of thermodynamics,
+...     through endlessly expanding
+...     growth, buying and
+...     using more of
+...     everything, every year
+...     and forever."
+>>> list zombie_food_court
+>>> set_list_to_string_column zombie_food_court "${on_growth}" 2
+>>> :stdout.echo "${zombie_food_court[@]}"
+society, only defying of endlessly buying more every forever.
+------------------------------------------
+==========================================
+
+If requiring more than one column, consider calling
+for_string_text_matching_pcre_multiline:(), whose generality is ideal for such tasks.
+/---
+function set_list_to_string_column() {
+    # Validate sanity, splitting such string on lines.
+    die_unless_args_3_or_4\
+        'Expected one list name, one string, one column index, and optional column separator.'
+    :str\
+        list_name__sltsc="${1}"\
+        text__sltsc="${2}"\
+        column_index__sltsc="${3}"\
+        column_separator_class__sltsc="${4:-[:space:]}"\
+        glob_columns_prior__sltsc\
+        glob_column__sltsc
+    :list lines__sltsc
+    :List.die_unless "${list_name__sltsc}"
+    :int.die_unless_positive "${column_index__sltsc}"
+    die_unless_string_nonempty "${column_separator_class__sltsc}"\
+        'Expected nonempty column separator class.'
+
+    # Glob expression matching all columns preceding the desired column. If the
+    # desired column is the first column, this is the empty string; otherwise,
+    # this is:
+    #
+    # * "[^${column_separator}]#", matching zero or more non-column separator
+    #   characters.
+    # * "([${column_separator}]##|(#e))", matching one or more column separator
+    #   characters or newline, whichever appears first.
+    # * "(#c$(( column_index - 1 )))", matching all columns up to but not
+    #   including the desired column.
+    if (( column_index__sltsc >= 2 )) {
+        glob_columns_prior="([^${ZY_ASCII_NEWLINE}${column_separator_class__sltsc}]#([${column_separator_class__sltsc}]##|(#e)))(#c$(( column_index__sltsc - 1 )))"
+    }
+
+    # Glob expression matching the desired column. Dismantled, this is:
+    #
+    # * "(#b)", enabling back references (i.e., match groups) for all
+    #   subsequent groups. Do this as late as possible to avoid capturing
+    #   columns preceding such column.
+    glob_column__sltsc="(#b)([^${ZY_ASCII_NEWLINE}${column_separator_class__sltsc}]#)([${column_separator_class__sltsc}]|(#e))"
+
+    # Split such string on newlines.
+    set_list_to_string_lines lines__sltsc "${text__sltsc}"
+
+    #FIXME: Does such expansion really *NOT* require double quotes?
+    # Set such list.
+    eval ${list_name__sltsc}'=(
+        ${lines__sltsc/${~glob_columns_prior__sltsc}${~glob_column__sltsc}*/${match[1]}}
+    )'
+}
+
+# ....................{ ITERATORS ~ class                  }....................
+:func.doc <<'/---'
+string for_string_line_fields_split_on_pcre_class(
+    string text,
+    string field_list_name = "field",
+    string remainder_string_name = "REMAINDER",
+    string field_separator_pcre_class,
+    string code)
+
+Run the passed code for each line of the passed string, capturing each field
+of such line into an element of the passed local list variable (defaulting to
+${field}) and the remainder of such line _not_ matching a valid field into the
+passed local string variable (defaulting to ${REMAINDER}). Fields are longest
+substrings _not_ matching the passed PCRE character class suffixed by either
+substrings matching such class or newlines. Such class must neither match
+newlines (e.g., `[:blank:]` rather than `[:space:]`) or be delimited by
+extraneous `[` and `]` (e.g., `a-zA-Z0-9` rather than `[a-zA-Z0-9]` and
+`[:punct:]` rather than `[[:punct:]]`).
+
+Each line may contain arbitrarily many fields. If each line contains at
+most a certain number of fields, consider calling the more efficient
+for_string_line_fields_in_range_split_on_pcre_class() instead. See
+for_string_line_fields_split_on_pcre_field_and_separator() for further details:
+e.g.,
+
+.for_string_line_fields_split_on_pcre_class()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_family=\
+...    "From the standpoint of social development, the family cannot be
+...     considered the basis of the authoritarian state, only as one of the most
+...     important institutions which support it. It is, however, its central
+...     reactionary germ cell, the most important place of reproduction of the
+...     reactionary and conservative individual. Being itself caused by the
+...     authoritarian system, the family becomes the most important institution
+...     for its conservation."
+>>> for_string_line_fields_split_on_pcre_class\
+...     "${on_family}" '[^[:space:]]++' '[[:blank:]]++'\
+...     ':stdout.echo "${match[3]}"'
+standpoint
+basis
+which
+cell,
+conservative
+the
+conservation.
+------------------------------------------
+==========================================
+/---
+function for_string_line_fields_split_on_pcre_class() {
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with for_string_line_fields_in_range_split_on_pcre_class().
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Validate sanity.
+    die_unless_args_3_to_5\
+        'Expected one string, optional fields list name, optional remainder string name, one PCRE character class, and one command.'
+    :str\
+        class_field_separator__fslfsopc="${@[-2]}"\
+        command__fslfsopc="${@[-1]}"\
+        pcre_field pcre_field_separator
+    die_unless_string_nonempty "${class_field_separator__fslfsopc}"\
+        'Expected nonempty field separator PCRE character class.'
+    pop_args_2
+
+    # PCRE capturing a field. Dismantled, this is:
+    #
+    # * "([^...]*+)", possessively capturing a longest (possibly empty)
+    #   substring of characters *NOT* in such class as the next field.
+    #   Possessive matching is simply greedy matching with backtracking
+    #   disabled, improving efficiency where not requiring backtracking. This is
+    #   usually the case where matching longest substrings of characters. Prefix
+    #   such negation with "\n" to avoid matching newlines.
+    pcre_field__fslfsopc="([^\n${class_field_separator__fslfsopc}]*+)"
+
+    # PCRE capturing a field separator. Dismantled, this is:
+    #
+    # * "([...]++)", possessively matching a longest nonempty substring of
+    #   characters in such class as the separator for the prior field.
+    pcre_field_separator__fslfsopc="[${class_field_separator__fslfsopc}]++"
+
+    # Iterate such matches.
+    for_string_line_fields_split_on_pcre_field_and_separator\
+        "${@}"\
+        "${pcre_field__fslfsopc}"\
+        "${pcre_field_separator__fslfsopc}"\
+        "${command__fslfsopc}"
+}
+
+:func.doc <<'/---'
+string for_string_line_fields_in_range_split_on_pcre_class(
+    string text,
+    int minimum_field_count,
+    int maximum_field_count,
+    string field_separator_pcre_class,
+    string command)
+
+Run the passed command for each line of the passed string, capturing such line
+into string global ${MATCH} and each field of such line into an element of list
+global ${match}. Fields are longest substrings _not_ matching the passed PCRE
+character class suffixed by either substrings matching such class or newlines.
+Such class must neither match newlines (e.g., `[:blank:]` rather than
+`[:space:]`) or be delimited by extraneous `[` and `]` (e.g., `a-zA-Z0-9` rather
+than `[a-zA-Z0-9]` and `[:punct:]` rather than `[[:punct:]]`).
+
+Each line must contain at least the passed minimum number of fields and at most
+the passed maximum number of fields. See
+for_string_line_fields_in_range_split_on_pcre_field_and_separator() for further
+details: e.g.,
+
+.for_string_line_fields_in_range_split_on_pcre_class()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_surveillance="
+...     Wherever you go, whatever you do, whoever you are, you are under
+...     surveillance. Because you are a potential criminal, perhaps you secretly
+...     doubt the sanctity of corporate property, or the validity of laws made
+...     by the rich to govern the poor, or the soundness of capitalism itself –
+...     we can't afford to assume you don't. That's why there are video cameras
+...     pointing at every cashier and police cars circling every block. Left to
+...     itself, a state of disorder and inequity returns to equilibrium; our job
+...     is to perpetuate this one indefinitely."
+>>> for_string_line_fields_in_range_split_on_pcre_class\
+...     "${on_surveillance}" 1 4 '.,;' ':stdout.echo "${match[1]}"'
+Wherever you go
+surveillance
+doubt the sanctity of corporate property
+by the rich to govern the poor
+we can't afford to assume you don't
+pointing at every cashier and police cars circling every block
+itself
+is to perpetuate this one indefinitely
+------------------------------------------
+==========================================
+/---
+function for_string_line_fields_in_range_split_on_pcre_class() {
+    # See for_string_line_fields_split_on_pcre_class() for further details.
+    die_unless_args_5\
+        'Expected one string, one minimum integer, one maximum integer, one PCRE character class, and one command.'
+    :str\
+        class_field_separator__fslfirsopc="${4}"\
+        pcre_field__fslfirsopc\
+        pcre_field_separator__fslfirsopc
+    die_unless_string_nonempty "${class_field_separator__fslfirsopc}"\
+        'Expected nonempty field separator PCRE character class.'
+    pcre_field="([^\n${class_field_separator__fslfirsopc}]*+)"
+    pcre_field_separator="[${class_field_separator__fslfirsopc}]++"
+    for_string_line_fields_in_range_split_on_pcre_field_and_separator\
+        "${@[1,3]}"\
+        "${pcre_field__fslfirsopc}"\
+        "${pcre_field_separator__fslfirsopc}"\
+        "${5}"
+}
+
+# ....................{ ITERATORS ~ pcre                   }....................
+:func.doc <<'/---'
+string for_string_line_fields_split_on_pcre(
+    string text,
+    string field_list_name = "field",
+    string remainder_string_name = "REMAINDER",
+    string field_separator_pcre,
+    string command)
+
+Run the passed command for each line of the passed string, capturing each field
+of such line into an element of the passed local list variable (defaulting to
+${field}) and the remainder of such line _not_ matching a valid field into the
+passed local string variable (defaulting to ${REMAINDER}). Fields are longest
+substrings _not_ matching the passed PCRE suffixed by either substrings matching
+such PCRE or newlines. Such PCRE must _not_ match newlines (e.g., `[:blank:]`
+rather than `[:space:]`).
+
+Each line may contain arbitrarily many fields. If each line contains at
+most a certain number of fields, consider calling the more efficient
+for_string_line_fields_in_range_split_on_pcre() instead. See
+for_string_line_fields_split_on_pcre_field_and_separator() for further details:
+e.g.,
+
+.for_string_line_fields_split_on_pcre()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_laws=\
+...    'One may well ask: "How can you advocate breaking some laws and obeying
+...     others?" The answer lies in the fact that there are two types of laws:
+...     just and unjust. I would be the first to advocate obeying just laws. One
+...     has not only a legal, but a moral, responsibility to obey just laws.
+...     Conversely, one has a moral responsibility to disobey unjust laws. I
+...     would agree with St. Augustine that "an unjust law is no law at all.".'
+>>> for_string_line_fields_split_on_pcre\
+...     "${on_laws}" '[^[:space:]]++' '[[:blank:]]++'\
+...     ':stdout.echo "${field[5]}"'
+"How
+in
+would
+legal
+moral
+Augustine
+------------------------------------------
+==========================================
+/---
+function for_string_line_fields_split_on_pcre() {
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # Synchronize with for_string_line_fields_in_range_split_on_pcre().
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    # Validate sanity.
+    die_unless_args_3_to_5\
+        'Expected one string, optional fields list name, optional remainder string name, one PCRE, and one command.'
+    :str\
+        pcre_field_separator__fslfsopc="${@[-2]}"\
+        command__fslfsopc="${@[-1]}"\
+        pcre_field__fslfsopc
+    die_unless_string_nonempty "${pcre_field_separator__fslfsopc}"\
+        'Expected nonempty field separator PCRE.'
+    pop_args_2
+
+    # PCRE capturing a field. The "?" guarantees a non-greedy and hence
+    # shortest possible match preceding the subsequent field separator.
+    pcre_field__fslfsopc="(.*?)"
+
+    # Iterate such matches.
+    for_string_line_fields_split_on_pcre_field_and_separator\
+        "${@}"\
+        "${pcre_field__fslfsopc}"\
+        "${pcre_field_separator__fslfsopc}"\
+        "${command__fslfsopc}"
+}
+
+:func.doc <<'/---'
+string for_string_line_fields_in_range_split_on_pcre(
+    string text,
+    int minimum_field_count,
+    int maximum_field_count,
+    string field_separator_pcre,
+    string command)
+
+Run the passed command for each line of the passed string, capturing such line
+into string global ${MATCH} and each field of such line into an element of list
+global ${match}. Fields are longest substrings _not_ matching the passed PCRE
+suffixed by either substrings matching such PCRE or newlines. Such PCRE must
+_not_ match newlines (e.g., `[:blank:]` rather than `[:space:]`).
+
+Each line must contain at least the passed minimum number of fields and at most
+the passed maximum number of fields. See
+for_string_line_fields_in_range_split_on_pcre_field_and_separator() for further
+details: e.g.,
+
+.for_string_line_fields_in_range_split_on_pcre()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_freedom=\
+...    'If "freedom" means, first of all, the responsibility of every
+...     individual for the rational determination of his own personal,
+...     professional and social existence, then there is no greater fear than
+...     that of the establishment of general freedom.'
+>>> for_string_line_fields_in_range_split_on_pcre\
+...     "${on_freedom}" 7 11 '[[:blank:]]++' ':stdout.echo "${match[4]}"'
+first
+rational
+existence,
+establishment
+------------------------------------------
+==========================================
+/---
+function for_string_line_fields_in_range_split_on_pcre() {
+    # See for_string_line_fields_split_on_pcre() for further details.
+    die_unless_args_5\
+        'Expected one string, one minimum integer, one maximum integer, one PCRE, and one command.'
+    :str pcre_field_separator__fslfirsopc="${4}" pcre_field__fslfirsopc
+    die_unless_string_nonempty "${pcre_field_separator__fslfirsopc}"\
+        'Expected nonempty field separator PCRE.'
+    pcre_field__fslfirsopc="(.*?)"
+    for_string_line_fields_in_range_split_on_pcre_field_and_separator\
+        "${@[1,3]}"\
+        "${pcre_field__fslfirsopc}"\
+        "${pcre_field_separator__fslfirsopc}"\
+        "${5}"
+}
+
+# ....................{ ITERATORS ~ pcres                  }....................
+:func.doc <<'/---'
+string for_string_line_fields_split_on_pcre_field_and_separator(
+    string text,
+    string field_list_name = "field",
+    string remainder_string_name = "REMAINDER",
+    string field_pcre,
+    string field_separator_pcre,
+    string command)
+
+Run the passed command for each line of the passed string, capturing each field
+of such line into an element of the passed local list variable (defaulting to
+${field}) and the remainder of such line _not_ matching a valid field into the
+passed local string variable (defaulting to ${REMAINDER}). Lines for which such
+remainder is empty are *well-formed* and is nonempty are *malformed*.
+
+A *field* is:
+
+* A longest substring matching the first passed PCRE (e.g., `[^[:space:]]++`,
+  matching substrings of nonempty nonwhitespace as fields).
+* Suffixed by a *field separator* consisting of either:
+** A substring matching the second passed PCRE (e.g., `[[:blank:]]++`, matching
+   nonempty whitespace as field separators).
+** A newline, in the case of the last field.
+
+The caller _must_ ensure that neither such PCRE matches a newline. Hence, the
+choice of PCREs `[^[:space:]]++` and `[[:blank:]]++` (which do _not_ match
+newlines) instead of `[^[:blank:]]++` and `[[:space:]]++` (which both match
+newlines) in the above examples.
+
+Each line may contain arbitrarily many fields. Each non-blank line contains at
+least one field. Each blank line contains either one or no fields, depending on
+whether the first passed PCRE matches the empty string. If each line contains at
+most a certain number of fields, consider calling the more efficient alternative
+for_string_line_fields_in_range_split_on_pcre_field_and_separator() instead.
+See such function for further details.
+
+This function offers a pure-`zsh` alternative to conventional field processors,
+including `awk` and cohorts (e.g., `gawk`, `nawk`): e.g.,
+
+.for_string_line_fields_split_on_pcre_field_and_separator()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_nonconformity=\
+...    "The hope of a secure and livable world lies with disciplined
+...     nonconformists, who are dedicated to justice, peace, and brotherhood.
+...     The trailblazers in human, academic, scientific, and religious freedom
+...     have always been nonconformists. In any cause that concerns the progress
+...     of mankind, put your faith in the nonconformist!"
+>>> for_string_line_fields_split_on_pcre_field_and_separator\
+...     "${on_nonconformity}" '[^[:space:]]++' '[[:blank:]]++'\
+...     'is_string_empty "${REMAINDER}" and :stdout.echo "${field[2]}"'
+hope
+who
+trailblazers
+always
+mankind,
+------------------------------------------
+==========================================
+/---
+function for_string_line_fields_split_on_pcre_field_and_separator() {
+    # Validate sanity.
+    die_unless_args_4_to_6\
+        'Expected one string, optional field list name, optional remainder string name, one field PCRE, one field separator PCRE, and one command.'
+    :str\
+        text__fslfsopfas\
+        field_list_name__fslfsopfas='field'\
+        remainder_string_name__fslfsopfas='REMAINDER'\
+        pcre_field__fslfsopfas="${@[-3]}"\
+        pcre_field_separator__fslfsopfas="${@[-2]}"\
+        command__fslfsopfas="${@[-1]}"\
+        pcre_field_separated__fslfsopfas
+    is_args_5_to_6 and field_list_name__fslfsopfas="${2}"
+    is_args_6 and remainder_string_name__fslfsopfas="${3}"
+    :die_unless_var_names\
+        "${field_list_name__fslfsopfas}" "${remainder_string_name__fslfsopfas}"
+    die_unless_string_nonempty "${pcre_field__fslfsopfas}"\
+        'Expected nonempty field PCRE.'
+    die_unless_string_nonempty "${pcre_field_separator__fslfsopfas}"\
+        'Expected nonempty field separator PCRE.'
+    die_unless_string_nonempty "${command__fslfsopfas}"\
+        'Expected nonempty command.'
+
+    #FIXME: Generalize into an exception handler :die_if_string_matches_pcre().
+
+    # If either such PCRE matches a newline, throw an exception.
+    if is "${ZY_ASCII_NEWLINE}" =~ "${pcre_field__fslfsopfas}" si {
+        :die "Field PCRE \"${pcre_field__fslfsopfas}\" matches newlines."
+    }
+    if is "${ZY_ASCII_NEWLINE}" =~ "${pcre_field_separator__fslfsopfas}" si {
+        :die "Field separator PCRE \"${pcre_field_separator__fslfsopfas}\" matches newlines."
+    }
+
+    # If such field PCRE is *NOT* parenthesized, do so.
+    if is "${pcre_field__fslfsopfas}" != '('*')' si {
+        pcre_field="(${pcre_field__fslfsopfas})"
+    }
+
+    # If such field separator PCRE is parenthesized, throw an exception.
+    if is "${pcre_field_separator__fslfsopfas}" == '('*')' si {
+        :die "Field separator PCRE \"${pcre_field_separator__fslfsopfas}\" parenthesized."
+    }
+
+    # Append a newline to such string, ensuring the PCRE constructed below
+    # matches the last line identically to previous lines.
+    text__fslfsopfas="${1}${ZY_ASCII_NEWLINE}"
+
+    # PCRE matching either:
+    #
+    # * A field consisting of:
+    #   * A nonempty field, captured into ${match[1]}.
+    #   * Suffixed by either the end of the string or current line or a nonempty
+    #     field separator, captured into ${match[2]}.
+    # * The end of the current line consisting of:
+    #   * A malformed remainder, captured into ${match[3]}.
+    #   * A newline, captured into ${match[4]}.
+    #
+    # Multiline PCREs are typically anchored against both the end of the string
+    # and end of each string line with a "$" suffix. However, "$" is a zero-
+    # width assertion; since capturing such assertion would only yield the
+    # empty string, such assertion cannot be captured to programmatically detect
+    # the end of each string line (e.g., by testing ${match[3]} for non-
+    # emptiness). Since the while loop below runs the passed command on matching
+    # the end of the current line and hence all fields in such line, this PCRE
+    # matches newlines explicitly. Assuming the passed PCREs to never similarly
+    # match newlines, ${match[3]} is nonempty only at the end of each line.
+    pcre_field_separated__fslfsopfas="$(convert_string_to_pcre_multiline\
+        "(?:${pcre_field}(\n|${pcre_field_separator})|(.*)(\n))"))"
+
+    # Human-readable indices of the match groups captured above.
+    :int\
+        field__fslfsopfas=1\
+        field_separator__fslfsopfas=2\
+        remainder__fslfsopfas=3\
+        newline__fslfsopfas=4
+
+    # Compile such PCRE.
+    pcre_compile -- "${pcre_field_separated__fslfsopfas}"
+    pcre_study
+
+    # Current list of fields.
+    :list ${field_list_name__fslfsopfas}
+
+    # Current field remainder.
+    :str ${remainder_string_name__fslfsopfas}
+
+    # Current match position.
+    :str ZPCRE_OP
+
+    # Localize string and list match globals.
+    :str MATCH
+    :list   match
+
+    # Iterate such matches. See for_matches_pcre() for further details.
+    eval 'while { pcre_match -b -n ${ZPCRE_OP[(w)2]} -- "${text__fslfsopfas}" } {
+        # If a field matched, append such field to the current list. Test for
+        # extent fields by the nonemptiness of the field separator (i.e.,
+        # ${match[2]}) rather than the field (i.e., ${match[1]}); fields may
+        # be empty but field separators are always nonempty. (After all, what
+        # would separation by the empty string even mean?)
+        if is -n "${match[${field_separator__fslfsopfas}]}" si {
+            # Append such field.
+            '${field_list_name__fslfsopfas}'+="${match[${field__fslfsopfas}]}"
+
+            # If such field is suffixed by a newline, set ${match[3]} to inform
+            # the conditional below of the end of the current line.
+            is  "${match[${field_separator__fslfsopfas}]}" ==\
+                "${ZY_ASCII_NEWLINE}" si and match['${newline__fslfsopfas}']=1
+        }
+
+        # If a newline matched, this is the end of the current line. Run such
+        # command with the current field list and remainder.
+        if is -n "${match['${newline__fslfsopfas}']}" si {
+            # Set such remainder.
+            '${remainder_string_name__fslfsopfas}'="${match['${remainder__fslfsopfas}']}"
+
+            # Run such command.
+            '${command__fslfsopfas}'
+
+            # Clear such list, in preparation for the next line.
+            '${field_list_name__fslfsopfas}'=()
+        }
+    }'
+}
+
+#FIXME: There's absolutely *NO* way this has been properly unit-tested. We
+#noted numerous superficial errors in its implementation already. Test! Test!
+
+:func.doc <<'/---'
+string for_string_line_fields_in_range_split_on_pcre_field_and_separator(
+    string text,
+    int minimum_field_count,
+    int maximum_field_count,
+    string field_pcre,
+    string field_separator_pcre,
+    string command)
+
+Run the passed command for each line of the passed string, capturing such line
+into string global ${MATCH} and each field of such line into an element of list
+global ${match}. Each line must contain at least the passed minimum number of
+fields and at most the passed maximum number of fields.
+
+A *field* is:
+
+* A longest substring matching the first passed PCRE (e.g., `[^[:space:]]++`,
+  matching substrings of nonempty nonwhitespace as fields).
+* Suffixed by a *field separator* consisting of either:
+** A substring matching the second passed PCRE (e.g., `[[:blank:]]++`, matching
+   nonempty whitespace as field separators).
+** A newline, in the case of the last field.
+
+The caller _must_ ensure that neither such PCRE matches a newline, as
+<<for_string_line_fields_split_on_pcre_field_and_separator_bounded_by_count.caveats,discussed below>>.
+Hence, the choice of PCREs `[^[:space:]]++` and `[[:blank:]]++` (which do _not_
+match newlines) instead of `[^[:blank:]]++` and `[[:space:]]++` (which both
+match newlines) in the above examples.
+
+This function offers a pure-`zsh` alternative to conventional field processors,
+including `awk` and cohorts (e.g., `gawk`, `nawk`): e.g.,
+
+.for_string_line_fields_in_range_split_on_pcre_field_and_separator()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_authoritarianism=\
+...    "At first the child has to submit to the structure of the authoritarian
+...     miniature state, the family; this makes it capable of later
+...     subordination to the general authoritarian system."
+>>> for_string_line_fields_in_range_split_on_pcre_field_and_separator\
+...     "${on_authoritarianism}" 6 13 '[^[:space:]]++' '[[:blank:]]++'\
+...     ':stdout.echo "${match[4]}"'
+child
+family
+general
+------------------------------------------
+==========================================
+
+[[for_string_line_fields_split_on_pcre_field_and_separator_bounded_by_count.caveats]]
+== PCRE Constraints ==
+
+The caller _must_ ensure that neither passed PCRE matches newlines, either
+explicitly (e.g., `[[:space:]]++`) or implicitly (e.g., `[[0-9:^alpha:]]{3,6}`).
+This function is internally implemented with one efficient PCRE in multiline
+mode rather than inefficient line splitting. Passing PCREs matching newlines
+disrupts such implementation by consuming more than a single line's worth of
+text when matching either fields or field separators.
+
+For safety, an exception is thrown if either passed PCRE matches a newline.
+While an exception is _not_ thrown if either passed PCRE matches a string of
+more than two characters containing a newline (since detecting all such PCREs
+is computationally intractable), such PCREs are equally fatal and should _not_
+be passed.
+
+== Fields ==
+
+For convenience, fields are assigned 1-based indices in ascending match order.
+The first field on each line is assigned index 1 and the last index
+`${maximum_field_count}`.
+
+All fields except the last must be suffixed by a field separator. The last field
+must be suffixed by a field separator, newline, or the end of such string.
+
+=== Mandatory Fields ===
+
+All fields with 1-based indices in the range `[1, minimum_field_count]` are
+*mandatory*. String lines _not_ containing such number of fields will be
+silently ignored (i.e., will neither be matched or result in an exception).
+
+=== Optional Fields ===
+
+All fields with 1-based indices in the range
+`[minimum_field_count + 1, maximum_field_count]` are *optional*. String lines
+_not_ containing such number of fields will be successfully matched, with all
+unmatched fields expanding to the empty string.
+
+=== Remaining Fields ===
+
+All fields with 1-based indices larger than `maximum_field_count` are
+*extraneous*. If the last field (indexed as `maximum_field_count`) of a line is
+suffixed by a field separator rather than a newline or the end of such string,
+the remainder of such line (i.e., the longest substring following such separator
+up to the next newline or end of such string) will be captured into a convenient
+pseudo-field with index `maximum_field_count + 1` -- regardless of whether such
+pseudo-field contains additional fields suffixed by field separators.
+
+This convenience prevents slightly malformed lines from either throwing
+exceptions (bad) or being silently ignored (worse!). Callers processing user-
+passed and hence possibly malformed strings should consider either throwing
+exceptions or printing warnings for lines containing a nonempty pseudo-field.
+
+=== Matched Fields ===
+
+List global ${match} contains all matched and unmatched fields for each line,
+indexed as above. Regardless of how many fields matched, such list _always_
+contains `maximum_field_count + 1` elements.
+
+Each element in the range `[1, maximum_field_count]` expands to the
+corresponding field of the current line. The element with index
+`maximum_field_count + 1` expands to all remaining fields of the current line;
+if nonempty, such element implies a malformed line.
+/---
+function for_string_line_fields_in_range_split_on_pcre_field_and_separator() {
+    #FIXME: Ugh; obviously, *ALL* locals declared below should be suffixed by
+    #"__fslfsiropfas".
+
+    # Validate sanity.
+    die_unless_args_6\
+        'Expected one string, one minimum integer, one maximum integer, one field PCRE, one field separator PCRE, and one command.'
+    :str\
+        text__fslfsiropfas="${1}"\
+        field_count_minimum__fslfsiropfas="${2}"\
+        field_count_maximum__fslfsiropfas="${3}"\
+        pcre_field__fslfsiropfas="${4}"\
+        pcre_field_separator__fslfsiropfas="${5}"\
+        command__fslfsiropfas="${6}"\
+        placeholder__fslfsiropfas\
+        pcre_field_separated\
+        pcre_fields_sans_last\
+        pcre_remainder\
+        pcre_fields
+    :int.die_unless_"<="\
+        "${field_count_minimum__fslfsiropfas}" "${field_count_maximum__fslfsiropfas}"
+    die_unless_string_nonempty "${pcre_field__fslfsiropfas}"\
+        'Expected nonempty field PCRE.'
+    die_unless_string_nonempty "${pcre_field_separator__fslfsiropfas}"\
+        'Expected nonempty field separator PCRE.'
+    die_unless_string_nonempty "${command__fslfsiropfas}"\
+        'Expected nonempty command.'
+
+    # If either such PCRE matches a newline, throw an exception.
+    if { is_string_matches_pcre\
+        "${ZY_ASCII_NEWLINE}" "${pcre_field__fslfsiropfas}" } {
+        :die 'Field PCRE "'${pcre_field__fslfsiropfas}'" matches newlines.'
+    }
+    if { is_string_matches_pcre\
+        "${ZY_ASCII_NEWLINE}" "${pcre_field_separator__fslfsiropfas}" } {
+        :die 'Field separator PCRE "'${pcre_field_separator__fslfsiropfas}'" matches newlines.'
+    }
+
+    # If such field PCRE is *NOT* parenthesized, do so.
+    :str.is_^= "${pcre_field__fslfsiropfas}" '('*')' or
+        pcre_field="(${pcre_field__fslfsiropfas})"
+
+    # If such field separator PCRE is parenthesized, throw an exception.
+    if { :str.is_^=\
+        "${pcre_field_separator__fslfsiropfas}" '('*')' } {
+        :die 'Field separator PCRE "'${pcre_field_separator__fslfsiropfas}'" parenthesized.'
+    }
+
+    # PCRE matching a mandatory field suffixed by such separator.
+    pcre_field_mandatory__fslfsiropfas="${pcre_field__fslfsiropfas}${pcre_field_separator__fslfsiropfas}"
+
+    # PCRE matching an optional field suffixed by such separator. Avoid
+    # capturing such separator, as we already capture such field.
+    pcre_field_optional__fslfsiropfas="(?:${pcre_field__fslfsiropfas}${pcre_field_separator__fslfsiropfas})?"
+
+    # PCRE capturing all such fields on a single line.
+    pcre_fields__fslfsiropfas='^'
+
+    # The last field need not (but optionally may) be suffixed by such separator
+    # and hence must be matched separately, below. To account for this, pretend
+    # momentarily that one less than such minimum and maximum number of fields
+    # was requested by the caller.
+    (( --field_count_minimum__fslfsiropfas ))
+    (( --field_count_maximum__fslfsiropfas ))
+
+    # Construct such PCRE. All fields up to and including the field with index
+    # the passed minimum field count are mandatory. All fields following such
+    # field up to and including the field with index the passed maximum field
+    # count are optional. All fields following such field will be matched
+    # altogether as the unmatched remainder of the current line, below.
+    for placeholder__fslfsiropfas (
+        {1..${field_count_minimum__fslfsiropfas}) {
+        pcre_fields+="${pcre_field_mandatory}"
+    }
+    for placeholder__fslfsiropfas (
+        {$(( field_count_minimum__fslfsiropfas + 1 ))..${field_count_maximum__fslfsiropfas}) {
+        pcre_fields+="${pcre_field_optional}"
+    }
+
+    # Complete such PCRE by capturing both the last field and unmatched
+    # remainder of the current line. Match non-greedily to prefer matching
+    # previous fields, instead.
+    pcre_fields+="${pcre_field__fslfsiropfas}(${pcre_field_separator__fslfsiropfas}(.*?))?$"
+
+    # Iterate such PCRE matches in multiline mode. Since the last match group
+    # matches only malformed lines containing more than the passed number of
+    # fields, print a warning for such lines. For efficiency, inline such test.
+    for_string_text_matching_pcre_multiline:\
+        "${text__fslfsiropfas}"\
+        "${pcre_fields__fslfsiropfas}"\
+        "${command__fslfsiropfas}"
+}
