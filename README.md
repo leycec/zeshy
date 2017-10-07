@@ -79,4 +79,4 @@ For all other distributions, please consult your distribution's package manager.
 
 ## License
 
-`zeshy` adheres to a conventional [GPLv3 license](http://gplv3.fsf.org). See COPYING for details.
+`zeshy` is [permissively distributed](LICENSE) under the community-friendly [BSD 2-clause license](https://opensource.org/licenses/BSD-2-Clause).
