@@ -1,0 +1,323 @@
+#!/usr/bin/env zeshy
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2017 by Cecil Curry.
+# See "LICENSE" for additional details.
+
+:parcel <<'/---'
+Handle core standard input functionality.
+
+== Caveats ==
+
+Standard file descriptors are shell-specific. Hence, avoid calling functions or
+expanding functions operating on such descriptors from subshells. Attempting to
+do so fails to both operate on and close such descriptors in the current shell.
+/---
+
+# ....................{ EXCEPTIONS                         }....................
+:func.doc <<'/---'
+:void die_unless_stdin_pipe()
+
+Throw an exception with the passed message unless standard input to the current
+context is a pipe. See :stdin.is_pipe() for further details.
+/---
+function die_unless_stdin_pipe() {
+    die_if_args
+    :stdin.is_pipe :or :die 'Standard input unpiped.'
+}
+
+:func.doc <<'/---'
+:void die_unless_stdin_terminal()
+
+Throw an exception with the passed message unless standard input to the current
+context is a terminal. See :is_stdin_terminal() for further details.
+/---
+function die_unless_stdin_terminal() {
+    die_if_args
+    :is_stdin_terminal :or :die 'Standard input not a terminal.'
+}
+
+# ....................{ TESTERS                            }....................
+:func.doc <<'/---'
+[status = :bool] :is_stdin()
+
+Report success if standard input to the current context is *open* (i.e.,
+attached to either an existing pipe _or_ file other than that of the bit
+bucket). Typically, such input is closed only if the current process is
+*headless* (i.e., _not_ running under a terminal process) and hence attached to
+the bit bucket (e.g., `/dev/null`).
+/---
+function :is_stdin() {
+    # Validate sanity.
+    die_if_args
+
+    # If standard input is attached to either a terminal or pipe, such input is
+    # by definition open. This is *NOT* merely an optimization. See the body of
+    # :is_stdin_file_simple() for further details.
+    :is_stdin_terminal :or :stdin.is_pipe :or {
+        # Else, such input is open only if the target file to which such
+        # input's symbolic link points both exists and is *NOT* the bit bucket.
+        :str stdin_target
+        :set_string_to_symlink_target_last stdin_target\
+            "${ZY_STDIN_PATH-/dev/stdin}"
+
+        # Report success only if such target exists and...
+        is_file "${stdin_target}" :and {
+            # ...is *NOT* the bit bucket.
+            :str bit_bucket
+            :set_string_to_bit_bucket bit_bucket
+
+            # Is such target the bit bucket?
+            :is ${stdin_target} != ${bit_bucket} :si
+        }
+    }
+}
+
+:func.doc <<'/---'
+[status = :bool] :is_stdin_here_doc_or_string()
+
+Report success if standard input to the current context is either a
+*here-document or -string* (i.e., if such input is received non-interactively
+from either a `<<`-enabled here-document or `<<<`-enabled here-string mediated
+through a `zsh`-specific temporary file).
+
+== Caveats ==
+
+*Success only strongly implies (rather than strictly guaranteeing) such input
+to be either a here-document or -string.* If such input is in fact a here-
+document or -string, `zsh` mediates such input through a temporary file deleted
+immediately after use prefixed by the standard `zsh`-specific prefix for such
+files (e.g., `/tmp/zsh`). Technically, the current user and/or system _could_
+symbolically link such input to such a file outside of a here-document or
+-string, in which case this function erroneously reports success.
+
+The unlikelihood of such a meaninglessly malicious scenario strongly implies
+the exit status reported by this function to signify its specified condition.
+/---
+function :is_stdin_here_doc_or_string() {
+    # Validate sanity.
+    die_if_args
+    :str stdin_target
+
+    # Target file to which the symbolic link for standard input points.
+    :set_string_to_symlink_target_last\
+        stdin_target "${ZY_STDIN_PATH-/dev/stdin}"
+
+    # Report success if such file does not exist *AND* is prefixed by the
+    # zsh-specific temporary path prefix.
+    :not is_file "${stdin_target}" :and {
+        # Prefix prefixing all zsh-specific temporary paths.
+        :str zsh_temp_prefix
+        :set_string_to_zsh_temp_prefix zsh_temp_prefix
+
+        # Test such target.
+        :is_string_prefix "${stdin_target}" "${zsh_temp_prefix}"
+    }
+}
+
+:func.doc <<'/---'
+[status = :bool] :is_stdin_file_simple()
+
+Report success if standard input to the current context is a *simple file*
+(i.e., if such input is received non-interactively from a typical file rather
+than interactively from a device file).
+
+== Implications ==
+
+This function reports failure if such input is either:
+
+* A *pipe*, either named (e.g., `/tmp/fifo`) or unnamed (i.e., a typical pipe).
+* A *pseudo-terminal device file* (e.g., `/dev/pts/0`). This is usually the case
+  if the current process is running unredirected under a graphical terminal
+  emulator (e.g., `xterm`).
+* The *bit bucket device file* (e.g., `/dev/null`). This is usually the case if
+  the current process is a cronjob.
+/---
+function :is_stdin_file_simple() {
+    # Validate sanity.
+    die_if_args
+
+    # If standard input is attached to either a terminal or pipe, such input
+    # cannot be a simple file. In either case, report failure.
+    #
+    # Technically, in either case (under Linux, at least), the canonical
+    # symbolic link for standard input is guaranteed to transitively point to a
+    # non-simple file. Assuming such guarantee holds across all other supported
+    # platforms, the logic below would implicitly report failure in either
+    # case, implying this conditional to be unnecessary (but improve efficiency
+    # in the common case).
+    #
+    # We now instructively show why this must be the case (again -- under
+    # Linux, at least). If standard input is attached to a:
+    #
+    # * Terminal, such link points to such terminal's device file. Since device
+    #   files are *NOT* simple files, the logic below would implicitly report
+    #   failure in such case.
+    # * Pipe, such link points to a non-existent file in the same directory
+    #   with basename resembling "pipe:[35692595]". Since non-existent files
+    #   are also *NOT* simple files, the logic below would implicitly report
+    #   failure in such case. If such file were creatable, such guarantee could
+    #   be circumvented by merely creating an empty simple file in such
+    #   directory with such basename. However, since such directory resides in
+    #   the "/proc" pseudo-filesystem under Linux and hence is read-only, such
+    #   file cannot be created -- even when attempting to do so as root.
+    #
+    # While this test is merely an optimization under Linux, there exists no
+    # guarantee of it not being required under other platforms. In short, it's
+    # best not to leave such delicate matters to chance.
+    :not { :is_stdin_terminal :or :stdin.is_pipe } :and {
+        # Target file to which such link points.
+        :str stdin_target
+        :set_string_to_symlink_target_last\
+            stdin_target "${ZY_STDIN_PATH-/dev/stdin}"
+
+        # Report success only if such file exists *AND* is simple.
+        is_file "${stdin_target}" :and :is_file_simple "${stdin_target}"
+    }
+}
+
+:func.doc <<'/---'
+[status = :bool] :stdin.is_pipe()
+
+Report success if standard input to the current context is a *pipe* (i.e., if
+such context is any subcommand of a pipeline -- excluding the first such
+subcommand, which receives no piped input).
+/---
+function :stdin.is_pipe() {
+    die_if_args
+    :is -p ${ZY_STDIN_PATH-/dev/stdin} :si
+}
+
+:func.doc <<'/---'
+[status = :bool] :is_stdin_terminal()
+
+Report success if standard input to the current context is an *interactive
+terminal*.
+
+== Blocking Behaviour ==
+
+If standard input to the current context is an interactive terminal, attempting
+to read such input will block the current process until the current user
+interactively types either one character _or_ zero or more characters followed
+by a newline (depending on the type of read performed).
+
+Else, standard input is probably either a pipe or file, in which case reading
+such input will block the current process only when such pipe or file has unread
+bytes _and_ is still open for reading.
+
+In either case, this function does _not_ provide a reliable means of testing
+whether or not attempting to read standard input will block the current process.
+To test such condition reliably, consider either iteratively calling
+:stdin.is_nonempty() or non-iteractively calling
+:is_stdin_pipe_or_file_simple() instead.
+/---
+function :is_stdin_terminal() {
+    die_if_args
+    :is -t ${ZY_STDIN_FILE_DESCRIPTOR-0} :si
+}
+
+:func.doc <<'/---'
+[status = :bool] :is_stdin_noninteractive()
+
+Report success if standard input to the current context is *non-interactively
+open* (i.e., attached to neither an interactive terminal or the bit bucket).
+Success suggests (but, due to improbable but possible edge cases, does _not_
+necessarily imply) that the caller may read such input without silently
+blocking on interactive input. See :is_stdin_terminal() and :is_stdin_open()
+for further details.
+/---
+function :is_stdin_noninteractive() {
+    die_if_args
+    :not :is_stdin_terminal :and :is_stdin
+}
+
+#FIXME: Actually, the documentation isn't *QUITE* right. This function *IS*
+#reliably callable in a non-iterable manner when testing whether standard input
+#derived from a here-document or -string. In such case, zsh appears to
+#synchronously and hence deterministically (i.e., *ALWAYS*) establish such
+#standard input *BEFORE* calling the function receiving such input; in such
+#case, this function *ALWAYS* reports success if called by such function.
+
+#FIXME: In lieu of unit tests...
+#function empo() {
+#    print ok | { :stdin.is_pipe     and print 'ok' or print 'ko' }
+#    print ok | { :stdin.is_nonempty and print 'ok' or print 'ko' }
+#    {   print "stdin: $(:stdin)"
+#        :stdin.is_nonempty and print 'ok' or print 'ko' } <<< yumo
+#   string yimo; :Str.from_stdin yimo <<< hamo; print "yimo: ${yimo}"
+#}
+
+# ....................{ GETTERS                            }....................
+:func.doc <<'/---'
+:str get_stdin_until_eot[stdin = (:str input)]
+
+Get all standard input to the current context until receiving a line of such
+input containing only the end-of-transmission (EOT) character. If no such line
+is received, all input will be returned.
+
+This function is intended to be called as a coprocess in low-level functions
+capturing output (e.g., run_silent_and_set_string_to_stderr()). Since
+coprocesses typically loop on standard input until receiving end-of-file _and_
+since there exists no builtin means of piping end-of-file to standard input,
+this function leverages the EOT character for such purposes.
+/---
+function get_stdin_until_eot() {
+    # Technically, there exist two means of caching standard input:
+    #
+    # 1. Appending each line of such input delimited by newline to a string and
+    #    returning such string as is.
+    # 2. Appending each line of such input undelimited to a list and returning
+    #    such list joined on newline.
+    #
+    # Having implemented both, the former informally appears to behave much more
+    # efficiently in time (and presumably in space) than the latter. Hence, we
+    # adopt such approach.
+    #
+    # Incidentally, do *NOT* attempt to trap signals (either locally or
+    # globally) within this function. Doing so irrevocably terminates the entire
+    # process group of shells owning this shell -- a probable zsh bug. See
+    # run_code_and_set_string_to_coprocess_output_from_redirection().
+
+    # Validate sanity.
+    die_if_args
+    :str stdin stdin_line
+
+    # Temporarily buffer each line of standard input to string local ${stdin},
+    # which will be output "all at once" after input subsequently terminates.
+    #
+    # Do *NOT* incrementally output such lines (e.g., with :stdout.echo()) in
+    # the loop body. Doing so behaves as expected on sufficiently small input
+    # but deadlocks on sufficiently large input when invoked from a pipeline or
+    # coprocess subshell whose parent shell only reads such input back from such
+    # subshell "all at once." In this case, "small" and "large" are defined by
+    # the size of the kernel-specific socket buffer. If the current system
+    # supports configuring such size, run "limit sockbufsize" to get such size;
+    # else, the current kernel internally hardcodes such size.
+    #
+    # Since the socket buffer has finite size, attempting to write a string of
+    # output larger than such size to such buffer blocks the process attempting
+    # such write -- in the example above, the pipeline or coprocess subshell
+    # executing this function.  If the process on the read end of such buffer --
+    # in the example above, the parent shell of such subshell -- is *NOT*
+    # concurrently reading such buffer but waiting for another command to
+    # terminate, the inevitable result is deadlock. How bad is it? Bad:
+    # indefinite, pseudo-random, and always silent.
+    #
+    # See page_stdin() for related logic.
+    :str IFS=
+    while {
+        read -r stdin_line :and
+            :is ${stdin_line} != ${ZY_ASCII_EOT} :si
+    } {
+        stdin+="${stdin_line}${ZY_ASCII_NEWLINE}"
+    }
+
+    # Return such input to the caller via a *SINGLE* output statement. Avoid
+    # suffixing such input with a newline; the prior loop already did.
+    #
+    # If such input is sufficiently large, attempting to output the entirety
+    # of such input from a pipeline or coprocess subshell will block such
+    # subshell unless the parent shell concurrently reads such output.
+    # Fortunately, this is the common case under the 
+#   :stderr.echo 'Coprocess terminating.'
+    :stdout.echo_sans_newline "${stdin[1,-2]}"
+}

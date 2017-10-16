@@ -1,0 +1,190 @@
+#!/usr/bin/env zeshy
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2017 by Cecil Curry.
+# See "LICENSE" for additional details.
+
+:parcel <<'/---'
+Handle *terminal testers* (i.e., functions testing attributes associated with
+the current terminal, if any).
+
+== Caveats ==
+
+Most functions declared by subparcels in parcel @{terminal} operate on file
+descriptors, including those declared by this subparcel. Since subshells do
+_not_ inherit file descriptors attached to terminal devices, such functions
+rarely behave as expected when called from subshells: e.g.,
+
+.Terminal Functions under Subshells
+==========================================
+[source]
+------------------------------------------
+>>> :stdout.is_terminal and :stdout.echo "Firefly Class"
+Firefly Class
+>>> $(:stdout.is_terminal or :stdout.echo "Universal Alliance")
+Universal Alliance
+------------------------------------------
+==========================================
+/---
+
+#FIXME: O.K.; I've definitively determined what went wrong when invoking the
+#"Cataclysm: DDA" error (i.e., running "cataclysm-dda" with an existing "save"
+#subdirectory corresponding to a prior version). For some reason,
+#"cataclysm-dda" corrupts (err... "changes") the terminal line settings of the
+#current shell on failing with an error. Restoring such settings turns out to be
+#both remarkably fast and simple: just run "stty sane". "sane" is an "aggregate
+#setting" combining multiple sane terminal line settings. We're unclear as to
+#whether or not it's GNU-specific, but suspect it is. Under BSD, the simplest
+#(but less functional) equivalent may be "stty echo -nl -cbreak". We probably
+#want a new function reset_terminal() in "io/terminal/terminal" running such
+#command. Since it is fast *AND* since terminal corruption when it occurs is
+#horrible enough to make frequent resets worthwhile, I'm having trouble coming
+#up with a compelling argument *AGAINST* resetting the terminal prior to
+#printing every shell prompt. Hence, consider adding:
+#
+#   run_hook_before_prompt_printed reset_terminal
+#
+#For further details, see http://docstore.mik.ua/orelly/unix/upt/ch42_04.htm and
+#http://www.unixguide.net/linux/faq/06.14.shtml.
+#FIXME: Actually, having reset_terminal() run "stty sane" really isn't the most
+#generally applicable solution, since that overwrites custom terminal line
+#settings that the user actually intended. Instead, do the following:
+#
+#* On zeshy startup, run "stty -g >'${ZY_USER_CACHE_DIR}/stty'". Again, check
+#  whether or not this is GNU-specific. If it is, just do *NOTHING* on BSD
+#  systems, which is obviously better than doing something horrible. In any case,
+#  this caches current terminal line settings to a zeshy-specific file.
+#* Implement the following functions:
+#
+#   function reset_terminal_to_sane_defaults() {
+#       stty sane
+#   }
+#   function reset_terminal_to_startup_defaults() {
+#       stty "$(get_file_text "${ZY_USER_CACHE_DIR}/stty")"
+#   }
+#
+#Ideally, we'd just save such settings to a global string, avoiding a file read
+#for each shell prompt. Sadly, "stty" only supports printing machine-readable
+#settings to a file. (I know.) We can circumvent this by:
+#
+#* Caching to such file as above, or perhaps simply a temporary file. Wait...
+#  doesn't zsh support writing to and from variables as files? Check. If not:
+#* Read such file into a string global.
+#* Delete such file.
+#
+#Annoying, but certainly faster.
+#FIXME: Serializing a file on each zeshy startup seems excessive. Honestly, such
+#settings are unlikely to change between startup invocations and hence should
+#probably be precompiled into zeshy's user digest file. We recompile it often
+#enough that this is unlikely to prove too problematic.
+
+# ....................{ EXCEPTIONS                         }....................
+:func.doc <<'/---'
+void :die_unless_terminal(
+    string error_message =
+        "Current shell headless (i.e., not running under terminal emulation).")
+
+Throw an exception unless the current shell is running under a terminal
+emulator. See :is_terminal() for further details.
+/---
+function :die_unless_terminal() {
+    die_unless_args_0_to_1 'Expected optional error message.'
+    :is_terminal or :die\
+        "${1-Current shell headless (i.e., not running under terminal emulation).}"
+}
+
+# ....................{ EXCEPTIONS ~ position              }....................
+:func.doc <<'/---'
+void :die_unless_terminal_column(
+    int terminal_column,
+    string error_message =
+        "Terminal column \"${terminal_column}\" invalid (i.e., not an integer in [1, ${COLUMNS}]).")
+
+Throw an exception unless the passed integer is a valid terminal column. See
+:is_terminal_column() for further details.
+/---
+function :die_unless_terminal_column() {
+    die_unless_args_1_to_2 'Expected one terminal column and optional error message.'
+    :is_terminal_column "${1}" :or {
+        :str terminal_column="${1}"
+        :die "${2-Terminal column \"${terminal_column}\" invalid (i.e., not an integer in [1, ${COLUMNS}]).}"
+    }
+}
+
+:func.doc <<'/---'
+void :die_unless_terminal_row(
+    int terminal_row,
+    string error_message =
+        "Terminal row \"${terminal_row}\" invalid (i.e., not an integer in [1, ${COLUMNS}]).")
+
+Throw an exception unless the passed integer is a valid terminal row. See
+:is_terminal_row() for further details.
+/---
+function :die_unless_terminal_row() {
+    die_unless_args_1_to_2 'Expected one terminal row and optional error message.'
+    :is_terminal_row "${1}" :or {
+        :str terminal_row="${1}"
+        :die "${2-Terminal row \"${terminal_row}\" invalid (i.e., not an integer in [1, ${COLUMNS}]).}"
+    }
+}
+
+# ....................{ TESTERS                            }....................
+:func.doc <<'/---'
+[status: bool] :is_terminal()
+
+Report success if the current shell is running under a *text terminal emulator*
+(i.e., software emulating a physical text-based terminal under some other
+display architecture), also referred to as a *term* or *Teletype (TTY)*.
+Specifically, report success if canonical string global ${TERM} both exists
+_and_ is *nonempty* (i.e., currently set to any string other than `""`).
+
+== Implications ==
+
+If this function reports success, all *terminal functions* (i.e., functions
+assuming the current process to be running under such a terminal) are safely
+callable (e.g., :set_int_to_terminal_width(), move_terminal_cursor_to()).
+
+If this function reports failure, no such functions are safely callable.
+Attempting to do so throws an immediate exception. To avoid this, terminal
+functions should be called only _after_ this function reports success.
+/---
+function :is_terminal() {
+    # For efficiency, default such variable to the empty string if currently
+    # undefined. While such test is also implementable as follows, this
+    # function is called sufficiently often to warrant minor optimization:
+    #    :Var.is TERM and :str.is_nonempty "${TERM}"
+    die_if_args
+    :str.is_nonempty "${TERM-}"
+}
+
+# ....................{ TESTERS ~ position                 }....................
+:func.doc <<'/---'
+[status: bool] :is_terminal_column(int terminal_column)
+
+Report success if the passed integer is a valid *terminal column* (i.e., an
+integer in the range `[1, ${COLUMNS}]`).
+/---
+function :is_terminal_column() {
+    # Validate sanity.
+    die_unless_arg 'Expected one terminal column.'
+    :int terminal_width
+
+    # Test such column against the current terminal width.
+    :set_int_to_terminal_width terminal_width
+    :int.">=<" "${1}" 1 "${terminal_width}"
+}
+
+:func.doc <<'/---'
+[status: bool] :is_terminal_row(int terminal_row)
+
+Report success if the passed integer is a valid *terminal row* (i.e., an
+integer in the range `[1, ${LINES}]`).
+/---
+function :is_terminal_row() {
+    # Validate sanity.
+    die_unless_arg 'Expected one terminal row.'
+    :int terminal_height
+
+    # Test such row against the current terminal height.
+    :set_int_to_terminal_height terminal_height
+    :int.">=<" "${1}" 1 "${terminal_height}"
+}
