@@ -6,11 +6,26 @@
 # Due to chicken-and-the-egg conundra, all operables defined below are
 # subsequently documented under ={help} in the main codebase.
 
+#FIXME: Manually rename all *CALLS* in the codebase:
+#
+#* From :stdin.die_unless_nonempty() to :stdin.die_unless_noninteractive().
+#* From :stdin.is_nonempty() to :stdin.is_noninteractive().
+
 # ....................{ EXCEPTIONS                         }....................
-# :void :stdin.die_unless_nonempty()
-function :stdin.die_unless_nonempty() {
-    die_if_args
-    :stdin.is_nonempty :or :die 'Standard input unreadable without blocking.'
+ZY__HELP_FUNCS+='
+:void :stdin.die_unless_noninteractive()
+
+Throw an exception unless standard input to the current context is
+*non-interactively open* (i.e., attached to neither an interactive terminal or
+the bit bucket).
+
+See :stdin.is_noninteractive() for further details.
+'
+function :stdin.die_unless_noninteractive() {
+    (( # == 0 )) || :die 'Expected no arguments.'
+
+    :stdin.is_noninteractive ||
+        :die 'Standard input closed or unreadable without blocking (e.g., attached to either an interactive terminal or the bit bucket).'
 }
 
 # ....................{ TESTERS                            }....................
@@ -50,7 +65,7 @@ function :stdin.die_unless_nonempty() {
 
 #FIXME: Refactor this function as follows:
 #
-#* Switch the :is_stdin_noninteractive() function from
+#* Switch the :stdin.is_noninteractive() function from
 #  "00-seed/20-alias/io/standard.zy" to here. Do *NOT* shift any other functions
 #  here. Ergo, that function must be refactored to be insular (i.e., reference
 #  no external functions or globals). Maybe? I sure do dislike DRY. But I also
@@ -60,76 +75,125 @@ function :stdin.die_unless_nonempty() {
 #* Switch this function to "00-seed/20-alias/io/standard.zy", which remains
 #  useful.
 #* Shift this function's documentation from "help" into the same parcel. On
-#  doing so, note that this function is safely callable *ONLY* iteratively.
+#  doing so, note that:
+#  * This function is safely callable *ONLY* iteratively.
+#  * For the same reason, there intentionally exists *NO* corresponding
+#    stdin.die_unless_nonempty() function, as no finite number of iterations is
+#    sufficient to decide non-emptiness in the general case.
 #* Replace *ALL* calls to :stdin.is_nonempty() in the codebase  with calls to
-#  :is_stdin_noninteractive() instead.
-#* Rename :is_stdin_noninteractive() to :stdin.is_noninteractive().
+#  :stdin.is_noninteractive() instead.
+#* Rename :stdin.is_noninteractive() to :stdin.is_noninteractive().
 
-# [status=:bool] :stdin.is_nonempty()
-function :stdin.is_nonempty() {
-    # Validate sanity.
+ZY__HELP_FUNCS+='
+[status=:bool] :stdin.is()
+
+Report success if standard input to the current context is *open* (i.e.,
+attached to either an existing pipe _or_ file other than the bit bucket).
+
+This function typically reports failure only if the current process is
+*headless* (i.e., _not_ running under a terminal process) and hence attached to
+the bit bucket (e.g., `/dev/null`).
+'
+function :stdin.is() {
     (( # == 0 )) || :die 'Expected no arguments.'
 
-    # Given the criticality and commonality of this test, one would assume there
-    # to exist builtins or commands for accomplishing it. One would be wrong.
-    # Testing whether this file descriptor and hence input is readable without
-    # blocking requires calling the commonly available kernel function select().
-    # Ideally, this test would elegantly reduce to the following:
-    #
-    #     read -t 0 -k 0
-    #
-    # Dismantled, this is:
-    #
-    # * "-t 0", testing whether standard input is readable without blocking and
-    #   returning immediately if not.
-    # * "-k 0", reading 0 bytes from standard input if this input is readable.
-    #
-    # Unfortunately, "read -t 0 -k 0" always returns failure. This differs from
-    # bash, in which "read -t 0 -N 0" conditionally returns success when one
-    # expects it to. Hence, this test defers to select() instead.
-    #
-    # Since zselect() (the zsh select() wrapper) returns failure with exit
-    # status 2 when the underlying OS fails to provide a select() function,
-    # capture and test this status rather than implicitly returning this status
-    # as this function's exit status.
-    #
-    # Dismantled, this is:
-    #
-    # * "-r ...", testing standard input's canonical file descriptor for
-    #   nonempty readability.
-    # * "-t 0", reporting whether input bytes exist in a non-blacking manner
-    #   (where "0" signifies 0 hundredths of a second wait time).
-    # * "-a ...", setting this list to contain a string resembling either
-    #   "-r 0" if standard input is nonempty or "" if standard input is empty.
-    #   Since zselect() defaults this list to ${reply} if unpassed *AND* since
-    #   this list is commonly used by callers and should *NOT* be overwritten by
-    #   such a low-level function as this, explicitly specify this list. Since
-    #   this function never references this list, our specifying it here is
-    #   simply to avoid overwriting ${reply}. (Frankly, this "unique" choice of
-    #   API design is one of the more eclectic that we've ever seen. And we were
-    #   proficient in ML... once.)
-    #
-    # Thus doth another feeble mind break. (O^o)
-    :list zselect_status
-    zselect -r 0 -t 0 -a zselect_status :or {
-        # Preserve the exit status reported by this builtin.
-        :int exit_status=${status}
+    # If standard input is attached to either a terminal or pipe, this input is
+    # by definition open. This is *NOT* merely an optimization. See the body of
+    # :is_stdin_file_simple() for further details.
+    :stdin.is_terminal || :stdin.is_pipe || {
+        # Else, this input is open only if the target file to which this
+        # input's symbolic link points both exists and is *NOT* the bit bucket.
 
-        # If this status indicates the current OS kernel to *NOT* provide this
-        # function, throw an exception.
-        if (( exit_status == 2 )) {
-            :die 'Kernel function select() undefined.'
-        }
+        # Absolute path of this input's symbolic link.
+        local stdin_target='/dev/stdin'
 
-        # Else, report this status. Technically, zselect() reports 0 if *ANY*
-        # passed file descriptor is non-blockably readable and 1 otherwise.
-        # Since this function tests only standard input, this status exactly
-        # coincides with what the caller expects. (Scoooooore!)
-        return ${exit_status}
+        # Absolute path of this input's transitive target. If this symbolic link
+        # does not exist or does but this target does not, this assignment
+        # silently reduces to a noop. In this case, that's fine.
+        #
+        # See the :set_string_to_symlink_target_last() function for details.
+        stdin_target="${stdin_target:A}"
+
+        # Report success only if:
+        #
+        # * This target exists.
+        # * This target is *NOT* a directory (i.e., is a possibly special file).
+        # * This target is *NOT* the bit bucket.
+        [[ -e ${stdin_target} && ! -d ${stdin_target} &&
+              ${stdin_target} != '/dev/null' ]]
     }
 }
 
-# ....................{ MAIN                               }....................
-# Load module "zselect", providing builtin zselect() required by standard
-# input-specific setters above (e.g., ::Doc.from_stdin()).
-zmodload zsh/zselect
+
+ZY__HELP_FUNCS+='
+[status=:bool] :stdin.is_noninteractive()
+
+Report success if standard input to the current context is *non-interactively
+open* (i.e., attached to neither an interactive terminal or the bit bucket).
+
+Success suggests (but, due to improbable but possible edge cases, does _not_
+guarantee) that the caller may typically read this input without silently
+blocking on interactive input. See :stdin.is_terminal() and :stdin.is() for
+further details.
+'
+function :stdin.is_noninteractive() {
+    (( # == 0 )) || :die 'Expected no arguments.'
+
+    #FIXME: In theory, the following compound test should be efficiently
+    #compressible into a single "[["- and "]]"-delimited test. This would have
+    #the distinct advantages of:
+    #
+    #* Extreme optimization. This function appears to be called at least once
+    #  per function definition, suggesting tangible benefits to optimizing.
+    #* Permitting us to shift *ALL* other tester functions in this parcel back
+    #  into the zy://10-root/ directory.
+
+    # Standard input to the current context is non-interactively open if and
+    # only if this input is:
+    #
+    # * *NOT* attached to an interactive terminal.
+    # * Currently open, but *NOT* to the bit bucket.
+    ! :stdin.is_terminal && :stdin.is
+}
+
+
+ZY__HELP_FUNCS+='
+[status=:bool] :stdin.is_terminal()
+
+Report success if standard input to the current context is an *interactive
+terminal*.
+
+== Blocking Behaviour ==
+
+If standard input to the current context is an interactive terminal, attempting
+to read this input will block the current process until the current user
+interactively types either one character _or_ zero or more characters followed
+by a newline (depending on the type of read performed).
+
+Else, standard input is probably either a pipe or file, in which case reading
+this input will block the current process only when this pipe or file has unread
+bytes _and_ is still open for reading.
+
+In either case, this function does _not_ provide a reliable means of testing
+whether or not attempting to read standard input will block the current process.
+To test this condition reliably, consider either iteratively calling
+:stdin.is_nonempty() or non-iteratively calling
+:is_stdin_pipe_or_file_simple() instead.
+'
+function :stdin.is_terminal() {
+    (( # == 0 )) || :die 'Expected no arguments.'
+    [[ -t 0 ]]
+}
+
+
+ZY__HELP_FUNCS+='
+[status=:bool] :stdin.is_pipe()
+
+Report success if standard input to the current context is a *pipe* (i.e., if
+this context is any subcommand of a pipeline -- excluding the first such
+subcommand, which receives no piped input).
+'
+function :stdin.is_pipe() {
+    (( # == 0 )) || :die 'Expected no arguments.'
+    [[ -p '/dev/stdin' ]]
+}
