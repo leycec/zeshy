@@ -52,32 +52,34 @@ setopt err_return no_unset warn_create_global
 #print "[${0}] sourcing ${ZY_MAIN_SCRIPT} ${(Qz)ZY_ARGS}"
 #print "[${0}] ZY_ARGS=${ZY_ARGS}"
 
+
 # Source zeshy's entry script immediately *BEFORE* printing the first command
 # prompt for the current interactive shell. (This script is sourced only under
 # interactive invocations of "zeshy" and "zeshy-login".)
 #
-# Such indirection ensures that the zeshy codebase will be loaded *AFTER* zsh
+# This indirection ensures that the zeshy codebase will be loaded *AFTER* zsh
 # startup, which appears to be the only means of enabling TRAPZERR() (i.e.,
 # converting failure status to thrown exceptions) during zeshy startup.
-# (Curiously, avoiding such indirection by sourcing such script directly here
-# does *NOT* suffice to enable such trap handler during zeshy startup, despite
-# such script clearly defining such function. We attribute this to an as-yet
+#
+# Curiously, avoiding this indirection by sourcing this script directly here
+# does *NOT* suffice to enable this trap handler during zeshy startup, despite
+# this script clearly defining this function. We attribute this to an as-yet
 # unidentified bug in which zsh enables trap handlers defined by startup
 # dotfiles only *AFTER* sourcing all such dotfiles. Curiously, the same bug
-# also extends to shell options "ERR_RETURN" and "ERR_EXIT".)
+# also extends to shell options "ERR_RETURN" and "ERR_EXIT".
 #
-# Enabling such trap handler during (rather than after) zeshy startup (and
-# hence such indirection) is essential to "inoculating" zeshy startup against
+# Enabling this trap handler during (rather than after) zeshy startup (and
+# hence this indirection) is essential to "inoculating" zeshy startup against
 # unanticipated errors.
 function precmd() {
-    # Undefine such hook, preventing zsh from erroneously reloading zeshy on
+    # Undefine this hook, preventing zsh from erroneously reloading zeshy on
     # subsequent command prompts.
     unfunction precmd
 
     # Source zeshy's entry script. Convert the list of arguments previously
     # passed to wrapper script "zeshy" from a flattened string back into the
     # original list. Since only scalars (and hence *NOT* lists) can be
-    # inherited by child shells, such circumlocution is sadly unavoidable. See
+    # inherited by child shells, this circumlocution is sadly unavoidable. See
     # restore_list() for further details.
     source -- "${ZY_MAIN_SCRIPT}" "${(Qz)ZY_ARGS}"
     # print "dir stack [main/after]: ${ZY_USER_DIR_STACK_FILE}"
