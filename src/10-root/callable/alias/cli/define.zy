@@ -1,0 +1,579 @@
+#!/usr/bin/env zeshy
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2017 by Cecil Curry.
+# See "LICENSE" for additional details.
+
+:parcel <<'/---'
+*CLI alias definers* (i.e., functions defining CLI aliases).
+/---
+
+#FIXME: Actually, the approach below effects nothing, effectively. Why? Simple:
+#any function already defined by the current shell remains defined even if the
+#${FPATH} is subsequently changed. While this approach *WOULD* prevent
+#additional CLI aliases from being autoloaded and hence defined in non-CLI
+#contexts, it fails to undefine CLI aliases previously autoloaded from a CLI
+#context. Indeed, such undefinition could never be made efficient or reliable.
+#Instead, a *MUCH* simpler alternative presents itself: the true issue, as I
+#see it, is to prevent non-interactive scripts from calling CLI aliases.
+#Happily, this, at least, is relatively easy to implement:
+#
+#* In "src/compile", *AFTER* calculating ${function_names} the list of all
+#  functions newly defined by the previous sourcing of the zeshy codebase, copy
+#  such list into a new list ${function_names_sans_cli_aliases}. Then remove all
+#  CLI alias names from ${function_names_sans_cli_aliases} with the list
+#  subtraction operator.
+#* Call zcompile() twice, once with:
+#  * ${function_names}, compiled into digest file
+#    "~/.zeshy/cache/digest/interactive.zwc". Note the use of subdirectory
+#    "digest" for organizational purposes.
+#  * ${function_names_sans_cli_aliases}, compiled into digest file
+#    "~/.zeshy/cache/digest/noninteractive.zwc".
+#* We'll need to start recording CLI alias names with a list or map global, if
+#  we don't already. Such global is required above, clearly.
+#* On zeshy startup, rather than always prepending ${FPATH} with
+#  "~/.zeshy/cache/digest/interactive.zwc", test string global ${ZSH_EVAL_CONTEXT} for
+#  equality with... Wait, no. This is a simple shell interactivity test. If the
+#  current shell is:
+#  * Interactive, prepend ${FPATH} with "~/.zeshy/cache/digest/interactive.zwc".
+#  * Else, with "~/.zeshy/cache/digest/noninteractive.zwc".
+#
+#Yup. This is absolutely the way to go. It's all readily and elegantly doable.
+#FIXME: Genius! (Or, at the least, modestly clever. Oh, very well: it's merely
+#obvious.) We can dramatically improve efficiency and reliability by
+#partitioning the digest file into two such files:
+#* One compiling the gamut of all Zeshy functions and active interactively.
+#* The other compiling all Zeshy functions *EXCEPT* interactive aliases and
+#  active non-interactively. (This is easy; just prepend a second call to a
+#  Zeshy compilation function with temporary disabling of such globals via
+#  ZY_IS_SUBSTITUTING_INTERACTIVE_COMMANDS= and
+#  ZY_IS_ABBREVIATING_INTERACTIVE_COMMANDS=).
+#Override the zsh hook called immediately:
+#* Before evaluation of a new user-input interactive command to prepend the
+#  ${FPATH} with the prior digest file, excising the latter digest file if
+#  already prepended.
+#* After evaluation of a new user-input interactive command to prepend the
+#  ${FPATH} with the latter digest file, excising the former digest file if
+#  already prepended.
+#All of this assumes zsh exposes sufficient hooks, of course. It may not. It
+#probably doesn't, in fact. But if it does... coolness is ours, baby.
+
+#FIXME: Technically, we can support interactive aliases on functions -- but only
+#in somewhat roundabout fashion. We would need detect this to be an alias on a
+#function (easy), then define a new function with the same implementation as the
+#function to be replaced by such alias but with a new name, say,
+#"${alias_name}____tmp" (perhaps easy; doesn't "which ${function_name}" provide
+#us a function implementation which we could then eval into a new function with
+#such placeholder name?), then replace the old with the new function name in the
+#alias expansion (easy). It's a bit involved, but nothing too intractable.
+
+# ....................{ DEFINERS ~ abbreviation            }....................
+#FIXME: Such functions should be calling :func.doc() to
+#ensure their addition to the current parcel for documentation and lookup
+#purposes. Incidentally, perhaps we want to treat CLI aliases as a genuine alias
+#type rather than a function? In such case, we'll want a new function
+#declare_alias_cli_with_stdin() and corresponding map globals in
+#"00-declare/05-parcel" (e.g., ${ZY_PARCEL_NAME_TO_ALIAS_CLI_NAMES}).
+
+:func.doc <<'/---'
+:void alias_cli_abbreviation(:str alias_name ?:str alias_expansion)
+
+Define a CLI abbreviation alias with the passed name expanding to the passed
+expansion if such name (sans `{` and `}` delimiters) is *NOT* the name of an
+existing *runnable* (i.e., external command or `zsh` alias, builtin, or
+function) _or_ throw an exception otherwise.
+
+If no expansion is passed, this name must be formatted as a conventional
+`=`-delimited alias specification (e.g., `l="ls -l"`).
+
+CLI abbreviation aliases never replace existing runnables _and_ always throw
+exceptions when _not_ expanded directly from the command line. This differs from
+CLI substitution aliases (which always replace existing runnables and expand to
+such runnables when _not_ expanded directly from the command line) and normal
+`zsh` aliases (which also always replace existing runnables and do _not_ alter
+their behavior when _not_ expanded directly from the command line).
+
+== See Also ==
+
+* alias_cli().
+
+== Examples ==
+
+.alias_cli_abbreviation()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_heritage="
+... Stop to consider how the so-called owners of the land got hold of it.
+... They simply seized it by force, afterwards hiring lawyers to provide
+... them with title-deeds. In the case of the enclosure of the common
+... lands, which was going on from about 1600 to 1850, the land-grabbers
+... did not even have the excuse of being foreign conquerors; they were
+... quite frankly taking the heritage of their own countrymen, upon no
+... sort of pretext except that they had the power to do so."
+>>> alias_cli_abbreviation ls=':stdout.echo "${on_heritage}"'
+zeshy: CLI abbreviation alias "ls" already an existing runnable
+>>> alias_cli_abbreviation common_lands=':stdout.echo "${on_heritage}"'
+>>> common_lands | head 1
+Stop to consider how the so-called owners of the land got hold of it.
+>>> get_string_line "$(common_lands)" 1
+zeshy: CLI abbreviation alias "common_lands" expandable only at the command line
+------------------------------------------
+==========================================
+/---
+function alias_cli_abbreviation() {
+    :str ZY_ALIAS_CLI_TYPE='abbreviation'
+    alias_cli "${@}"
+}
+
+# ....................{ DEFINERS ~ substitution            }....................
+:func.doc <<'/---'
+:void alias_cli_substitution(:str alias_name ?:str alias_expansion)
+
+Define a CLI substitution alias with the passed name expanding to the passed
+expansion if such name (sans `{` and `}` delimiters) is the name of an existing
+*runnable* (i.e., external command or `zsh` alias, builtin, or function) _or_
+throw an exception otherwise.
+
+If no expansion is passed, this name must be formatted as a conventional
+`=`-delimited alias specification (e.g., `l="ls -l"`).
+
+CLI substitution aliases always replace existing runnables _and_ expand to such
+runnables rather than the passed expansion when _not_ expanded directly from the
+command line. This differs from CLI abbreviation aliases (which never replace
+existing runnables and throw exceptions when _not_ expanded directly from the
+command line) and normal `zsh` aliases (which always replace existing runnables
+but do _not_ alter their behavior when _not_ expanded directly from the command
+line).
+
+== See Also ==
+
+* alias_cli().
+
+== Examples ==
+
+.alias_cli_substitution()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_totalitarianism="
+... The fallacy is to believe that under a dictatorial government you can be
+... free inside. Quite a number of people console themselves with this
+... thought, now that totalitarianism in one form or another is visibly on
+... the upgrade in every part of the world. Out in the street the
+... loudspeakers bellow, the flags flutter from the rooftops, the police
+... with their tommy-guns prowl to and fro, the face of the Leader, four
+... feet wide, glares from every hoarding; but up in the attics the secret
+... enemies of the regime can record their thoughts in perfect freedom —
+... that is the idea, more or less."
+>>> alias_cli_substitution in_the_attics=':stdout.echo "${on_totalitarianism}"'
+zeshy: CLI substitution alias "in_the_attics" not an existing runnable
+>>> alias_cli_substitution ls=':stdout.echo "${on_totalitarianism}"'
+>>> ls | head -1
+The fallacy is to believe that under a dictatorial government you can be
+>>> get_string_line "$(ls)" 1
+./                .mutt/             pub/            .screenrc
+------------------------------------------
+==========================================
+/---
+function alias_cli_substitution() {
+    :str ZY_ALIAS_CLI_TYPE='substitution'
+    alias_cli "${@}"
+}
+
+
+:func.doc <<'/---'
+[status=:bool] alias_cli_substitution_if_found(
+    :str alias_name ?:str alias_expansion)
+
+Define a CLI substitution alias with the passed name expanding to the passed
+expansion if such name (sans `{` and `}` delimiters) is the name of an existing
+*runnable* (i.e., external command or `zsh` alias, builtin, or function) _or_
+report failure otherwise.
+
+If no expansion is passed, this name must be formatted as a conventional
+`=`-delimited alias specification (e.g., `l="ls -l"`).
+
+== See Also ==
+
+* alias_cli_substitution().
+
+== Examples ==
+
+.alias_cli_substitution_if_found()
+==========================================
+[source]
+------------------------------------------
+>>> :str on_superstructure="
+... Ideas may not change, but emphasis shifts constantly. It could be
+... claimed, for example, that the most important part of Marx's theory is
+... contained in the saying: 'Where your treasure is, there will your heart
+... be also.' But before Marx developed it, what force had that saying had?
+... Who had paid any attention to it? Who had inferred from it — what it
+... certainly implies — that laws, religions and moral codes are all a
+... superstructure built over existing property relations? It was Christ,
+... according to the Gospel, who uttered the text, but it was Marx who
+... brought it to life. And ever since he did so the motives of politicians,
+... priests, judges, moralists and millionaires have been under the deepest
+... suspicion — which, of course, is why they hate him so much."
+>>> alias_cli_substitution_if_found\
+...     in_the_gospel=':stdout.echo "${on_superstructure}"' or :stdout.echo\
+...     "Either we all live in a decent world, or nobody does."
+Either we all live in a decent world, or nobody does.
+>>> alias_cli_substitution_if_found ls=':stdout.echo "${on_superstructure}"'
+>>> ls | head -1
+Ideas may not change, but emphasis shifts constantly. It could be
+>>> get_string_line "$(ls)" 1
+./                .mutt/             pub/            .screenrc
+------------------------------------------
+==========================================
+/---
+function alias_cli_substitution_if_found() {
+    :str ZY_ALIAS_CLI_TYPE='substitution'
+    :bool   ZY_ALIAS_CLI_SUBSTITUTION_IS_RETURNING_IF_UNFOUND=${ZY_BOOLEAN_TRUE}
+    alias_cli "${@}"
+}
+
+# ....................{ DEFINERS                           }....................
+:func.doc <<'/---'
+:void alias_cli(:str alias_name ?:str alias_expansion)
+
+Define a CLI alias with the passed name expanding to the passed expansion.
+
+If no expansion is passed, the name must be formatted as a conventional
+`=`-delimited alias specification (e.g., `l="ls -l"`). Unlike normal `zsh`
+aliases, CLI aliases are expanded only when run directly from the command line
+by a interactive user. Consider calling the higher-level wrappers
+alias_cli_abbreviation() and alias_cli_substitution() rather than this
+comparatively lower-level function.
+
+== External Input Variables ==
+
+For convenience, this function also accepts the following externally set
+variables as optional input:
+
+* String `${ZY_ALIAS_CLI_TYPE}`. This is a `zeshy`-specific lowercase string
+  identifying the type of CLI alias to be defined (e.g., `abbreviation`). See
+  ${ZY_ALIAS_CLI_NAME_TO_TYPE} for further details.
+* Boolean `${ZY_ALIAS_CLI_SUBSTITUTION_IS_RETURNING_IF_UNFOUND}`. If true,
+  this function fails by returning *failure* (i.e., non-zero exit status) if the
+  passed alias is of type `substitution` and the passed alias name sans `{` and
+  `}` delimiters is _not_ already the name of an existing runnable.
+
+Callers should generally avoid explicitly setting such variables. Consider
+calling the higher-level wrapper functions alias_cli_abbreviation() and
+alias_cli_substitution() instead.
+
+== Examples ==
+
+.alias_cli()
+==========================================
+[source]
+------------------------------------------
+# Alias print() to print arguments in lexicographic order when interactive.
+>>> print T M D
+T M D
+>>> alias_cli print="print -o"
+>>> print T M D
+D M T
+# Run print() from a non-interactive subshell. Note the normal behavior.
+>>> (print T M D)
+T M D
+------------------------------------------
+==========================================
+/---
+function alias_cli() {
+    # Validate passed arguments, splitting the "="-delimited alias name and
+    # expansion split from all passed strings. Dismantled, this is:
+    #
+    # * "${*...}", expanding to all passed strings concatenated together.
+    # * "[[:space:]]#", excluding zero or more whitespace characters (e.g.,
+    #   tab, space) and hence ignoring whitespace surrounding such delimiter.
+    die_unless_args_1_to_2\
+        'Expected either one "="-delimited alias specification or one alias name and one alias expansion.'
+    :str\
+        alias_name\
+        alias_name_passed\
+        alias_expansion_passed\
+        alias_type_readable\
+        alias_name_type\
+        alias_expansion_if_noncli\
+        alias_logic_if_cli\
+        alias_logic_if_noncli
+#   print "cli alias: ${*}"  # print "args: ${*%%=*}"
+
+    # Type of interactive alias to be defined, defaulting to "alias" if not
+    # already set by the caller. Recognized types include:
+    #
+    # * "substitution", only set by alias_cli_substitution().
+    # * "abbreviation", only set by alias_cli_abbreviation().
+    # * "alias", only set by this function.
+    :str ZY_ALIAS_CLI_TYPE="${ZY_ALIAS_CLI_TYPE:-untyped}"
+
+    # If passed the name and expansion as explicit arguments, localize such
+    # arguments. Since this is the common case, handle this first.
+    if { is_args_2 } {
+        alias_name_passed="${1}"
+        alias_expansion_passed="${2}"
+    # Else, only one argument delimiting such name and expansion by "=" was
+    # passed. Match such name and expansion.
+    } else {
+        # The glob expression '(*)=(*)' is glorious to behold, indeed.
+        :str alias_specification="${1}"
+        :str.^=.die_unless_grouped\
+            "${alias_specification}" '([^=]#)=(*)'\
+            'CLI '${ZY_ALIAS_CLI_TYPE:-alias}' specifier "${*}" has no "=" delimiter.'
+        alias_name_passed="${match[1]}"
+        alias_expansion_passed="${match[2]}"
+#       :stdout.echo "alias name: ${alias_name}; expansion: ${alias_expansion}"
+    }
+
+    # Copy such alias name to ${alias_name}, from which "{" and "}" delimiters
+    # will subsequently be removed if present.
+    alias_name="${alias_name_passed}"
+#   is "${ZY_ALIAS_CLI_TYPE}" == abbreviation si and print "alias type: ${ZY_ALIAS_CLI_TYPE}\nalias name: ${alias_name}\nalias expansion: ${alias_expansion}" 1>&2
+#   is "${alias_name}" == '{acr}oread' si and { print "acroread!"; curse_call_stack }
+
+    # For readability, convert such type to a human-readable label.
+    case "${ZY_ALIAS_CLI_TYPE}" {
+    abbreviation)
+        alias_type_readable='CLI abbreviation alias'
+        :case.break
+    substitution)
+        alias_type_readable='CLI substitution alias'
+        :case.break
+    untyped)
+        alias_type_readable='CLI alias'
+        :case.break
+    # If such type is unrecognized, throw an exception.
+    *) :die 'CLI alias type "'${ZY_ALIAS_CLI_TYPE}'" unrecognized (i.e., neither "substitution", "abbreviation", or "alias").'
+    }
+
+    # If such name or expansion are the empty string, throw an exception.
+    die_unless_string_nonempty "${alias_name}"\
+        "Expected nonempty alias name in ${alias_type_readable}:${ZY_ASCII_NEWLINE}${*}."
+    die_unless_string_nonempty "${alias_expansion_passed}"\
+        "Expected nonempty alias expansion in ${alias_type_readable}:${ZY_ASCII_NEWLINE}${*}."
+
+    # If such alias name contains at least one "{" or "}" delimiter,
+    # concatenating all substrings delimited by such delimiters provides the
+    # abbreviation name embedded in such alias name (e.g., abbreviation "ichy"
+    # in alias "l{ich}mumm{y}"). Parse and possibly define such abbreviation.
+    if :is "${alias_name}" == *[{}]* :si {
+        alias_cli_parse_embedding
+    }
+
+    #FIXME: Subshells are horrible! Correct.
+    #FIXME: Replace the "if" portion of this conditional with a single call to
+    #die_if_runnable().
+
+    # If such alias name is already a declared runnable, handle such case.
+    if { alias_name_type="$(get_runnable_type_if_found "${alias_name}")" } {
+        # If such alias already exists, throw an exception. CLI aliases are
+        # implemented as actual aliases and hence cannot replace aliases of the
+        # same name without silently obliterating such aliases. As there is no
+        # compelling use case for permitting this, don't.
+        if :is "${alias_name_type}" == 'alias' :si {
+            :die ${alias_type_readable}' "'${alias_name}'" already an alias defined as:'${ZY_ASCII_NEWLINE}$(print_runnable "${alias_name}")
+        # ...any other runnable (e.g., alias, builtin, command) and this is a
+        # CLI abbreviation alias, throw an exception. Such aliases *NEVER*
+        # replace existing runnables.
+        } elif :is "${ZY_ALIAS_CLI_TYPE}" == 'abbreviation' :si {
+            :die ${alias_type_readable}' "'${alias_name}'" already a defined '${alias_name_type}':'${ZY_ASCII_NEWLINE}$(print_runnable "${alias_name}")
+        # Else, silently wrap such runnable in the passed alias.
+        }
+    # Else, such alias name is *NOT* already an existing runnable, in which case
+    # ${alias_name_type} is now the empty string (as tested below).
+    #
+    # If this is a CLI substitution alias, however, there exists nothing to be
+    # substituted. Fail with an appropriate exception or warning.
+    } elif :is "${ZY_ALIAS_CLI_TYPE}" == 'substitution' :si {
+        # If the caller requests returning failure in such case, do so.
+        if (( ${ZY_ALIAS_CLI_SUBSTITUTION_IS_RETURNING_IF_UNFOUND-${ZY_BOOLEAN_FALSE}} )) {
+            :failure.report
+        # Else, throw an exception.
+        } else {
+            :die ${alias_type_readable}' "'${alias_name}'" not an existing runnable and hence unsubstitutable.'
+        }
+    # Else, declare such runnable to be such CLI alias.
+    }
+#   is "${ZY_ALIAS_CLI_TYPE}" == abbreviation si and print "still alias name: ${alias_name}" 1>&2
+
+    #FIXME: I'm no longer convinced such distinctions are necessary. Standard
+    #input should *ALWAYS* be accessible to whatever is being expanded without
+    #our needing to explicitly pass it. If this is indeed the case, reduce such
+    #logic to:
+    #    alias_logic_if_cli=':stdout.echo "'${alias_expansion_passed}'"'
+    #FIXME: In such case, reduce the similar logic below as well.
+
+    # Interactive logic to be performed by the function definition below.
+    alias_logic_if_cli='if { :stdin.is_pipe } {
+        :stdout.echo ":stdin | '${alias_expansion_passed}'"
+    } else {
+        :stdout.echo "'${alias_expansion_passed}'"
+    }'
+
+    # Non-interactive logic to be performed by the function definition below. If
+    # this alias name is not already an existing runnable (e.g., as in the case
+    # of interactive abbreviations), throw an exception. Otherwise, call this alias
+    # name as is without expanding the passed expansion.
+    if { :str.is_empty "${alias_name_type}" } {
+        alias_logic_if_noncli=':stdout.echo "die '''${alias_type_readable}' \"'${alias_name}'\" expandable only at the command line; passed arguments:'${ZY_ASCII_NEWLINE}'''"'
+    } else {
+        alias_logic_if_noncli='
+    if { :stdin.is_pipe } {
+        :stdout.echo ":stdin | '${alias_name}'"
+    } else {
+        :stdout.echo "'${alias_name}'"
+    }'
+    }
+
+    # Define such alias.
+    :alias_command.define "${alias_name}" \
+'$(if { :context.is_cli_command_substitution } {
+    '${alias_logic_if_cli}'
+} else {
+    '${alias_logic_if_noncli}'
+})'
+
+    # Map such alias name to the passed name, expansion, and type *AFTER*
+    # successfully defining such alias.
+    ZY_ALIAS_CLI_NAME_TO_EXPANSION_PASSED[${alias_name}]="${alias_expansion_passed}"
+    ZY_ALIAS_CLI_NAME_TO_NAME_PASSED[${alias_name}]="${alias_name_passed}"
+    ZY_ALIAS_CLI_NAME_TO_TYPE[${alias_name}]="${ZY_ALIAS_CLI_TYPE}"
+}
+
+
+:func.doc <<'/---'
+:void alias_cli_parse_embedding()
+
+Parse `{`- and `}`-delimited substrings from the current interactive alias
+name of the current type (`substitution` or `abbreviation`) expanding to the
+current alias expansion.
+
+Concatenating these substrings gives the interactive abbreviation embedded in
+this name (e.g., alias name "`{ich}mumm{y}` embeds abbreviation `ichy`). If this
+type is:
+
+* An abbreviation, this abbreviation name is returned.
+* A substitution and:
+** If all possible extensions of the embedded abbreviation have been claimed
+   by existing runnables, a warning is printed and no such abbreviation is
+   defined.
+** Otherwise, this abbreviation is defined to the passed expansion.
+** In either case, this alias name is returned stripped of `{` and `}`
+   characters.
+
+This function is a helper intended to be called only by alias_cli(),
+thus accepting no arguments and returning no values.
+/---
+function alias_cli_parse_embedding() {
+    die_if_args
+
+    # If such abbreviation is syntactically invalid, throw an exception.
+    :is "${ZY_ALIAS_CLI_TYPE}" != 'alias' :si :or :die\
+        ${alias_type_readable}' "'${alias_name}'" delimited by "{" and "}" but neither an abbreviation or substitution CLI alias.'
+    :is "${alias_name}" != '{'[^{}]#'}' :si :or :die\
+        ${alias_type_readable}' "'${alias_name}'" fully delimited by "{" and "}" (i.e., no characters before "{" or after "}").'
+    :is "${alias_name}" != *'{}'* :si :or :die\
+        ${alias_type_readable}' "'${alias_name}'" delimited by empty "{" and "}".'
+    :is "${alias_name}" != *'{'[^}]# :si :or :die\
+        ${alias_type_readable}' "'${alias_name}'" undelimited by "}".'
+    :is "${alias_name}" != [^{]#'}'* :si :or :die\
+        ${alias_type_readable}' "'${alias_name}'" undelimited by "{".'
+
+    # Copy of the passed alias name.
+    :str alias_name_copy="${alias_name}"
+
+    # Abbreviation name parsed from ${alias_name_copy}.
+    :str abbre_name
+
+    # Character succeeding the leftmost "}" in ${alias_name_copy}.
+    :str abbre_next_char
+
+    # 1-based indices of the characters immediately preceding and succeeding
+    # the leftmost "}" in ${alias_name_copy}.
+    :int\
+        abbre_last_char_index\
+        abbre_next_char_index\
+        abbre_next_next_char_index
+
+    # Iteratively shift the leftmost "}" in ${alias_name_copy} right one
+    # character until either finding an abbreviation conflicting with no
+    # existing runnables *OR* reaching the end of ${alias_name_copy}.
+    while { true } {
+        abbre_name="${alias_name_copy//[^\{\}]#\{(#b)([^\{\}]##)\}[^\{\}]#/${match[1]}}"
+#       print_string_with_escapes "abbreviation: ${abbre_name}"
+
+        # If such abbreviation conflicts with no existing runnables, halt.
+        is_runnable "${abbre_name}" or break
+
+        # Find the index of the leftmost "}" in ${alias_name_copy} by
+        # matching the first "{..}" in such copy. Dismantled, this is:
+        #
+        # * "#", matching from the beginning of ${alias_name_copy}.
+        # * "(#m)", setting global integer ${MEND}, the 1-based index of
+        #   the last character matched -- in this case, the leftmost "{".
+        :noop "${alias_name_copy#(#m)[^\{\}]#\{[^\{\}]##\}}"
+
+        # If the index of the leftmost "}" is the last character in
+        # ${alias_name_copy}, the prior iteration shifted such "}" to the
+        # end of such copy and hence exhausted all characters. Return!
+        abbre_next_char_index=$(( MEND + 1 ))
+        (( abbre_next_char_index < ${#alias_name_copy} )) or break
+
+        # Else, get the character succeeding the leftmost "}".
+        abbre_last_char_index=$(( MEND - 1 ))
+#       :stdout.echo "abbre_next_char_index: ${abbre_next_char_index}"
+        abbre_next_char="${alias_name_copy[${abbre_next_char_index}]}"
+
+        # Shift the leftmost "}" in ${alias_name_copy} right one character.
+        #
+        # If the character succeeding the leftmost "}" is a "{", there exist
+        # two adjacent "{..}" expressions (e.g., "{mk}{d}ir"). Do not shift
+        # the "}" to the right of the "{" (e.g., "{mk{}d}ir"); rather, merge
+        # the two expressions (e.g., "{mkd}ir").
+        if :is "${abbre_next_char}" == '{' :si {
+            abbre_next_char_index+=1
+            alias_name_copy="${alias_name_copy[1,${abbre_last_char_index}]}${alias_name_copy[${abbre_next_char_index},-1]}"
+        # Otherwise, simply shift the leftmost "}" right one character.
+        } else {
+            abbre_next_next_char_index=$(( abbre_next_char_index + 1 ))
+            alias_name_copy="${alias_name_copy[1,${abbre_last_char_index}]}${abbre_next_char}}${alias_name_copy[${abbre_next_next_char_index},-1]}"
+        }
+#       :stdout.echo "new alias name: ${alias_name_copy}"
+    }
+
+    # If all possible abbreviation names have already been claimed by
+    # existing runnables and:
+    #
+    # * This is an interactive substitution, print a warning and define no
+    #   such abbreviation.
+    # * This is an interactive abbreviation, do nothing (i.e., attempt to
+    #   use the entire alias name stripped of "{" and "}" characters as the
+    #   abbreviation name).
+    if (( abbre_next_char_index == ${#alias_name_copy} )) {
+        if :is "${ZY_ALIAS_CLI_TYPE}" == 'substitution' :si {
+            :str abbre_name_type
+            abbre_name="${alias_name//[^\{\}]#\{(#b)([^\{\}]##)\}[^\{\}]#/${match[1]}}"
+            abbre_name_type="$(get_runnable_type "${abbre_name}")"
+            :warning.print 'Abbreviation "'${abbre_name}'" in '${alias_type_readable}' "'${alias_name}'" already a defined '${abbre_name_type}':'${ZY_ASCII_NEWLINE}$(print_runnable "${abbre_name}")
+        }
+    # If this is an interactive substitution, define an interactive
+    # abbreviation of the above abbreviation name and same expansion as this
+    # substitution. While this does recursively call alias_cli(), such
+    # call *NEVER* performs another recursive call. (Why? Listen close: such
+    # abbreviation name contains no "{" or "}" characters and hence no embedded
+    # abbreviation. Since such recursive call never calls this function, all
+    # recursion is guaranteed to "bottom out" after the first recursion.)
+    } elif :is "${ZY_ALIAS_CLI_TYPE}" == 'substitution' :si {
+#       print "abbreviating embedded ${abbre_name}:catch\"${alias_expansion}\"" 1>&2
+        alias_cli_abbreviation "${abbre_name}" "${alias_expansion_passed}"
+    # If this is an interactive abbreviation, set the alias name to be returned
+    # to the above abbreviation name.
+    } else {
+        alias_name="${abbre_name}"
+    }
+
+    # Strip "{" and "}" characters from the alias name to be returned.
+    alias_name="${alias_name//[\{\}]}"
+}
