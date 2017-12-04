@@ -1,0 +1,119 @@
+#!/usr/bin/env zeshy
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2017 by Cecil Curry.
+# See "LICENSE" for additional details.
+
+:parcel <<'/---'
+*SSHfuse*, a FUSE module mounting remote SSH hosts locally.
+/---
+
+#FIXME: This component requires quite a bit of updating. It no longers complies
+#with current Zeshy style *AT ALL*, and is doing pretty much everything wrong.
+
+# ....................{ ALIASES                            }....................
+#FIXME: Terrible. Just terrible. Replace with proper configuration file settings.
+alias_cli_substitution sshfs='sshfs -o allow_other,kernel_cache,reconnect,transform_symlinks,compression=yes,cache_timeout=256,cache_stat_timeout=16,cache_dir_timeout=16,cache_link_timeout=16,idmap=user,workaround=rename'
+alias_cli sshfs-umount='fusermount -uz'
+
+alias_cli_abbreviation '{sshm}ount'='mount_ssh_host'
+alias_cli_abbreviation '{sshu}mount'='unmount_ssh_host'
+
+# ....................{ [UN]MOUNTING                       }....................
+# Define high-level "front-facing" functions serving as this file's command-
+# line interface to common users.
+
+:func.doc <<'/---'
+:void mount_ssh_host(:str hostname)
+
+Mount the passed SSH hostname to its corresponding local mount point.
+/---
+function mount_ssh_host() {
+    die_unless_arg 'expected exactly one SSH hostname'
+    :str ssh_host="${1}" local_dirname remote_path
+    local_dirname="$ZY_SSH_HOST_TO_LOCAL_PATH[$ssh_host]"\
+    remote_pathname="$ZY_SSH_HOST_TO_REMOTE_PATH[$ssh_host]"
+    :is -n "$local_dirname" :si :or
+        :die "\"$ssh_host\" not a recognized host!"
+
+    is_dir "${local_dirname}" :or {
+        print_message "creating \"$local_dirname\"..."
+        sudo mkdir --parents "$local_dirname"
+        sudo chown "$(get_user)" "$local_dirname"
+    }
+
+    unmount_ssh_host "${ssh_host}"
+
+    # Load the "fuse" kernel module, if compiled as a module and not already loaded.
+    command grep -qw fuse /proc/filesystems :or {
+        # If the "/etc/init.d/fuse" initscript exists, preferentially run that.
+        if :is -x "/etc/init.d/fuse" :si {
+            sudo  "/etc/init.d/fuse" restart :or
+                :die "\"fuse\" initscript cannot be started!"
+        # Otherwise, load the kernel module.
+        } else {
+            sudo modprobe --quiet fuse ||
+                :die "\"fuse\" kernel module cannot be loaded!"
+        }
+    }
+
+    # Mount the passed SSH hostname.
+    print_message "mounting \"$ssh_host\" to \"${local_dirname}\"..."
+    command sshfs "${ssh_host}:${remote_pathname}" "${local_dirname}" :or
+      :die "\"$ssh_host\" cannot be mounted to \"${local_dirname}\"!"
+}
+
+
+:func.doc <<'/---'
+:void unmount_ssh_host(:str hostname)
+
+Unmount the passed SSH hostname from its corresponding local mount point.
+/---
+function unmount_ssh_host() {
+    die_unless_arg 'expected exactly one SSH hostname'
+    :str ssh_host="${1}" local_dirname
+    local_dirname="${ZY_SSH_HOST_TO_LOCAL_PATH[${ssh_host}]}"
+
+    :is -n "${local_dirname}" :si :or
+        :die "\"${ssh_host}\" not a recognized host!"
+
+    # Unmount the passed SSH hostname only if already mounted.
+    if { command grep "$local_dirname" /etc/mtab 2>&1 1>/dev/null } {
+        print_message "unmounting \"$ssh_host\" from \"$local_dirname\"..."
+        command sshfs-umount "$local_dirname" :or
+            :die "\"$ssh_host\" cannot be unmounted from \"$local_dirname\"!"
+    }
+}
+
+# ....................{ STARTUP                            }....................
+:hook.startup.add startup_zeshy_sshfs_mappings
+
+
+function startup_zeshy_sshfs_mappings() {
+    #FIXME: This is basically fundamentally broken. I can't be bothered at the
+    #moment, so... You know what to do, men.
+    :success.report
+
+    die_if_args
+    :str ssh_hosts ssh_host mount_home
+    mount_home="$(get_mount_home)"
+
+    # Split the scalar string of paths "$ZY_SSH_CONFIGS" on colons with (s.:.).
+    for ssh_config ("${ZY_SSH_CONFIGS[@]}") {
+        :is_file "${ssh_config}" :or break
+
+        #FIXME: Where to even begin.
+        # Extract a space-delimited set of all "Hosts" defined by this "ssh_config".
+        ssh_hosts="$(command grep --extended-regexp 'Host[ \t]' "${ssh_config}" | command cut --delimiter=' ' --fields=2 | command tr '\n' ' ' | command tr --delete '*')"
+
+        # Split the scalar string of words "$ssh_hosts" on spaces with '='.
+        for ssh_host (${(z)ssh_hosts}) {
+            # Do not append a terminating '/' onto mount points. Why? We later grep
+            # "/etc/mtab" for existing mount points and, since that file also does not
+            # append the same terminating '/', must thus ensure the two paths conform.
+            :map.is_key ZY_SSH_HOST_TO_LOCAL_PATH "${ssh_host}" :or
+                ZY_SSH_HOST_TO_LOCAL_PATH[${ssh_host}]="${mount_home}/${ssh_host}"
+            :map.is_key ZY_SSH_HOST_TO_REMOTE_PATH "${ssh_host}" :or
+                ZY_SSH_HOST_TO_REMOTE_PATH[${ssh_host}]=
+        }
+    }
+}
