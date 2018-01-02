@@ -1,0 +1,366 @@
+#!/usr/bin/env zeshy
+# --------------------( LICENSE                            )--------------------
+# Copyright 2007-2017 by Cecil Curry.
+# See "LICENSE" for additional details.
+
+:parcel <<'/---'
+*Dynamic block alias definers* (i.e., functions defining pairs of related
+aliases accepting arbitrarily many passed arguments intended to be expanded in
+proximity to each other, typically delimiting blocks of user-defined code
+effectively evaluated by such aliases).
+/---
+
+#FIXME: I believe we've finally cracked the tough nut of defining block aliases
+#(i.e., aliases that accept arbitrary code blocks as parameters). In hindsight,
+#all of our prior approaches were functionally insane. This approach, however,
+#is sane. Why?  Because it abuses global aliases, which turn out to be the key
+#to doing anything (and everything) interesting in the zsh language.
+#
+#Consider the case example of defining a :for block alias. Superficially, the
+#operation of this alias is trivial; it simply declares all variables to be
+#iterated over as local variables of the passed type: e.g.,
+#
+#    # Instead of this...
+#    :str world
+#    for  world ('Hello' 'World') {
+#        :stdout.echo "${world}"
+#    }
+#
+#    # Zeshy permits this.
+#    :for :str world ('Hello' 'World') :{
+#        :stdout.echo "${world}"
+#    }:
+#
+#So. How, exactly, would the above work? Simple. Consider a :for() block alias
+#defined as follows:
+#
+#    :int.global ZY__MACRO_BLOCK_INDEX=-1 <<'/---'
+#    0-based index of the currently expanded block alias if at least one such alias
+#    is expanded in the current context (i.e., function or script) or -1 otherwise.
+#
+#    == Motivation ==
+#
+#    That alias internally expands this index to uniquify local variable names,
+#    preventing variable name collisions when expanding block aliases within
+#    expansions of the same block aliases (i.e., when nesting two or more of the
+#    same block aliases).
+#    /---
+#
+#
+#    :list.global ZY__MACRO_ARGS <<'/---'
+#    List of all scalar arguments passed to the current macro.
+#    /---
+#
+#    :alias_command :for '
+#        ZY__MACRO_FUNC_NAMES
+#        ZY__MACRO_BLOCK_INDEX+=1
+#        noglob :List.items ZY__MACRO_ARGS'
+#    :alias_global ':{' '
+#         function "::macro.block:${ZY__MACRO_BLOCK_INDEX}"() {'
+#    :alias_global '}:' '
+#         }
+#
+#         #FIXME: Obvously insufficient. In actuality, we'd need to instead
+#         #evaluate all arguments *EXCLUDING* the first odd argument beginning
+#         #with a "(" character and all following arguments. Not terribly
+#         #arduous; merely annoying.
+#         # Localize all loop variables.
+#         eval ${ZY__MACRO_ARGS}
+#
+#         # Iterate this code block over this loop list.
+#         eval for ${ZY__MACRO_ARGS} {
+#             "::macro.block:${ZY__MACRO_BLOCK_INDEX}"
+#         }
+#
+#         # Decrement the current block index to preserve context-freeness,
+#         # effectively "popping off" this block argument from the hypothetical
+#         # stack of such arguments shared between all block aliases.
+#         ZY__MACRO_BLOCK_INDEX+=-1'
+#
+#Given these:
+#
+#    # ...the above example:
+#    :for :str world ('Hello' 'World') :{
+#        :stdout.echo "${world}"
+#    }:
+#
+#    # ...expands to this:
+#    ZY__MACRO_BLOCK_INDEX+=1
+#    noglob :List.items ZY__MACRO_ARGS :str world ('Hello' 'World')
+#    function "::macro.block:${ZY__MACRO_BLOCK_INDEX}"() {
+#        :stdout.echo "${world}"
+#    }
+#    eval ${ZY__MACRO_ARGS}
+#    eval for ${ZY__MACRO_ARGS} {
+#        "::macro.block:${ZY__MACRO_BLOCK_INDEX}"
+#    }
+#    ZY__MACRO_BLOCK_INDEX+=-1
+#FIXME: Great! Except for the definition of "}:". Clearly, we want to share a
+#single "}:" global definition between *ALL* block aliases. Can we do this?
+#
+#We shall. Simply replace the simple ${ZY__MACRO_BLOCK_INDEX} global defined
+#above with the following list global:
+#
+#    :list.global ZY__MACROS_FUNC_NAME <<'/---'
+#    Stack of the names of all low-level functions implementing high-level block
+#    aliases.
+#
+#    This stack is intended to be indexed by the ${ZY__MACRO_BLOCK_INDEX}
+#    global, such that the stack item with index ${ZY__MACRO_BLOCK_INDEX} is the
+#    name of the function implementing the current block alias.
+#    /---
+#
+#The corresponding alias definitions then resemble:
+#
+#    :alias_command :for '
+#        # Push the name of the function implementing this block alias onto the
+#        # stack of these names. 
+#        ZY__MACROS_FUNC_NAME+='::for'
+#
+#        # Store all passed scalar arguments for subsequent lookup.
+#        noglob :List.items ZY__MACRO_ARGS'
+#
+#    # Begin to pass a block argument to the current block alias.
+#    :alias_global ':{' '
+#        # Append the name of a function dynamically synthesized to implement
+#        # the passed block argument to this list.
+#        ZY__MACRO_ARGS+="::macro.block:${#ZY__MACROS_FUNC_NAME}"
+#
+#        # Synthesize this function, effectively storing this block argument
+#        # in a convenient manner for subsequent calling.
+#        function "${ZY__MACRO_ARGS[-1]}"() {'
+#
+#    # Finish passing a block argument to the current block alias.
+#    :alias_global '}:' '
+#        # Close the previously synthesized function.
+#        }
+#
+#        #FIXME: Obvously insufficient. In actuality, we'd need to instead
+#        #evaluate all arguments *EXCLUDING* the first odd argument beginning
+#        #with a "(" character and all following arguments. Not terribly
+#        #arduous; merely annoying.
+#        # Localize all loop variables.
+#        eval ${ZY__MACRO_ARGS}
+#
+#        # Call the function implementing this block alias, passed:
+#        #
+#        # * All scalar arguments passed to this block alias.
+#        # * The names of all functions encapsulating all block arguments
+#        #   passed to this block alias.
+#        "${ZY__MACROS_FUNC_NAME[-1]}" "${ZY__MACRO_ARGS[@]}"
+#
+#        # Pop the name of this function off this stack, preserving
+#        # context-freeness. See pop_list().
+#        ZY__MACROS_FUNC_NAME[-1]=()'
+#
+#    # Low-level function actually implementing the :for block alias.
+#    :func ':full ::for(+:str for_args :str for_block_func_name)' :func{
+#        # Iterate this code block over this loop list.
+#        eval for ${for_args} {
+#            "${for_block_func_name}"
+#        }
+#
+#Super-simple. Given the above, the :for block alias should be trivially
+#definable as follows:
+#
+#    :alias_block :for ::for '
+#        #FIXME: Obvously insufficient. In actuality, we'd need to instead
+#        #evaluate all arguments *EXCLUDING* the first odd argument beginning
+#        #with a "(" character and all following arguments. Not terribly
+#        #arduous; merely annoying.
+#        # Localize all loop variables.
+#        eval ${ZY__MACRO_ARGS}
+#    ' ''
+#
+#Super-simple, right? :alias_block() is a function accepting three parameters:
+#
+#    :void :alias_block(
+#        :str alias_block_func_name alias_block_preamble alias_block_postamble)
+#
+#Given that:
+#
+#* "${alias_block_func_name}" is the name of the low-level function implementing
+#  this code block. This function should avoid internally accessing unsafe
+#  global variables (e.g., "${ZY__MACRO_ARGS}") and should instead simply
+#  operate on the passed arguments, as described above.
+#* "${alias_block_preamble}" is arbitrary code to be run *BEFORE* calling this
+#  function.
+#* "${alias_block_postamble}" is arbitrary code to be run *AFTER* calling this
+#  function.
+#
+#That's it. Collectively, this permits us to define arbitrarily complex block
+#aliases accepting an arbitrary number of scalar and block arguments.
+#FIXME: Actually, note that the approach implemented above has been hard-coded
+#to support only block aliases accepting an arbitrary number of scalar arguments
+#followed by a single block argument. Ideally, this should be generalized to
+#support an arbitrary number of block arguments as well. Doing so *SHOULD* be
+#mostly feasible.
+#
+#Actually, doing so appears to be already supported! How so? Consider the
+#following calling conventions:
+#
+#* Each outermost "{" of a block argument should be instead be ":{".
+#* Each outermost "}" of all block arguments except the last should be left
+#  unchanged -- *NOT* "}:".
+#* The outermost "}" of the last block argument should instead be "}:".
+#
+#That's a bit cumbersome to remember, but we see little alternatives. Since zsh
+#does *NOT* require statements to be terminated by semicolons or any other
+#syntactic markers, terminating a block alias requires an explicit syntax.
+#
+#This is it, sadly. It's still substantially superior to... wait. We can tidy
+#this up a little bit. Consider the following alternative calling convention:
+#
+#    :for[ :str world ('Hello' 'World') :{
+#        :stdout.echo "${world}"
+#    }: :str universe ('Hello' 'Universe') :{
+#        :stdout.echo "${universe}"
+#    }: ]:
+#
+#The "["- and "]"-style delimiters are fairly decent, no? Under this
+#nomenclature:
+#
+#* All block alias names are required to be delimited by "[". If zsh prohibits
+#  this, any other character (e.g., "(", "?") will do. ":for?" is quite nice.
+#* All block alias calls are required to be suffixed by a trailing "]:"
+#  argument.
+#
+#Given that, the above alias definitions then generalize to:
+#
+#    :alias_command ':for[' '
+#        # Push the name of the function implementing this block alias onto the
+#        # stack of these names. 
+#        ZY__MACROS_FUNC_NAME+='::for'
+#
+#        # Store all passed scalar arguments for subsequent lookup.
+#        noglob :List.items ZY__MACRO_ARGS'
+#
+#    # Begin to pass a block argument to the current block alias.
+#    :alias_global ':{' '
+#        # Append the name of a function dynamically synthesized to implement
+#        # the passed block argument to this list.
+#        ZY__MACRO_ARGS+="::macro.block:${#ZY__MACROS_FUNC_NAME}"
+#
+#        # Synthesize this function, effectively storing this block argument
+#        # in a convenient manner for subsequent calling.
+#        function "${ZY__MACRO_ARGS[-1]}"() {'
+#
+#    # Finish passing a block argument to the current block alias.
+#    :alias_global '}:' '
+#        # Close the previously synthesized function.
+#        }
+#
+#        # Append all subsequently passed scalar arguments if any.
+#        noglob :List.append ZY__MACRO_ARGS'
+#
+#    # Finish passing all arguments to the current block alias.
+#    :alias_global ']:' '
+#        #FIXME: Obvously insufficient. In actuality, we'd need to instead
+#        #evaluate all arguments *EXCLUDING* the first odd argument beginning
+#        #with a "(" character and all following arguments. Not terribly
+#        #arduous; merely annoying.
+#        # Localize all loop variables.
+#        eval ${ZY__MACRO_ARGS}
+#
+#        # Call the function implementing this block alias, passed:
+#        #
+#        # * All scalar arguments passed to this block alias.
+#        # * The names of all functions encapsulating all block arguments
+#        #   passed to this block alias.
+#        "${ZY__MACROS_FUNC_NAME[-1]}" "${ZY__MACRO_ARGS[@]}"
+#
+#        # Pop the name of this function off this stack, preserving
+#        # context-freeness. See pop_list().
+#        ZY__MACROS_FUNC_NAME[-1]=()'
+#FIXME: Excellent. The only question then is how do we generalize
+#"${alias_block_preamble}" and "${alias_block_postamble}" across multiple
+#block aliases? In theory, this may be achieved by:
+#
+#* Preserving the existing ${ZY__MACROS_FUNC_NAME} stack, which we require for
+#  lookup.
+#* Defining a new ${ZY__MACRO_FUNC_NAME_TO_CODE} map mapping from the name of
+#  each function implementing all globally defined block aliases to a string of
+#  all zsh code to be dynamically evaluated for that block alias.
+#
+#The :alias_block() function should then synthesize key-value pairs of the
+#${ZY__MACRO_FUNC_NAME_TO_CODE} map as need. For example, after defining the
+#:for() block alias:
+#
+#    ZY__MACRO_FUNC_NAME_TO_CODE['::for']='
+#        #FIXME: Obvously insufficient. In actuality, we'd need to instead
+#        #evaluate all arguments *EXCLUDING* the first odd argument beginning
+#        #with a "(" character and all following arguments. Not terribly
+#        #arduous; merely annoying.
+#        # Localize all loop variables.
+#        eval ${ZY__MACRO_ARGS}
+#
+#        # Call the function implementing this block alias, passed:
+#        #
+#        # * All scalar arguments passed to this block alias.
+#        # * The names of all functions encapsulating all block arguments
+#        #   passed to this block alias.
+#        ::for "${ZY__MACRO_ARGS[@]}"
+#    '
+#
+#Finally, given that, we put everything together as follows:
+#
+#    :list.global ZY__MACROS_FUNC_NAME <<'/---'
+#    Stack of the names of all low-level functions implementing high-level block
+#    aliases.
+#
+#    This stack is intended to be accessed by the "]:" global alias, such that
+#    the last stack item is the name of the function implementing the current
+#    block alias.
+#    /---
+#
+#
+#    :map.global ZY__MACRO_FUNC_NAME_TO_CODE <<'/---'
+#    Map mapping from the name of each function implementing all globally defined
+#    block aliases to a string of all zsh code to be dynamically evaluated for
+#    that block alias.
+#    /---
+#
+#
+#    :alias_command ':for[' '
+#        # Push the name of the function implementing this block alias onto the
+#        # stack of these names. 
+#        ZY__MACROS_FUNC_NAME+='::for'
+#
+#        # Store all passed scalar arguments for subsequent lookup.
+#        noglob :List.items ZY__MACRO_ARGS'
+#
+#
+#    # Begin to pass a block argument to the current block alias.
+#    :alias_global ':{' '
+#        # Append the name of a function dynamically synthesized to implement
+#        # the passed block argument to this list.
+#        ZY__MACRO_ARGS+="::macro.block:${#ZY__MACROS_FUNC_NAME}"
+#
+#        # Synthesize this function, effectively storing this block argument
+#        # in a convenient manner for subsequent calling.
+#        function "${ZY__MACRO_ARGS[-1]}"() {'
+#
+#
+#    # Finish passing a block argument to the current block alias.
+#    :alias_global '}:' '
+#        # Close the previously synthesized function.
+#        }
+#
+#        # Append all subsequently passed scalar arguments if any.
+#        noglob :List.append ZY__MACRO_ARGS'
+#
+#
+#    # Finish passing all arguments to the current block alias.
+#    :alias_global ']:' '
+#        #FIXME: For safety, throw a human-readable exception if this
+#        #dictionary key is undefined.
+#        "${ZY__MACRO_FUNC_NAME_TO_CODE[${ZY__MACROS_FUNC_NAME[-1]}}"
+#
+#        # Pop the name of this function off this stack, preserving
+#        # context-freeness. See pop_list().
+#        ZY__MACROS_FUNC_NAME[-1]=()'
+#
+#Wow. That's it. It's incredibly intense, but absolutely worth it. See to it.
+
+#FIXME: See "var/var.zy" for significantly older (albeit arguably still
+#relevant) discussion.
